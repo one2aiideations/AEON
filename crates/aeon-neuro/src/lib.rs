@@ -9,9 +9,11 @@
 //!   an energy meter.
 //! * [`plasticity`]: local learning rules (Hebbian, Oja, pair STDP).
 //! * [`competition`]: k-winners-take-all selection.
+//! * [`eligibility`]: decaying per-synapse traces and reward-modulated updates for delayed reward.
 #![forbid(unsafe_code)]
 
 pub mod competition;
+pub mod eligibility;
 pub mod network;
 pub mod neuron;
 pub mod plasticity;
