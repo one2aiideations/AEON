@@ -226,7 +226,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_shapes() {
-        assert_eq!(Layout::contiguous(DType::I8, &[]), Err(TensorError::BadRank));
+        assert_eq!(
+            Layout::contiguous(DType::I8, &[]),
+            Err(TensorError::BadRank)
+        );
         assert_eq!(
             Layout::contiguous(DType::I8, &[1; 9]),
             Err(TensorError::BadRank)

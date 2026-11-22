@@ -122,7 +122,10 @@ impl ModelIndex {
             spans.push((t.offset, end));
         }
         spans.sort_unstable();
-        if spans.windows(2).any(|w| w[1].0 < w[0].1 || w[1].0 == w[0].0) {
+        if spans
+            .windows(2)
+            .any(|w| w[1].0 < w[0].1 || w[1].0 == w[0].0)
+        {
             return Err(ModelError::BadRange);
         }
         Ok(())

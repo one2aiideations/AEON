@@ -11,6 +11,7 @@ AEON is a lean, AI-native operating system for x86_64 laptops (CPU and GPU), wri
 | `aeon-gguf` | GGUF model file types (reader in progress) |
 | `aeon-tensor` | Tensor layouts, views, bump arena |
 | `aeon-model` | Model index, manifest, bounded reads, tiered MoE experts |
+| `aeon-engine` | Inference engine (CPU reference kernels so far) |
 
 ## Build and test
 

@@ -4,6 +4,7 @@
 //! * [`manifest`]: text manifest (`name | offset | bytes | dtype | rank | d0,d1,..`).
 //! * [`source`]: random-access byte sources (memory, file) and a bounded stream.
 //! * [`binding`]: a cursor that can only read inside one tensor's bytes.
+//! * [`cache`]: byte-budgeted LRU cache of fully loaded tensors.
 //! * [`experts`]: tiered (fast / RAM LRU / disk) mixture-of-experts store and routing.
 //!
 //! Ported from the retired C core (`aeon_model_*`, `aeon_tensor_binding`,
@@ -11,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod binding;
+pub mod cache;
 pub mod experts;
 pub mod index;
 pub mod manifest;
