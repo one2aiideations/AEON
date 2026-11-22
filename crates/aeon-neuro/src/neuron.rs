@@ -90,7 +90,7 @@ impl Neuron {
 
     fn refractory_at(&self, t: u64) -> bool {
         self.last_spike
-            .is_some_and(|s| t >= s && t <= s.saturating_add(u64::from(self.params.refractory)))
+            .is_some_and(|s| (s..=s.saturating_add(u64::from(self.params.refractory))).contains(&t))
     }
 
     /// Add `input` at time `t`. Returns the membrane value at firing, if it fired.
