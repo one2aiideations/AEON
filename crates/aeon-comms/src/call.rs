@@ -123,7 +123,9 @@ impl CallSession {
 
     fn current(&self) -> Option<u64> {
         match self.state {
-            State::Calling { call, .. } | State::Ringing { call, .. } | State::Connected { call } => Some(call),
+            State::Calling { call, .. }
+            | State::Ringing { call, .. }
+            | State::Connected { call } => Some(call),
             _ => None,
         }
     }
@@ -270,7 +272,10 @@ mod tests {
         let oa = a.dial(10, AV, "a", 0).unwrap();
         let ob = b.dial(20, AV, "b", 0).unwrap();
         // a (lower id) keeps its call and rejects b's offer; b yields to a's.
-        assert!(matches!(a.on_signal(ob, 0), Some(Signal::Hangup { call: 20, .. })));
+        assert!(matches!(
+            a.on_signal(ob, 0),
+            Some(Signal::Hangup { call: 20, .. })
+        ));
         assert!(b.on_signal(oa, 0).is_none());
         assert!(matches!(b.state(), State::Ringing { call: 10, .. }));
 
@@ -278,6 +283,9 @@ mod tests {
         c.dial(1, AV, "x", 100).unwrap();
         assert!(c.tick(120).is_none());
         assert!(matches!(c.tick(145), Some(Signal::Hangup { .. })));
-        assert!(c.dial(2, AV, "y", 200).is_some(), "can call again after end");
+        assert!(
+            c.dial(2, AV, "y", 200).is_some(),
+            "can call again after end"
+        );
     }
 }

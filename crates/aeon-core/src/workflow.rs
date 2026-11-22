@@ -92,8 +92,16 @@ impl Workflow {
 
     /// Steps in dependency order (Kahn's algorithm).
     pub fn topo_order(&self) -> Result<Vec<StepId>, FlowError> {
-        let mut indeg: BTreeMap<StepId, usize> = self.steps.iter().map(|(&id, n)| (id, n.deps.len())).collect();
-        let mut ready: Vec<StepId> = indeg.iter().filter(|(_, &d)| d == 0).map(|(&id, _)| id).collect();
+        let mut indeg: BTreeMap<StepId, usize> = self
+            .steps
+            .iter()
+            .map(|(&id, n)| (id, n.deps.len()))
+            .collect();
+        let mut ready: Vec<StepId> = indeg
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(&id, _)| id)
+            .collect();
         let mut order = Vec::with_capacity(self.steps.len());
         while let Some(id) = ready.pop() {
             order.push(id);
@@ -117,8 +125,11 @@ impl Workflow {
     fn refresh(&mut self) {
         loop {
             let mut changed = false;
-            let snapshot: BTreeMap<StepId, StepState> =
-                self.steps.iter().map(|(&id, n)| (id, n.state.clone())).collect();
+            let snapshot: BTreeMap<StepId, StepState> = self
+                .steps
+                .iter()
+                .map(|(&id, n)| (id, n.state.clone()))
+                .collect();
             for n in self.steps.values_mut() {
                 if n.state != StepState::Blocked {
                     continue;
@@ -212,7 +223,8 @@ mod tests {
 
     #[test]
     fn failure_cancels_downstream() {
-        let mut wf = Workflow::new(&[(1, "a", &[]), (2, "b", &[1]), (3, "c", &[2]), (4, "d", &[])]).unwrap();
+        let mut wf =
+            Workflow::new(&[(1, "a", &[]), (2, "b", &[1]), (3, "c", &[2]), (4, "d", &[])]).unwrap();
         wf.take_ready();
         wf.finish(1, Err("offline".into())).unwrap();
         assert_eq!(wf.state(3), Some(&StepState::Cancelled));
@@ -224,8 +236,17 @@ mod tests {
 
     #[test]
     fn rejects_bad_graphs() {
-        assert_eq!(Workflow::new(&[(1, "a", &[2]), (2, "b", &[1])]).unwrap_err(), FlowError::Cycle);
-        assert_eq!(Workflow::new(&[(1, "a", &[9])]).unwrap_err(), FlowError::MissingDep(9));
-        assert_eq!(Workflow::new(&[(1, "a", &[]), (1, "b", &[])]).unwrap_err(), FlowError::Duplicate(1));
+        assert_eq!(
+            Workflow::new(&[(1, "a", &[2]), (2, "b", &[1])]).unwrap_err(),
+            FlowError::Cycle
+        );
+        assert_eq!(
+            Workflow::new(&[(1, "a", &[9])]).unwrap_err(),
+            FlowError::MissingDep(9)
+        );
+        assert_eq!(
+            Workflow::new(&[(1, "a", &[]), (1, "b", &[])]).unwrap_err(),
+            FlowError::Duplicate(1)
+        );
     }
 }

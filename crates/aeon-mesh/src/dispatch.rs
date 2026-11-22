@@ -147,7 +147,13 @@ impl Dispatcher {
     }
 
     /// A worker finished. Ignored unless `node` owns the task.
-    pub fn complete(&mut self, nodes: &mut NodeTable, id: TaskId, node: NodeId, result: Vec<u8>) -> bool {
+    pub fn complete(
+        &mut self,
+        nodes: &mut NodeTable,
+        id: TaskId,
+        node: NodeId,
+        result: Vec<u8>,
+    ) -> bool {
         match self.tasks.get_mut(&id) {
             Some(t) if t.status == Status::Running(node) => {
                 nodes.add_load(node, -1);

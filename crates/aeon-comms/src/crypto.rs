@@ -74,7 +74,8 @@ impl Identity {
         let mut info = Vec::with_capacity(64);
         info.extend_from_slice(&lo);
         info.extend_from_slice(&hi);
-        hk.expand(&info, &mut okm).map_err(|_| CryptoError::BadPeer)?;
+        hk.expand(&info, &mut okm)
+            .map_err(|_| CryptoError::BadPeer)?;
         let (k_lo, k_hi) = okm.split_at(32);
         let (send, recv) = if me == lo { (k_lo, k_hi) } else { (k_hi, k_lo) };
         Ok(Session {
@@ -202,7 +203,10 @@ mod tests {
     fn pair() -> (Session, Session) {
         let a = Identity::from_secret([1; 32]);
         let b = Identity::from_secret([2; 32]);
-        (a.session(b.public()).unwrap(), b.session(a.public()).unwrap())
+        (
+            a.session(b.public()).unwrap(),
+            b.session(a.public()).unwrap(),
+        )
     }
 
     #[test]

@@ -29,7 +29,12 @@ impl Kind {
     pub fn sensitive(self) -> bool {
         matches!(
             self,
-            Self::Login | Self::Signup | Self::Purchase | Self::Subscribe | Self::Book | Self::Contact
+            Self::Login
+                | Self::Signup
+                | Self::Purchase
+                | Self::Subscribe
+                | Self::Book
+                | Self::Contact
         )
     }
 }
@@ -82,7 +87,11 @@ pub fn classify(text: &str, fields: &[Field], action: &str) -> Kind {
         "{} {} {}",
         text.to_lowercase(),
         action.to_lowercase(),
-        fields.iter().map(|f| f.name.to_lowercase()).collect::<Vec<_>>().join(" ")
+        fields
+            .iter()
+            .map(|f| f.name.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     let has = |ws: &[&str]| ws.iter().any(|w| t.contains(w));
     if fields.iter().any(|f| f.kind == "password") {
@@ -91,7 +100,9 @@ pub fn classify(text: &str, fields: &[Field], action: &str) -> Kind {
         }
         return Kind::Login;
     }
-    if has(&["checkout", "buy", "purchase", "pay", "order", "cart", "card"]) {
+    if has(&[
+        "checkout", "buy", "purchase", "pay", "order", "cart", "card",
+    ]) {
         Kind::Purchase
     } else if has(&["subscribe", "newsletter"]) {
         Kind::Subscribe
@@ -99,7 +110,9 @@ pub fn classify(text: &str, fields: &[Field], action: &str) -> Kind {
         Kind::Book
     } else if has(&["contact", "message", "feedback"]) {
         Kind::Contact
-    } else if has(&["search", "query"]) || fields.iter().any(|f| f.kind == "search" || f.name == "q") {
+    } else if has(&["search", "query"])
+        || fields.iter().any(|f| f.kind == "search" || f.name == "q")
+    {
         Kind::Search
     } else {
         Kind::Other
@@ -116,11 +129,15 @@ pub fn resolve(base: &str, href: &str) -> String {
         return href.to_owned();
     }
     let scheme_end = base.find("://").map_or(0, |i| i + 3);
-    let host_end = base[scheme_end..].find('/').map_or(base.len(), |i| scheme_end + i);
+    let host_end = base[scheme_end..]
+        .find('/')
+        .map_or(base.len(), |i| scheme_end + i);
     if href.starts_with('/') {
         return format!("{}{href}", &base[..host_end]);
     }
-    let dir_end = base[host_end..].rfind('/').map_or(base.len(), |i| host_end + i + 1);
+    let dir_end = base[host_end..]
+        .rfind('/')
+        .map_or(base.len(), |i| host_end + i + 1);
     if dir_end > base.len() || host_end == base.len() {
         return format!("{}/{href}", &base[..host_end]);
     }
@@ -155,8 +172,14 @@ pub fn detect(html: &str, base_url: &str) -> Vec<Intent> {
         i += 1;
         while i < tokens.len() && !matches!(&tokens[i], Token::End(tag) if tag == "form") {
             match &tokens[i] {
-                t @ Token::Start { tag, .. } if matches!(tag.as_str(), "input" | "select" | "textarea" | "button") => {
-                    let name = t.attr("name").or_else(|| t.attr("id")).unwrap_or("").to_owned();
+                t @ Token::Start { tag, .. }
+                    if matches!(tag.as_str(), "input" | "select" | "textarea" | "button") =>
+                {
+                    let name = t
+                        .attr("name")
+                        .or_else(|| t.attr("id"))
+                        .unwrap_or("")
+                        .to_owned();
                     let kind = t
                         .attr("type")
                         .unwrap_or(if tag == "input" { "text" } else { tag })
@@ -189,7 +212,8 @@ pub fn detect(html: &str, base_url: &str) -> Vec<Intent> {
             })
             .map(|f| f.name.clone());
         let kind = classify(&text, &fields, &action);
-        let needs_consent = kind.sensitive() || method == "POST" || fields.iter().any(Field::secret);
+        let needs_consent =
+            kind.sensitive() || method == "POST" || fields.iter().any(Field::secret);
         out.push(Intent {
             id: format!("form:{}", out.len()),
             kind,

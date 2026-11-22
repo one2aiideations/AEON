@@ -101,7 +101,8 @@ impl Bm25 {
             for (&d, &tf) in p {
                 let tf = tf as f32;
                 let dl = self.lengths[&d] as f32;
-                let norm = tf * (self.k1 + 1.0) / (tf + self.k1 * (1.0 - self.b + self.b * dl / avg.max(1e-6)));
+                let norm = tf * (self.k1 + 1.0)
+                    / (tf + self.k1 * (1.0 - self.b + self.b * dl / avg.max(1e-6)));
                 *scores.entry(d).or_insert(0.0) += idf * norm;
             }
         }

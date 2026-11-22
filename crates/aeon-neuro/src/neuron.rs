@@ -160,6 +160,10 @@ mod tests {
         n.adapt(-100.0);
         assert!((n.threshold - 0.01).abs() < 1e-6);
         assert!(Params::default().is_valid());
-        assert!(!Params { decay: 0.0, ..Params::default() }.is_valid());
+        assert!(!Params {
+            decay: 0.0,
+            ..Params::default()
+        }
+        .is_valid());
     }
 }

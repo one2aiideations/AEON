@@ -52,8 +52,16 @@ pub fn consent_for(intent: &Intent, payload: &BTreeMap<String, String>) -> Conse
 
 /// Decide what may happen with `payload` for `intent`.
 #[must_use]
-pub fn decide(intent: &Intent, payload: &BTreeMap<String, String>, mode: Mode, consent: Option<Consent>) -> Decision {
-    if let Some(name) = payload.keys().find(|k| !intent.fields.iter().any(|f| &f.name == *k)) {
+pub fn decide(
+    intent: &Intent,
+    payload: &BTreeMap<String, String>,
+    mode: Mode,
+    consent: Option<Consent>,
+) -> Decision {
+    if let Some(name) = payload
+        .keys()
+        .find(|k| !intent.fields.iter().any(|f| &f.name == *k))
+    {
         return Decision::Refused(format!("unknown field {name}"));
     }
     if let Some(f) = intent
@@ -103,24 +111,37 @@ mod tests {
     }
 
     fn p(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
-        kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn search_runs_login_needs_consent() {
         let v = page();
         let q = p(&[("q", "aeon")]);
-        assert_eq!(decide(&v[0], &q, Mode::Execute, None), Decision::Submit(q.clone()));
+        assert_eq!(
+            decide(&v[0], &q, Mode::Execute, None),
+            Decision::Submit(q.clone())
+        );
 
         let u = p(&[("user", "alice")]);
-        assert!(matches!(decide(&v[1], &u, Mode::Execute, None), Decision::NeedsConsent(_)));
+        assert!(matches!(
+            decide(&v[1], &u, Mode::Execute, None),
+            Decision::NeedsConsent(_)
+        ));
         let c = consent_for(&v[1], &u);
         match decide(&v[1], &u, Mode::Execute, Some(c)) {
-            Decision::Submit(vals) => assert_eq!(vals.get("_token").map(String::as_str), Some("t1")),
+            Decision::Submit(vals) => {
+                assert_eq!(vals.get("_token").map(String::as_str), Some("t1"))
+            }
             other => panic!("unexpected {other:?}"),
         }
         let other = p(&[("user", "mallory")]);
-        assert!(matches!(decide(&v[1], &other, Mode::Execute, Some(c)), Decision::Refused(_)));
+        assert!(matches!(
+            decide(&v[1], &other, Mode::Execute, Some(c)),
+            Decision::Refused(_)
+        ));
     }
 
     #[test]
@@ -134,6 +155,9 @@ mod tests {
             decide(&v[0], &p(&[("evil", "1")]), Mode::DryRun, None),
             Decision::Refused(_)
         ));
-        assert!(matches!(decide(&v[1], &p(&[]), Mode::DryRun, None), Decision::Preview(_)));
+        assert!(matches!(
+            decide(&v[1], &p(&[]), Mode::DryRun, None),
+            Decision::Preview(_)
+        ));
     }
 }

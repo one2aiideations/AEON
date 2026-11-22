@@ -149,7 +149,12 @@ impl VersionVector {
 /// Choose up to `copies` replica holders from `live` nodes, preferring
 /// nodes that already hold the file, then by id. Deterministic per file.
 #[must_use]
-pub fn place_replicas(file: &Hash, live: &[NodeId], holders: &[NodeId], copies: usize) -> Vec<NodeId> {
+pub fn place_replicas(
+    file: &Hash,
+    live: &[NodeId],
+    holders: &[NodeId],
+    copies: usize,
+) -> Vec<NodeId> {
     let mut v: Vec<NodeId> = live.to_vec();
     v.sort_by_key(|n| {
         // Rendezvous hashing: stable spread of files across nodes.

@@ -94,7 +94,13 @@ impl Network {
     }
 
     /// Connect `from -> to` with `weight`, delivered after `delay` steps (>= 1).
-    pub fn connect(&mut self, from: NeuronId, to: NeuronId, weight: f32, delay: u64) -> Result<(), NetError> {
+    pub fn connect(
+        &mut self,
+        from: NeuronId,
+        to: NeuronId,
+        weight: f32,
+        delay: u64,
+    ) -> Result<(), NetError> {
         if from >= self.neurons.len() || to >= self.neurons.len() {
             return Err(NetError::BadNeuron);
         }

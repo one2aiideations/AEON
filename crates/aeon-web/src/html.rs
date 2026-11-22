@@ -207,7 +207,9 @@ mod tests {
 
     #[test]
     fn tokens_and_attrs() {
-        let t = tokenize(r#"<P class='x' hidden>Fish &amp; chips<br/></p><!-- c --><a href=/go>go</a>"#);
+        let t = tokenize(
+            r#"<P class='x' hidden>Fish &amp; chips<br/></p><!-- c --><a href=/go>go</a>"#,
+        );
         assert_eq!(t[0].attr("class"), Some("x"));
         assert_eq!(t[0].attr("hidden"), Some(""));
         assert_eq!(t[1], Token::Text("Fish & chips".into()));

@@ -14,14 +14,38 @@ pub struct Readable {
 fn skipped(tag: &str) -> bool {
     matches!(
         tag,
-        "script" | "style" | "noscript" | "nav" | "header" | "footer" | "aside" | "form" | "svg" | "template" | "iframe"
+        "script"
+            | "style"
+            | "noscript"
+            | "nav"
+            | "header"
+            | "footer"
+            | "aside"
+            | "form"
+            | "svg"
+            | "template"
+            | "iframe"
     )
 }
 
 fn block(tag: &str) -> bool {
     matches!(
         tag,
-        "p" | "div" | "br" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "tr" | "section" | "article" | "main" | "pre" | "blockquote"
+        "p" | "div"
+            | "br"
+            | "li"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "tr"
+            | "section"
+            | "article"
+            | "main"
+            | "pre"
+            | "blockquote"
     )
 }
 
@@ -35,7 +59,9 @@ fn extract(tokens: &[Token]) -> String {
     let mut skip_depth = 0usize;
     for t in tokens {
         match t {
-            Token::Start { tag, self_closing, .. } => {
+            Token::Start {
+                tag, self_closing, ..
+            } => {
                 if skipped(tag) && !self_closing {
                     skip_depth += 1;
                 } else if block(tag) && skip_depth == 0 {
