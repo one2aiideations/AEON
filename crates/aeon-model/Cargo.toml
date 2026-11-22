@@ -1,0 +1,13 @@
+[package]
+name = "aeon-model"
+version = "0.1.0"
+description = "AEON model index, manifest, bounded tensor reads and tiered MoE expert store"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aeon-tensor = { path = "../aeon-tensor" }
+
+[lints]
+workspace = true
