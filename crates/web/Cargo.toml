@@ -1,12 +1,12 @@
 [package]
-name = "aeon-web"
+name = "aeonos-web"
 version = "0.1.0"
 edition = "2021"
 description = "AEON-WEB: AI-native web authoring, intelligence and execution monolith"
 license = "MIT"
 
 [[bin]]
-name = "aeon-web"
+name = "aeonos-web"
 path = "src/main.rs"
 
 [dependencies]

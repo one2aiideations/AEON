@@ -1,12 +1,12 @@
 [package]
-name = "aeon-mail"
+name = "aeonos-mail"
 version = "0.1.0"
 edition = "2021"
 description = "AEON-MAIL: AI-native email server and desktop client monolith"
 license = "MIT"
 
 [[bin]]
-name = "aeon-mail"
+name = "aeonos-mail"
 path = "src/main.rs"
 
 [dependencies]
