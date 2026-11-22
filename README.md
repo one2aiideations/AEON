@@ -21,6 +21,7 @@ AEON is a lean, AI-native operating system for x86_64 laptops (CPU and GPU), wri
 | `aeon-agents` | Scheduled agents, runner, hash-chained audit log |
 | `aeon-sched` | CPU/iGPU/dGPU/NPU placement with thermal-aware migration |
 | `aeon-core` | Kernel objects, capability registry, cognitive engines, agent lifecycle |
+| `aeon-neuro` | Event-driven spiking runtime with local learning |
 
 ## Build and test
 
