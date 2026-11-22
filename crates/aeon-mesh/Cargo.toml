@@ -1,0 +1,13 @@
+[package]
+name = "aeon-mesh"
+version = "0.1.0"
+description = "AEON device mesh: node health, fault-tolerant task dispatch, chunked file sync with version vectors"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true
