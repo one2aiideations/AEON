@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chunk;
+pub mod context;
 pub mod fusion;
 pub mod graph;
 pub mod lexical;
