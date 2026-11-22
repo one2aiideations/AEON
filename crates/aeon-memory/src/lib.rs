@@ -7,6 +7,7 @@
 //! * [`graph`]: knowledge graph with spreading activation (related ideas
 //!   light up from a few seeds).
 //! * [`fusion`]: reciprocal-rank fusion of several ranked lists.
+//! * [`ontology`]: class hierarchy (is-a) with inherited, typed relations.
 //! * [`chunk`]: recursive text chunking with overlap and source offsets, to feed the indexes.
 #![forbid(unsafe_code)]
 
@@ -15,6 +16,7 @@ pub mod context;
 pub mod fusion;
 pub mod graph;
 pub mod lexical;
+pub mod ontology;
 pub mod vector;
 
 /// Document id shared by all indexes.
