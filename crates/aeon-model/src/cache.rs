@@ -122,6 +122,44 @@ impl TensorCache {
         Ok(())
     }
 
+    /// Check the cache's internal invariants (the Rust form of the C `aeon_tensor_cache_validate`):
+    /// resident bytes within budget, entry count within the limit, every entry non-empty with a
+    /// distinct non-zero age and a unique name, and `bytes_used` equal to the sum of entry sizes.
+    ///
+    /// Meant for tests and debug assertions; a healthy cache always passes.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.entries.len() > self.max_entries {
+            return Err(ModelError::Inconsistent("more entries than the limit"));
+        }
+        if self.stats.bytes_used > self.budget {
+            return Err(ModelError::Inconsistent("bytes used exceed the budget"));
+        }
+        let mut resident = 0usize;
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.data.is_empty() {
+                return Err(ModelError::Inconsistent("empty entry"));
+            }
+            if e.age == 0 || e.age > self.clock {
+                return Err(ModelError::Inconsistent("entry age out of range"));
+            }
+            resident = resident
+                .checked_add(e.data.len())
+                .ok_or(ModelError::Inconsistent("resident bytes overflow"))?;
+            for other in &self.entries[i + 1..] {
+                if other.name == e.name {
+                    return Err(ModelError::Inconsistent("duplicate entry name"));
+                }
+                if other.age == e.age {
+                    return Err(ModelError::Inconsistent("duplicate entry age"));
+                }
+            }
+        }
+        if resident != self.stats.bytes_used {
+            return Err(ModelError::Inconsistent("bytes used do not match entries"));
+        }
+        Ok(())
+    }
+
     /// Drop one entry. Returns whether it was present.
     pub fn invalidate(&mut self, name: &str) -> bool {
         match self.entries.iter().position(|e| e.name == name) {
@@ -204,6 +242,95 @@ mod tests {
         assert_eq!(c.stats().peak_bytes, 8);
         assert!(c.put("e", bytes(11)).is_err());
         assert_eq!(c.set_budget(7), Err(ModelError::BadConfig));
+    }
+
+    #[test]
+    fn validate_passes_through_normal_use() {
+        let mut c = TensorCache::new(3, 12).unwrap();
+        c.validate().unwrap();
+        for (n, size) in [("a", 4), ("b", 4), ("c", 4), ("d", 8), ("a", 3)] {
+            c.put(n, bytes(size)).unwrap();
+            c.validate().unwrap();
+            let _ = c.get("b");
+            c.validate().unwrap();
+        }
+        c.invalidate("a");
+        c.validate().unwrap();
+        c.invalidate_all();
+        c.validate().unwrap();
+        assert_eq!(c.stats().bytes_used, 0);
+    }
+
+    #[test]
+    fn validate_detects_corruption() {
+        let mut c = TensorCache::new(4, 100).unwrap();
+        c.put("a", bytes(10)).unwrap();
+        c.put("b", bytes(10)).unwrap();
+
+        let mut bad = TensorCache::new(4, 100).unwrap();
+        bad.put("a", bytes(10)).unwrap();
+        bad.stats.bytes_used = 11;
+        assert_eq!(
+            bad.validate(),
+            Err(ModelError::Inconsistent("bytes used do not match entries"))
+        );
+        bad.stats.bytes_used = 101;
+        assert_eq!(
+            bad.validate(),
+            Err(ModelError::Inconsistent("bytes used exceed the budget"))
+        );
+
+        c.entries[1].name = "a".into();
+        assert_eq!(
+            c.validate(),
+            Err(ModelError::Inconsistent("duplicate entry name"))
+        );
+        c.entries[1].name = "b".into();
+        c.entries[1].age = c.entries[0].age;
+        assert_eq!(
+            c.validate(),
+            Err(ModelError::Inconsistent("duplicate entry age"))
+        );
+        c.entries[1].age = 0;
+        assert_eq!(
+            c.validate(),
+            Err(ModelError::Inconsistent("entry age out of range"))
+        );
+        c.entries[1].age = c.clock + 1;
+        assert_eq!(
+            c.validate(),
+            Err(ModelError::Inconsistent("entry age out of range"))
+        );
+        c.entries[1].age = 2;
+        c.entries[1].data = Arc::from(Vec::new());
+        assert_eq!(c.validate(), Err(ModelError::Inconsistent("empty entry")));
+        c.entries.push(Entry {
+            name: "x".into(),
+            data: bytes(1),
+            age: 9,
+        });
+        c.entries.push(Entry {
+            name: "y".into(),
+            data: bytes(1),
+            age: 10,
+        });
+        c.entries.push(Entry {
+            name: "z".into(),
+            data: bytes(1),
+            age: 11,
+        });
+        assert_eq!(
+            c.validate(),
+            Err(ModelError::Inconsistent("more entries than the limit"))
+        );
+    }
+
+    #[test]
+    fn inconsistent_error_displays_its_reason() {
+        assert_eq!(
+            ModelError::Inconsistent("x").to_string(),
+            "inconsistent state: x"
+        );
     }
 
     #[test]

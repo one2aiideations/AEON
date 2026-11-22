@@ -57,6 +57,8 @@ pub enum ModelError {
     NoSlot,
     /// Bad configuration or arguments.
     BadConfig,
+    /// An internal invariant does not hold (the text names it).
+    Inconsistent(&'static str),
 }
 
 impl fmt::Display for ModelError {
@@ -78,6 +80,7 @@ impl fmt::Display for ModelError {
             Self::Denied => f.write_str("expert not allowed"),
             Self::NoSlot => f.write_str("no evictable expert slot"),
             Self::BadConfig => f.write_str("bad configuration"),
+            Self::Inconsistent(what) => write!(f, "inconsistent state: {what}"),
         }
     }
 }
