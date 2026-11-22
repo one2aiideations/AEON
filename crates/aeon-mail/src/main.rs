@@ -209,7 +209,10 @@ impl RateLimiter {
 
 /// Rate-limit key for a peer: the IP without the port.
 fn peer_key(stream: &TcpStream) -> String {
-    stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default()
+    stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default()
 }
 
 // ============================================================
@@ -219,7 +222,16 @@ fn peer_key(stream: &TcpStream) -> String {
 fn dropped_element(tag: &str) -> bool {
     matches!(
         tag,
-        "script" | "style" | "iframe" | "frame" | "frameset" | "object" | "embed" | "applet" | "template" | "noscript"
+        "script"
+            | "style"
+            | "iframe"
+            | "frame"
+            | "frameset"
+            | "object"
+            | "embed"
+            | "applet"
+            | "template"
+            | "noscript"
     )
 }
 
@@ -246,7 +258,9 @@ fn safe_url(v: &str) -> bool {
         .filter(|c| !c.is_whitespace() && !c.is_control())
         .collect::<String>()
         .to_ascii_lowercase();
-    !(compact.starts_with("javascript:") || compact.starts_with("vbscript:") || compact.starts_with("data:"))
+    !(compact.starts_with("javascript:")
+        || compact.starts_with("vbscript:")
+        || compact.starts_with("data:"))
 }
 
 /// Rebuild HTML keeping only passive markup: active elements, event
@@ -264,7 +278,11 @@ fn sanitize_html(input: &str) -> String {
         }
         match t {
             Token::Text(s) => escape_text(&s, &mut out),
-            Token::Start { tag, attrs, self_closing } => {
+            Token::Start {
+                tag,
+                attrs,
+                self_closing,
+            } => {
                 if dropped_element(&tag) {
                     if !self_closing {
                         skip = Some(tag);
@@ -280,9 +298,15 @@ fn sanitize_html(input: &str) -> String {
                     let unsafe_attr = name.starts_with("on")
                         || name == "style"
                         || name == "srcdoc"
-                        || (matches!(name.as_str(), "href" | "src" | "action" | "formaction" | "xlink:href")
-                            && !safe_url(&value));
-                    if unsafe_attr || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':') {
+                        || (matches!(
+                            name.as_str(),
+                            "href" | "src" | "action" | "formaction" | "xlink:href"
+                        ) && !safe_url(&value));
+                    if unsafe_attr
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':')
+                    {
                         continue;
                     }
                     out.push(' ');
@@ -364,7 +388,12 @@ fn collect_attachments(part: &mailparse::ParsedMail, out: &mut Vec<(String, Stri
 
 /// Store a message (deduplicated by SHA-256 per mailbox). Returns the row id
 /// and how many attachments were skipped for size.
-fn store_message(conn: &Connection, mailbox_id: i64, raw: &[u8], max_att: usize) -> rusqlite::Result<(i64, usize)> {
+fn store_message(
+    conn: &Connection,
+    mailbox_id: i64,
+    raw: &[u8],
+    max_att: usize,
+) -> rusqlite::Result<(i64, usize)> {
     let parsed = parse_message(raw);
     let sha = hex::encode(Sha256::digest(raw));
     if let Ok(existing) = conn.query_row(
@@ -504,7 +533,10 @@ impl AiProvider for OpenAiCompatibleAi {
             .build()
             .map_err(|e| e.to_string())?;
         let mut req = client
-            .post(format!("{}/chat/completions", self.endpoint.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                self.endpoint.trim_end_matches('/')
+            ))
             .json(&serde_json::json!({
                 "model": self.model,
                 "messages": [
@@ -566,7 +598,10 @@ fn handle_smtp(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
 
         match cmd {
             "EHLO" | "HELO" => {
-                send_line(&mut writer, "250-aeon-mail\r\n250-AUTH PLAIN\r\n250-8BITMIME\r\n250 SIZE 26214400");
+                send_line(
+                    &mut writer,
+                    "250-aeon-mail\r\n250-AUTH PLAIN\r\n250-8BITMIME\r\n250 SIZE 26214400",
+                );
             }
             "AUTH" => {
                 if !limiter.check(&peer) {
@@ -588,7 +623,10 @@ fn handle_smtp(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                     continue;
                 };
                 let segs: Vec<&str> = d.split('\0').collect();
-                let (user, pass) = (segs.get(1).copied().unwrap_or(""), segs.get(2).copied().unwrap_or(""));
+                let (user, pass) = (
+                    segs.get(1).copied().unwrap_or(""),
+                    segs.get(2).copied().unwrap_or(""),
+                );
                 let Ok(conn) = open_db(&cfg.db_path) else {
                     send_line(&mut writer, "451 db error");
                     continue;
@@ -646,7 +684,11 @@ fn handle_smtp(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                     if l == b".\r\n" || l == b".\n" {
                         break;
                     }
-                    let unstuffed: &[u8] = if l.starts_with(b"..") { l.get(1..).unwrap_or_default() } else { &l };
+                    let unstuffed: &[u8] = if l.starts_with(b"..") {
+                        l.get(1..).unwrap_or_default()
+                    } else {
+                        &l
+                    };
                     if !oversize {
                         raw.extend_from_slice(unstuffed);
                         if raw.len() > cfg.max_message_bytes {
@@ -675,11 +717,12 @@ fn handle_smtp(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                         )
                         .ok();
                     let result = match local {
-                        Some(mbox) => store_message(&conn, mbox, &raw, cfg.max_attachment_bytes).map(|(_, skipped)| {
-                            if skipped > 0 {
-                                warn!("{skipped} oversized attachment(s) skipped for {addr}");
-                            }
-                        }),
+                        Some(mbox) => store_message(&conn, mbox, &raw, cfg.max_attachment_bytes)
+                            .map(|(_, skipped)| {
+                                if skipped > 0 {
+                                    warn!("{skipped} oversized attachment(s) skipped for {addr}");
+                                }
+                            }),
                         None => conn
                             .execute(
                                 "INSERT INTO delivery_queue(recipient,raw) VALUES(?1,?2)",
@@ -755,10 +798,16 @@ fn handle_imap(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
         };
 
         match cmd.as_str() {
-            "CAPABILITY" => send_line(&mut writer, &format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done")),
+            "CAPABILITY" => send_line(
+                &mut writer,
+                &format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done"),
+            ),
             "LOGIN" => {
                 if !limiter.check(&peer) {
-                    send_line(&mut writer, &format!("{tag} NO too many attempts, try later"));
+                    send_line(
+                        &mut writer,
+                        &format!("{tag} NO too many attempts, try later"),
+                    );
                     continue;
                 }
                 let args: Vec<&str> = rest.split_whitespace().collect();
@@ -788,7 +837,10 @@ fn handle_imap(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                     })
                     .unwrap_or_default();
                 for n in names {
-                    send_line(&mut writer, &format!("* LIST (\\HasNoChildren) \"/\" \"{n}\""));
+                    send_line(
+                        &mut writer,
+                        &format!("* LIST (\\HasNoChildren) \"/\" \"{n}\""),
+                    );
                 }
                 send_line(&mut writer, &format!("{tag} OK LIST done"));
             }
@@ -814,7 +866,10 @@ fn handle_imap(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
-                    send_line(&mut writer, &format!("* {n} EXISTS\r\n{tag} OK [READ-WRITE] selected"));
+                    send_line(
+                        &mut writer,
+                        &format!("* {n} EXISTS\r\n{tag} OK [READ-WRITE] selected"),
+                    );
                 } else {
                     send_line(&mut writer, &format!("{tag} NO mailbox not found"));
                 }
@@ -838,7 +893,10 @@ fn handle_imap(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                     )
                     .ok();
                 if let Some((uidn, raw)) = row {
-                    send_line(&mut writer, &format!("* {seq} FETCH (UID {uidn} RFC822 {{{}}}", raw.len()));
+                    send_line(
+                        &mut writer,
+                        &format!("* {seq} FETCH (UID {uidn} RFC822 {{{}}}", raw.len()),
+                    );
                     let _ = writer.write_all(&raw);
                     let _ = writer.write_all(b")\r\n");
                     send_line(&mut writer, &format!("{tag} OK FETCH done"));
@@ -883,11 +941,17 @@ fn handle_imap(stream: TcpStream, cfg: Arc<Config>, limiter: Arc<RateLimiter>) {
                             .map(|rows| rows.flatten().map(|u| u.to_string()).collect())
                     })
                     .unwrap_or_default();
-                send_line(&mut writer, &format!("* SEARCH {}\r\n{tag} OK SEARCH done", uids.join(" ")));
+                send_line(
+                    &mut writer,
+                    &format!("* SEARCH {}\r\n{tag} OK SEARCH done", uids.join(" ")),
+                );
             }
             "NOOP" => send_line(&mut writer, &format!("{tag} OK NOOP done")),
             "LOGOUT" => {
-                send_line(&mut writer, &format!("* BYE aeon-mail logging out\r\n{tag} OK LOGOUT done"));
+                send_line(
+                    &mut writer,
+                    &format!("* BYE aeon-mail logging out\r\n{tag} OK LOGOUT done"),
+                );
                 break;
             }
             _ => send_line(&mut writer, &format!("{tag} BAD unsupported command")),
@@ -922,17 +986,22 @@ async fn api_login(
     if !st.limiter.check(&ip) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many attempts".into()));
     }
-    let conn = open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let conn =
+        open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(uid) = authenticate(&conn, &req.email, &req.password) else {
         audit(&conn, &req.email, "http_login_failed", &ip);
         return Err((StatusCode::UNAUTHORIZED, "invalid credentials".into()));
     };
-    let token = create_session(&conn, uid).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let token = create_session(&conn, uid)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     audit(&conn, &req.email, "http_login", &ip);
     Ok(axum::Json(serde_json::json!({"token": token})))
 }
 
-fn find_part<'a>(p: &'a mailparse::ParsedMail<'a>, mime: &str) -> Option<&'a mailparse::ParsedMail<'a>> {
+fn find_part<'a>(
+    p: &'a mailparse::ParsedMail<'a>,
+    mime: &str,
+) -> Option<&'a mailparse::ParsedMail<'a>> {
     if p.ctype.mimetype.eq_ignore_ascii_case(mime)
         && p.get_content_disposition().disposition != mailparse::DispositionType::Attachment
     {
@@ -972,7 +1041,10 @@ async fn api_message(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    let (subject, from, raw) = row.ok_or((axum::http::StatusCode::NOT_FOUND, "no such message".to_string()))?;
+    let (subject, from, raw) = row.ok_or((
+        axum::http::StatusCode::NOT_FOUND,
+        "no such message".to_string(),
+    ))?;
     Ok(axum::Json(serde_json::json!({
         "id": id, "subject": subject, "from": from, "body_html": display_body(&raw)
     })))
@@ -991,9 +1063,16 @@ async fn api_agent_messages(
     headers: axum::http::HeaderMap,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     use axum::http::StatusCode;
-    let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let header = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
     let (name, token) = (header("x-agent-name"), header("x-agent-token"));
-    let conn = open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let conn =
+        open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     let agent: Option<(i64, i64)> = conn
         .query_row(
@@ -1002,10 +1081,16 @@ async fn api_agent_messages(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
-    let (aid, owner) = agent.ok_or((StatusCode::UNAUTHORIZED, "unknown or revoked agent".to_string()))?;
+    let (aid, owner) = agent.ok_or((
+        StatusCode::UNAUTHORIZED,
+        "unknown or revoked agent".to_string(),
+    ))?;
     if !agent_has_perm(&conn, aid, &q.mailbox, "read") {
         audit(&conn, &format!("agent:{name}"), "read_denied", &q.mailbox);
-        return Err((StatusCode::FORBIDDEN, "no read permission for this mailbox".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "no read permission for this mailbox".into(),
+        ));
     }
     let subjects: Vec<String> = conn
         .prepare(
@@ -1018,7 +1103,9 @@ async fn api_agent_messages(
         })
         .unwrap_or_default();
     audit(&conn, &format!("agent:{name}"), "read", &q.mailbox);
-    Ok(axum::Json(serde_json::json!({"mailbox": q.mailbox, "subjects": subjects})))
+    Ok(axum::Json(
+        serde_json::json!({"mailbox": q.mailbox, "subjects": subjects}),
+    ))
 }
 
 type ApiError = (axum::http::StatusCode, String);
@@ -1029,7 +1116,9 @@ struct Health {
     db: bool,
 }
 
-async fn http_health(axum::extract::State(st): axum::extract::State<AppState>) -> axum::Json<Health> {
+async fn http_health(
+    axum::extract::State(st): axum::extract::State<AppState>,
+) -> axum::Json<Health> {
     let db = open_db(&st.cfg.db_path).is_ok_and(|c| migrate(&c).is_ok());
     axum::Json(Health {
         status: if db { "ok" } else { "degraded" },
@@ -1037,15 +1126,20 @@ async fn http_health(axum::extract::State(st): axum::extract::State<AppState>) -
     })
 }
 
-fn bearer_user(st: &AppState, headers: &axum::http::HeaderMap) -> Result<(Connection, i64), ApiError> {
+fn bearer_user(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(Connection, i64), ApiError> {
     use axum::http::StatusCode;
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
-    let conn = open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let uid = user_for_token(&conn, token).ok_or((StatusCode::UNAUTHORIZED, "invalid token".to_string()))?;
+    let conn =
+        open_db(&st.cfg.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let uid = user_for_token(&conn, token)
+        .ok_or((StatusCode::UNAUTHORIZED, "invalid token".to_string()))?;
     Ok((conn, uid))
 }
 
@@ -1061,7 +1155,9 @@ async fn api_summary(
             |r| r.get(0),
         )
         .unwrap_or(0);
-    Ok(axum::Json(serde_json::json!({"user_id": uid, "message_count": msgs})))
+    Ok(axum::Json(
+        serde_json::json!({"user_id": uid, "message_count": msgs}),
+    ))
 }
 
 /// Summarise the request body. Only invoked by an explicit user request
@@ -1073,7 +1169,12 @@ async fn api_ai_summarize(
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     let uid = {
         let (conn, uid) = bearer_user(&st, &headers)?;
-        audit(&conn, &format!("user:{uid}"), "ai_summarize_requested", "explicit user request");
+        audit(
+            &conn,
+            &format!("user:{uid}"),
+            "ai_summarize_requested",
+            "explicit user request",
+        );
         uid
     };
     let summary = st
@@ -1081,7 +1182,9 @@ async fn api_ai_summarize(
         .summarize(&body)
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
-    Ok(axum::Json(serde_json::json!({"user_id": uid, "summary": summary})))
+    Ok(axum::Json(
+        serde_json::json!({"user_id": uid, "summary": summary}),
+    ))
 }
 
 // ============================================================
@@ -1159,7 +1262,11 @@ async fn main() {
             };
             info!(
                 "AI provider: {}",
-                if cfg.ai_endpoint.is_some() { "openai-compatible" } else { "disabled" }
+                if cfg.ai_endpoint.is_some() {
+                    "openai-compatible"
+                } else {
+                    "disabled"
+                }
             );
 
             let state = AppState {
@@ -1173,8 +1280,14 @@ async fn main() {
                 .route("/api/v1/login", axum::routing::post(api_login))
                 .route("/api/v1/summary", axum::routing::get(api_summary))
                 .route("/api/v1/messages/:id", axum::routing::get(api_message))
-                .route("/api/v1/agent/messages", axum::routing::get(api_agent_messages))
-                .route("/api/v1/ai/summarize", axum::routing::post(api_ai_summarize))
+                .route(
+                    "/api/v1/agent/messages",
+                    axum::routing::get(api_agent_messages),
+                )
+                .route(
+                    "/api/v1/ai/summarize",
+                    axum::routing::post(api_ai_summarize),
+                )
                 .with_state(state)
                 .layer(axum::extract::DefaultBodyLimit::max(cfg.max_message_bytes));
 
@@ -1251,9 +1364,13 @@ mod tests {
     fn migration_creates_tables() {
         let conn = temp_db();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(n >= 11);
+        assert_eq!(n, 10, "10 tables (the other 2 statements are indexes)");
         migrate(&conn).unwrap();
     }
 
@@ -1275,20 +1392,28 @@ mod tests {
         let conn = temp_db();
         create_user(&conn, "m@x.y", "twelvecharsmin").unwrap();
         let mbox: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name='INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name='INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let raw = b"Message-ID: <abc@test>\r\nFrom: s@x.y\r\nTo: m@x.y\r\nSubject: Hi\r\nDate: Mon, 01 Jan 2024 00:00:00 +0000\r\nContent-Type: text/plain\r\n\r\nBody text\r\n";
         let (id1, _) = store_message(&conn, mbox, raw, 1024).unwrap();
         let (id2, _) = store_message(&conn, mbox, raw, 1024).unwrap();
         assert_eq!(id1, id2, "dedup by sha256");
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE mailbox_id=?1", params![mbox], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id=?1",
+                params![mbox],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
         let (subj, mid): (String, String) = conn
-            .query_row("SELECT subject, message_id FROM messages WHERE id=?1", params![id1], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT subject, message_id FROM messages WHERE id=?1",
+                params![id1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(subj, "Hi");
         assert_eq!(mid, "abc@test");
@@ -1316,9 +1441,16 @@ mod tests {
         )
         .unwrap();
         assert!(agent_has_perm(&conn, aid, "INBOX", "read"));
-        assert!(!agent_has_perm(&conn, aid, "INBOX", "send"), "no privilege creep");
-        conn.execute("UPDATE agents SET revoked=1 WHERE id=?1", params![aid]).unwrap();
-        assert!(!agent_has_perm(&conn, aid, "INBOX", "read"), "revocation works");
+        assert!(
+            !agent_has_perm(&conn, aid, "INBOX", "send"),
+            "no privilege creep"
+        );
+        conn.execute("UPDATE agents SET revoked=1 WHERE id=?1", params![aid])
+            .unwrap();
+        assert!(
+            !agent_has_perm(&conn, aid, "INBOX", "read"),
+            "revocation works"
+        );
     }
 
     #[test]
@@ -1332,7 +1464,9 @@ mod tests {
         let conn = temp_db();
         create_user(&conn, "z@x.y", "twelvecharsmin").unwrap();
         let mbox: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name='INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name='INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let (_, skipped) = store_message(&conn, mbox, raw, 2).unwrap();
         assert_eq!(skipped, 1);
