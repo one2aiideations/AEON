@@ -3,6 +3,7 @@
 //! * [`index`]: named tensor table with overlap and bounds checks.
 //! * [`manifest`]: text manifest (`name | offset | bytes | dtype | rank | d0,d1,..`).
 //! * [`source`]: random-access byte sources (memory, file) and a bounded stream.
+//! * [`block`]: block-device (NVMe) sources, including submit/poll queues.
 //! * [`binding`]: a cursor that can only read inside one tensor's bytes.
 //! * [`cache`]: byte-budgeted LRU cache of fully loaded tensors.
 //! * [`experts`]: tiered (fast / RAM LRU / disk) mixture-of-experts store and routing.
@@ -12,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod binding;
+pub mod block;
 pub mod cache;
 pub mod experts;
 pub mod index;

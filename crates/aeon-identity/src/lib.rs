@@ -10,7 +10,7 @@
 //!    attestation bound to the same context,
 //! 5. it carries a credential hash and a content address (CID).
 //!
-//! Modules: [`registry`], [`semantic`], [`friction`], [`wire`], [`gate`].
+//! Modules: [`registry`], [`semantic`], [`friction`], [`wire`], [`gate`], [`hooks`].
 //! Ported from the retired C core (`aeon_identity*`, `aeon_semantic*`,
 //! `aeon_friction`, `aeon_syscall`, `aeon_io_gate`, `aeon_process_gate`,
 //! `aeon_net_policy`).
@@ -18,6 +18,7 @@
 
 pub mod friction;
 pub mod gate;
+pub mod hooks;
 pub mod registry;
 pub mod semantic;
 pub mod wire;

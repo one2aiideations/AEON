@@ -16,6 +16,7 @@ AEON is a lean, AI-native operating system for x86_64 laptops (CPU and GPU), wri
 | `aeon-cognition` | Hypervectors, spiking net, active inference, causal graph, memory, workspace |
 | `aeon-runtime` | Agent loop, capability-checked tools, gated actions |
 | `aeon-adapters` | Adapters to sibling systems (TOPSTAR) |
+| `aeond` | Init (PID 1) and inference-service supervisor |
 
 ## Build and test
 
