@@ -76,7 +76,12 @@ pub enum Method {
 /// Returns `None` when shapes differ or the weight count is wrong; callers
 /// then keep the base tensor unchanged.
 #[must_use]
-pub fn merge_tensor(base: &[f32], finetuned: &[&[f32]], method: &Method, lambda: f32) -> Option<Vec<f32>> {
+pub fn merge_tensor(
+    base: &[f32],
+    finetuned: &[&[f32]],
+    method: &Method,
+    lambda: f32,
+) -> Option<Vec<f32>> {
     if finetuned.is_empty() || finetuned.iter().any(|f| f.len() != base.len()) {
         return None;
     }
@@ -173,11 +178,21 @@ mod tests {
         let base = [1.0f32, 1.0];
         let f1 = [2.0f32, 1.0];
         let f2 = [1.0f32, 3.0];
-        let lin = merge_tensor(&base, &[&f1, &f2], &Method::Linear { weights: vec![0.5, 0.5] }, 1.0).unwrap();
+        let lin = merge_tensor(
+            &base,
+            &[&f1, &f2],
+            &Method::Linear {
+                weights: vec![0.5, 0.5],
+            },
+            1.0,
+        )
+        .unwrap();
         assert_eq!(lin, vec![1.5, 2.0]);
         let ties = merge_tensor(&base, &[&f1, &f2], &Method::Ties { density: 1.0 }, 1.0).unwrap();
         assert_eq!(ties, vec![2.0, 3.0]);
-        assert!(merge_tensor(&base, &[&[1.0f32][..]], &Method::Ties { density: 1.0 }, 1.0).is_none());
+        assert!(
+            merge_tensor(&base, &[&[1.0f32][..]], &Method::Ties { density: 1.0 }, 1.0).is_none()
+        );
     }
 
     #[test]

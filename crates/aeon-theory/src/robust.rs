@@ -122,7 +122,8 @@ fn mean(xs: &[f64]) -> Option<f64> {
 /// Summarise per-condition accuracy and measured reliance.
 #[must_use]
 pub fn summarise(acc: &BTreeMap<Condition, f64>, rel: &BTreeMap<Shortcut, f64>) -> Summary {
-    let pick = |cs: &[Condition]| -> Vec<f64> { cs.iter().filter_map(|c| acc.get(c).copied()).collect() };
+    let pick =
+        |cs: &[Condition]| -> Vec<f64> { cs.iter().filter_map(|c| acc.get(c).copied()).collect() };
     let closure = pick(&CLOSURE);
     let held = pick(&HELDOUT);
     let familiar = pick(&[

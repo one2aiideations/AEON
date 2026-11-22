@@ -65,7 +65,10 @@ mod tests {
 
     #[test]
     fn merge_weight_ties_prefer_half() {
-        assert_eq!(choose_merge_weight(&[(0.2, 0.7), (0.5, 0.7), (0.9, 0.6)]), Some(0.5));
+        assert_eq!(
+            choose_merge_weight(&[(0.2, 0.7), (0.5, 0.7), (0.9, 0.6)]),
+            Some(0.5)
+        );
         assert_eq!(choose_merge_weight(&[(0.3, 0.1), (0.8, 0.9)]), Some(0.8));
         assert_eq!(choose_merge_weight(&[]), None);
     }

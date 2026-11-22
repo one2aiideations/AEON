@@ -176,7 +176,15 @@ mod tests {
             records: rows
                 .iter()
                 .enumerate()
-                .map(|(i, &(correct, confidence))| (i as u64, Scored { correct, confidence }))
+                .map(|(i, &(correct, confidence))| {
+                    (
+                        i as u64,
+                        Scored {
+                            correct,
+                            confidence,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -184,10 +192,15 @@ mod tests {
     #[test]
     fn cascade_saves_compute() {
         // Small model is right exactly when confident; large model is always right.
-        let small_rows: Vec<(bool, f64)> = (0..20).map(|i| (i < 15, if i < 15 { 0.9 } else { 0.3 })).collect();
+        let small_rows: Vec<(bool, f64)> = (0..20)
+            .map(|i| (i < 15, if i < 15 { 0.9 } else { 0.3 }))
+            .collect();
         let large_rows: Vec<(bool, f64)> = (0..20).map(|_| (true, 0.95)).collect();
         let r = plan(
-            &[cand("small", 1.0, &small_rows), cand("large", 10.0, &large_rows)],
+            &[
+                cand("small", 1.0, &small_rows),
+                cand("large", 10.0, &large_rows),
+            ],
             21,
             0.0,
             20,

@@ -38,7 +38,9 @@ pub fn calibration(records: &[(f64, bool)], bins: usize) -> Option<Calibration> 
     let mut count = vec![0usize; bins];
     for &(p, v) in records {
         let p = p.clamp(0.0, 1.0);
-        let b = ((p * bins as f64).ceil() as usize).saturating_sub(1).min(bins - 1);
+        let b = ((p * bins as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(bins - 1);
         sum_p[b] += p;
         sum_v[b] += f64::from(u8::from(v));
         count[b] += 1;
