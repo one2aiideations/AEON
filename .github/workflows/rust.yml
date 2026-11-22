@@ -1,0 +1,59 @@
+name: AEON Rust workspace
+
+"on":
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aeon-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: Format
+        id: fmt
+        run: cargo fmt --all -- --check
+      - name: Make a rustfmt patch when formatting fails
+        if: failure() && steps.fmt.outcome == 'failure'
+        run: cargo fmt --all && git diff > rustfmt.patch
+      - name: Upload rustfmt patch
+        if: failure() && steps.fmt.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+      - name: Clippy
+        if: always()
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        if: always()
+        run: cargo test --workspace

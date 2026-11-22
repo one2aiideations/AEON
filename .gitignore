@@ -1,0 +1,7 @@
+# Rust
+target/
+
+# never commit model weights or caches
+*.safetensors
+*.gguf
+*.bin
