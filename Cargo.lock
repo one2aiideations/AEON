@@ -264,11 +264,18 @@ version = "0.1.0"
 name = "aeon-project"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "eframe",
+ "http-body-util",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3844,7 +3851,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

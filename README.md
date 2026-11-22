@@ -31,6 +31,7 @@ AEON is a lean, AI-native operating system for x86_64 laptops (CPU and GPU), wri
 | `aeon-mail` | AI-native mail server: SMTP submission, minimal IMAP, HTTP API, agent permissions |
 | `aeon-sheet` | Spreadsheet core: formulas, dependency-ordered recalculation, cycle detection |
 | `aeon-studio` | One creative/office app: documents, spreadsheets (aeon-sheet), fail-closed engine stubs |
+| `aeon-project` | Project management: tasks, dependencies, critical path, kanban, REST API, optional desktop UI |
 
 ## Build and test
 
