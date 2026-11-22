@@ -112,7 +112,7 @@ impl AeonSystem {
         self.cpu_usage = self.system.global_cpu_info().cpu_usage();
         self.processes = self.system.processes().iter().map(|(pid, p)| ProcessRow {
             pid: pid.to_string(),
-            name: p.name().to_string_lossy().into_owned(),
+            name: p.name().to_string(),
             cpu_percent: p.cpu_usage(),
             memory_bytes: p.memory(),
             status: format!("{:?}", p.status()),
