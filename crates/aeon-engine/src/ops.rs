@@ -196,10 +196,7 @@ mod tests {
         rope(&mut q, &mut k, 1, 4, 7, 10000.0).unwrap();
         assert!(close(q[0] * q[0] + q[1] * q[1], 5.0));
         assert_eq!(q, k);
-        assert_eq!(
-            rope(&mut q, &mut k, 1, 3, 0, 10000.0),
-            Err(OpError::Param)
-        );
+        assert_eq!(rope(&mut q, &mut k, 1, 3, 0, 10000.0), Err(OpError::Param));
     }
 
     #[test]

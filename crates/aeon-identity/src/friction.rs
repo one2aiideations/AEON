@@ -72,9 +72,7 @@ impl Attestation {
             nonce: c.nonce,
             context_hash: c.context_hash,
             verifier_key: verifier.verifying_key().to_bytes(),
-            signature: verifier
-                .sign(&message(c.nonce, &c.context_hash))
-                .to_bytes(),
+            signature: verifier.sign(&message(c.nonce, &c.context_hash)).to_bytes(),
         }
     }
 }

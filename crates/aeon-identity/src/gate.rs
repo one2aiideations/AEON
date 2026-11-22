@@ -198,7 +198,10 @@ mod tests {
     #[test]
     fn net_policy() {
         let (f, reg) = signed_frame();
-        assert_eq!(net_decide(&reg, NetHook::PreRx, false, None), NetAction::Accept);
+        assert_eq!(
+            net_decide(&reg, NetHook::PreRx, false, None),
+            NetAction::Accept
+        );
         assert_eq!(
             net_decide(&reg, NetHook::PreRx, true, None),
             NetAction::DeferIdentity
