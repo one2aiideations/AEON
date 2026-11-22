@@ -72,7 +72,10 @@ impl Evolver {
     /// Current version and score.
     #[must_use]
     pub fn current(&self) -> (&str, f64) {
-        let (v, s) = self.history.last().map_or(("", 0.0), |(v, s)| (v.as_str(), *s));
+        let (v, s) = self
+            .history
+            .last()
+            .map_or(("", 0.0), |(v, s)| (v.as_str(), *s));
         (v, s)
     }
 
@@ -83,7 +86,12 @@ impl Evolver {
     }
 
     /// One repair round for `failure`.
-    pub fn round(&mut self, failure: &str, gen: &mut dyn Generator, val: &mut dyn Validator) -> RoundResult {
+    pub fn round(
+        &mut self,
+        failure: &str,
+        gen: &mut dyn Generator,
+        val: &mut dyn Validator,
+    ) -> RoundResult {
         let (current, baseline) = {
             let (c, s) = self.current();
             (c.to_owned(), s)
@@ -108,7 +116,10 @@ impl Evolver {
         match best {
             Some((c, v)) => {
                 self.history.push((c, v.score));
-                RoundResult::Accepted { score: v.score, tried }
+                RoundResult::Accepted {
+                    score: v.score,
+                    tried,
+                }
             }
             None => RoundResult::Kept {
                 tried,
@@ -137,7 +148,9 @@ mod tests {
     struct Digits;
     impl Generator for Digits {
         fn propose(&mut self, current: &str, _failure: &str, n: usize) -> Vec<String> {
-            (0..n).map(|i| format!("{current}{}", [9, 3, 1][i % 3])).collect()
+            (0..n)
+                .map(|i| format!("{current}{}", [9, 3, 1][i % 3]))
+                .collect()
         }
     }
     struct NoNines;
@@ -146,7 +159,11 @@ mod tests {
             Validation {
                 passed: !c.contains('9'),
                 score: c.parse::<f64>().unwrap_or(0.0),
-                notes: if c.contains('9') { "contains 9".into() } else { String::new() },
+                notes: if c.contains('9') {
+                    "contains 9".into()
+                } else {
+                    String::new()
+                },
             }
         }
     }
@@ -155,7 +172,13 @@ mod tests {
     fn accepts_best_valid_and_rolls_back() {
         let mut e = Evolver::new("1", 1.0);
         let r = e.round("too small", &mut Digits, &mut NoNines);
-        assert_eq!(r, RoundResult::Accepted { score: 13.0, tried: 3 });
+        assert_eq!(
+            r,
+            RoundResult::Accepted {
+                score: 13.0,
+                tried: 3
+            }
+        );
         assert_eq!(e.current().0, "13");
         assert!(e.rollback());
         assert_eq!(e.current(), ("1", 1.0));

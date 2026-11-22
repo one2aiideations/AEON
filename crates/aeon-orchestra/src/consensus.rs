@@ -95,9 +95,17 @@ mod tests {
 
     #[test]
     fn trusted_majority_wins() {
-        let v = [p(1, "A", 0.9, 0.9), p(2, "A", 0.6, 0.8), p(3, "B", 1.0, 0.3)];
+        let v = [
+            p(1, "A", 0.9, 0.9),
+            p(2, "A", 0.6, 0.8),
+            p(3, "B", 1.0, 0.3),
+        ];
         match decide(&v, 0.6) {
-            Outcome::Agreed { answer, share, supporters } => {
+            Outcome::Agreed {
+                answer,
+                share,
+                supporters,
+            } => {
                 assert_eq!(answer, "A");
                 assert!(share > 0.7);
                 assert_eq!(supporters, vec![1, 2]);

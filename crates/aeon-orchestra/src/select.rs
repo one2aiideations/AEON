@@ -94,9 +94,10 @@ pub fn resolve_capability(capability: &str, ctx: &Context) -> Option<String> {
     }
     match base {
         "ocr" | "asr" | "tts" => Some(format!("{base}.{}", ctx.language)),
-        "translate" if !ctx.target_language.is_empty() => {
-            Some(format!("translate.{}_to_{}", ctx.language, ctx.target_language))
-        }
+        "translate" if !ctx.target_language.is_empty() => Some(format!(
+            "translate.{}_to_{}",
+            ctx.language, ctx.target_language
+        )),
         _ => None,
     }
 }
@@ -116,7 +117,10 @@ impl ModelCatalog {
 
     /// Add a model for `capability`.
     pub fn add(&mut self, capability: &str, m: ModelEntry) {
-        self.models.entry(capability.to_owned()).or_default().push(m);
+        self.models
+            .entry(capability.to_owned())
+            .or_default()
+            .push(m);
     }
 
     /// Usable models for `capability`, best first: the first is the choice,
@@ -163,7 +167,14 @@ impl ModelCatalog {
 mod tests {
     use super::*;
 
-    fn m(name: &str, accuracy: f32, latency_ms: u32, cost: f32, low_risk: bool, gpu: bool) -> ModelEntry {
+    fn m(
+        name: &str,
+        accuracy: f32,
+        latency_ms: u32,
+        cost: f32,
+        low_risk: bool,
+        gpu: bool,
+    ) -> ModelEntry {
         ModelEntry {
             name: name.into(),
             accuracy,
@@ -196,12 +207,25 @@ mod tests {
     #[test]
     fn context_changes_choice() {
         let c = catalog();
-        let cpu_regulated = c.ranked("chat", &ctx(Urgency::High, Environment::Regulated, Device::Cpu));
+        let cpu_regulated = c.ranked(
+            "chat",
+            &ctx(Urgency::High, Environment::Regulated, Device::Cpu),
+        );
         assert_eq!(cpu_regulated.len(), 1);
         assert_eq!(cpu_regulated[0].name, "small-cpu");
-        let remote = c.ranked("chat", &ctx(Urgency::Normal, Environment::Remote, Device::Gpu));
+        let remote = c.ranked(
+            "chat",
+            &ctx(Urgency::Normal, Environment::Remote, Device::Gpu),
+        );
         assert_eq!(remote[0].name, "cloud");
-        assert_eq!(c.ranked("asr.AUTO", &ctx(Urgency::High, Environment::Local, Device::Cpu))[0].name, "whisper-ta");
+        assert_eq!(
+            c.ranked(
+                "asr.AUTO",
+                &ctx(Urgency::High, Environment::Local, Device::Cpu)
+            )[0]
+            .name,
+            "whisper-ta"
+        );
     }
 
     #[test]
@@ -209,11 +233,19 @@ mod tests {
         let c = catalog();
         let x = ctx(Urgency::Normal, Environment::Remote, Device::Gpu);
         let (used, out) = c
-            .run_with_fallback("chat", &x, |m| if m.name == "cloud" { Err("offline".into()) } else { Ok(1) })
+            .run_with_fallback("chat", &x, |m| {
+                if m.name == "cloud" {
+                    Err("offline".into())
+                } else {
+                    Ok(1)
+                }
+            })
             .unwrap();
         assert_ne!(used, "cloud");
         assert_eq!(out, 1);
-        let errs = c.run_with_fallback::<()>("chat", &x, |_| Err("down".into())).unwrap_err();
+        let errs = c
+            .run_with_fallback::<()>("chat", &x, |_| Err("down".into()))
+            .unwrap_err();
         assert_eq!(errs.len(), 3);
         assert!(c.run_with_fallback::<()>("nope", &x, |_| Ok(())).is_err());
     }
@@ -221,7 +253,10 @@ mod tests {
     #[test]
     fn auto_resolution() {
         let x = ctx(Urgency::High, Environment::Local, Device::Cpu);
-        assert_eq!(resolve_capability("translate.AUTO", &x).unwrap(), "translate.ta_to_en");
+        assert_eq!(
+            resolve_capability("translate.AUTO", &x).unwrap(),
+            "translate.ta_to_en"
+        );
         assert_eq!(resolve_capability("chat", &x).unwrap(), "chat");
         assert!(resolve_capability("video.AUTO", &x).is_none());
     }

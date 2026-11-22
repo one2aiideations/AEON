@@ -77,7 +77,9 @@ impl Constitution {
         self.rules
             .iter()
             .find(|r| matches(&r.pattern, action))
-            .map_or((self.default, "no rule matched"), |r| (r.verdict, r.reason.as_str()))
+            .map_or((self.default, "no rule matched"), |r| {
+                (r.verdict, r.reason.as_str())
+            })
     }
 
     /// Final permission given whether the user approved this action.
@@ -175,7 +177,10 @@ impl Quota {
     /// Record a call at `now` if allowed.
     pub fn allow(&mut self, key: &str, now: u64) -> bool {
         let q = self.calls.entry(key.to_owned()).or_default();
-        while q.front().is_some_and(|&t| now.saturating_sub(t) >= self.window) {
+        while q
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= self.window)
+        {
             q.pop_front();
         }
         if q.len() >= self.limit {
@@ -197,11 +202,17 @@ mod tests {
             .rule("files.read", Verdict::Allow, "reading is safe")
             .rule("files.*", Verdict::RequireApproval, "changes need the user");
         assert_eq!(c.judge("payments.send").0, Verdict::Deny);
-        assert!(!c.permits("payments.send", true), "approval cannot override deny");
+        assert!(
+            !c.permits("payments.send", true),
+            "approval cannot override deny"
+        );
         assert!(c.permits("files.read", false));
         assert!(!c.permits("files.delete", false));
         assert!(c.permits("files.delete", true));
-        assert_eq!(c.judge("net.post"), (Verdict::RequireApproval, "no rule matched"));
+        assert_eq!(
+            c.judge("net.post"),
+            (Verdict::RequireApproval, "no rule matched")
+        );
     }
 
     #[test]

@@ -78,7 +78,12 @@ pub struct Orchestrator {
 impl Orchestrator {
     /// New orchestrator.
     #[must_use]
-    pub fn new(registry: Registry, constitution: Constitution, budget: Budget, quota: Quota) -> Self {
+    pub fn new(
+        registry: Registry,
+        constitution: Constitution,
+        budget: Budget,
+        quota: Quota,
+    ) -> Self {
         Self {
             registry,
             constitution,
@@ -89,12 +94,19 @@ impl Orchestrator {
         }
     }
 
-    fn govern(&mut self, step: &PlanStep, approved: &dyn Fn(&PlanStep) -> bool, period: u64) -> Option<String> {
+    fn govern(
+        &mut self,
+        step: &PlanStep,
+        approved: &dyn Fn(&PlanStep) -> bool,
+        period: u64,
+    ) -> Option<String> {
         let (verdict, reason) = self.constitution.judge(&step.action);
         let reason = reason.to_owned();
         match verdict {
             Verdict::Deny => return Some(format!("denied: {reason}")),
-            Verdict::RequireApproval if !approved(step) => return Some(format!("needs approval: {reason}")),
+            Verdict::RequireApproval if !approved(step) => {
+                return Some(format!("needs approval: {reason}"))
+            }
             _ => {}
         }
         if self.budget.spend(period, f64::from(step.cost)) == Spend::Refused {
@@ -118,7 +130,8 @@ impl Orchestrator {
         let mut out: BTreeMap<u32, StepOutcome> = BTreeMap::new();
         // Process in rounds: each round runs every step whose deps are resolved.
         loop {
-            let pending: Vec<&PlanStep> = steps.iter().filter(|s| !out.contains_key(&s.id)).collect();
+            let pending: Vec<&PlanStep> =
+                steps.iter().filter(|s| !out.contains_key(&s.id)).collect();
             if pending.is_empty() {
                 break;
             }
@@ -235,9 +248,17 @@ mod tests {
         let writer = reg.register("writer", &["doc.write"], 2);
         let mut c = Constitution::new();
         c.rule("net.get", Verdict::Allow, "reading the web is fine")
-            .rule("files.write", Verdict::RequireApproval, "writes need the user")
+            .rule(
+                "files.write",
+                Verdict::RequireApproval,
+                "writes need the user",
+            )
             .rule("payments.*", Verdict::Deny, "never");
-        (Orchestrator::new(reg, c, Budget::new(10.0, true), Quota::new(100, 60_000)), researcher, writer)
+        (
+            Orchestrator::new(reg, c, Budget::new(10.0, true), Quota::new(100, 60_000)),
+            researcher,
+            writer,
+        )
     }
 
     #[test]
@@ -249,7 +270,9 @@ mod tests {
             step(3, "doc.write", "payments.send", &[]),
             step(4, "video.edit", "net.get", &[]),
         ]);
-        let mut worker = |agent: AgentId, s: &PlanStep| -> Result<String, String> { Ok(format!("{agent}:{}", s.id)) };
+        let mut worker = |agent: AgentId, s: &PlanStep| -> Result<String, String> {
+            Ok(format!("{agent}:{}", s.id))
+        };
         struct W<F>(F);
         impl<F: FnMut(AgentId, &PlanStep) -> Result<String, String>> Worker for W<F> {
             fn run(&mut self, agent: AgentId, step: &PlanStep) -> Result<String, String> {
@@ -276,7 +299,10 @@ mod tests {
     fn retries_on_other_agent_and_skips_dependents() {
         let (mut o, _r, _w) = orch();
         let backup = o.registry.register("researcher-2", &["web.read"], 1);
-        let mut plan = Fixed(vec![step(1, "web.read", "net.get", &[]), step(2, "doc.write", "net.get", &[1])]);
+        let mut plan = Fixed(vec![
+            step(1, "web.read", "net.get", &[]),
+            step(2, "doc.write", "net.get", &[1]),
+        ]);
         struct FailFirst(Vec<AgentId>);
         impl Worker for FailFirst {
             fn run(&mut self, agent: AgentId, _s: &PlanStep) -> Result<String, String> {

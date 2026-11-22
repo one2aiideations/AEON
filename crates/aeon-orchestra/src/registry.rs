@@ -86,7 +86,10 @@ impl Registry {
 
     /// Enable or disable.
     pub fn set_enabled(&mut self, id: AgentId, enabled: bool) -> bool {
-        self.agents.get_mut(&id).map(|a| a.enabled = enabled).is_some()
+        self.agents
+            .get_mut(&id)
+            .map(|a| a.enabled = enabled)
+            .is_some()
     }
 
     /// Best available agent for `capability`: highest trust, then lowest
@@ -99,7 +102,10 @@ impl Registry {
             .max_by(|a, b| {
                 a.trust
                     .total_cmp(&b.trust)
-                    .then((u64::from(b.load) * u64::from(a.max_load)).cmp(&(u64::from(a.load) * u64::from(b.max_load))))
+                    .then(
+                        (u64::from(b.load) * u64::from(a.max_load))
+                            .cmp(&(u64::from(a.load) * u64::from(b.max_load))),
+                    )
                     .then(b.id.cmp(&a.id))
             })
             .map(|a| a.id)
@@ -131,8 +137,13 @@ impl Registry {
     }
 
     /// Agents offering `capability`.
-    pub fn with_capability<'a>(&'a self, capability: &'a str) -> impl Iterator<Item = &'a AgentInfo> + 'a {
-        self.agents.values().filter(move |a| a.capabilities.contains(capability))
+    pub fn with_capability<'a>(
+        &'a self,
+        capability: &'a str,
+    ) -> impl Iterator<Item = &'a AgentInfo> + 'a {
+        self.agents
+            .values()
+            .filter(move |a| a.capabilities.contains(capability))
     }
 }
 

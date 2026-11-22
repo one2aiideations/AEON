@@ -181,7 +181,8 @@ impl LeasedQueue {
         self.expire(now);
         let mut job = self.ready.pop_front()?;
         job.deliveries += 1;
-        self.leased.insert(job.id, (job.clone(), now + self.lease_ms, worker));
+        self.leased
+            .insert(job.id, (job.clone(), now + self.lease_ms, worker));
         Some(job)
     }
 
@@ -237,7 +238,9 @@ impl LeaderLease {
     /// Current leader at `now`.
     #[must_use]
     pub fn leader(&self, now: u64) -> Option<u32> {
-        self.holder.filter(|&(_, until)| until > now).map(|(h, _)| h)
+        self.holder
+            .filter(|&(_, until)| until > now)
+            .map(|(h, _)| h)
     }
 }
 
