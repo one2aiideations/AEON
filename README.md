@@ -28,6 +28,7 @@ AEON is a lean, AI-native operating system for x86_64 laptops (CPU and GPU), wri
 | `aeon-comms` | Encrypted messaging, ordered conversations, call signalling |
 | `aeon-store` | Durable system state: in-memory map with checksummed log |
 | `aeon-orchestra` | Multi-agent orchestration: trust, routing, consensus, governance, resilience, self-repair |
+| `aeon-mail` | AI-native mail server: SMTP submission, minimal IMAP, HTTP API, agent permissions |
 
 ## Build and test
 
