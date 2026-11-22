@@ -2,8 +2,8 @@
 #![forbid(unsafe_code)]
 
 use aeon_studio::{
-    calc, capabilities, launch_gui, open_any, run_api, run_batch, Block, Document, Opened, SpreadsheetDoc, MODES,
-    VERSION,
+    calc, capabilities, launch_gui, open_any, run_api, run_batch, Block, Document, Opened,
+    SpreadsheetDoc, MODES, VERSION,
 };
 use std::path::PathBuf;
 
@@ -20,7 +20,9 @@ fn usage() {
 }
 
 fn arg(args: &[String], i: usize, what: &str) -> Result<String, String> {
-    args.get(i).cloned().ok_or_else(|| format!("missing {what}"))
+    args.get(i)
+        .cloned()
+        .ok_or_else(|| format!("missing {what}"))
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -35,7 +37,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let p = PathBuf::from(arg(args, 2, "path")?);
             let title = args.get(3).cloned().unwrap_or_else(|| "Untitled".into());
             Document {
-                blocks: vec![Block::Heading(title), Block::Paragraph("Start writing.".into())],
+                blocks: vec![
+                    Block::Heading(title),
+                    Block::Paragraph("Start writing.".into()),
+                ],
             }
             .save(&p)
             .map_err(e)?;
@@ -68,7 +73,12 @@ fn run(args: &[String]) -> Result<(), String> {
                         keys.sort_unstable();
                         for (r, c) in keys {
                             let cell = &sh.cells[&(r, c)];
-                            println!("{} = {}    ({})", aeon_sheet::cell_name(r, c), cell.value.display(), cell.raw);
+                            println!(
+                                "{} = {}    ({})",
+                                aeon_sheet::cell_name(r, c),
+                                cell.value.display(),
+                                cell.raw
+                            );
                         }
                     }
                 }
@@ -80,14 +90,20 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("status") => {
-            capabilities().iter().for_each(|(area, cap)| println!("{cap:?}\t{area}"));
+            capabilities()
+                .iter()
+                .for_each(|(area, cap)| println!("{cap:?}\t{area}"));
             Ok(())
         }
         Some("api") => {
-            let port: u16 = arg(args, 2, "port")?.parse().map_err(|_| "bad port".to_string())?;
+            let port: u16 = arg(args, 2, "port")?
+                .parse()
+                .map_err(|_| "bad port".to_string())?;
             run_api(port).map_err(e)
         }
-        Some("batch") => run_batch(&PathBuf::from(arg(args, 2, "dir")?), &arg(args, 3, "op")?).map_err(e),
+        Some("batch") => {
+            run_batch(&PathBuf::from(arg(args, 2, "dir")?), &arg(args, 3, "op")?).map_err(e)
+        }
         _ => {
             usage();
             Ok(())

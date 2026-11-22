@@ -83,9 +83,18 @@ fn ni<T>(feature: &'static str) -> AeonResult<T> {
 #[must_use]
 pub fn capabilities() -> Vec<(&'static str, Capability)> {
     vec![
-        ("spreadsheet formulas & recalculation", Capability::Implemented),
-        ("document container (.aeonstudio v0)", Capability::Implemented),
-        ("spreadsheet container (.aeonstudio v0)", Capability::Implemented),
+        (
+            "spreadsheet formulas & recalculation",
+            Capability::Implemented,
+        ),
+        (
+            "document container (.aeonstudio v0)",
+            Capability::Implemented,
+        ),
+        (
+            "spreadsheet container (.aeonstudio v0)",
+            Capability::Implemented,
+        ),
         ("AI consent / local-only gates", Capability::Implemented),
         ("agent approval gates", Capability::Implemented),
         ("xlsx/docx/pptx/pdf import-export", Capability::Stubbed),
@@ -251,7 +260,9 @@ impl Workspace {
 /* ============================ 4. .aeonstudio CONTAINER (plain-text v0) ============================ */
 
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn unesc(s: &str) -> AeonResult<String> {
@@ -279,7 +290,9 @@ fn read_header<'a>(input: &'a str, kind: &str) -> AeonResult<std::str::Lines<'a>
         return Err(AeonError::Validation("bad magic".into()));
     }
     if lines.next() != Some(&format!("kind={kind}")[..]) {
-        return Err(AeonError::UnsupportedFormat(format!("expected kind={kind}")));
+        return Err(AeonError::UnsupportedFormat(format!(
+            "expected kind={kind}"
+        )));
     }
     Ok(lines)
 }
@@ -355,7 +368,9 @@ pub fn open_any(p: &Path) -> AeonResult<Opened> {
     match text.lines().nth(1) {
         Some("kind=document") => Document::from_container(&text).map(Opened::Document),
         Some("kind=spreadsheet") => SpreadsheetDoc::from_container(&text).map(Opened::Spreadsheet),
-        other => Err(AeonError::UnsupportedFormat(format!("unknown kind line {other:?}"))),
+        other => Err(AeonError::UnsupportedFormat(format!(
+            "unknown kind line {other:?}"
+        ))),
     }
 }
 
@@ -473,13 +488,17 @@ pub struct SpreadsheetDoc {
 impl SpreadsheetDoc {
     /// Set a cell by name (`B7`) on the first sheet.
     pub fn set(&mut self, cell: &str, raw: &str) -> AeonResult<()> {
-        let (r, c) = aeon_sheet::parse_cell_name(cell).ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
-        self.workbook.set_cell(0, r, c, raw).map_err(AeonError::Validation)
+        let (r, c) = aeon_sheet::parse_cell_name(cell)
+            .ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
+        self.workbook
+            .set_cell(0, r, c, raw)
+            .map_err(AeonError::Validation)
     }
 
     /// Value of a cell by name on the first sheet.
     pub fn get(&self, cell: &str) -> AeonResult<CellValue> {
-        let (r, c) = aeon_sheet::parse_cell_name(cell).ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
+        let (r, c) = aeon_sheet::parse_cell_name(cell)
+            .ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
         Ok(self.workbook.get_cell(0, r, c))
     }
 
@@ -494,7 +513,11 @@ impl SpreadsheetDoc {
             keys.sort();
             for k in keys {
                 let raw = &sh.cells[k].raw;
-                s.push_str(&format!("C:{i}:{}:{}\n", aeon_sheet::cell_name(k.0, k.1), esc(raw)));
+                s.push_str(&format!(
+                    "C:{i}:{}:{}\n",
+                    aeon_sheet::cell_name(k.0, k.1),
+                    esc(raw)
+                ));
             }
         }
         s
@@ -508,15 +531,22 @@ impl SpreadsheetDoc {
                 wb.sheets.push(aeon_sheet::Sheet::new(&unesc(name)?));
             } else if let Some(rest) = line.strip_prefix("C:") {
                 let mut parts = rest.splitn(3, ':');
-                let (Some(si), Some(cell), Some(raw)) = (parts.next(), parts.next(), parts.next()) else {
+                let (Some(si), Some(cell), Some(raw)) = (parts.next(), parts.next(), parts.next())
+                else {
                     return Err(AeonError::Validation(format!("bad cell line: {line}")));
                 };
-                let si: usize = si.parse().map_err(|_| AeonError::Validation(format!("bad sheet index: {line}")))?;
+                let si: usize = si
+                    .parse()
+                    .map_err(|_| AeonError::Validation(format!("bad sheet index: {line}")))?;
                 if si >= wb.sheets.len() {
-                    return Err(AeonError::Validation(format!("cell before its sheet: {line}")));
+                    return Err(AeonError::Validation(format!(
+                        "cell before its sheet: {line}"
+                    )));
                 }
-                let (r, c) = aeon_sheet::parse_cell_name(cell).ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
-                wb.set_cell(si, r, c, &unesc(raw)?).map_err(AeonError::Validation)?;
+                let (r, c) = aeon_sheet::parse_cell_name(cell)
+                    .ok_or_else(|| AeonError::Validation(format!("bad cell {cell}")))?;
+                wb.set_cell(si, r, c, &unesc(raw)?)
+                    .map_err(AeonError::Validation)?;
             } else if !line.trim().is_empty() {
                 return Err(AeonError::Validation(format!("unknown line: {line}")));
             }
@@ -675,7 +705,9 @@ impl ImageDocument {
     }
     pub fn generative_fill(&mut self, _prompt: &str, consent: bool) -> AeonResult<()> {
         if !consent {
-            return Err(AeonError::ConsentRequired("external/local generative model"));
+            return Err(AeonError::ConsentRequired(
+                "external/local generative model",
+            ));
         }
         ni("generative fill")
     }
@@ -819,7 +851,11 @@ impl AnimationScene {
     /// and last keyframe values outside their range).
     #[must_use]
     pub fn sample(&self, property: AnimProperty, tick: u64) -> Option<f64> {
-        let mut ks: Vec<&Keyframe> = self.keyframes.iter().filter(|k| k.property == property).collect();
+        let mut ks: Vec<&Keyframe> = self
+            .keyframes
+            .iter()
+            .filter(|k| k.property == property)
+            .collect();
         ks.sort_by_key(|k| k.tick);
         let first = ks.first()?;
         if tick <= first.tick {
@@ -829,7 +865,11 @@ impl AnimationScene {
             let (a, b) = (w[0], w[1]);
             if tick <= b.tick {
                 let span = (b.tick - a.tick) as f64;
-                let t = if span > 0.0 { (tick - a.tick) as f64 / span } else { 1.0 };
+                let t = if span > 0.0 {
+                    (tick - a.tick) as f64 / span
+                } else {
+                    1.0
+                };
                 return Some(a.value + (b.value - a.value) * t);
             }
         }
@@ -894,7 +934,11 @@ pub struct ConversionReport {
     pub unsupported: Vec<String>,
 }
 
-pub fn convert(_kind: ConversionKind, _input: &Path, _output: &Path) -> AeonResult<ConversionReport> {
+pub fn convert(
+    _kind: ConversionKind,
+    _input: &Path,
+    _output: &Path,
+) -> AeonResult<ConversionReport> {
     ni("conversion engine")
 }
 
@@ -956,10 +1000,14 @@ pub struct ProviderConfig {
 pub fn chat(cfg: &ProviderConfig, req: &AiRequest) -> AeonResult<AiResponse> {
     let remote = !cfg.kind.is_local();
     if remote && (req.local_only || cfg.local_only) {
-        return Err(AeonError::PermissionDenied("local_only forbids remote providers".into()));
+        return Err(AeonError::PermissionDenied(
+            "local_only forbids remote providers".into(),
+        ));
     }
     if remote && !req.external_consent {
-        return Err(AeonError::ConsentRequired("sending document context to an external AI"));
+        return Err(AeonError::ConsentRequired(
+            "sending document context to an external AI",
+        ));
     }
     if remote && !cfg!(feature = "net") {
         return Err(AeonError::ExternalProviderUnavailable(
@@ -1036,14 +1084,19 @@ pub fn execute_tool(
     sheet: Option<&mut SpreadsheetDoc>,
 ) -> AeonResult<String> {
     if !agent.scopes.iter().any(|s| s == tool.scope()) {
-        return Err(AeonError::PermissionDenied(format!("agent lacks scope {}", tool.scope())));
+        return Err(AeonError::PermissionDenied(format!(
+            "agent lacks scope {}",
+            tool.scope()
+        )));
     }
     let is_read = matches!(tool, ToolCall::Spreadsheet(op) if op.starts_with("get "));
     if !is_read && !agent.can_write {
         return Err(AeonError::PermissionDenied("read-only agent".into()));
     }
     if !is_read && agent.approval_required && !human_approved {
-        return Err(AeonError::PermissionDenied("human approval required".into()));
+        return Err(AeonError::PermissionDenied(
+            "human approval required".into(),
+        ));
     }
     match tool {
         ToolCall::Spreadsheet(op) => {
@@ -1055,7 +1108,9 @@ pub fn execute_tool(
                     sheet.set(cell, raw)?;
                     Ok(sheet.get(cell)?.display())
                 }
-                _ => Err(AeonError::Validation(format!("unknown spreadsheet op {op}"))),
+                _ => Err(AeonError::Validation(format!(
+                    "unknown spreadsheet op {op}"
+                ))),
             }
         }
         ToolCall::Document(_) => ni("document agent op"),
@@ -1130,7 +1185,10 @@ mod tests {
     #[test]
     fn calc_uses_full_sheet_engine() {
         assert_eq!(calc("1+2*3"), CellValue::Number(7.0));
-        assert_eq!(calc("=IF(2>1,\"yes\",\"no\")"), CellValue::Text("yes".into()));
+        assert_eq!(
+            calc("=IF(2>1,\"yes\",\"no\")"),
+            CellValue::Text("yes".into())
+        );
         assert_eq!(calc("1/0"), CellValue::Error("#DIV/0!".into()));
     }
 
@@ -1143,16 +1201,24 @@ mod tests {
         let text = s.to_container();
         let back = SpreadsheetDoc::from_container(&text).unwrap();
         assert_eq!(back.get("A2").unwrap(), CellValue::Number(20.0));
-        assert_eq!(back.get("B1").unwrap(), CellValue::Text("multi\nline \\ text".into()));
+        assert_eq!(
+            back.get("B1").unwrap(),
+            CellValue::Text("multi\nline \\ text".into())
+        );
         assert_eq!(back.to_container(), text);
         assert!(SpreadsheetDoc::from_container("AEONSTUDIO-1\nkind=document\n").is_err());
-        assert!(SpreadsheetDoc::from_container("AEONSTUDIO-1\nkind=spreadsheet\nC:0:A1:1\n").is_err());
+        assert!(
+            SpreadsheetDoc::from_container("AEONSTUDIO-1\nkind=spreadsheet\nC:0:A1:1\n").is_err()
+        );
     }
 
     #[test]
     fn document_roundtrip_and_open_any() {
         let d = Document {
-            blocks: vec![Block::Heading("T".into()), Block::Paragraph("a\nb\\c".into())],
+            blocks: vec![
+                Block::Heading("T".into()),
+                Block::Paragraph("a\nb\\c".into()),
+            ],
         };
         assert_eq!(Document::from_container(&d.to_container()).unwrap(), d);
         let dir = std::env::temp_dir().join(format!("aeon-studio-{}", std::process::id()));
@@ -1194,17 +1260,26 @@ mod tests {
             local_only: true,
             external_consent: true,
         };
-        assert!(matches!(chat(&remote, &req), Err(AeonError::PermissionDenied(_))));
+        assert!(matches!(
+            chat(&remote, &req),
+            Err(AeonError::PermissionDenied(_))
+        ));
         req.local_only = false;
         req.external_consent = false;
-        assert!(matches!(chat(&remote, &req), Err(AeonError::ConsentRequired(_))));
+        assert!(matches!(
+            chat(&remote, &req),
+            Err(AeonError::ConsentRequired(_))
+        ));
         let local = ProviderConfig {
             kind: AiProviderKind::Ollama,
             endpoint: "http://127.0.0.1:11434".into(),
             local_only: true,
         };
         req.local_only = true;
-        assert!(matches!(chat(&local, &req), Err(AeonError::NotImplemented(_))));
+        assert!(matches!(
+            chat(&local, &req),
+            Err(AeonError::NotImplemented(_))
+        ));
     }
 
     #[test]
@@ -1219,10 +1294,22 @@ mod tests {
         let mut sheet = SpreadsheetDoc::default();
         sheet.set("A1", "5").unwrap();
         assert_eq!(
-            execute_tool(&reader, &ToolCall::Spreadsheet("get A1".into()), false, Some(&mut sheet)).unwrap(),
+            execute_tool(
+                &reader,
+                &ToolCall::Spreadsheet("get A1".into()),
+                false,
+                Some(&mut sheet)
+            )
+            .unwrap(),
             "5"
         );
-        assert!(execute_tool(&reader, &ToolCall::Spreadsheet("set A1 9".into()), true, Some(&mut sheet)).is_err());
+        assert!(execute_tool(
+            &reader,
+            &ToolCall::Spreadsheet("set A1 9".into()),
+            true,
+            Some(&mut sheet)
+        )
+        .is_err());
         assert!(execute_tool(&reader, &ToolCall::Document("create".into()), true, None).is_err());
 
         let writer = AgentIdentity {
@@ -1237,7 +1324,10 @@ mod tests {
             execute_tool(&writer, &op, false, Some(&mut sheet)),
             Err(AeonError::PermissionDenied(_))
         ));
-        assert_eq!(execute_tool(&writer, &op, true, Some(&mut sheet)).unwrap(), "10");
+        assert_eq!(
+            execute_tool(&writer, &op, true, Some(&mut sheet)).unwrap(),
+            "10"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aeon-hw", "crates/aeon-gate", "crates/aeon-gguf", "crates/aeon-tensor", "crates/aeon-model", "crates/aeon-engine", "crates/aeon-identity", "crates/aeon-cognition", "crates/aeon-runtime", "crates/aeon-adapters", "crates/aeond", "crates/aeon-theory", "crates/aeon-agents", "crates/aeon-sched", "crates/aeon-core", "crates/aeon-neuro", "crates/aeon-mesh", "crates/aeon-memory", "crates/aeon-web", "crates/aeon-comms", "crates/aeon-store", "crates/aeon-orchestra", "crates/aeon-mail", "crates/aeon-sheet", "crates/aeon-studio"]
+members = ["crates/aeon-hw", "crates/aeon-gate", "crates/aeon-gguf", "crates/aeon-tensor", "crates/aeon-model", "crates/aeon-engine", "crates/aeon-identity", "crates/aeon-cognition", "crates/aeon-runtime", "crates/aeon-adapters", "crates/aeond", "crates/aeon-theory", "crates/aeon-agents", "crates/aeon-sched", "crates/aeon-core", "crates/aeon-neuro", "crates/aeon-mesh", "crates/aeon-memory", "crates/aeon-web", "crates/aeon-comms", "crates/aeon-store", "crates/aeon-orchestra", "crates/aeon-mail", "crates/aeon-sheet", "crates/aeon-business", "crates/aeon-data", "crates/aeon-project", "crates/aeon-studio", "crates/aeon-system"]
 
 [workspace.package]
 edition = "2021"
