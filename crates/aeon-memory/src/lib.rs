@@ -7,6 +7,7 @@
 //! * [`graph`]: knowledge graph with spreading activation (related ideas
 //!   light up from a few seeds).
 //! * [`fusion`]: reciprocal-rank fusion of several ranked lists.
+//! * [`context`]: versioned claims with trust levels, reviewed evidence and trusted snapshots.
 //! * [`ontology`]: class hierarchy (is-a) with inherited, typed relations.
 //! * [`chunk`]: recursive text chunking with overlap and source offsets, to feed the indexes.
 #![forbid(unsafe_code)]
