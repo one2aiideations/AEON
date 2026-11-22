@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ops;
+pub mod quant;
 
 use core::fmt;
 
