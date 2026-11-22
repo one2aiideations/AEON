@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 fn open_state() -> Result<AppState, String> {
-    let path = std::env::var("AEON_PROJECT_DB").map_or_else(|_| PathBuf::from("aeon-project.db"), PathBuf::from);
+    let path = std::env::var("AEON_PROJECT_DB")
+        .map_or_else(|_| PathBuf::from("aeon-project.db"), PathBuf::from);
     let db = Db::open(&path).map_err(|e| e.to_string())?;
     let store = db.load().map_err(|e| e.to_string())?;
     Ok(AppState {
@@ -34,11 +35,15 @@ fn main() {
     };
     let result = match args.get(1).map(String::as_str) {
         Some("serve") | None => {
-            let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:8765".into());
+            let addr = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:8765".into());
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     eprintln!("{} API on http://{addr}", aeon_project::APP_NAME);
-                    rt.block_on(api::serve(state, &addr)).map_err(|e| e.to_string())
+                    rt.block_on(api::serve(state, &addr))
+                        .map_err(|e| e.to_string())
                 }
                 Err(e) => Err(e.to_string()),
             }

@@ -21,7 +21,9 @@ pub struct AiConfig {
 
 /// Host part of an http(s) URL, lowercased, without port or brackets.
 fn host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
     let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;
     let host = if let Some(v6) = authority.strip_prefix('[') {
@@ -35,7 +37,10 @@ fn host(url: &str) -> Option<String> {
 /// Whether `endpoint` points at this machine.
 #[must_use]
 pub fn is_local(endpoint: &str) -> bool {
-    matches!(host(endpoint).as_deref(), Some("localhost" | "127.0.0.1" | "::1"))
+    matches!(
+        host(endpoint).as_deref(),
+        Some("localhost" | "127.0.0.1" | "::1")
+    )
 }
 
 /// Check the call may go out: endpoint set and valid, consent for remote hosts.
@@ -55,7 +60,11 @@ pub fn check(config: &AiConfig, remote_consent: bool) -> Result<(), ProjectError
 }
 
 /// Ask the assistant. Returns the reply text.
-pub async fn ask(config: &AiConfig, prompt: &str, remote_consent: bool) -> Result<String, ProjectError> {
+pub async fn ask(
+    config: &AiConfig,
+    prompt: &str,
+    remote_consent: bool,
+) -> Result<String, ProjectError> {
     check(config, remote_consent)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -68,11 +77,20 @@ pub async fn ask(config: &AiConfig, prompt: &str, remote_consent: bool) -> Resul
     if !config.api_key.is_empty() {
         req = req.bearer_auth(&config.api_key);
     }
-    let resp = req.send().await.map_err(|e| ProjectError::Ai(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ProjectError::Ai(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(ProjectError::Ai(format!("provider returned {}", resp.status())));
+        return Err(ProjectError::Ai(format!(
+            "provider returned {}",
+            resp.status()
+        )));
     }
-    let body: serde_json::Value = resp.json().await.map_err(|e| ProjectError::Ai(e.to_string()))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ProjectError::Ai(e.to_string()))?;
     body["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_owned)

@@ -54,7 +54,9 @@ impl Db {
     pub fn load(&self) -> Result<Store, ProjectError> {
         let payload: Option<String> = self
             .conn
-            .query_row("SELECT payload FROM aeon_state WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT payload FROM aeon_state WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(storage)?;
         match payload {

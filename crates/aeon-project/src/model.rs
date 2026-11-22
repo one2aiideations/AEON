@@ -398,14 +398,22 @@ impl Store {
         if status == "Done" {
             task.progress = 100.0;
         }
-        self.audit("local-user", "UPDATE_TASK_STATUS", &format!("{id} -> {status}"));
+        self.audit(
+            "local-user",
+            "UPDATE_TASK_STATUS",
+            &format!("{id} -> {status}"),
+        );
         Ok(())
     }
 
     /// Whether `to` is reachable from `from` following dependency edges
     /// (task -> its dependencies).
     fn depends_on(&self, from: &str, to: &str) -> bool {
-        let deps: HashMap<&str, &Vec<String>> = self.tasks.iter().map(|t| (t.id.as_str(), &t.dependencies)).collect();
+        let deps: HashMap<&str, &Vec<String>> = self
+            .tasks
+            .iter()
+            .map(|t| (t.id.as_str(), &t.dependencies))
+            .collect();
         let mut stack = vec![from];
         let mut seen = HashSet::new();
         while let Some(cur) = stack.pop() {
@@ -423,9 +431,15 @@ impl Store {
     }
 
     /// Make `task_id` depend on `dependency_id` (same project, no cycles).
-    pub fn add_dependency(&mut self, task_id: &str, dependency_id: &str) -> Result<(), ProjectError> {
+    pub fn add_dependency(
+        &mut self,
+        task_id: &str,
+        dependency_id: &str,
+    ) -> Result<(), ProjectError> {
         if task_id == dependency_id {
-            return Err(ProjectError::Invalid("a task cannot depend on itself".into()));
+            return Err(ProjectError::Invalid(
+                "a task cannot depend on itself".into(),
+            ));
         }
         let project = |id: &str| {
             self.tasks
@@ -445,12 +459,22 @@ impl Store {
         if !task.dependencies.iter().any(|d| d == dependency_id) {
             task.dependencies.push(dependency_id.to_owned());
         }
-        self.audit("local-user", "ADD_DEPENDENCY", &format!("{task_id} after {dependency_id}"));
+        self.audit(
+            "local-user",
+            "ADD_DEPENDENCY",
+            &format!("{task_id} after {dependency_id}"),
+        );
         Ok(())
     }
 
     /// Log time on a task (adds to its actual hours).
-    pub fn log_time(&mut self, task_id: &str, user: &str, hours: f64, billable: bool) -> Result<(), ProjectError> {
+    pub fn log_time(
+        &mut self,
+        task_id: &str,
+        user: &str,
+        hours: f64,
+        billable: bool,
+    ) -> Result<(), ProjectError> {
         if !hours.is_finite() || hours <= 0.0 || hours > 24.0 {
             return Err(ProjectError::Invalid("hours must be in (0, 24]".into()));
         }
@@ -467,7 +491,12 @@ impl Store {
     }
 
     /// Add or replace a project document (replacing bumps the version).
-    pub fn save_document(&mut self, project_id: &str, title: &str, content: &str) -> Result<u64, ProjectError> {
+    pub fn save_document(
+        &mut self,
+        project_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<u64, ProjectError> {
         let title = non_empty(title, "document title")?;
         if !self.projects.iter().any(|p| p.id == project_id) {
             return Err(ProjectError::NotFound(format!("project {project_id}")));
@@ -500,13 +529,21 @@ impl Store {
     /// Tasks of one project.
     #[must_use]
     pub fn project_tasks(&self, project_id: &str) -> Vec<Task> {
-        self.tasks.iter().filter(|t| t.project_id == project_id).cloned().collect()
+        self.tasks
+            .iter()
+            .filter(|t| t.project_id == project_id)
+            .cloned()
+            .collect()
     }
 
     /// Progress 0..=100, weighted by estimate (equal weights when no estimates).
     #[must_use]
     pub fn calculate_progress(&self, project_id: &str) -> f64 {
-        let tasks: Vec<&Task> = self.tasks.iter().filter(|t| t.project_id == project_id).collect();
+        let tasks: Vec<&Task> = self
+            .tasks
+            .iter()
+            .filter(|t| t.project_id == project_id)
+            .collect();
         if tasks.is_empty() {
             return 0.0;
         }
@@ -518,7 +555,11 @@ impl Store {
                 .sum::<f64>()
                 / total_est
         } else {
-            tasks.iter().map(|t| t.progress.clamp(0.0, 100.0)).sum::<f64>() / tasks.len() as f64
+            tasks
+                .iter()
+                .map(|t| t.progress.clamp(0.0, 100.0))
+                .sum::<f64>()
+                / tasks.len() as f64
         }
     }
 
@@ -536,7 +577,11 @@ impl Store {
     /// logging user's resource rate (unknown users cost 0).
     #[must_use]
     pub fn calculate_cost(&self, project_id: &str) -> f64 {
-        let rates: HashMap<&str, f64> = self.resources.iter().map(|r| (r.name.as_str(), r.hourly_rate)).collect();
+        let rates: HashMap<&str, f64> = self
+            .resources
+            .iter()
+            .map(|r| (r.name.as_str(), r.hourly_rate))
+            .collect();
         let tasks: HashSet<&str> = self
             .tasks
             .iter()
@@ -595,12 +640,20 @@ pub(crate) mod tests {
     #[test]
     fn dependency_rules() {
         let mut s = sample_store();
-        let (a, b, c) = (s.tasks[0].id.clone(), s.tasks[1].id.clone(), s.tasks[2].id.clone());
+        let (a, b, c) = (
+            s.tasks[0].id.clone(),
+            s.tasks[1].id.clone(),
+            s.tasks[2].id.clone(),
+        );
         s.add_dependency(&b, &a).unwrap();
         s.add_dependency(&b, &a).unwrap();
         assert_eq!(s.tasks[1].dependencies.len(), 1, "no duplicates");
         s.add_dependency(&c, &b).unwrap();
-        assert_eq!(s.add_dependency(&a, &c), Err(ProjectError::Cycle), "indirect cycle");
+        assert_eq!(
+            s.add_dependency(&a, &c),
+            Err(ProjectError::Cycle),
+            "indirect cycle"
+        );
         assert!(s.add_dependency(&a, &a).is_err());
         let other = s.add_project("Other").unwrap();
         let x = s.add_task(&other, "X").unwrap();
@@ -616,7 +669,10 @@ pub(crate) mod tests {
         assert!((s.calculate_progress(&pid) - 50.0).abs() < 1e-9);
         s.tasks[0].estimated_hours = 3.0;
         s.tasks[1].estimated_hours = 1.0;
-        assert!((s.calculate_progress(&pid) - 87.5).abs() < 1e-9, "estimate-weighted");
+        assert!(
+            (s.calculate_progress(&pid) - 87.5).abs() < 1e-9,
+            "estimate-weighted"
+        );
 
         s.resources.push(Resource {
             name: "asha".into(),

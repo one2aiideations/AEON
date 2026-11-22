@@ -42,7 +42,11 @@ struct App {
 
 impl App {
     fn snapshot(&self) -> Store {
-        self.state.store.lock().map(|s| s.clone()).unwrap_or_default()
+        self.state
+            .store
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     /// Apply a change and save; reports the outcome in the status bar.
@@ -108,7 +112,10 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(&p.name);
                 ui.label(&p.status);
-                ui.add(egui::ProgressBar::new((s.calculate_progress(&p.id) / 100.0) as f32).desired_width(160.0));
+                ui.add(
+                    egui::ProgressBar::new((s.calculate_progress(&p.id) / 100.0) as f32)
+                        .desired_width(160.0),
+                );
             });
         }
     }
@@ -142,7 +149,10 @@ impl App {
                 }
                 ui.label(&p.status);
                 ui.label(&p.priority);
-                ui.add(egui::ProgressBar::new((s.calculate_progress(&p.id) / 100.0) as f32).desired_width(100.0));
+                ui.add(
+                    egui::ProgressBar::new((s.calculate_progress(&p.id) / 100.0) as f32)
+                        .desired_width(100.0),
+                );
                 ui.end_row();
             }
         });
@@ -217,14 +227,19 @@ impl App {
         let tasks = self.selected_tasks();
         match critical_path(&tasks) {
             Ok(results) => {
-                let span = results.iter().map(|r| r.earliest_finish).fold(1.0_f64, f64::max);
+                let span = results
+                    .iter()
+                    .map(|r| r.earliest_finish)
+                    .fold(1.0_f64, f64::max);
                 let scale = 300.0 / span;
                 for (r, t) in results.iter().zip(&tasks) {
                     ui.horizontal(|ui| {
                         ui.add_sized([180.0, 18.0], egui::Label::new(&t.title));
                         ui.add_space((r.earliest_start * scale) as f32);
-                        let width = (((r.earliest_finish - r.earliest_start) * scale) as f32).max(5.0);
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 15.0), egui::Sense::hover());
+                        let width =
+                            (((r.earliest_finish - r.earliest_start) * scale) as f32).max(5.0);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(width, 15.0), egui::Sense::hover());
                         let color = if r.critical {
                             egui::Color32::RED
                         } else {
@@ -282,7 +297,10 @@ impl App {
             ui.group(|ui| {
                 ui.heading(&r.name);
                 ui.label(&r.role);
-                ui.label(format!("Capacity: {} h/week, rate {}", r.capacity_hours, r.hourly_rate));
+                ui.label(format!(
+                    "Capacity: {} h/week, rate {}",
+                    r.capacity_hours, r.hourly_rate
+                ));
                 ui.label(format!("Skills: {}", r.skills.join(", ")));
             });
         }
@@ -296,7 +314,11 @@ impl App {
                 ui.heading(&p.name);
                 ui.label(format!("Progress: {:.1}%", s.calculate_progress(&p.id)));
                 ui.label(format!("Effort: {:.1} h", s.effort_hours(&p.id)));
-                ui.label(format!("Cost: {:.2} of budget {:.2}", s.calculate_cost(&p.id), p.budget));
+                ui.label(format!(
+                    "Cost: {:.2} of budget {:.2}",
+                    s.calculate_cost(&p.id),
+                    p.budget
+                ));
             });
         }
     }
@@ -310,14 +332,19 @@ impl App {
         ui.label("API key");
         ui.add(egui::TextEdit::singleline(&mut self.ai_config.api_key).password(true));
         if !ai::is_local(&self.ai_config.endpoint) {
-            ui.checkbox(&mut self.ai_remote_consent, "Allow sending my prompt to this remote service");
+            ui.checkbox(
+                &mut self.ai_remote_consent,
+                "Allow sending my prompt to this remote service",
+            );
         }
         ui.separator();
         ui.add(egui::TextEdit::multiline(&mut self.ai_prompt).desired_rows(5));
         if ui.button("Ask").clicked() {
-            let result = self
-                .runtime
-                .block_on(ai::ask(&self.ai_config, &self.ai_prompt, self.ai_remote_consent));
+            let result = self.runtime.block_on(ai::ask(
+                &self.ai_config,
+                &self.ai_prompt,
+                self.ai_remote_consent,
+            ));
             self.ai_answer = result.unwrap_or_else(|e| e.to_string());
         }
         ui.separator();
@@ -351,24 +378,26 @@ impl eframe::App for App {
                 });
             });
         });
-        egui::SidePanel::left("nav").min_width(180.0).show(ctx, |ui| {
-            for (label, view) in [
-                ("Home", View::Home),
-                ("Projects", View::Projects),
-                ("Tasks", View::Tasks),
-                ("Kanban", View::Kanban),
-                ("Gantt", View::Gantt),
-                ("Documents", View::Documents),
-                ("Resources", View::Resources),
-                ("Reports", View::Reports),
-                ("AI Assistant", View::Ai),
-                ("Administration", View::Administration),
-            ] {
-                if ui.selectable_label(self.view == view, label).clicked() {
-                    self.view = view;
+        egui::SidePanel::left("nav")
+            .min_width(180.0)
+            .show(ctx, |ui| {
+                for (label, view) in [
+                    ("Home", View::Home),
+                    ("Projects", View::Projects),
+                    ("Tasks", View::Tasks),
+                    ("Kanban", View::Kanban),
+                    ("Gantt", View::Gantt),
+                    ("Documents", View::Documents),
+                    ("Resources", View::Resources),
+                    ("Reports", View::Reports),
+                    ("AI Assistant", View::Ai),
+                    ("Administration", View::Administration),
+                ] {
+                    if ui.selectable_label(self.view == view, label).clicked() {
+                        self.view = view;
+                    }
                 }
-            }
-        });
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().show(ui, |ui| match self.view {
                 View::Home => self.home(ui),

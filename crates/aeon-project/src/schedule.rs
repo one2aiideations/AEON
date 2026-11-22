@@ -24,7 +24,9 @@ pub fn kanban_groups(tasks: &[Task]) -> Vec<(String, Vec<Task>)> {
             let in_col = tasks
                 .iter()
                 .filter(|t| {
-                    t.status == *col || (*col == KANBAN_COLUMNS[0] && !KANBAN_COLUMNS.contains(&t.status.as_str()))
+                    t.status == *col
+                        || (*col == KANBAN_COLUMNS[0]
+                            && !KANBAN_COLUMNS.contains(&t.status.as_str()))
                 })
                 .cloned()
                 .collect();
@@ -55,7 +57,11 @@ pub struct ScheduleResult {
 /// Critical-path method over `tasks` (dependencies outside the slice are an error).
 /// Results are in the same order as `tasks`.
 pub fn critical_path(tasks: &[Task]) -> Result<Vec<ScheduleResult>, ProjectError> {
-    let index: HashMap<&str, usize> = tasks.iter().enumerate().map(|(i, t)| (t.id.as_str(), i)).collect();
+    let index: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i))
+        .collect();
     let n = tasks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -98,7 +104,10 @@ pub fn critical_path(tasks: &[Task]) -> Result<Vec<ScheduleResult>, ProjectError
     let mut ls = vec![0.0f64; n];
     for &i in order.iter().rev() {
         if !succs[i].is_empty() {
-            lf[i] = succs[i].iter().map(|&s| ls[s]).fold(f64::INFINITY, f64::min);
+            lf[i] = succs[i]
+                .iter()
+                .map(|&s| ls[s])
+                .fold(f64::INFINITY, f64::min);
         }
         ls[i] = lf[i] - dur(i);
     }
@@ -126,7 +135,11 @@ mod tests {
     #[test]
     fn chain_is_fully_critical() {
         let mut s = sample_store();
-        let (a, b, c) = (s.tasks[0].id.clone(), s.tasks[1].id.clone(), s.tasks[2].id.clone());
+        let (a, b, c) = (
+            s.tasks[0].id.clone(),
+            s.tasks[1].id.clone(),
+            s.tasks[2].id.clone(),
+        );
         s.tasks[0].estimated_hours = 4.0;
         s.tasks[1].estimated_hours = 5.0;
         s.tasks[2].estimated_hours = 2.0;
@@ -140,7 +153,11 @@ mod tests {
     #[test]
     fn parallel_branch_has_float() {
         let mut s = sample_store();
-        let (a, b, c) = (s.tasks[0].id.clone(), s.tasks[1].id.clone(), s.tasks[2].id.clone());
+        let (a, b, c) = (
+            s.tasks[0].id.clone(),
+            s.tasks[1].id.clone(),
+            s.tasks[2].id.clone(),
+        );
         // A(4) -> C(2), B(1) -> C: B has 3h float.
         s.tasks[0].estimated_hours = 4.0;
         s.tasks[1].estimated_hours = 1.0;
@@ -158,7 +175,10 @@ mod tests {
     fn missing_dependency_and_cycle() {
         let mut s = sample_store();
         s.tasks[0].dependencies.push("ghost".into());
-        assert!(matches!(critical_path(&s.tasks), Err(ProjectError::NotFound(_))));
+        assert!(matches!(
+            critical_path(&s.tasks),
+            Err(ProjectError::NotFound(_))
+        ));
         let mut s = sample_store();
         let (a, b) = (s.tasks[0].id.clone(), s.tasks[1].id.clone());
         s.tasks[0].dependencies.push(b);
@@ -174,7 +194,10 @@ mod tests {
         s.update_task_status(&id, "In Progress").unwrap();
         s.tasks[1].status = "legacy".into();
         let g = kanban_groups(&s.tasks);
-        assert_eq!(g.iter().find(|(n, _)| n == "In Progress").unwrap().1.len(), 1);
+        assert_eq!(
+            g.iter().find(|(n, _)| n == "In Progress").unwrap().1.len(),
+            1
+        );
         assert_eq!(g[0].1.len(), 2, "unknown status shown in Backlog");
         assert_eq!(next_status("Review"), Some("Done"));
         assert_eq!(next_status("Done"), None);
