@@ -150,7 +150,7 @@ impl eframe::App for AeonApp {
                         ui.text_edit_singleline(&mut self.new_task);
                         if ui.button("Add task").clicked(){
                             let title=self.new_task.trim().to_string();
-                            if let Ok(s)=self.store.lock(){let result=s.create_task(&self.project.id,&title);drop(s);match result{Ok(_)=>{self.new_task.clear();self.refresh();self.error.clear();},Err(e)=>self.error=format!("{e:?}")}}
+                            let store=self.store.clone();if let Ok(s)=store.lock(){let result=s.create_task(&self.project.id,&title);drop(s);match result{Ok(_)=>{self.new_task.clear();self.refresh();self.error.clear();},Err(e)=>self.error=format!("{e:?}")}}
                         }
                     });
                     ui.separator();ui.heading("Recently updated work");
@@ -188,7 +188,7 @@ impl eframe::App for AeonApp {
                     ui.horizontal(|ui|{
                         ui.text_edit_singleline(&mut self.new_project);
                         if ui.button("Create project").clicked(){
-                            if let Ok(s)=self.store.lock(){let result=s.create_project(&self.new_project,"");drop(s);match result{Ok(p)=>{self.new_project.clear();self.project=p;self.refresh();},Err(e)=>self.error=format!("{e:?}")}}
+                            let store=self.store.clone();if let Ok(s)=store.lock(){let result=s.create_project(&self.new_project,"");drop(s);match result{Ok(p)=>{self.new_project.clear();self.project=p;self.refresh();},Err(e)=>self.error=format!("{e:?}")}}
                         }
                     });
                     for p in self.projects.clone(){
