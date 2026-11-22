@@ -8,8 +8,10 @@
 //!   light up from a few seeds).
 //! * [`fusion`]: reciprocal-rank fusion of several ranked lists.
 //! * [`ontology`]: class hierarchy (is-a) with inherited, typed relations.
+//! * [`chunk`]: recursive text chunking with overlap and source offsets, to feed the indexes.
 #![forbid(unsafe_code)]
 
+pub mod chunk;
 pub mod fusion;
 pub mod graph;
 pub mod lexical;
