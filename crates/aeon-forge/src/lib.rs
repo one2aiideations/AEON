@@ -15,6 +15,7 @@
 
 pub mod candidate;
 pub mod capability;
+pub mod compare;
 pub mod evaluation;
 pub mod fitness;
 pub mod manifest;
@@ -22,6 +23,7 @@ pub mod registry;
 
 pub use candidate::{generate, Candidate, CandidateError, Operator};
 pub use capability::{CapabilityError, CapabilityRecord, CapabilityRegistry, Contract};
+pub use compare::{compare, CompareError, Comparison, Outcome, Run};
 pub use evaluation::{
     score, Assertion, Case, EvalError, Gates, Profile, Score, Scoring, Submitted, Value,
 };
