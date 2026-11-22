@@ -1,22 +1,24 @@
-name: AEON-WEB Rust checks
+name: AEON-MAIL Rust CI
 
 on:
   push:
     paths:
-      - "web/**"
-      - ".github/workflows/aeon-web.yml"
+      - "crates/mail/**"
+      - ".github/workflows/aeonos-mail.yml"
   pull_request:
     paths:
-      - "web/**"
-      - ".github/workflows/aeon-web.yml"
-  workflow_dispatch:
+      - "crates/mail/**"
+      - ".github/workflows/aeonos-mail.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  rust:
+  verify:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: web
+        working-directory: crates/mail
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,12 +26,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: web
-      - name: Format source in CI workspace
-        run: cargo fmt --all
-      - name: Check
+          workspaces: mail
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Compile
         run: cargo check --all-targets
-      - name: Clippy
+      - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test --all-targets
