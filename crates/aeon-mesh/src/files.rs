@@ -70,6 +70,51 @@ impl Manifest {
             .collect()
     }
 
+    /// Chunks of `self` that are present in `store` but do not match their hash.
+    #[must_use]
+    pub fn corrupt<'a>(&'a self, store: &BTreeMap<Hash, Vec<u8>>) -> Vec<&'a Hash> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.chunks
+            .iter()
+            .filter(|h| {
+                seen.insert(**h)
+                    && store
+                        .get(*h)
+                        .is_some_and(|c| Sha256::digest(c).as_slice() != h.as_slice())
+            })
+            .collect()
+    }
+
+    /// Fix `store` for this manifest: drop corrupt chunks and refill every missing or
+    /// corrupt chunk from the first replica holding a copy that matches its hash.
+    /// Replica chunks are verified before use, so a corrupt replica cannot spread damage.
+    pub fn repair(
+        &self,
+        store: &mut BTreeMap<Hash, Vec<u8>>,
+        replicas: &[&BTreeMap<Hash, Vec<u8>>],
+    ) -> RepairReport {
+        let bad: Vec<Hash> = self.corrupt(store).into_iter().copied().collect();
+        for h in &bad {
+            store.remove(h);
+        }
+        let mut report = RepairReport::default();
+        for h in self.missing(store).into_iter().copied().collect::<Vec<_>>() {
+            let good = replicas
+                .iter()
+                .filter_map(|r| r.get(&h))
+                .find(|c| Sha256::digest(c).as_slice() == h.as_slice());
+            match good {
+                Some(c) => {
+                    store.insert(h, c.clone());
+                    report.repaired += 1;
+                }
+                None => report.unrecoverable.push(h),
+            }
+        }
+        report.corrupt_dropped = bad.len();
+        report
+    }
+
     /// Reassemble and verify. `None` if a chunk is missing or corrupt.
     #[must_use]
     pub fn assemble(&self, store: &BTreeMap<Hash, Vec<u8>>) -> Option<Vec<u8>> {
@@ -84,6 +129,17 @@ impl Manifest {
         }
         (out.len() as u64 == self.len).then_some(out)
     }
+}
+
+/// Outcome of [`Manifest::repair`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Corrupt local chunks that were dropped.
+    pub corrupt_dropped: usize,
+    /// Chunks restored from a replica.
+    pub repaired: usize,
+    /// Chunks no replica could supply intact.
+    pub unrecoverable: Vec<Hash>,
 }
 
 /// Per-device edit counters.
@@ -191,6 +247,73 @@ mod tests {
         let k = m.chunks[1];
         store.get_mut(&k).unwrap()[0] ^= 1;
         assert!(m.assemble(&store).is_none());
+    }
+
+    #[test]
+    fn corrupt_lists_only_damaged_chunks() {
+        let (m, mut store) = Manifest::build(b"aaaabbbbcccc", 4);
+        assert!(m.corrupt(&store).is_empty());
+        let k = m.chunks[1];
+        store.get_mut(&k).unwrap()[3] ^= 0x80;
+        assert_eq!(m.corrupt(&store), vec![&k]);
+        store.remove(&m.chunks[2]); // missing is not corrupt
+        assert_eq!(m.corrupt(&store).len(), 1);
+    }
+
+    #[test]
+    fn repair_restores_from_a_good_replica() {
+        let data = b"the quick brown fox jumps over".to_vec();
+        let (m, good) = Manifest::build(&data, 5);
+        let mut local = good.clone();
+        let (first, second, third) = (m.chunks[0], m.chunks[2], m.chunks[4]);
+        local.get_mut(&first).unwrap()[0] ^= 1; // corrupt
+        local.remove(&second); // missing
+                               // replica A has a corrupt copy of `first`, replica B a good one
+        let mut a = good.clone();
+        a.get_mut(&first).unwrap()[1] ^= 1;
+        a.remove(&third);
+        let b = good.clone();
+        assert!(m.assemble(&local).is_none());
+        let r = m.repair(&mut local, &[&a, &b]);
+        assert_eq!(
+            r,
+            RepairReport {
+                corrupt_dropped: 1,
+                repaired: 2,
+                unrecoverable: vec![]
+            }
+        );
+        assert_eq!(m.assemble(&local).unwrap(), data);
+    }
+
+    #[test]
+    fn repair_reports_what_it_cannot_fix() {
+        let (m, good) = Manifest::build(b"aaaabbbb", 4);
+        let mut local = BTreeMap::new();
+        let mut bad_replica = good.clone();
+        bad_replica.get_mut(&m.chunks[0]).unwrap()[0] ^= 1;
+        let r = m.repair(&mut local, &[&bad_replica]);
+        assert_eq!(r.repaired, 1);
+        assert_eq!(r.unrecoverable, vec![m.chunks[0]]);
+        assert!(m.assemble(&local).is_none());
+        assert_eq!(m.repair(&mut BTreeMap::new(), &[]).unrecoverable.len(), 2);
+    }
+
+    #[test]
+    fn repair_of_a_healthy_store_changes_nothing() {
+        let (m, good) = Manifest::build(b"healthy data here", 6);
+        let mut local = good.clone();
+        assert_eq!(m.repair(&mut local, &[]), RepairReport::default());
+        assert_eq!(local, good);
+    }
+
+    #[test]
+    fn repeated_chunks_are_repaired_once() {
+        let (m, good) = Manifest::build(b"abcdabcdabcd", 4);
+        let mut local = BTreeMap::new();
+        let r = m.repair(&mut local, &[&good]);
+        assert_eq!(r.repaired, 1);
+        assert_eq!(m.assemble(&local).unwrap(), b"abcdabcdabcd");
     }
 
     #[test]
