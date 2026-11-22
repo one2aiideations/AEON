@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -232,7 +232,7 @@ impl Engine {
         let tx = self.db.begin_write()?;
         let mut table = tx.open_table(RECORDS)?;
         let previous = table.get(storage_key.as_str())?;
-        let (version, created_at) = if let Some(old) = previous {
+        let (version, created_at) = if let Some(ref old) = previous {
             let old: Record = serde_json::from_str(old.value())?;
             (old.version + 1, old.created_at)
         } else {
