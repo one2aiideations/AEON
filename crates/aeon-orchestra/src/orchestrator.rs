@@ -124,12 +124,17 @@ impl Orchestrator {
             }
             let mut progressed = false;
             for step in pending {
-                let dep_states: Vec<Option<&StepOutcome>> = step.deps.iter().map(|d| out.get(d)).collect();
-                if dep_states.iter().any(Option::is_none) && step.deps.iter().all(|d| steps.iter().any(|s| s.id == *d)) {
+                let unresolved = step.deps.iter().any(|d| !out.contains_key(d));
+                let all_exist = step.deps.iter().all(|d| steps.iter().any(|s| s.id == *d));
+                if unresolved && all_exist {
                     continue;
                 }
                 progressed = true;
-                if dep_states.iter().any(|s| !matches!(s, Some(StepOutcome::Done { .. }))) {
+                let deps_done = step
+                    .deps
+                    .iter()
+                    .all(|d| matches!(out.get(d), Some(StepOutcome::Done { .. })));
+                if !deps_done {
                     out.insert(step.id, StepOutcome::Skipped);
                     continue;
                 }
