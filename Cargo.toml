@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aeon-hw", "crates/aeon-gate", "crates/aeon-gguf", "crates/aeon-tensor", "crates/aeon-model", "crates/aeon-engine", "crates/aeon-identity", "crates/aeon-cognition", "crates/aeon-runtime", "crates/aeon-adapters", "crates/aeond"]
+members = ["crates/aeon-hw", "crates/aeon-gate", "crates/aeon-gguf", "crates/aeon-tensor", "crates/aeon-model", "crates/aeon-engine", "crates/aeon-identity", "crates/aeon-cognition", "crates/aeon-runtime", "crates/aeon-adapters", "crates/aeond", "crates/aeon-theory"]
 
 [workspace.package]
 edition = "2021"
