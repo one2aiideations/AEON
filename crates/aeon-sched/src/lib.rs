@@ -194,7 +194,10 @@ impl Topology {
 
     /// Remove a finished task.
     pub fn finish(&mut self, id: u64) -> Result<Task, SchedError> {
-        self.tasks.remove(&id).map(|(t, _)| t).ok_or(SchedError::Unknown)
+        self.tasks
+            .remove(&id)
+            .map(|(t, _)| t)
+            .ok_or(SchedError::Unknown)
     }
 
     /// Update a unit's sensor readings.
@@ -217,7 +220,8 @@ impl Topology {
             };
             let u = &self.units[from];
             let (mem, load) = self.usage(from);
-            let stressed = !u.online || u.temp_c >= u.temp_limit_c || mem > u.mem_bytes || load > 1.0 + 1e-6;
+            let stressed =
+                !u.online || u.temp_c >= u.temp_limit_c || mem > u.mem_bytes || load > 1.0 + 1e-6;
             if !stressed || !task.migratable {
                 continue;
             }
@@ -243,7 +247,9 @@ impl Topology {
     /// Unit currently running `id`.
     #[must_use]
     pub fn unit_of(&self, id: u64) -> Option<&str> {
-        self.tasks.get(&id).map(|(_, u)| self.units[*u].name.as_str())
+        self.tasks
+            .get(&id)
+            .map(|(_, u)| self.units[*u].name.as_str())
     }
 }
 
@@ -283,11 +289,23 @@ mod tests {
     #[test]
     fn placement_follows_affinity_and_memory() {
         let mut t = laptop();
-        assert_eq!(t.place(task(1, Work::Tensor, 6 << 30, true)).unwrap(), "dgpu");
-        assert_eq!(t.place(task(2, Work::Scalar, 1 << 30, true)).unwrap(), "cpu");
+        assert_eq!(
+            t.place(task(1, Work::Tensor, 6 << 30, true)).unwrap(),
+            "dgpu"
+        );
+        assert_eq!(
+            t.place(task(2, Work::Scalar, 1 << 30, true)).unwrap(),
+            "cpu"
+        );
         // Too big for any GPU now: dGPU has 2 GiB left, iGPU 4 GiB.
-        assert_eq!(t.place(task(3, Work::Tensor, 5 << 30, true)).unwrap(), "cpu");
-        assert_eq!(t.place(task(3, Work::Tensor, 1, true)), Err(SchedError::Duplicate));
+        assert_eq!(
+            t.place(task(3, Work::Tensor, 5 << 30, true)).unwrap(),
+            "cpu"
+        );
+        assert_eq!(
+            t.place(task(3, Work::Tensor, 1, true)),
+            Err(SchedError::Duplicate)
+        );
         assert_eq!(
             t.place(task(9, Work::Tensor, 64 << 30, true)),
             Err(SchedError::NoCapacity)

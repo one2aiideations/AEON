@@ -121,7 +121,13 @@ impl ObjectStore {
     }
 
     /// Create an object in `Pending` state.
-    pub fn create(&mut self, kind: Kind, namespace: &str, name: &str, owner: ObjectId) -> Result<ObjectId, ObjError> {
+    pub fn create(
+        &mut self,
+        kind: Kind,
+        namespace: &str,
+        name: &str,
+        owner: ObjectId,
+    ) -> Result<ObjectId, ObjError> {
         if name.trim().is_empty() || self.find(kind, namespace, name).is_some() {
             return Err(ObjError::Name);
         }
@@ -200,7 +206,11 @@ impl ObjectStore {
     }
 
     /// Targets of `from` via `label`.
-    pub fn related<'a>(&'a self, from: ObjectId, label: &'a str) -> impl Iterator<Item = ObjectId> + 'a {
+    pub fn related<'a>(
+        &'a self,
+        from: ObjectId,
+        label: &'a str,
+    ) -> impl Iterator<Item = ObjectId> + 'a {
         self.relations
             .iter()
             .filter(move |r| r.from == from && r.label == label)
@@ -208,7 +218,10 @@ impl ObjectStore {
     }
 
     /// Objects matching a label selector (all pairs must match).
-    pub fn select<'a>(&'a self, selector: &'a [(&'a str, &'a str)]) -> impl Iterator<Item = &'a KernelObject> + 'a {
+    pub fn select<'a>(
+        &'a self,
+        selector: &'a [(&'a str, &'a str)],
+    ) -> impl Iterator<Item = &'a KernelObject> + 'a {
         self.objects.values().filter(move |o| {
             selector
                 .iter()
@@ -231,9 +244,16 @@ mod tests {
     #[test]
     fn create_update_conflict() {
         let mut s = ObjectStore::new();
-        let a = s.create(Kind::Agent, "home/alice", "mail-digest", 7).unwrap();
-        assert_eq!(s.create(Kind::Agent, "home/alice", "mail-digest", 7), Err(ObjError::Name));
-        assert!(s.create(Kind::Model, "home/alice", "mail-digest", 7).is_ok());
+        let a = s
+            .create(Kind::Agent, "home/alice", "mail-digest", 7)
+            .unwrap();
+        assert_eq!(
+            s.create(Kind::Agent, "home/alice", "mail-digest", 7),
+            Err(ObjError::Name)
+        );
+        assert!(s
+            .create(Kind::Model, "home/alice", "mail-digest", 7)
+            .is_ok());
         let v = s
             .update(a, 1, |o| {
                 o.state = State::Active;
@@ -247,7 +267,10 @@ mod tests {
         assert_eq!(o.name, "mail-digest");
         assert_eq!(
             s.update(a, 1, |_| {}),
-            Err(ObjError::Conflict { expected: 1, actual: 2 })
+            Err(ObjError::Conflict {
+                expected: 1,
+                actual: 2
+            })
         );
         assert_eq!(s.select(&[("tier", "fast")]).count(), 1);
     }

@@ -57,7 +57,14 @@ impl AuditLog {
     }
 
     /// Append a record and return its hash.
-    pub fn append(&mut self, time: u64, actor: &str, action: &str, resource: &str, outcome: &str) -> [u8; 32] {
+    pub fn append(
+        &mut self,
+        time: u64,
+        actor: &str,
+        action: &str,
+        resource: &str,
+        outcome: &str,
+    ) -> [u8; 32] {
         let prev = self.entries.last().map_or([0; 32], |e| e.hash);
         let mut e = Entry {
             seq: self.entries.len() as u64,

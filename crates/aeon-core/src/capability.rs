@@ -72,7 +72,11 @@ impl CapabilityRegistry {
         if c.name.trim().is_empty() {
             return Err(CapError::BadName);
         }
-        if self.caps.get(&c.name).is_some_and(|old| old.version >= c.version) {
+        if self
+            .caps
+            .get(&c.name)
+            .is_some_and(|old| old.version >= c.version)
+        {
             return Err(CapError::Stale);
         }
         self.caps.insert(c.name.clone(), c);
@@ -99,11 +103,20 @@ impl CapabilityRegistry {
     /// Capabilities whose name starts with `prefix`, cheapest first, that
     /// `held` may call and that meet `max_latency_ms`.
     #[must_use]
-    pub fn candidates(&self, prefix: &str, held: &BTreeSet<String>, max_latency_ms: u32) -> Vec<&Capability> {
+    pub fn candidates(
+        &self,
+        prefix: &str,
+        held: &BTreeSet<String>,
+        max_latency_ms: u32,
+    ) -> Vec<&Capability> {
         let mut v: Vec<&Capability> = self
             .caps
             .values()
-            .filter(|c| c.name.starts_with(prefix) && c.latency_ms <= max_latency_ms && c.permissions.is_subset(held))
+            .filter(|c| {
+                c.name.starts_with(prefix)
+                    && c.latency_ms <= max_latency_ms
+                    && c.permissions.is_subset(held)
+            })
             .collect();
         v.sort_by(|a, b| a.cost.total_cmp(&b.cost));
         v
@@ -134,9 +147,14 @@ mod tests {
     #[test]
     fn versions_and_permissions() {
         let mut r = CapabilityRegistry::new();
-        r.register(cap("files.search", 1, &["files.read"], 1.0, 50)).unwrap();
-        assert_eq!(r.register(cap("files.search", 1, &[], 1.0, 50)), Err(CapError::Stale));
-        r.register(cap("files.search", 2, &["files.read"], 0.5, 20)).unwrap();
+        r.register(cap("files.search", 1, &["files.read"], 1.0, 50))
+            .unwrap();
+        assert_eq!(
+            r.register(cap("files.search", 1, &[], 1.0, 50)),
+            Err(CapError::Stale)
+        );
+        r.register(cap("files.search", 2, &["files.read"], 0.5, 20))
+            .unwrap();
         assert_eq!(r.get("files.search").unwrap().version, 2);
         assert!(r.authorize("files.search", &held(&["files.read"])).is_ok());
         assert_eq!(
@@ -149,11 +167,18 @@ mod tests {
     #[test]
     fn candidate_ranking() {
         let mut r = CapabilityRegistry::new();
-        r.register(cap("web.fetch.fast", 1, &["net"], 3.0, 100)).unwrap();
-        r.register(cap("web.fetch.cheap", 1, &["net"], 1.0, 900)).unwrap();
-        r.register(cap("web.fetch.admin", 1, &["net", "admin"], 0.1, 10)).unwrap();
+        r.register(cap("web.fetch.fast", 1, &["net"], 3.0, 100))
+            .unwrap();
+        r.register(cap("web.fetch.cheap", 1, &["net"], 1.0, 900))
+            .unwrap();
+        r.register(cap("web.fetch.admin", 1, &["net", "admin"], 0.1, 10))
+            .unwrap();
         let h = held(&["net"]);
-        let all: Vec<&str> = r.candidates("web.fetch", &h, 1000).iter().map(|c| c.name.as_str()).collect();
+        let all: Vec<&str> = r
+            .candidates("web.fetch", &h, 1000)
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert_eq!(all, vec!["web.fetch.cheap", "web.fetch.fast"]);
         assert_eq!(r.candidates("web.fetch", &h, 200).len(), 1);
     }

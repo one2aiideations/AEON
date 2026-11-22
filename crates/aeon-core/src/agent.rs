@@ -68,7 +68,12 @@ pub struct Episode {
 }
 
 /// Run one goal to completion within budgets.
-pub fn run_episode(agent: &mut dyn Agent, goal: &str, max_steps: usize, max_failures: usize) -> Episode {
+pub fn run_episode(
+    agent: &mut dyn Agent,
+    goal: &str,
+    max_steps: usize,
+    max_failures: usize,
+) -> Episode {
     let mut trace = Vec::new();
     let mut failures = 0;
     let obs = agent.observe();
@@ -155,7 +160,11 @@ mod tests {
 
     #[test]
     fn replans_after_failure_and_finishes() {
-        let mut a = Counter { value: 0, target: 4, failed_once: false };
+        let mut a = Counter {
+            value: 0,
+            target: 4,
+            failed_once: false,
+        };
         let ep = run_episode(&mut a, "reach 4", 10, 3);
         assert_eq!(ep.end, EpisodeEnd::Done);
         assert_eq!(a.value, 4);
@@ -164,11 +173,29 @@ mod tests {
 
     #[test]
     fn budgets_apply() {
-        let mut a = Counter { value: 0, target: 100, failed_once: true };
+        let mut a = Counter {
+            value: 0,
+            target: 100,
+            failed_once: true,
+        };
         assert_eq!(run_episode(&mut a, "far", 3, 3).end, EpisodeEnd::Budget);
-        let mut b = Counter { value: 2, target: 5, failed_once: false };
-        assert_eq!(run_episode(&mut b, "x", 10, 1).end, EpisodeEnd::TooManyFailures);
-        let mut c = Counter { value: 5, target: 5, failed_once: true };
-        assert_eq!(run_episode(&mut c, "x", 10, 1).end, EpisodeEnd::PlanExhausted);
+        let mut b = Counter {
+            value: 2,
+            target: 5,
+            failed_once: false,
+        };
+        assert_eq!(
+            run_episode(&mut b, "x", 10, 1).end,
+            EpisodeEnd::TooManyFailures
+        );
+        let mut c = Counter {
+            value: 5,
+            target: 5,
+            failed_once: true,
+        };
+        assert_eq!(
+            run_episode(&mut c, "x", 10, 1).end,
+            EpisodeEnd::PlanExhausted
+        );
     }
 }

@@ -129,14 +129,39 @@ mod tests {
 
     #[test]
     fn stops_at_confident_engine() {
-        let mut small = Fixed { name: "small", conf: 0.4, cost: 1.0, calls: 0 };
-        let mut big = Fixed { name: "big", conf: 0.9, cost: 10.0, calls: 0 };
-        let mut huge = Fixed { name: "huge", conf: 0.99, cost: 100.0, calls: 0 };
-        let (who, r) = cascade(&mut [&mut small, &mut big, &mut huge], &req(Task::Answer), 0.8).unwrap();
+        let mut small = Fixed {
+            name: "small",
+            conf: 0.4,
+            cost: 1.0,
+            calls: 0,
+        };
+        let mut big = Fixed {
+            name: "big",
+            conf: 0.9,
+            cost: 10.0,
+            calls: 0,
+        };
+        let mut huge = Fixed {
+            name: "huge",
+            conf: 0.99,
+            cost: 100.0,
+            calls: 0,
+        };
+        let (who, r) = cascade(
+            &mut [&mut small, &mut big, &mut huge],
+            &req(Task::Answer),
+            0.8,
+        )
+        .unwrap();
         assert_eq!(who, "big");
         assert!((r.cost - 11.0).abs() < 1e-6);
         assert_eq!(huge.calls, 0);
-        let mut e = Fixed { name: "x", conf: 1.0, cost: 0.0, calls: 0 };
+        let mut e = Fixed {
+            name: "x",
+            conf: 1.0,
+            cost: 0.0,
+            calls: 0,
+        };
         assert!(cascade(&mut [&mut e], &req(Task::Embed), 0.5).is_err());
     }
 }

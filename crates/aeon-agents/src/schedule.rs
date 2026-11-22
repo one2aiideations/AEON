@@ -112,7 +112,11 @@ mod tests {
         assert_eq!(s.next_after(0), Some(10));
         assert_eq!(s.next_after(10), Some(15));
         assert_eq!(s.next_after(17), Some(20));
-        assert!(!Schedule::Every { start: 0, period: 0 }.is_valid());
+        assert!(!Schedule::Every {
+            start: 0,
+            period: 0
+        }
+        .is_valid());
     }
 
     #[test]
@@ -124,7 +128,10 @@ mod tests {
         };
         let day0 = 20_000 * DAY;
         assert_eq!(s.next_after(day0), Some(day0 + 3 * 3600 + 1800));
-        assert_eq!(s.next_after(day0 + 4 * 3600), Some(day0 + DAY + 3 * 3600 + 1800));
+        assert_eq!(
+            s.next_after(day0 + 4 * 3600),
+            Some(day0 + DAY + 3 * 3600 + 1800)
+        );
         // 02:00 at UTC+5:30 is 20:30 UTC the previous day.
         let early = Schedule::Daily {
             second_of_day: 2 * 3600,

@@ -1,8 +1,8 @@
 //! Job table and due queue.
 
 use crate::schedule::Schedule;
-use std::collections::{BTreeMap, BTreeSet};
 use core::fmt;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Job id.
 pub type JobId = u64;
@@ -91,7 +91,13 @@ impl Scheduler {
     }
 
     /// Register a job; its first run is computed from `now`.
-    pub fn add(&mut self, owner: &str, action: &str, schedule: Schedule, now: u64) -> Result<JobId, SchedError> {
+    pub fn add(
+        &mut self,
+        owner: &str,
+        action: &str,
+        schedule: Schedule,
+        now: u64,
+    ) -> Result<JobId, SchedError> {
         if !schedule.is_valid() {
             return Err(SchedError::BadSchedule);
         }
@@ -192,7 +198,17 @@ mod tests {
     #[test]
     fn due_order_and_reschedule() {
         let mut s = Scheduler::new(8);
-        let a = s.add("u", "summarise mail", Schedule::Every { start: 100, period: 60 }, 0).unwrap();
+        let a = s
+            .add(
+                "u",
+                "summarise mail",
+                Schedule::Every {
+                    start: 100,
+                    period: 60,
+                },
+                0,
+            )
+            .unwrap();
         let b = s.add("u", "backup", Schedule::Once { at: 50 }, 0).unwrap();
         assert_eq!(s.next_wake(), Some(50));
         assert!(s.pop_due(49).is_none());
@@ -210,7 +226,17 @@ mod tests {
     fn failures_pause_job() {
         let mut s = Scheduler::new(2);
         s.max_failures = 2;
-        let id = s.add("sys", "sync", Schedule::Every { start: 0, period: 10 }, 0).unwrap();
+        let id = s
+            .add(
+                "sys",
+                "sync",
+                Schedule::Every {
+                    start: 0,
+                    period: 10,
+                },
+                0,
+            )
+            .unwrap();
         for t in [0, 10] {
             assert_eq!(s.pop_due(t).unwrap().id, id);
             s.complete(id, t, false).unwrap();
@@ -224,13 +250,27 @@ mod tests {
     #[test]
     fn validation() {
         let mut s = Scheduler::new(1);
-        assert_eq!(s.add("", "x", Schedule::Once { at: 1 }, 0), Err(SchedError::BadJob));
         assert_eq!(
-            s.add("u", "x", Schedule::Every { start: 0, period: 0 }, 0),
+            s.add("", "x", Schedule::Once { at: 1 }, 0),
+            Err(SchedError::BadJob)
+        );
+        assert_eq!(
+            s.add(
+                "u",
+                "x",
+                Schedule::Every {
+                    start: 0,
+                    period: 0
+                },
+                0
+            ),
             Err(SchedError::BadSchedule)
         );
         s.add("u", "x", Schedule::Once { at: 1 }, 0).unwrap();
-        assert_eq!(s.add("u", "y", Schedule::Once { at: 1 }, 0), Err(SchedError::Full));
+        assert_eq!(
+            s.add("u", "y", Schedule::Once { at: 1 }, 0),
+            Err(SchedError::Full)
+        );
         assert_eq!(s.remove(99), Err(SchedError::Unknown));
     }
 }

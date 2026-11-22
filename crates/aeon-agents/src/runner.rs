@@ -70,7 +70,15 @@ mod tests {
     fn runs_and_audits() {
         let mut r = Runner::new(Scheduler::new(4));
         r.scheduler
-            .add("alice", "daily digest", Schedule::Every { start: 0, period: 100 }, 0)
+            .add(
+                "alice",
+                "daily digest",
+                Schedule::Every {
+                    start: 0,
+                    period: 100,
+                },
+                0,
+            )
             .unwrap();
         r.scheduler
             .add("bob", "flaky sync", Schedule::Once { at: 0 }, 0)
@@ -86,7 +94,11 @@ mod tests {
         assert_eq!(r.tick(50, 10, &mut exec), 0);
         assert_eq!(r.tick(100, 10, &mut exec), 1);
         assert_eq!(r.audit.entries().len(), 3);
-        assert!(r.audit.entries().iter().any(|e| e.outcome == "error: network down"));
+        assert!(r
+            .audit
+            .entries()
+            .iter()
+            .any(|e| e.outcome == "error: network down"));
         assert_eq!(r.audit.verify(), None);
     }
 
