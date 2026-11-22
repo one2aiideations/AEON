@@ -3,11 +3,11 @@ name: AEON-MAIL Rust CI
 on:
   push:
     paths:
-      - "crates/mail/**"
+      - "crates/aeon-mail/**"
       - ".github/workflows/aeonos-mail.yml"
   pull_request:
     paths:
-      - "crates/mail/**"
+      - "crates/aeon-mail/**"
       - ".github/workflows/aeonos-mail.yml"
 
 permissions:
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/mail
+        working-directory: crates/aeon-mail
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

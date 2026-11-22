@@ -3,11 +3,11 @@ name: AEON-WEB Rust checks
 on:
   push:
     paths:
-      - "crates/web/**"
+      - "crates/aeon-web/**"
       - ".github/workflows/aeonos-web.yml"
   pull_request:
     paths:
-      - "crates/web/**"
+      - "crates/aeon-web/**"
       - ".github/workflows/aeonos-web.yml"
   workflow_dispatch:
 
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/web
+        working-directory: crates/aeon-web
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
