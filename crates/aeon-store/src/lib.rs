@@ -36,8 +36,10 @@ const DEL: u8 = 2;
 const HEADER: usize = 13;
 
 fn encode(op: u8, key: &[u8], val: &[u8]) -> io::Result<Vec<u8>> {
-    let kl = u32::try_from(key.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "key too long"))?;
-    let vl = u32::try_from(val.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "value too long"))?;
+    let kl = u32::try_from(key.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "key too long"))?;
+    let vl = u32::try_from(val.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "value too long"))?;
     let mut body = Vec::with_capacity(HEADER - 4 + key.len() + val.len());
     body.push(op);
     body.extend_from_slice(&kl.to_le_bytes());
@@ -58,9 +60,14 @@ pub fn replay(log: &[u8]) -> (BTreeMap<Vec<u8>, Vec<u8>>, usize) {
     while log.len() - pos >= HEADER {
         let crc = u32::from_le_bytes([log[pos], log[pos + 1], log[pos + 2], log[pos + 3]]);
         let op = log[pos + 4];
-        let kl = u32::from_le_bytes([log[pos + 5], log[pos + 6], log[pos + 7], log[pos + 8]]) as usize;
-        let vl = u32::from_le_bytes([log[pos + 9], log[pos + 10], log[pos + 11], log[pos + 12]]) as usize;
-        let Some(end) = (pos + HEADER).checked_add(kl).and_then(|x| x.checked_add(vl)) else {
+        let kl =
+            u32::from_le_bytes([log[pos + 5], log[pos + 6], log[pos + 7], log[pos + 8]]) as usize;
+        let vl = u32::from_le_bytes([log[pos + 9], log[pos + 10], log[pos + 11], log[pos + 12]])
+            as usize;
+        let Some(end) = (pos + HEADER)
+            .checked_add(kl)
+            .and_then(|x| x.checked_add(vl))
+        else {
             break;
         };
         if end > log.len() || crc32(&log[pos + 4..end]) != crc {
