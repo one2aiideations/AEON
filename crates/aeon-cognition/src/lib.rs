@@ -9,6 +9,7 @@
 //! * [`causal`]: weighted cause -> effect graph with a `do()` query.
 //! * [`memory`]: ring-buffer episodic memory with EWC-style consolidation.
 //! * [`workspace`]: global workspace (bounded, salience-ranked broadcast).
+//! * [`working`]: working memory with priorities, expiry and eviction.
 //!
 //! Ported from the retired C core (`aeon_cognitive_core`, `aeon_cognitive_engine`).
 #![forbid(unsafe_code)]
@@ -18,6 +19,7 @@ pub mod inference;
 pub mod memory;
 pub mod snn;
 pub mod vsa;
+pub mod working;
 pub mod workspace;
 
 use core::fmt;
