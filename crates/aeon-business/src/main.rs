@@ -65,7 +65,9 @@ impl MoneyInput {
         if self.amount < Decimal::ZERO {
             return Err("amount cannot be negative".into());
         }
-        if self.currency.trim().len() != 3 || !self.currency.chars().all(|c| c.is_ascii_alphabetic()) {
+        if self.currency.trim().len() != 3
+            || !self.currency.chars().all(|c| c.is_ascii_alphabetic())
+        {
             return Err("currency must be a three-letter ISO-style code".into());
         }
         Ok(())
@@ -74,7 +76,9 @@ impl MoneyInput {
 
 impl DataAuthority {
     fn new() -> Self {
-        let base_url = env::var("AEON_DATA_API_BASE").ok().filter(|v| !v.trim().is_empty());
+        let base_url = env::var("AEON_DATA_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let service_token = env::var("AEON_DATA_SERVICE_TOKEN").ok();
         Self {
             client: Client::builder()
@@ -115,10 +119,15 @@ impl DataAuthority {
             url.push_str(record_id);
         }
 
-        let mut request = self.client.request(method, url)
+        let mut request = self
+            .client
+            .request(method, url)
             .header("x-aeon-tenant-id", &context.tenant_id)
             .header("x-aeon-user-id", &context.user_id)
-            .header("x-aeon-authorization-context", &context.authorization_context);
+            .header(
+                "x-aeon-authorization-context",
+                &context.authorization_context,
+            );
 
         if let Some(token) = &self.service_token {
             request = request.bearer_auth(token);
@@ -133,17 +142,29 @@ impl DataAuthority {
         })?;
         let status = response.status();
         let bytes = response.bytes().await.map_err(|_| {
-            (StatusCode::BAD_GATEWAY, "could not read AEON-DATA response".into())
+            (
+                StatusCode::BAD_GATEWAY,
+                "could not read AEON-DATA response".into(),
+            )
         })?;
         if !status.is_success() {
-            let detail = String::from_utf8_lossy(&bytes).chars().take(500).collect::<String>();
-            return Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), detail));
+            let detail = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(500)
+                .collect::<String>();
+            return Err((
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                detail,
+            ));
         }
         if bytes.is_empty() {
             return Ok(json!({"ok": true}));
         }
         serde_json::from_slice(&bytes).map_err(|_| {
-            (StatusCode::BAD_GATEWAY, "AEON-DATA returned a non-JSON response".into())
+            (
+                StatusCode::BAD_GATEWAY,
+                "AEON-DATA returned a non-JSON response".into(),
+            )
         })
     }
 }
@@ -153,11 +174,15 @@ impl DataAuthority {
 // copies of these headers on a publicly exposed listener.
 fn request_context(headers: &HeaderMap) -> Result<RequestContext, (StatusCode, String)> {
     let get = |name: &'static str| -> Result<String, (StatusCode, String)> {
-        headers.get(name)
+        headers
+            .get(name)
             .and_then(|v| v.to_str().ok())
             .filter(|v| !v.trim().is_empty())
             .map(str::to_owned)
-            .ok_or((StatusCode::UNAUTHORIZED, format!("missing trusted gateway context: {name}")))
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                format!("missing trusted gateway context: {name}"),
+            ))
     };
     Ok(RequestContext {
         tenant_id: get("x-aeon-tenant-id")?,
@@ -168,7 +193,8 @@ fn request_context(headers: &HeaderMap) -> Result<RequestContext, (StatusCode, S
 
 fn validate_record(resource: &str, value: &Value) -> Result<(), String> {
     let required = |key: &str| -> Result<(), String> {
-        value.get(key)
+        value
+            .get(key)
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(|_| ())
@@ -185,42 +211,66 @@ fn validate_record(resource: &str, value: &Value) -> Result<(), String> {
         "opportunities" => {
             required("name")?;
             required("stage")?;
-            let amount = value.get("amount").and_then(Value::as_str)
+            let amount = value
+                .get("amount")
+                .and_then(Value::as_str)
                 .ok_or("amount must be a decimal string")?
-                .parse::<Decimal>().map_err(|_| "amount is not a valid decimal")?;
-            let currency = value.get("currency").and_then(Value::as_str)
-                .ok_or("currency is required")?.to_owned();
+                .parse::<Decimal>()
+                .map_err(|_| "amount is not a valid decimal")?;
+            let currency = value
+                .get("currency")
+                .and_then(Value::as_str)
+                .ok_or("currency is required")?
+                .to_owned();
             MoneyInput { amount, currency }.validate()
         }
         "sales-orders" | "purchase-orders" => {
             required("customer_or_supplier_id")?;
             required("currency")?;
-            let amount = value.get("total").and_then(Value::as_str)
+            let amount = value
+                .get("total")
+                .and_then(Value::as_str)
                 .ok_or("total must be a decimal string")?;
-            let amount = amount.parse::<Decimal>().map_err(|_| "total is not a valid decimal")?;
-            if amount < Decimal::ZERO { return Err("total cannot be negative".into()); }
+            let amount = amount
+                .parse::<Decimal>()
+                .map_err(|_| "total is not a valid decimal")?;
+            if amount < Decimal::ZERO {
+                return Err("total cannot be negative".into());
+            }
             Ok(())
         }
         "journal-entries" => {
-            let debit = value.get("debit_total").and_then(Value::as_str)
-                .ok_or("debit_total must be a decimal string")?.parse::<Decimal>()
+            let debit = value
+                .get("debit_total")
+                .and_then(Value::as_str)
+                .ok_or("debit_total must be a decimal string")?
+                .parse::<Decimal>()
                 .map_err(|_| "debit_total is invalid")?;
-            let credit = value.get("credit_total").and_then(Value::as_str)
-                .ok_or("credit_total must be a decimal string")?.parse::<Decimal>()
+            let credit = value
+                .get("credit_total")
+                .and_then(Value::as_str)
+                .ok_or("credit_total must be a decimal string")?
+                .parse::<Decimal>()
                 .map_err(|_| "credit_total is invalid")?;
             if debit < Decimal::ZERO || credit < Decimal::ZERO {
                 return Err("journal totals cannot be negative".into());
             }
             if debit != credit {
-                return Err("journal entry is not balanced: debit_total must equal credit_total".into());
+                return Err(
+                    "journal entry is not balanced: debit_total must equal credit_total".into(),
+                );
             }
             Ok(())
         }
         "inventory-items" => {
             required("sku")?;
-            let quantity = value.get("quantity").and_then(Value::as_i64)
+            let quantity = value
+                .get("quantity")
+                .and_then(Value::as_i64)
                 .ok_or("quantity must be an integer")?;
-            if quantity < 0 { return Err("quantity cannot be negative".into()); }
+            if quantity < 0 {
+                return Err("quantity cannot be negative".into());
+            }
             Ok(())
         }
         "tickets" => {
@@ -240,12 +290,20 @@ fn validate_record(resource: &str, value: &Value) -> Result<(), String> {
 }
 
 async fn health() -> Json<Health> {
-    Json(Health { status: "ok", service: "aeon-business", version: env!("CARGO_PKG_VERSION") })
+    Json(Health {
+        status: "ok",
+        service: "aeon-business",
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readiness>) {
     let ready = state.data_configured;
-    let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (status, Json(Readiness {
         status: if ready { "ready_for_adapter_calls" } else { "not_ready" },
         aeon_data_configured: ready,
@@ -260,7 +318,11 @@ async fn list_records(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let context = request_context(&headers).map_err(api_error)?;
-    let result = state.data.request(Method::GET, &resource, None, &context, None).await.map_err(api_error)?;
+    let result = state
+        .data
+        .request(Method::GET, &resource, None, &context, None)
+        .await
+        .map_err(api_error)?;
     Ok(Json(result))
 }
 
@@ -270,7 +332,11 @@ async fn get_record(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let context = request_context(&headers).map_err(api_error)?;
-    let result = state.data.request(Method::GET, &resource, Some(&id), &context, None).await.map_err(api_error)?;
+    let result = state
+        .data
+        .request(Method::GET, &resource, Some(&id), &context, None)
+        .await
+        .map_err(api_error)?;
     Ok(Json(result))
 }
 
@@ -281,17 +347,24 @@ async fn create_record(
     Json(mut payload): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
     let context = request_context(&headers).map_err(api_error)?;
-    validate_record(&resource, &payload).map_err(|e| api_error((StatusCode::UNPROCESSABLE_ENTITY, e)))?;
+    validate_record(&resource, &payload)
+        .map_err(|e| api_error((StatusCode::UNPROCESSABLE_ENTITY, e)))?;
     if !payload.is_object() {
-        return Err(api_error((StatusCode::BAD_REQUEST, "record must be a JSON object".into())));
+        return Err(api_error((
+            StatusCode::BAD_REQUEST,
+            "record must be a JSON object".into(),
+        )));
     }
     if payload.get("id").is_none() {
         payload["id"] = json!(Uuid::new_v4().to_string());
     }
     payload["tenant_id"] = json!(context.tenant_id.clone());
     payload["created_by"] = json!(context.user_id.clone());
-    let result = state.data.request(Method::POST, &resource, None, &context, Some(payload))
-        .await.map_err(api_error)?;
+    let result = state
+        .data
+        .request(Method::POST, &resource, None, &context, Some(payload))
+        .await
+        .map_err(api_error)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -302,14 +375,24 @@ async fn update_record(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let context = request_context(&headers).map_err(api_error)?;
-    validate_record(&resource, &payload).map_err(|e| api_error((StatusCode::UNPROCESSABLE_ENTITY, e)))?;
-    let result = state.data.request(Method::PUT, &resource, Some(&id), &context, Some(payload))
-        .await.map_err(api_error)?;
+    validate_record(&resource, &payload)
+        .map_err(|e| api_error((StatusCode::UNPROCESSABLE_ENTITY, e)))?;
+    let result = state
+        .data
+        .request(Method::PUT, &resource, Some(&id), &context, Some(payload))
+        .await
+        .map_err(api_error)?;
     Ok(Json(result))
 }
 
 fn api_error(error: (StatusCode, String)) -> (StatusCode, Json<ApiError>) {
-    (error.0, Json(ApiError { error: error.0.to_string(), detail: error.1 }))
+    (
+        error.0,
+        Json(ApiError {
+            error: error.0.to_string(),
+            detail: error.1,
+        }),
+    )
 }
 
 fn app(state: Arc<AppState>) -> Router {
@@ -330,21 +413,30 @@ async fn main() {
 
     let data = DataAuthority::new();
     let data_configured = data.base_url.is_some();
-    let state = Arc::new(AppState { data, data_configured });
+    let state = Arc::new(AppState {
+        data,
+        data_configured,
+    });
 
     let host = env::var("AEON_BUSINESS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port = env::var("AEON_BUSINESS_PORT").ok()
-        .and_then(|v| v.parse::<u16>().ok()).unwrap_or(8088);
-    let address: SocketAddr = format!("{host}:{port}").parse()
+    let port = env::var("AEON_BUSINESS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8088);
+    let address: SocketAddr = format!("{host}:{port}")
+        .parse()
         .expect("AEON_BUSINESS_HOST and AEON_BUSINESS_PORT must form a valid socket address");
 
-    let listener = tokio::net::TcpListener::bind(address).await
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
         .expect("could not bind AEON-BUSINESS listener");
     info!(%address, data_configured, "AEON-BUSINESS server starting");
     if !data_configured {
         info!("AEON_DATA_API_BASE is unset; business data routes will return 503");
     }
-    axum::serve(listener, app(state)).await.expect("server failed");
+    axum::serve(listener, app(state))
+        .await
+        .expect("server failed");
 }
 
 #[cfg(test)]
@@ -364,9 +456,13 @@ mod tests {
         assert!(validate_record("opportunities", &json!({
             "name":"Factory automation","stage":"qualification","amount":"25000.00","currency":"INR"
         })).is_ok());
-        assert!(validate_record("opportunities", &json!({
-            "name":"Invalid","stage":"qualification","amount":"-1.00","currency":"INR"
-        })).is_err());
+        assert!(validate_record(
+            "opportunities",
+            &json!({
+                "name":"Invalid","stage":"qualification","amount":"-1.00","currency":"INR"
+            })
+        )
+        .is_err());
     }
 
     #[test]
@@ -383,7 +479,10 @@ mod tests {
 
     #[test]
     fn money_validation_uses_decimal() {
-        let money = MoneyInput { amount: "0.10".parse().unwrap(), currency: "INR".into() };
+        let money = MoneyInput {
+            amount: "0.10".parse().unwrap(),
+            currency: "INR".into(),
+        };
         assert!(money.validate().is_ok());
     }
 }

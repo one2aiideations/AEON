@@ -140,7 +140,11 @@ struct ApiState {
 }
 
 #[derive(Parser)]
-#[command(name = "aeon-data", version, about = "AEON unified local data authority")]
+#[command(
+    name = "aeon-data",
+    version,
+    about = "AEON unified local data authority"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -279,7 +283,8 @@ impl Engine {
         };
         let encoded = serde_json::to_string(&node)?;
         let tx = self.db.begin_write()?;
-        tx.open_table(GRAPH_NODES)?.insert(key.as_str(), encoded.as_str())?;
+        tx.open_table(GRAPH_NODES)?
+            .insert(key.as_str(), encoded.as_str())?;
         append_audit_tx(&tx, namespace, actor, "graph.node.create", &id)?;
         tx.commit()?;
         Ok(node)
@@ -309,7 +314,8 @@ impl Engine {
         };
         let encoded = serde_json::to_string(&edge)?;
         let tx = self.db.begin_write()?;
-        tx.open_table(GRAPH_EDGES)?.insert(key.as_str(), encoded.as_str())?;
+        tx.open_table(GRAPH_EDGES)?
+            .insert(key.as_str(), encoded.as_str())?;
         append_audit_tx(&tx, namespace, actor, "graph.edge.create", &id)?;
         tx.commit()?;
         Ok(edge)
@@ -335,7 +341,8 @@ impl Engine {
         };
         let encoded = serde_json::to_string(&entry)?;
         let tx = self.db.begin_write()?;
-        tx.open_table(VECTORS)?.insert(key.as_str(), encoded.as_str())?;
+        tx.open_table(VECTORS)?
+            .insert(key.as_str(), encoded.as_str())?;
         append_audit_tx(&tx, namespace, actor, "vector.insert", &id)?;
         tx.commit()?;
         Ok(entry)
@@ -474,7 +481,9 @@ async fn api_get_record(
         .get_record(&namespace, &key)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(serde_json::to_value(record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    Ok(Json(
+        serde_json::to_value(record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn api_put_record(
@@ -494,7 +503,9 @@ async fn api_put_record(
             warn!(error = %e, "record write failed");
             StatusCode::BAD_REQUEST
         })?;
-    Ok(Json(serde_json::to_value(record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    Ok(Json(
+        serde_json::to_value(record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn api_put_node(
@@ -507,9 +518,13 @@ async fn api_put_node(
     if namespace != state.namespace {
         return Err(StatusCode::FORBIDDEN);
     }
-    let node = state.engine.put_node(&namespace, body, "http-bearer")
+    let node = state
+        .engine
+        .put_node(&namespace, body, "http-bearer")
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(serde_json::to_value(node).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    Ok(Json(
+        serde_json::to_value(node).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn api_put_edge(
@@ -522,9 +537,13 @@ async fn api_put_edge(
     if namespace != state.namespace {
         return Err(StatusCode::FORBIDDEN);
     }
-    let edge = state.engine.put_edge(&namespace, body, "http-bearer")
+    let edge = state
+        .engine
+        .put_edge(&namespace, body, "http-bearer")
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(serde_json::to_value(edge).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    Ok(Json(
+        serde_json::to_value(edge).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn api_put_vector(
@@ -537,9 +556,13 @@ async fn api_put_vector(
     if namespace != state.namespace {
         return Err(StatusCode::FORBIDDEN);
     }
-    let vector = state.engine.put_vector(&namespace, body, "http-bearer")
+    let vector = state
+        .engine
+        .put_vector(&namespace, body, "http-bearer")
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(serde_json::to_value(vector).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+    Ok(Json(
+        serde_json::to_value(vector).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn api_search_vectors(
@@ -552,7 +575,9 @@ async fn api_search_vectors(
     if namespace != state.namespace {
         return Err(StatusCode::FORBIDDEN);
     }
-    let hits = state.engine.search_vectors(&namespace, &body.query, &body.metric, body.top_k)
+    let hits = state
+        .engine
+        .search_vectors(&namespace, &body.query, &body.metric, body.top_k)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(json!({"hits": hits, "strategy":"exact_scan"})))
 }
@@ -567,7 +592,9 @@ async fn serve(engine: Engine, bind: SocketAddr) -> Result<()> {
     let token = env::var("AEON_DATA_TOKEN")
         .context("AEON_DATA_TOKEN is required; refusing to start an unauthenticated server")?;
     if token.len() < 24 {
-        return Err(anyhow!("AEON_DATA_TOKEN must contain at least 24 characters"));
+        return Err(anyhow!(
+            "AEON_DATA_TOKEN must contain at least 24 characters"
+        ));
     }
     let namespace = env::var("AEON_DATA_NAMESPACE").unwrap_or_else(|_| "local".to_owned());
     validate_namespace(&namespace)?;
@@ -575,10 +602,18 @@ async fn serve(engine: Engine, bind: SocketAddr) -> Result<()> {
     if !matches!(role.as_str(), "reader" | "writer" | "admin") {
         return Err(anyhow!("AEON_DATA_ROLE must be reader, writer, or admin"));
     }
-    let state = ApiState { engine, token, namespace, role };
+    let state = ApiState {
+        engine,
+        token,
+        namespace,
+        role,
+    };
     let app = Router::new()
         .route("/health", get(health))
-        .route("/v1/records/:namespace/:key", get(api_get_record).put(api_put_record))
+        .route(
+            "/v1/records/:namespace/:key",
+            get(api_get_record).put(api_put_record),
+        )
         .route("/v1/graph/:namespace/nodes", post(api_put_node))
         .route("/v1/graph/:namespace/edges", post(api_put_edge))
         .route("/v1/vectors/:namespace", post(api_put_vector))
@@ -602,17 +637,19 @@ async fn main() -> Result<()> {
         Command::Init => {
             println!("{}", serde_json::to_string_pretty(&engine.stats()?)?);
         }
-        Command::Put { namespace, key, json: raw } => {
+        Command::Put {
+            namespace,
+            key,
+            json: raw,
+        } => {
             let value: Value = serde_json::from_str(&raw).context("invalid JSON payload")?;
             let record = engine.put_record(&namespace, &key, value, "local-cli")?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
-        Command::Get { namespace, key } => {
-            match engine.get_record(&namespace, &key)? {
-                Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
-                None => println!("null"),
-            }
-        }
+        Command::Get { namespace, key } => match engine.get_record(&namespace, &key)? {
+            Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
+            None => println!("null"),
+        },
         Command::Serve { bind } => serve(engine, bind).await?,
         Command::Stats => println!("{}", serde_json::to_string_pretty(&engine.stats()?)?),
     }
@@ -635,7 +672,10 @@ mod tests {
         drop(engine);
         let reopened = Engine::open(&path)?;
         assert_eq!(
-            reopened.get_record("tenant-a", "customer-1")?.unwrap().value["name"],
+            reopened
+                .get_record("tenant-a", "customer-1")?
+                .unwrap()
+                .value["name"],
             "Ada"
         );
         Ok(())
@@ -645,18 +685,26 @@ mod tests {
     fn cosine_search_ranks_matching_vector_first() -> Result<()> {
         let dir = tempdir()?;
         let engine = Engine::open(dir.path().join("vectors.redb"))?;
-        engine.put_vector("local", NewVector {
-            id: Some("same".into()),
-            values: vec![1.0, 0.0],
-            metadata: json!({}),
-            model: None,
-        }, "test")?;
-        engine.put_vector("local", NewVector {
-            id: Some("orthogonal".into()),
-            values: vec![0.0, 1.0],
-            metadata: json!({}),
-            model: None,
-        }, "test")?;
+        engine.put_vector(
+            "local",
+            NewVector {
+                id: Some("same".into()),
+                values: vec![1.0, 0.0],
+                metadata: json!({}),
+                model: None,
+            },
+            "test",
+        )?;
+        engine.put_vector(
+            "local",
+            NewVector {
+                id: Some("orthogonal".into()),
+                values: vec![0.0, 1.0],
+                metadata: json!({}),
+                model: None,
+            },
+            "test",
+        )?;
         let hits = engine.search_vectors("local", &[1.0, 0.0], "cosine", 2)?;
         assert_eq!(hits[0].entry.id, "same");
         assert!(hits[0].score > hits[1].score);
