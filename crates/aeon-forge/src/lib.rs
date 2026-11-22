@@ -14,13 +14,17 @@
 //! deterministic and testable.
 
 pub mod candidate;
+pub mod capability;
 pub mod evaluation;
+pub mod fitness;
 pub mod manifest;
 pub mod registry;
 
 pub use candidate::{generate, Candidate, CandidateError, Operator};
+pub use capability::{CapabilityError, CapabilityRecord, CapabilityRegistry, Contract};
 pub use evaluation::{
     score, Assertion, Case, EvalError, Gates, Profile, Score, Scoring, Submitted, Value,
 };
+pub use fitness::{select_fitness, Fitness, FitnessError, Observation};
 pub use manifest::{Manifest, ManifestError, Origin};
 pub use registry::{Record, Registry, RegistryError};
