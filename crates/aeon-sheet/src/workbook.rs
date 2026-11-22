@@ -36,7 +36,10 @@ pub struct Sheet {
 
 impl Grid for Sheet {
     fn value(&self, row: u32, col: u32) -> CellValue {
-        self.cells.get(&(row, col)).map(|c| c.value.clone()).unwrap_or_default()
+        self.cells
+            .get(&(row, col))
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -76,7 +79,8 @@ impl Sheet {
                 users.entry(d).or_default().push(k);
             }
         }
-        let mut ready: VecDeque<(u32, u32)> = formulas.iter().copied().filter(|k| indeg[k] == 0).collect();
+        let mut ready: VecDeque<(u32, u32)> =
+            formulas.iter().copied().filter(|k| indeg[k] == 0).collect();
         let mut done: HashSet<(u32, u32)> = HashSet::new();
         while let Some(k) = ready.pop_front() {
             let value = self
@@ -108,9 +112,14 @@ impl Sheet {
     /// Whether `(row, col)` is part of, or depends on, a reference cycle.
     #[must_use]
     pub fn in_cycle(&self, row: u32, col: u32) -> bool {
-        self.cells.get(&(row, col)).is_some_and(|c| c.value == CellValue::error(err::CYCLE))
+        self.cells
+            .get(&(row, col))
+            .is_some_and(|c| c.value == CellValue::error(err::CYCLE))
     }
 }
+
+/// Named range: (sheet, top-left, bottom-right), 0-based.
+pub type NamedRange = (usize, (u32, u32), (u32, u32));
 
 /// A workbook.
 #[derive(Clone, Debug)]
@@ -120,7 +129,7 @@ pub struct Workbook {
     /// Active sheet index.
     pub active: usize,
     /// Named ranges: name -> (sheet, top-left, bottom-right).
-    pub names: BTreeMap<String, (usize, (u32, u32), (u32, u32))>,
+    pub names: BTreeMap<String, NamedRange>,
 }
 
 impl Default for Workbook {
@@ -142,7 +151,12 @@ impl Workbook {
 
     /// Add a sheet; returns its index.
     pub fn add_sheet(&mut self, name: &str) -> Result<usize, String> {
-        if name.trim().is_empty() || self.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+        if name.trim().is_empty()
+            || self
+                .sheets
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(name))
+        {
             return Err(format!("sheet name {name:?} empty or taken"));
         }
         self.sheets.push(Sheet::new(name));
@@ -152,18 +166,28 @@ impl Workbook {
     /// Value of a cell (empty if missing).
     #[must_use]
     pub fn get_cell(&self, sheet: usize, row: u32, col: u32) -> CellValue {
-        self.sheets.get(sheet).map(|s| s.value(row, col)).unwrap_or_default()
+        self.sheets
+            .get(sheet)
+            .map(|s| s.value(row, col))
+            .unwrap_or_default()
     }
 
     /// Raw input of a cell.
     #[must_use]
     pub fn get_raw(&self, sheet: usize, row: u32, col: u32) -> Option<&str> {
-        self.sheets.get(sheet)?.cells.get(&(row, col)).map(|c| c.raw.as_str())
+        self.sheets
+            .get(sheet)?
+            .cells
+            .get(&(row, col))
+            .map(|c| c.raw.as_str())
     }
 
     /// Set what the user typed and recalculate the sheet. Empty input clears the cell.
     pub fn set_cell(&mut self, sheet: usize, row: u32, col: u32, raw: &str) -> Result<(), String> {
-        let sh = self.sheets.get_mut(sheet).ok_or_else(|| format!("no sheet {sheet}"))?;
+        let sh = self
+            .sheets
+            .get_mut(sheet)
+            .ok_or_else(|| format!("no sheet {sheet}"))?;
         if raw.trim().is_empty() {
             sh.cells.remove(&(row, col));
         } else if let Some(body) = raw.strip_prefix('=') {
@@ -194,7 +218,13 @@ impl Workbook {
     }
 
     /// Define a named range.
-    pub fn define_name(&mut self, name: &str, sheet: usize, from: (u32, u32), to: (u32, u32)) -> Result<(), String> {
+    pub fn define_name(
+        &mut self,
+        name: &str,
+        sheet: usize,
+        from: (u32, u32),
+        to: (u32, u32),
+    ) -> Result<(), String> {
         if sheet >= self.sheets.len() || name.is_empty() || crate::parse_cell_name(name).is_some() {
             return Err(format!("invalid name {name:?}"));
         }
@@ -217,8 +247,16 @@ mod tests {
         assert_eq!(wb.get_cell(0, 2, 0), CellValue::Number(3.0));
         assert_eq!(wb.get_cell(0, 3, 0), CellValue::Number(30.0));
         wb.set_cell(0, 0, 0, "5").unwrap();
-        assert_eq!(wb.get_cell(0, 2, 0), CellValue::Number(7.0), "dependent recalculated");
-        assert_eq!(wb.get_cell(0, 3, 0), CellValue::Number(70.0), "chain recalculated");
+        assert_eq!(
+            wb.get_cell(0, 2, 0),
+            CellValue::Number(7.0),
+            "dependent recalculated"
+        );
+        assert_eq!(
+            wb.get_cell(0, 3, 0),
+            CellValue::Number(70.0),
+            "chain recalculated"
+        );
         // Formula entered before its inputs exist.
         wb.set_cell(0, 0, 5, "=G1+1").unwrap();
         wb.set_cell(0, 0, 6, "41").unwrap();
@@ -233,7 +271,11 @@ mod tests {
         wb.set_cell(0, 0, 1, "=1+").unwrap();
         assert_eq!(wb.get_cell(0, 0, 1), CellValue::error(err::PARSE));
         wb.set_cell(0, 0, 2, "=B1+1").unwrap();
-        assert_eq!(wb.get_cell(0, 0, 2), CellValue::error(err::PARSE), "errors propagate");
+        assert_eq!(
+            wb.get_cell(0, 0, 2),
+            CellValue::error(err::PARSE),
+            "errors propagate"
+        );
     }
 
     #[test]

@@ -170,7 +170,9 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             }
             c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '.' | '$')) {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '.' | '$'))
+                {
                     i += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
@@ -446,7 +448,9 @@ fn finite(x: f64) -> Ev {
 
 fn compare(a: &CellValue, b: &CellValue) -> Option<std::cmp::Ordering> {
     match (a.as_number(), b.as_number()) {
-        (Ok(x), Ok(y)) if !matches!((a, b), (CellValue::Text(_), _) | (_, CellValue::Text(_))) => x.partial_cmp(&y),
+        (Ok(x), Ok(y)) if !matches!((a, b), (CellValue::Text(_), _) | (_, CellValue::Text(_))) => {
+            x.partial_cmp(&y)
+        }
         _ => Some(a.display().to_lowercase().cmp(&b.display().to_lowercase())),
     }
 }
@@ -488,7 +492,11 @@ fn call(g: &dyn Grid, name: &str, args: &[Expr]) -> Ev {
         "ROUND" => {
             arity(args, 1, 2)?;
             let x = num(g, &args[0])?;
-            let d = if args.len() == 2 { num(g, &args[1])? } else { 0.0 };
+            let d = if args.len() == 2 {
+                num(g, &args[1])?
+            } else {
+                0.0
+            };
             let m = 10f64.powi(d.clamp(-15.0, 15.0) as i32);
             finite((x * m).round() / m)
         }
@@ -524,12 +532,18 @@ fn call(g: &dyn Grid, name: &str, args: &[Expr]) -> Ev {
         }
         "LEN" => {
             arity(args, 1, 1)?;
-            Ok(CellValue::Number(eval_inner(g, &args[0])?.display().chars().count() as f64))
+            Ok(CellValue::Number(
+                eval_inner(g, &args[0])?.display().chars().count() as f64,
+            ))
         }
         "UPPER" | "LOWER" => {
             arity(args, 1, 1)?;
             let s = eval_inner(g, &args[0])?.display();
-            Ok(CellValue::Text(if name == "UPPER" { s.to_uppercase() } else { s.to_lowercase() }))
+            Ok(CellValue::Text(if name == "UPPER" {
+                s.to_uppercase()
+            } else {
+                s.to_lowercase()
+            }))
         }
         "PMT" => {
             // PMT(rate, nper, pv): deterministic annuity payment.
@@ -642,12 +656,25 @@ mod tests {
         assert_eq!(run("SUM(A1:A3)"), CellValue::Number(30.0));
         assert_eq!(run("AVERAGE(A1:A2)"), CellValue::Number(15.0));
         assert_eq!(run("MAX(A1:A3, 99)"), CellValue::Number(99.0));
-        assert_eq!(run("IF(A1>5,\"big\",\"small\")"), CellValue::Text("big".into()));
+        assert_eq!(
+            run("IF(A1>5,\"big\",\"small\")"),
+            CellValue::Text("big".into())
+        );
         assert_eq!(run("IF(A1>50,1)"), CellValue::Bool(false));
         assert_eq!(run("IFERROR(1/0, -1)"), CellValue::Number(-1.0));
-        assert_eq!(run("B1&\" \"&\"there\""), CellValue::Text("hi there".into()));
-        assert_eq!(run("\"say \"\"hi\"\"\""), CellValue::Text("say \"hi\"".into()));
-        assert_eq!(run("ABS()"), CellValue::error(err::VALUE), "no panic on missing args");
+        assert_eq!(
+            run("B1&\" \"&\"there\""),
+            CellValue::Text("hi there".into())
+        );
+        assert_eq!(
+            run("\"say \"\"hi\"\"\""),
+            CellValue::Text("say \"hi\"".into())
+        );
+        assert_eq!(
+            run("ABS()"),
+            CellValue::error(err::VALUE),
+            "no panic on missing args"
+        );
         assert_eq!(run("NOPE(1)"), CellValue::error(err::NAME));
         assert_eq!(run("A3+1"), CellValue::error(err::VALUE));
         assert_eq!(run("SQRT(-1)"), CellValue::error(err::NUM));
