@@ -60,7 +60,7 @@ impl<D: BlockDevice> ModelSource for BlockSource<D> {
             return Ok(());
         }
         let bs = u64::from(self.dev.block_bytes());
-        if offset % bs == 0 && n % bs == 0 {
+        if offset.is_multiple_of(bs) && n.is_multiple_of(bs) {
             return self.dev.read_blocks(offset / bs, buf);
         }
         let first = offset / bs;
@@ -125,7 +125,7 @@ impl<Q: QueuedDevice> BlockDevice for Polled<Q> {
 
     fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> Result<(), ModelError> {
         let bs = self.q.block_bytes() as usize;
-        if bs == 0 || buf.is_empty() || buf.len() % bs != 0 {
+        if bs == 0 || buf.is_empty() || !buf.len().is_multiple_of(bs) {
             return Err(ModelError::BadConfig);
         }
         let count = u32::try_from(buf.len() / bs).map_err(|_| ModelError::BadConfig)?;

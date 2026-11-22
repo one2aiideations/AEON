@@ -190,9 +190,16 @@ impl Runtime {
     }
 
     /// Invoke a tool with the caller's capability bits.
-    pub fn invoke_tool(&mut self, id: u32, caps: u32, input: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+    pub fn invoke_tool(
+        &mut self,
+        id: u32,
+        caps: u32,
+        input: &[u8],
+    ) -> Result<Vec<u8>, RuntimeError> {
         self.enter(Phase::Tools);
-        self.tools.invoke(id, caps, input).map_err(RuntimeError::Tool)
+        self.tools
+            .invoke(id, caps, input)
+            .map_err(RuntimeError::Tool)
     }
 
     /// Ask the actuator for `command`; the gate decides.

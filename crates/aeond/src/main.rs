@@ -24,13 +24,25 @@ fn log_path(pid1: bool) -> &'static str {
     }
 }
 
-fn start_server(a: &Args, model: &Path, threads: u32, ctx: u32, pid1: bool) -> std::io::Result<Child> {
+fn start_server(
+    a: &Args,
+    model: &Path,
+    threads: u32,
+    ctx: u32,
+    pid1: bool,
+) -> std::io::Result<Child> {
     let log = std::fs::File::create(log_path(pid1))?;
     Command::new(&a.server)
         .args(["-m"])
         .arg(model)
         .args(["--host", "127.0.0.1", "--port", &a.port.to_string()])
-        .args(["-c", &ctx.to_string(), "-t", &threads.to_string(), "--no-webui"])
+        .args([
+            "-c",
+            &ctx.to_string(),
+            "-t",
+            &threads.to_string(),
+            "--no-webui",
+        ])
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -84,7 +96,11 @@ fn main() -> ExitCode {
     say(&format!(
         "AEON {} - AI-native OS init{}",
         aeond::VERSION,
-        if pid1 { " (PID 1)" } else { " (development mode)" }
+        if pid1 {
+            " (PID 1)"
+        } else {
+            " (development mode)"
+        }
     ));
 
     let hw = Hw::probe();
@@ -105,11 +121,17 @@ fn main() -> ExitCode {
 
     let stdin = std::io::stdin();
     loop {
-        say(&format!("AEON: starting inference server with {}", model.display()));
+        say(&format!(
+            "AEON: starting inference server with {}",
+            model.display()
+        ));
         let mut child = match start_server(&args, &model, plan.threads, plan.ctx, pid1) {
             Ok(c) => c,
             Err(e) => {
-                say(&format!("AEON: cannot start {}: {e}", args.server.display()));
+                say(&format!(
+                    "AEON: cannot start {}: {e}",
+                    args.server.display()
+                ));
                 if args.selftest {
                     say("AEON selftest: FAIL (server)");
                     return finish(pid1, None, 1);

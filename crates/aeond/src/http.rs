@@ -119,8 +119,14 @@ pub fn chat(port: u16, prompt: &str, n_predict: u32) -> Result<String, String> {
         "{{\"prompt\":\"{}\",\"n_predict\":{n_predict},\"temperature\":0,\"cache_prompt\":true}}",
         json_escape(prompt)
     );
-    let (status, resp) = request(port, "POST", "/completion", Some(&body), Duration::from_secs(120))
-        .map_err(|e| format!("request failed: {e}"))?;
+    let (status, resp) = request(
+        port,
+        "POST",
+        "/completion",
+        Some(&body),
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("request failed: {e}"))?;
     if status != 200 {
         return Err(format!("HTTP {status}"));
     }

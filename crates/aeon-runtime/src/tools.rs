@@ -52,7 +52,10 @@ pub struct ToolBus {
 impl fmt::Debug for ToolBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolBus")
-            .field("tools", &self.entries.iter().map(|e| e.id).collect::<Vec<_>>())
+            .field(
+                "tools",
+                &self.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            )
             .field("cap", &self.cap)
             .finish()
     }
@@ -105,10 +108,18 @@ mod tests {
     #[test]
     fn capability_checks() {
         let mut bus = ToolBus::new(2);
-        bus.register(1, 0b11, Box::new(|i: &[u8]| Ok(i.iter().rev().copied().collect())))
+        bus.register(
+            1,
+            0b11,
+            Box::new(|i: &[u8]| Ok(i.iter().rev().copied().collect())),
+        )
+        .unwrap();
+        bus.register(2, 0, Box::new(|_: &[u8]| Err("boom".into())))
             .unwrap();
-        bus.register(2, 0, Box::new(|_: &[u8]| Err("boom".into()))).unwrap();
-        assert_eq!(bus.register(3, 0, Box::new(|_: &[u8]| Ok(vec![]))), Err(ToolError::Full));
+        assert_eq!(
+            bus.register(3, 0, Box::new(|_: &[u8]| Ok(vec![]))),
+            Err(ToolError::Full)
+        );
         assert_eq!(bus.invoke(1, 0b111, b"ab").unwrap(), b"ba");
         assert_eq!(bus.invoke(1, 0b01, b"ab"), Err(ToolError::Denied));
         assert_eq!(bus.invoke(2, 0, b""), Err(ToolError::Failed("boom".into())));

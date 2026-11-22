@@ -129,7 +129,10 @@ mod tests {
     #[test]
     fn classifier() {
         assert_eq!(classify(1, IoClass::Ipc, false), Ok(Classify::NotSemantic));
-        assert_eq!(classify(1, IoClass::NetTx, true), Ok(Classify::IdentityGate));
+        assert_eq!(
+            classify(1, IoClass::NetTx, true),
+            Ok(Classify::IdentityGate)
+        );
         assert!(classify(0, IoClass::NetRx, true).is_err());
     }
 }
