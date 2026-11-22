@@ -146,8 +146,13 @@ impl Orchestrator {
             }
             if !progressed {
                 // Cycle: skip the rest.
-                for s in steps.iter().filter(|s| !out.contains_key(&s.id)) {
-                    out.insert(s.id, StepOutcome::Skipped);
+                let rest: Vec<u32> = steps
+                    .iter()
+                    .map(|s| s.id)
+                    .filter(|id| !out.contains_key(id))
+                    .collect();
+                for id in rest {
+                    out.insert(id, StepOutcome::Skipped);
                 }
                 break;
             }
