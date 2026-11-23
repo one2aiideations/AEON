@@ -136,6 +136,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-auth"
+version = "0.1.0"
+dependencies = [
+ "aeon-interface",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-business"
 version = "0.1.0"
 dependencies = [
@@ -223,6 +231,13 @@ name = "aeon-identity"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
+name = "aeon-interface"
+version = "0.1.0"
+dependencies = [
  "sha2",
 ]
 
@@ -387,7 +402,6 @@ version = "0.1.0"
 name = "aeond"
 version = "0.1.0"
 dependencies = [
- "aeon-gguf",
  "aeon-hw",
  "nix",
 ]

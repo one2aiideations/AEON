@@ -39,3 +39,20 @@ public APIs. **Differential tests against the C code (same input through both, o
 `AEON_RUST_PLAN.md` (migration rules), `AEON_OS_ARCHITECTURE.md`, `AEON_OS_ROADMAP.md`, `AEON_KERNEL_STRATEGY.md`,
 `AEON_ENGINE_PLAN.md`, `AEON_APP_LAYER.md`, `AEON_THEORY_NATIVE.md`, `EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md`.
 Those were written in the C era; treat statements about "C core" as historical.
+
+## Main interface (LibreOne)
+
+| Source | Rust | Status |
+|---|---|---|
+| LibreOne `libreone/` contracts (message, session, intent, artifacts, approval, policy, capabilities, routing, data_washing, audit, workflow, limits, retry, sandbox policy) | `aeon-interface` | ported and tightened; unit tested; **not yet wired to a UI or to any application** |
+| LibreOne README scope (multimodal ingestion, connectors, MCP, enterprise identity, observability) | none | product vision only; no code in the source to port |
+| `libreone/native/aeon_contract.py` | none | superseded: AEON itself is the native layer |
+
+## Enterprise authority (AEONONE / AEON-AUTH)
+
+| Source | Rust | Status |
+|---|---|---|
+| `AEON-AUTH.md` capability map: tenancy and org hierarchy, RBAC/ABAC policy, maker-checker with limits and escalation, tamper-evident audit | `aeon-auth` | core built from the spec; 21 unit tests |
+| `AEONONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `aeon-auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme AEONONE documents** |
+| AEONONE repository (`CMKIXVI/aeonone`) | none | **not available** (not in `sources/`, not reachable from this account); nothing derived from its code |
+| Login, MFA, SSO, sessions, persistence, admin APIs, policy lifecycle | none | not implemented |
