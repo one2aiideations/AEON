@@ -17,6 +17,7 @@
 pub mod args;
 pub mod http;
 pub mod models;
+pub mod net;
 pub mod system;
 pub mod ui;
 

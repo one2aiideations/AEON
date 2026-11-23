@@ -18,3 +18,15 @@ if [ -n "${AEON_MODEL:-}" ] && [ -f "${AEON_MODEL}" ]; then
 else
     echo "AEON post-build: no AEON_MODEL given; image boots without a model"
 fi
+
+# Networking needs BusyBox's udhcpc, its configuration script and `ip`; fail the build now rather
+# than boot an image that silently has no network.
+for need in usr/share/udhcpc/default.script bin/busybox; do
+    [ -e "${TARGET_DIR}/${need}" ] || { echo "AEON post-build: ${need} missing" >&2; exit 1; }
+done
+for applet in udhcpc ip hwclock; do
+    "${TARGET_DIR}/bin/busybox" 2>&1 | tr ',' '\n' | grep -qw "$applet" \
+        || strings "${TARGET_DIR}/bin/busybox" 2>/dev/null | grep -qx "$applet" \
+        || { echo "AEON post-build: BusyBox lacks the $applet applet" >&2; exit 1; }
+done
+echo "AEON post-build: networking tools present"
