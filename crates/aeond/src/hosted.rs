@@ -24,7 +24,11 @@ fn key_dir(store: &Store) -> std::path::PathBuf {
     store.root().join("keys")
 }
 
-fn ask<R: BufRead, W: Write>(input: &mut R, out: &mut W, prompt: &str) -> io::Result<Option<String>> {
+fn ask<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    prompt: &str,
+) -> io::Result<Option<String>> {
     write!(out, "{prompt}")?;
     out.flush()?;
     let mut line = String::new();
@@ -35,7 +39,11 @@ fn ask<R: BufRead, W: Write>(input: &mut R, out: &mut W, prompt: &str) -> io::Re
 }
 
 /// Read a line with the terminal's echo turned off, so the key is not shown on screen.
-fn ask_secret<R: BufRead, W: Write>(input: &mut R, out: &mut W, prompt: &str) -> io::Result<Option<String>> {
+fn ask_secret<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    prompt: &str,
+) -> io::Result<Option<String>> {
     #[cfg(target_os = "linux")]
     let _guard = EchoOff::new();
     let r = ask(input, out, prompt);
@@ -68,7 +76,8 @@ impl EchoOff {
 impl Drop for EchoOff {
     fn drop(&mut self) {
         if let Some(orig) = &self.0 {
-            let _ = nix::sys::termios::tcsetattr(&io::stdin(), nix::sys::termios::SetArg::TCSANOW, orig);
+            let _ =
+                nix::sys::termios::tcsetattr(io::stdin(), nix::sys::termios::SetArg::TCSANOW, orig);
         }
     }
 }
@@ -104,7 +113,10 @@ pub fn setup<R: BufRead, W: Write>(
     store: Option<&Store>,
 ) -> io::Result<Option<(Provider, bool)>> {
     let saved = store.map(Store::settings).unwrap_or_default();
-    writeln!(out, "\n  Hosted model setup (press Enter on an empty answer to go back)")?;
+    writeln!(
+        out,
+        "\n  Hosted model setup (press Enter on an empty answer to go back)"
+    )?;
     writeln!(
         out,
         "  Enter the provider's API address, for example https://api.example.com/v1"
@@ -125,7 +137,10 @@ pub fn setup<R: BufRead, W: Write>(
         }
         match Url::parse(&a) {
             Ok(u) if u.scheme == aeon_http::Scheme::Https || u.is_loopback() => break a,
-            Ok(_) => writeln!(out, "  Only https:// addresses are allowed (http only for this computer).")?,
+            Ok(_) => writeln!(
+                out,
+                "  Only https:// addresses are allowed (http only for this computer)."
+            )?,
             Err(e) => writeln!(out, "  {e}")?,
         }
     };
@@ -226,7 +241,8 @@ impl HostedBackend {
     /// # Errors
     /// A message when the CA bundle is missing or empty.
     pub fn new(provider: Provider, store: Option<&Store>) -> Result<Self, String> {
-        let client = Client::system().map_err(|e| format!("cannot load the trusted certificates: {e}"))?;
+        let client =
+            Client::system().map_err(|e| format!("cannot load the trusted certificates: {e}"))?;
         Ok(Self::with_client(client, provider, store))
     }
 
@@ -276,8 +292,14 @@ impl Backend for HostedBackend {
             self.record(last.role, &last.content);
         }
         let turns: Vec<(&str, &str)> = washed.iter().map(|(r, c)| (*r, c.as_str())).collect();
-        let answer = chat_stream(&self.client, &self.provider, &turns, REPLY_TOKENS, &mut |_| {})
-            .map_err(|e| explain(&e))?;
+        let answer = chat_stream(
+            &self.client,
+            &self.provider,
+            &turns,
+            REPLY_TOKENS,
+            &mut |_| {},
+        )
+        .map_err(|e| explain(&e))?;
         self.record("assistant", &answer);
         // Counts every washed item in the history, so the note repeats while it stays in view.
         if removed > 0 {
@@ -305,7 +327,12 @@ mod tests {
 
     fn run_setup(script: &str, store: Option<&Store>) -> (Option<(Provider, bool)>, String) {
         let mut out = Vec::new();
-        let r = setup(&mut Cursor::new(script.as_bytes().to_vec()), &mut out, store).unwrap();
+        let r = setup(
+            &mut Cursor::new(script.as_bytes().to_vec()),
+            &mut out,
+            store,
+        )
+        .unwrap();
         (r, String::from_utf8(out).unwrap())
     }
 
@@ -319,10 +346,16 @@ mod tests {
         );
         let (p, saved) = r.expect("set up");
         assert!(saved);
-        assert_eq!((p.base_url.as_str(), p.model.as_str()), ("https://api.example.com/v1", "small-1"));
+        assert_eq!(
+            (p.base_url.as_str(), p.model.as_str()),
+            ("https://api.example.com/v1", "small-1")
+        );
         assert!(!out.contains("sk-live-123456"));
         assert!(out.contains("api.example.com") && out.contains("leave this computer"));
-        assert_eq!(store.settings().get("hosted.model").map(String::as_str), Some("small-1"));
+        assert_eq!(
+            store.settings().get("hosted.model").map(String::as_str),
+            Some("small-1")
+        );
         // second time: saved key and defaults are offered
         let (r, out) = run_setup("\n\n\nyes\n", Some(&store));
         let (p, saved) = r.expect("second setup");
@@ -383,16 +416,31 @@ mod tests {
         };
         let mut b = HostedBackend::with_client(Client::new(TrustStore::new()), provider, None);
         let history = vec![
-            Turn { role: "system", content: SYSTEM_PROMPT.into() },
-            Turn { role: "user", content: "mail me at jo@example.com, password=hunter2hunter2".into() },
+            Turn {
+                role: "system",
+                content: SYSTEM_PROMPT.into(),
+            },
+            Turn {
+                role: "user",
+                content: "mail me at jo@example.com, password=hunter2hunter2".into(),
+            },
         ];
         let reply = b.reply(&history).unwrap();
-        assert!(reply.contains("sensitive items removed") && reply.ends_with("ok"), "{reply}");
+        assert!(
+            reply.contains("sensitive items removed") && reply.ends_with("ok"),
+            "{reply}"
+        );
         let body = t.join().unwrap();
-        assert!(!body.contains("jo@example.com") && !body.contains("hunter2"), "{body}");
+        assert!(
+            !body.contains("jo@example.com") && !body.contains("hunter2"),
+            "{body}"
+        );
         assert!(body.contains("REDACTED"));
         // nothing listening any more: a readable error, not a panic
         let err = b.reply(&history).unwrap_err();
-        assert!(err.contains("network") || err.contains("connect") || err.contains("refused"), "{err}");
+        assert!(
+            err.contains("network") || err.contains("connect") || err.contains("refused"),
+            "{err}"
+        );
     }
 }

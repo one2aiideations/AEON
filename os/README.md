@@ -90,3 +90,10 @@ Known limits of this stage:
   and keeps nothing between boots unless an `AEON-DATA` partition is present (see above).
 - Keyboards: USB, PS/2 and I2C-HID are built in; layout is US.
 - aeond has no SIGTERM handling and does not reap orphaned processes.
+
+## Hosted models (optional, online)
+
+With a network cable connected, press `h` in the model list to chat with a hosted model instead of a local one:
+enter the provider's API address (https), the model name and your API key, and agree that messages leave the
+computer. The key is typed hidden and can be saved on the AEON-DATA partition (anyone with that stick can read
+it). Emails, card numbers and passwords are replaced before sending. Local models never touch the network.

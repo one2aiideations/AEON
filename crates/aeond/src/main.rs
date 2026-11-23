@@ -3,6 +3,7 @@
 
 use aeon_hw::{Hw, Plan};
 use aeond::args::{Args, DEFAULT_MODEL_DIR};
+use aeond::hosted::{self, HostedBackend};
 use aeond::models::{describe, discover, Found};
 use aeond::net;
 use aeond::persist::{self, Store};
@@ -221,6 +222,37 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         match choice {
             Choice::Quit => return finish(pid1, 0),
             Choice::Rescan => continue,
+            Choice::Hosted => {
+                let Ok(Some((provider, _saved))) = hosted::setup(&mut input, &mut out, store)
+                else {
+                    continue;
+                };
+                let mut backend = match HostedBackend::new(provider, store) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        say(&format!("AEON: {e}"));
+                        continue;
+                    }
+                };
+                say("AEON ready (hosted model)");
+                let end = chat_loop(
+                    &mut backend,
+                    &mut input,
+                    &mut out,
+                    hosted::SYSTEM_PROMPT,
+                    12_000,
+                );
+                match end {
+                    Ok(End::SwitchModel) if a.model.is_none() => {}
+                    Ok(End::Quit | End::SwitchModel) => return finish(pid1, 0),
+                    Ok(End::Eof) | Err(_) => {
+                        if !pid1 {
+                            return finish(pid1, 0);
+                        }
+                        sleep(Duration::from_secs(1));
+                    }
+                }
+            }
             Choice::Model(i) => {
                 let m = &models[i];
                 if let (Some(s), Some(name)) = (store, m.path.file_name()) {
