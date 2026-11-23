@@ -324,6 +324,14 @@ name = "aeon-orchestra"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-pki"
+version = "0.1.0"
+dependencies = [
+ "aeon-crypto",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-project"
 version = "0.1.0"
 dependencies = [

@@ -77,3 +77,16 @@ Domain core from `crates/aeon-crm/AEON-CRM.md` with ideas from the owner's AEONC
 ## aeon-crypto (new): primitives for the in-house TLS client
 
 Decision: AEON writes its own HTTPS client for hosted models instead of adding curl or rustls. This is step 1: HMAC/HKDF (over the `sha2` crate), `HKDF-Expand-Label`, ChaCha20, Poly1305, ChaCha20-Poly1305 and X25519. Checked against RFC 4231, 5869, 7748, 8439 and 8448 vectors, plus 129 randomised vectors from OpenSSL (`tools/gen_vectors.py`, `tests/cross_check.rs`). Not audited for side channels. Still to build, in order: X.509 parsing, ECDSA P-256/P-384 and RSA signature verification, the TLS 1.3 client (handshake, records, certificate and hostname checks), an HTTP/1.1 client with streaming, then key storage and the hosted-model backend. Until certificate verification exists, nothing may connect to the internet.
+
+## aeon-pki (certificates for the in-house TLS client, step 2)
+
+Own implementation, no new dependencies beyond the SHA-2 crate already used:
+
+- `bignum`: unsigned big integers (Knuth division, modular power and inverse). Public data only, not constant time.
+- `der`: strict DER reader (definite and minimal lengths, no trailing data).
+- `x509`: v3 certificates: names, validity, key, SAN (DNS, IP), basic constraints, key usage, extended key usage; unknown critical extensions are refused. Signature algorithms: RSA PKCS#1 v1.5 and PSS, ECDSA, with SHA-256/384/512 (SHA-1 and MD5 are refused). Keys: RSA 2048 to 8192 bits, ECDSA P-256 and P-384.
+- `ecdsa`, `rsa`: signature verification.
+- `verify`: chain building to a trust store (signatures, validity, CA and path-length rules, server-auth purpose), host name matching by SAN only, wildcard only as a whole left-most label.
+- `pem`: PEM bundles, so `/etc/ssl/certs/ca-certificates.crt` loads as the trust store (116 of 120 certificates of a typical bundle load; the rest use unsupported algorithms or curves).
+
+Checked against 288 OpenSSL signature vectors (96 valid, 192 altered), chains generated with OpenSSL (EC, RSA, PSS; wrong name, expired, not yet valid, forged root, missing intermediate, path length, client-only purpose, unknown critical extension, tampering). Not covered yet: name constraints and revocation (CRL/OCSP); a certificate that uses them as critical is refused. Next: the TLS 1.3 client itself.
