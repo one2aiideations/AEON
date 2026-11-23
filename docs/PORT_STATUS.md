@@ -67,4 +67,4 @@ Domain core from `crates/aeon-crm/AEON-CRM.md` with ideas from the owner's AEONC
 
 ### aeon-crm: aeon-auth gate
 
-`aeon_crm::authorizer::AuthorityGate` hands every CRM permission check to an `aeon-auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Not passed yet: amount and attribute conditions, signed envelopes, `aeon-auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
+`aeon_crm::authorizer::AuthorityGate` hands every CRM permission check to an `aeon-auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Deal, conversion and renewal amounts are passed so `AmountAtMost` rules work; winning a deal now also needs `crm.opportunity.close` (checked with the amount). Not passed yet: attribute conditions, signed envelopes, `aeon-auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
