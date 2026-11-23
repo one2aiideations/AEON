@@ -12,6 +12,8 @@
 //!   requirement (different approver, single use) for closing large deals, and a weighted
 //!   forecast in exact money.
 //! - [`service`]: cases with priority SLAs, renewals and an explainable account health score.
+//! - [`marketing`]: segments, campaigns, consent- and frequency-aware send plans, approval of
+//!   a send by a second person, and idempotent execution through a channel adapter.
 //! - [`timeline`]: the customer timeline, consent records and marketing eligibility, with
 //!   provenance so AI suggestions are never mixed up with facts.
 //!
@@ -23,14 +25,16 @@
 //!
 //! Deviations and gaps, stated plainly: the spec asks for one executable with one source file;
 //! this is a library of modules like the other AEON crates. Storage is in memory (the spec
-//! requires AEON-DATA, not wired in), permissions are plain strings unless an `aeon-auth` gate is
-//! installed (see [`authorizer`]; amount and attribute conditions are not passed), and campaigns and journeys, quotes and proposals, the knowledge base, deal-risk
-//! models, import/export and erasure are not implemented. Nothing here has run against real
-//! data.
+//! requires AEON-DATA, not wired in), and permissions are plain strings unless an `aeon-auth`
+//! gate is installed (see [`authorizer`]; deal and renewal amounts are passed for limit rules,
+//! attributes are not). Journeys, real channel adapters (email/SMS), quotes and proposals, the
+//! knowledge base, deal-risk models, import/export and erasure are not implemented. Nothing
+//! here has run against real data.
 #![forbid(unsafe_code)]
 
 pub mod authorizer;
 pub mod leads;
+pub mod marketing;
 pub mod model;
 pub mod pipeline;
 pub mod service;
@@ -179,6 +183,9 @@ pub struct Crm {
     pub(crate) events: Vec<TimelineEvent>,
     pub(crate) approvals: BTreeMap<String, Approval>,
     pub(crate) consents: Vec<ConsentRecord>,
+    pub(crate) segments: BTreeMap<String, marketing::Segment>,
+    pub(crate) campaigns: BTreeMap<String, marketing::Campaign>,
+    pub(crate) sends: Vec<marketing::SendRecord>,
     pub(crate) idem: BTreeMap<(String, String), String>,
     pub(crate) cursor: BTreeMap<String, usize>,
     audit: AuditLog,
@@ -201,6 +208,9 @@ impl Crm {
             events: Vec::new(),
             approvals: BTreeMap::new(),
             consents: Vec::new(),
+            segments: BTreeMap::new(),
+            campaigns: BTreeMap::new(),
+            sends: Vec::new(),
             idem: BTreeMap::new(),
             cursor: BTreeMap::new(),
             audit: AuditLog::new(),
