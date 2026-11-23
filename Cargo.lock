@@ -191,6 +191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-crypto"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "aeon-data"
 version = "0.1.0"
 dependencies = [
