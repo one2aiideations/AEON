@@ -136,6 +136,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-auth"
+version = "0.1.0"
+dependencies = [
+ "aeon-interface",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-business"
 version = "0.1.0"
 dependencies = [
