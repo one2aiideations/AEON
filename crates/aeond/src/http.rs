@@ -133,6 +133,31 @@ pub fn chat(port: u16, prompt: &str, n_predict: u32) -> Result<String, String> {
     json_get_string(&resp, "content").ok_or_else(|| "no content in reply".into())
 }
 
+/// Send a whole conversation to `/v1/chat/completions` (the server applies the model's chat
+/// template) and return the assistant's text.
+pub fn chat_messages(port: u16, turns: &[(&str, &str)], max_tokens: u32) -> Result<String, String> {
+    let msgs: Vec<String> = turns
+        .iter()
+        .map(|(r, c)| format!("{{\"role\":\"{r}\",\"content\":\"{}\"}}", json_escape(c)))
+        .collect();
+    let body = format!(
+        "{{\"messages\":[{}],\"max_tokens\":{max_tokens},\"temperature\":0.7,\"stream\":false}}",
+        msgs.join(",")
+    );
+    let (status, resp) = request(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        Some(&body),
+        Duration::from_secs(600),
+    )
+    .map_err(|e| format!("request failed: {e}"))?;
+    if status != 200 {
+        return Err(format!("HTTP {status}"));
+    }
+    json_get_string(&resp, "content").ok_or_else(|| "no content in reply".into())
+}
+
 /// True when `/health` answers 200.
 #[must_use]
 pub fn healthy(port: u16) -> bool {
@@ -168,6 +193,34 @@ mod tests {
         assert_eq!(parse_response(r), Some((200, "{\"a\":1}")));
         assert_eq!(parse_response("HTTP/1.0 503 Busy\n\nno"), Some((503, "no")));
         assert_eq!(parse_response("garbage"), None);
+    }
+
+    #[test]
+    fn chat_messages_sends_history_and_reads_reply() {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 256];
+            while !got.ends_with(b"}") {
+                let n = c.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed early");
+                got.extend_from_slice(&buf[..n]);
+            }
+            c.write_all(
+                b"HTTP/1.0 200 OK\r\n\r\n{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"hmm\",\"content\":\"hi \\u00e9\\n!\"}}]}",
+            )
+            .unwrap();
+            String::from_utf8(got).unwrap()
+        });
+        let r = chat_messages(port, &[("system", "be brief"), ("user", "say \"hi\"")], 16).unwrap();
+        assert_eq!(r, "hi \u{e9}\n!");
+        let sent = t.join().unwrap();
+        assert!(sent.contains("POST /v1/chat/completions"));
+        assert!(sent.contains("{\"role\":\"system\",\"content\":\"be brief\"},{\"role\":\"user\",\"content\":\"say \\\"hi\\\"\"}"));
+        assert!(sent.contains("\"max_tokens\":16"));
     }
 
     #[test]

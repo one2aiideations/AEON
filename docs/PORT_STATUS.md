@@ -26,7 +26,7 @@ public APIs. **Differential tests against the C code (same input through both, o
 | `userspace/aeond` | `aeond` | ported; HTTP surface not diffed against C |
 | `aeon_kernel_device` (character device and ioctl) | none | **non-Rust by design**: Linux kernel module (track K0/K2) |
 | `aeon_uefi_network` (probe, TLS POST) | none | **non-Rust for now**: UEFI boot environment; a `no_std` Rust port belongs to the kernel track |
-| `os/` (Buildroot, QEMU scripts) | none | build tooling, not ported |
+| `os/` (Buildroot, QEMU scripts) | `os/` | copied; aeond is now the Rust crate (`os/build.sh` builds it static musl); image boot test is the `os-image.yml` workflow |
 
 ## What is still open
 
