@@ -92,6 +92,12 @@ jobs:
       - name: Build the release ISO (no model; users bring their own)
         run: os/make-iso.sh "$RUNNER_TEMP/aeon-out" "$RUNNER_TEMP/aeon-out/images/aeon.iso"
 
+      - name: Check that the screen (not just the serial console) shows output, BIOS and UEFI
+        run: |
+          mkdir -p artifact
+          python3 os/tools/screencheck.py "$RUNNER_TEMP/aeon-out/images/aeon.iso" bios artifact/screen-bios 100
+          python3 os/tools/screencheck.py "$RUNNER_TEMP/aeon-out/images/aeon.iso" uefi artifact/screen-uefi 100
+
       - name: Build the test ISO (tiny model, serial console, self-test on boot)
         run: |
           AEON_MODEL="$RUNNER_TEMP/aeon-tiny.gguf" AEON_SERIAL=1 AEON_CMDLINE="aeon.selftest=1" \
@@ -122,16 +128,28 @@ jobs:
           grep -q "AEON selftest: PASS" boot-uefi.log
           echo "The ISO booted under BIOS and UEFI, served a chat reply and passed the self-test"
 
-      - name: Upload image and boot log
+      - name: Collect files to upload
+        if: always()
+        run: |
+          mkdir -p artifact iso
+          cp "$RUNNER_TEMP/aeon-out/images/aeon.iso" iso/ || true
+          cp boot-bios.log boot-uefi.log artifact/ || true
+          cp "$RUNNER_TEMP/aeon-out/images/bzImage" "$RUNNER_TEMP/aeon-out/images/rootfs.cpio.gz" artifact/ || true
+
+      - name: Upload the ISO (the only file you need for a USB stick)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: aeon-x86_64-image
-          path: |
-            boot-bios.log
-            boot-uefi.log
-            ${{ runner.temp }}/aeon-out/images/aeon.iso
-            ${{ runner.temp }}/aeon-out/images/bzImage
-            ${{ runner.temp }}/aeon-out/images/rootfs.cpio.gz
+          name: aeon-iso
+          path: iso/aeon.iso
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload boot logs, screenshots and parts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aeon-debug
+          path: artifact/
           if-no-files-found: warn
           retention-days: 14

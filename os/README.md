@@ -15,7 +15,8 @@ sudo dd if=.aeon-out/images/aeon.iso of=/dev/sdX bs=4M conv=fsync status=progres
 ```
 
 CI builds `aeon.iso` on every change to `os/` or `crates/aeond` and uploads it as the
-`aeon-x86_64-image` artifact, so you can skip the local build. Check the device name with `lsblk`
+`aeon-iso` artifact (just `aeon.iso`; boot logs, screenshots and kernel parts are in `aeon-debug`), so you
+can skip the local build. Write it as a raw disk image (`dd`, Rufus in DD Image mode, balenaEtcher). Check the device name with `lsblk`
 before `dd`: it overwrites the target completely.
 
 On the PC: disable **Secure Boot** (the kernel is not signed), boot from the USB stick, and pick
@@ -63,3 +64,11 @@ Known limits of this stage:
   and keeps nothing between boots (chat history is not saved).
 - Keyboards: USB, PS/2 and I2C-HID are built in; layout is US.
 - aeond has no SIGTERM handling and does not reap orphaned processes.
+
+## Screen on real PCs
+
+The serial-console boot tests cannot show a black screen. CI also boots the release ISO with a virtual
+display (BIOS and UEFI) and fails when nothing is drawn (`os/tools/screencheck.py`, screenshots in the
+`aeon-debug` artifact). The kernel hands the firmware framebuffer to `efifb`/`vesafb` (not `simpledrm`)
+so the text console works on UEFI PCs; the build fails if the kernel configuration loses those options.
+If a PC still shows nothing, pick "AEON (verbose boot messages)" or "safe graphics" in the GRUB menu.

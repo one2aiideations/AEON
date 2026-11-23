@@ -12,15 +12,21 @@ CONFIG_SYSFS=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 
-# Screen: console on the EFI/VESA framebuffer, no vendor GPU driver that needs firmware.
+# Screen: console on the firmware framebuffer (UEFI GOP via efifb, BIOS VESA via vesafb) or the
+# VGA text mode, with no vendor GPU driver that needs firmware. The firmware framebuffer is NOT
+# handed to simpledrm (SYSFB_SIMPLEFB): without fbdev emulation that left a black screen on UEFI PCs.
 CONFIG_VT=y
 CONFIG_VT_CONSOLE=y
+CONFIG_VGA_CONSOLE=y
 CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_FB=y
 CONFIG_FB_EFI=y
 CONFIG_FB_VESA=y
-CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_EFI=y
+CONFIG_EFI_STUB=y
+# CONFIG_SYSFB_SIMPLEFB is not set
 CONFIG_DRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
 CONFIG_DRM_SIMPLEDRM=y
 CONFIG_DRM_BOCHS=y
 CONFIG_DRM_VIRTIO_GPU=y
