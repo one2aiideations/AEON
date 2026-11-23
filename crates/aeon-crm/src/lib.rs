@@ -25,10 +25,11 @@
 //!
 //! Deviations and gaps, stated plainly: the spec asks for one executable with one source file;
 //! this is a library of modules like the other AEON crates. Storage is in memory (the spec
-//! requires AEON-DATA, not wired in), permissions are plain strings unless an `aeon-auth` gate is
-//! installed (see [`authorizer`]; amount and attribute conditions are not passed), and journeys, real channel adapters (email/SMS), quotes and proposals, the knowledge base, deal-risk
-//! models, import/export and erasure are not implemented. Nothing here has run against real
-//! data.
+//! requires AEON-DATA, not wired in), and permissions are plain strings unless an `aeon-auth`
+//! gate is installed (see [`authorizer`]; deal and renewal amounts are passed for limit rules,
+//! attributes are not). Journeys, real channel adapters (email/SMS), quotes and proposals, the
+//! knowledge base, deal-risk models, import/export and erasure are not implemented. Nothing
+//! here has run against real data.
 #![forbid(unsafe_code)]
 
 pub mod authorizer;
@@ -241,11 +242,29 @@ impl Crm {
 
     /// Check a permission; a denial is audited.
     pub(crate) fn guard(&mut self, ctx: &Ctx, perm: &str, subject: &str) -> Result<()> {
+        self.guard_amount(ctx, perm, subject, None)
+    }
+
+    /// Like [`Crm::guard`], also telling the authority how much money (minor units) is
+    /// involved so amount limits apply. Without a gate the amount is not used.
+    pub(crate) fn guard_amount(
+        &mut self,
+        ctx: &Ctx,
+        perm: &str,
+        subject: &str,
+        amount: Option<i64>,
+    ) -> Result<()> {
         if ctx.tenant.trim().is_empty() || ctx.user.trim().is_empty() {
             return Err(Error::Invalid("tenant and user are required".into()));
         }
         let verdict = match self.gate.as_mut() {
-            Some(g) => g.check(&ctx.tenant, &ctx.user, perm, ctx.now),
+            Some(g) => g.check(
+                &ctx.tenant,
+                &ctx.user,
+                perm,
+                amount.and_then(|a| u64::try_from(a).ok()),
+                ctx.now,
+            ),
             None if ctx.allows(perm) => Ok(()),
             None => Err(format!("missing permission {perm}")),
         };
