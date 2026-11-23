@@ -216,6 +216,13 @@ name = "aeon-gate"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-gateway"
+version = "0.1.0"
+dependencies = [
+ "aeon-interface",
+]
+
+[[package]]
 name = "aeon-gguf"
 version = "0.1.0"
 dependencies = [
