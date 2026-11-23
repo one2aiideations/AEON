@@ -15,17 +15,21 @@
 //! - [`timeline`]: the customer timeline, consent records and marketing eligibility, with
 //!   provenance so AI suggestions are never mixed up with facts.
 //!
+//! - [`authorizer`]: optional hand-over of every permission decision to `aeon-auth`, the
+//!   enterprise authority, instead of the permission strings in [`Ctx`].
+//!
 //! Every operation takes a [`Ctx`] (tenant, user, permissions, time), is default-deny, never
 //! sees another tenant's records, and appends to a hash-chained audit log (denials included).
 //!
 //! Deviations and gaps, stated plainly: the spec asks for one executable with one source file;
 //! this is a library of modules like the other AEON crates. Storage is in memory (the spec
-//! requires AEON-DATA, not wired in), permissions are plain strings (not yet `aeon-auth`
-//! decisions), and campaigns and journeys, quotes and proposals, the knowledge base, deal-risk
+//! requires AEON-DATA, not wired in), permissions are plain strings unless an `aeon-auth` gate is
+//! installed (see [`authorizer`]; amount and attribute conditions are not passed), and campaigns and journeys, quotes and proposals, the knowledge base, deal-risk
 //! models, import/export and erasure are not implemented. Nothing here has run against real
 //! data.
 #![forbid(unsafe_code)]
 
+pub mod authorizer;
 pub mod leads;
 pub mod model;
 pub mod pipeline;
@@ -33,6 +37,7 @@ pub mod service;
 pub mod timeline;
 
 use aeon_interface::audit::AuditLog;
+use authorizer::Authorizer;
 use model::{Account, Case, Contact, Lead, Opportunity, Provenance, Renewal, TimelineEvent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -177,6 +182,7 @@ pub struct Crm {
     pub(crate) idem: BTreeMap<(String, String), String>,
     pub(crate) cursor: BTreeMap<String, usize>,
     audit: AuditLog,
+    gate: Option<Box<dyn Authorizer>>,
 }
 
 impl Crm {
@@ -198,7 +204,14 @@ impl Crm {
             idem: BTreeMap::new(),
             cursor: BTreeMap::new(),
             audit: AuditLog::new(),
+            gate: None,
         }
+    }
+
+    /// Hand every permission decision to `gate` from now on. The permissions in [`Ctx`] are
+    /// then ignored, so there is exactly one authority.
+    pub fn set_authorizer(&mut self, gate: Box<dyn Authorizer>) {
+        self.gate = Some(gate);
     }
 
     /// The audit log (hash-chained; call `verify`).
@@ -222,11 +235,17 @@ impl Crm {
         if ctx.tenant.trim().is_empty() || ctx.user.trim().is_empty() {
             return Err(Error::Invalid("tenant and user are required".into()));
         }
-        if ctx.allows(perm) {
-            Ok(())
-        } else {
-            self.note(ctx, perm, subject, "denied");
-            Err(Error::Denied(format!("missing permission {perm}")))
+        let verdict = match self.gate.as_mut() {
+            Some(g) => g.check(&ctx.tenant, &ctx.user, perm, ctx.now),
+            None if ctx.allows(perm) => Ok(()),
+            None => Err(format!("missing permission {perm}")),
+        };
+        match verdict {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                self.note(ctx, perm, subject, "denied");
+                Err(Error::Denied(why))
+            }
         }
     }
 

@@ -64,3 +64,7 @@ Newline-delimited JSON over a Unix socket (mode 0600) so applications and agents
 ## aeon-crm (new from spec, not a port)
 
 Domain core from `crates/aeon-crm/AEON-CRM.md` with ideas from the owner's AEONCRM prototype: lead capture/dedupe/scoring/assignment/conversion, governed pipeline with approval for large wins and exact-money forecast, cases with SLAs, renewals, explainable account health, timeline with provenance, consent. 15 unit tests. Gaps: in-memory only (AEON-DATA not wired), string permissions (not `aeon-auth` decisions), library not the single-file executable the spec asks for, no campaigns/journeys, quotes, knowledge base, deal-risk models, import/export/erasure. Not used with real data.
+
+### aeon-crm: aeon-auth gate
+
+`aeon_crm::authorizer::AuthorityGate` hands every CRM permission check to an `aeon-auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Not passed yet: amount and attribute conditions, signed envelopes, `aeon-auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
