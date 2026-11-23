@@ -1,0 +1,20 @@
+#!/bin/sh
+# Buildroot post-build: install the Rust aeond as init and add the model, if one was provided.
+#   AEOND_BIN   static aeond binary built by os/build.sh (required)
+#   AEON_MODEL  optional GGUF to bake into the image
+set -eu
+TARGET_DIR="$1"
+if [ -z "${AEOND_BIN:-}" ] || [ ! -x "${AEOND_BIN}" ]; then
+    echo "AEON post-build: AEOND_BIN must point to the built aeond binary" >&2
+    exit 1
+fi
+install -D -m 0755 "${AEOND_BIN}" "${TARGET_DIR}/sbin/aeond"
+ln -sf sbin/aeond "${TARGET_DIR}/init"          # initramfs: the kernel runs /init as PID 1
+ln -sf aeond "${TARGET_DIR}/sbin/init"
+mkdir -p "${TARGET_DIR}/aeon/models" "${TARGET_DIR}/var/log"
+if [ -n "${AEON_MODEL:-}" ] && [ -f "${AEON_MODEL}" ]; then
+    cp "${AEON_MODEL}" "${TARGET_DIR}/aeon/models/"
+    echo "AEON post-build: added model $(basename "${AEON_MODEL}")"
+else
+    echo "AEON post-build: no AEON_MODEL given; image boots without a model"
+fi

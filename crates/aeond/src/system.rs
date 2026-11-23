@@ -7,6 +7,11 @@
 #[must_use]
 pub fn early_setup() -> Vec<String> {
     use nix::mount::{mount, MsFlags};
+    // The kernel starts init with no PATH, so child programs (ip, llama-server) would not be found.
+    std::env::set_var(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     let mut warn = Vec::new();
     for (src, dst, fs) in [
         ("proc", "/proc", "proc"),
@@ -27,7 +32,50 @@ pub fn early_setup() -> Vec<String> {
     if let Err(e) = nix::unistd::sethostname("aeon") {
         warn.push(format!("sethostname failed: {e}"));
     }
+    if let Err(e) = console_stdio() {
+        warn.push(format!("console setup failed: {e}"));
+    }
+    if !loopback_up() {
+        warn.push("loopback up failed (no `ip` or `ifconfig`)".into());
+    }
     warn
+}
+
+/// Point stdin, stdout and stderr at `/dev/console`, so the chat works even when the kernel
+/// started init without a console (initramfs before devtmpfs is mounted).
+#[cfg(target_os = "linux")]
+fn console_stdio() -> nix::Result<()> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    use nix::unistd::dup2;
+    let fd = open(
+        "/dev/console",
+        OFlag::O_RDWR | OFlag::O_NOCTTY,
+        Mode::empty(),
+    )?;
+    for target in 0..=2 {
+        dup2(std::os::fd::AsRawFd::as_raw_fd(&fd), target)?;
+    }
+    Ok(())
+}
+
+/// Bring the loopback interface up with the system's `ip` or `ifconfig` (the inference server
+/// listens on 127.0.0.1). Returns whether one of them succeeded.
+#[cfg(target_os = "linux")]
+fn loopback_up() -> bool {
+    use std::process::{Command, Stdio};
+    let attempts: [(&str, &[&str]); 2] = [
+        ("ip", &["link", "set", "lo", "up"]),
+        ("ifconfig", &["lo", "up"]),
+    ];
+    attempts.iter().any(|(cmd, args)| {
+        Command::new(cmd)
+            .args(*args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 /// Development-mode stand-in.

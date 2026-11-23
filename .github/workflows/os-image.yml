@@ -1,0 +1,137 @@
+name: AEON OS image (build + QEMU boot test)
+
+"on":
+  push:
+    branches:
+      - main
+    paths:
+      - "os/**"
+      - "crates/aeond/**"
+      - "crates/aeon-hw/**"
+      - ".github/workflows/os-image.yml"
+  pull_request:
+    paths:
+      - "os/**"
+      - "crates/aeond/**"
+      - "crates/aeon-hw/**"
+      - ".github/workflows/os-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aeon-os-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BR_VERSION: "2026.02.3"
+  BR2_DL_DIR: ${{ github.workspace }}/../br-dl
+
+jobs:
+  image:
+    name: Build AEON x86_64 image and boot it in QEMU
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Free disk space (the Buildroot tree, caches and ISOs need tens of GB)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build and QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc cpio unzip rsync wget file patch perl \
+            python3 python3-pip qemu-system-x86 ccache grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools ovmf
+          python3 -m pip install --user numpy gguf
+
+      - name: Enable KVM when the runner offers it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          fi
+          ls -l /dev/kvm || echo "no KVM: QEMU will use TCG (slower)"
+
+      - name: Cache Buildroot downloads and ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/../br-dl
+            ~/.buildroot-ccache
+          key: aeon-br-${{ env.BR_VERSION }}-${{ hashFiles('os/buildroot/**') }}
+          restore-keys: |
+            aeon-br-${{ env.BR_VERSION }}-
+
+      - name: Install Rust with the musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y musl-tools
+
+      - name: Unit tests for aeond (host)
+        run: cargo test --locked -p aeond -p aeon-hw
+
+      - name: Create the tiny test model
+        run: python3 os/tools/make_tiny_gguf.py "$RUNNER_TEMP/aeon-tiny.gguf"
+
+      - name: Build the image with Buildroot
+        run: os/build.sh "$RUNNER_TEMP/buildroot" "$RUNNER_TEMP/aeon-out"
+
+      - name: Show disk use after the build
+        run: df -h /
+
+      - name: Build the release ISO (no model; users bring their own)
+        run: os/make-iso.sh "$RUNNER_TEMP/aeon-out" "$RUNNER_TEMP/aeon-out/images/aeon.iso"
+
+      - name: Build the test ISO (tiny model, serial console, self-test on boot)
+        run: |
+          AEON_MODEL="$RUNNER_TEMP/aeon-tiny.gguf" AEON_SERIAL=1 AEON_CMDLINE="aeon.selftest=1" \
+            os/make-iso.sh "$RUNNER_TEMP/aeon-out" "$RUNNER_TEMP/aeon-test.iso"
+
+      - name: Boot the ISO in QEMU with BIOS firmware and run the AEON self-test
+        run: |
+          set -o pipefail
+          ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
+          timeout 1500 qemu-system-x86_64 -M pc -m 2048 -smp 2 $ACCEL \
+            -cdrom "$RUNNER_TEMP/aeon-test.iso" -boot d -nographic -no-reboot | tee boot-bios.log || true
+          grep -q "AEON hardware:" boot-bios.log
+          grep -q "AEON ready" boot-bios.log
+          grep -q "AEON chat reply:" boot-bios.log
+          grep -q "AEON selftest: PASS" boot-bios.log
+
+      - name: Boot the ISO in QEMU with UEFI firmware and run the AEON self-test
+        run: |
+          set -o pipefail
+          OVMF="$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd 2>/dev/null | head -1 || true)"
+          [ -n "$OVMF" ] || { echo "no OVMF firmware found"; exit 1; }
+          ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
+          timeout 1500 qemu-system-x86_64 -M q35 -m 2048 -smp 2 $ACCEL -bios "$OVMF" \
+            -cdrom "$RUNNER_TEMP/aeon-test.iso" -boot d -nographic -no-reboot | tee boot-uefi.log || true
+          grep -q "AEON hardware:" boot-uefi.log
+          grep -q "AEON ready" boot-uefi.log
+          grep -q "AEON chat reply:" boot-uefi.log
+          grep -q "AEON selftest: PASS" boot-uefi.log
+          echo "The ISO booted under BIOS and UEFI, served a chat reply and passed the self-test"
+
+      - name: Upload image and boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aeon-x86_64-image
+          path: |
+            boot-bios.log
+            boot-uefi.log
+            ${{ runner.temp }}/aeon-out/images/aeon.iso
+            ${{ runner.temp }}/aeon-out/images/bzImage
+            ${{ runner.temp }}/aeon-out/images/rootfs.cpio.gz
+          if-no-files-found: warn
+          retention-days: 14
