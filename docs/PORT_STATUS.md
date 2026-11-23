@@ -60,3 +60,7 @@ Those were written in the C era; treat statements about "C core" as historical.
 ## aeon-gateway (new, not a port)
 
 Newline-delimited JSON over a Unix socket (mode 0600) so applications and agents outside the console can use `aeon-interface` with streamed replies. Own JSON reader/writer, no new dependencies. Open: no real model backend attached (the `Backend` trait is for `aeond`'s llama-server client), caller identity is claimed not authenticated (`aeon-auth` envelopes not wired in), one connection served at a time, never run outside tests.
+
+## aeon-crm (new from spec, not a port)
+
+Domain core from `crates/aeon-crm/AEON-CRM.md` with ideas from the owner's AEONCRM prototype: lead capture/dedupe/scoring/assignment/conversion, governed pipeline with approval for large wins and exact-money forecast, cases with SLAs, renewals, explainable account health, timeline with provenance, consent. 15 unit tests. Gaps: in-memory only (AEON-DATA not wired), string permissions (not `aeon-auth` decisions), library not the single-file executable the spec asks for, no campaigns/journeys, quotes, knowledge base, deal-risk models, import/export/erasure. Not used with real data.
