@@ -101,12 +101,25 @@ jobs:
         run: |
           set -o pipefail
           ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
+          # A second disk holding an ext4 filesystem labelled AEON-DATA: the OS must find it,
+          # save a setting and a chat log there, and unmount it cleanly before power-off.
+          DATA="$RUNNER_TEMP/aeon-data.img"
+          truncate -s 32M "$DATA"
+          mke2fs -q -F -t ext4 -L AEON-DATA "$DATA"
           timeout 1500 qemu-system-x86_64 -M pc -m 2048 -smp 2 $ACCEL \
+            -device ich9-ahci,id=ahci -drive if=none,id=data,file="$DATA",format=raw \
+            -device ide-hd,drive=data,bus=ahci.0 \
             -cdrom "$RUNNER_TEMP/aeon-test.iso" -boot d -nographic -no-reboot | tee boot-bios.log || true
           grep -q "AEON hardware:" boot-bios.log
           grep -q "AEON ready" boot-bios.log
           grep -q "AEON chat reply:" boot-bios.log
           grep -q "AEON selftest: PASS" boot-bios.log
+          grep -q "AEON: saving settings and chat history to /aeon/data" boot-bios.log
+          grep -q "AEON data: saved settings and chat log" boot-bios.log
+          # Read the disk back on the host: the data must really be on it.
+          debugfs -R "cat /settings" "$DATA" | grep -q "^selftest=ok$"
+          debugfs -R "cat /history/chat-0001.log" "$DATA" | grep -q "^user.hello AEON$"
+          e2fsck -n -f "$DATA"
 
       - name: Boot the ISO in QEMU with UEFI firmware and run the AEON self-test
         run: |
@@ -120,6 +133,7 @@ jobs:
           grep -q "AEON ready" boot-uefi.log
           grep -q "AEON chat reply:" boot-uefi.log
           grep -q "AEON selftest: PASS" boot-uefi.log
+          grep -q "nothing will be saved after power-off" boot-uefi.log
           echo "The ISO booted under BIOS and UEFI, served a chat reply and passed the self-test"
 
       - name: Upload image and boot log
