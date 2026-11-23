@@ -407,6 +407,15 @@ name = "aeon-theory"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-tls"
+version = "0.1.0"
+dependencies = [
+ "aeon-crypto",
+ "aeon-pki",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-tokenizer"
 version = "0.1.0"
 dependencies = [

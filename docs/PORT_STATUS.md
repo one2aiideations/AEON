@@ -90,3 +90,11 @@ Own implementation, no new dependencies beyond the SHA-2 crate already used:
 - `pem`: PEM bundles, so `/etc/ssl/certs/ca-certificates.crt` loads as the trust store (116 of 120 certificates of a typical bundle load; the rest use unsupported algorithms or curves).
 
 Checked against 288 OpenSSL signature vectors (96 valid, 192 altered), chains generated with OpenSSL (EC, RSA, PSS; wrong name, expired, not yet valid, forged root, missing intermediate, path length, client-only purpose, unknown critical extension, tampering). Not covered yet: name constraints and revocation (CRL/OCSP); a certificate that uses them as critical is refused. Next: the TLS 1.3 client itself.
+
+## aeon-tls (own TLS 1.3 client, step 3)
+
+`Connection::connect(stream, &Config)` runs a TLS 1.3 handshake over any `Read + Write` and then behaves as a stream. One cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519, SNI for DNS hosts. The server's chain is checked with `aeon-pki` (trusted root, validity, CA rules, host name by SAN), the CertificateVerify signature must match the leaf key (ECDSA P-256/P-384, RSA-PSS SHA-256/384), and Finished is verified. Handles tickets (ignored), KeyUpdate in both directions, `close_notify`; a close without it is reported as an error (truncation). Not supported: HelloRetryRequest, resumption, 0-RTT, client certificates, AES-GCM-only servers.
+
+Tested against a real `openssl s_server` over loopback (skipped when openssl is absent): ECDSA and RSA servers, a 1.5 MB transfer with key updates, wrong host name, untrusted root, empty trust store, and a server that only offers AES-GCM (refused). Key-schedule values are exercised end to end by the interop; no separate published trace is checked in. Hand-written crypto: not audited for side channels.
+
+Next: HTTP/1.1 client with streaming (step 4), then key storage and the hosted-model backend (step 5).
