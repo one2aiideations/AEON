@@ -8,6 +8,12 @@ if [ -z "${AEOND_BIN:-}" ] || [ ! -x "${AEOND_BIN}" ]; then
     echo "AEON post-build: AEOND_BIN must point to the built aeond binary" >&2
     exit 1
 fi
+# Wi-Fi tools, regulatory database and firmware must have been installed into the image.
+for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/iw; do
+    [ -x "${TARGET_DIR}/$f" ] || [ -x "${TARGET_DIR}/${f#usr/}" ] || { echo "AEON post-build: $f missing from the image" >&2; exit 1; }
+done
+ls "${TARGET_DIR}"/lib/firmware/regulatory.db >/dev/null 2>&1 || { echo "AEON post-build: regulatory.db missing" >&2; exit 1; }
+ls "${TARGET_DIR}"/lib/firmware/iwlwifi-* >/dev/null 2>&1 || { echo "AEON post-build: no Intel Wi-Fi firmware in the image" >&2; exit 1; }
 install -D -m 0755 "${AEOND_BIN}" "${TARGET_DIR}/sbin/aeond"
 ln -sf sbin/aeond "${TARGET_DIR}/init"          # initramfs: the kernel runs /init as PID 1
 ln -sf aeond "${TARGET_DIR}/sbin/init"

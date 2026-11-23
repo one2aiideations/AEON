@@ -8,6 +8,7 @@ use aeond::models::{describe, discover, Found};
 use aeond::net;
 use aeond::persist::{self, Store};
 use aeond::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
+use aeond::wifi;
 use aeond::{cmdline_has, find_model, http, system};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -222,6 +223,15 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         match choice {
             Choice::Quit => return finish(pid1, 0),
             Choice::Rescan => continue,
+            Choice::Wifi => {
+                let _ = wifi::connect_flow(
+                    &mut input,
+                    &mut out,
+                    &mut wifi::System,
+                    Path::new(net::SYS_NET),
+                );
+                continue;
+            }
             Choice::Hosted => {
                 let Ok(Some((provider, _saved))) = hosted::setup(&mut input, &mut out, store)
                 else {
@@ -360,6 +370,22 @@ fn main() -> ExitCode {
             say("AEON clock: set from the hardware clock");
         }
         say(&net::bring_up_wired(3).summary());
+        let _ = wifi::unblock_radios(Path::new("/sys/class/rfkill"));
+        say(&wifi::summary(&wifi::wireless_interfaces(Path::new(
+            net::SYS_NET,
+        ))));
+        if cmdline_has(&system::kernel_cmdline(), "aeon.wifitest=1") {
+            return match wifi::selftest(&mut wifi::System, Path::new(net::SYS_NET)) {
+                Ok(()) => {
+                    say("AEON wifi test: PASS (scanned, refused a wrong password, joined with the right one)");
+                    finish(pid1, 0)
+                }
+                Err(e) => {
+                    say(&format!("AEON wifi test: FAIL ({e})"));
+                    finish(pid1, 1)
+                }
+            };
+        }
     }
     let store = open_store(pid1);
     if args.selftest {

@@ -140,31 +140,35 @@ pub fn bring_up_wired(link_wait: u32) -> Link {
         if !has_carrier(sys, i) {
             continue;
         }
-        // -n: give up if no lease, -q: exit once configured, -t/-T: 3 tries 2 s apart.
-        let leased = Command::new("udhcpc")
-            .args(["-i", i, "-n", "-q", "-t", "3", "-T", "2"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !leased {
-            continue;
-        }
-        if let Some(addr) = run("ip", &["-4", "-o", "addr", "show", "dev", i])
-            .as_deref()
-            .and_then(parse_ipv4)
-        {
-            let dns =
-                parse_nameservers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
-            return Link::Up {
-                iface: i.clone(),
-                addr,
-                dns,
-            };
+        if let Some(link) = lease(i) {
+            return link;
         }
     }
     Link::NoLease(ifaces)
+}
+
+/// Ask for an address on `iface` with DHCP (about ten seconds at most) and describe the result.
+pub fn lease(iface: &str) -> Option<Link> {
+    // -n: give up if no lease, -q: exit once configured, -t/-T: 3 tries 2 s apart.
+    let leased = Command::new("udhcpc")
+        .args(["-i", iface, "-n", "-q", "-t", "3", "-T", "2"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !leased {
+        return None;
+    }
+    let addr = run("ip", &["-4", "-o", "addr", "show", "dev", iface])
+        .as_deref()
+        .and_then(parse_ipv4)?;
+    let dns = parse_nameservers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+    Some(Link::Up {
+        iface: iface.to_string(),
+        addr,
+        dns,
+    })
 }
 
 /// Set the system clock from the hardware clock (RTC), so file times and, later, certificate

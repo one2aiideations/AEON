@@ -31,6 +31,7 @@ pub mod net;
 pub mod persist;
 pub mod system;
 pub mod ui;
+pub mod wifi;
 
 use std::path::{Path, PathBuf};
 

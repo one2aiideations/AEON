@@ -24,7 +24,7 @@ fn key_dir(store: &Store) -> std::path::PathBuf {
     store.root().join("keys")
 }
 
-fn ask<R: BufRead, W: Write>(
+pub(crate) fn ask<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
     prompt: &str,
@@ -39,7 +39,7 @@ fn ask<R: BufRead, W: Write>(
 }
 
 /// Read a line with the terminal's echo turned off, so the key is not shown on screen.
-fn ask_secret<R: BufRead, W: Write>(
+pub(crate) fn ask_secret<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
     prompt: &str,

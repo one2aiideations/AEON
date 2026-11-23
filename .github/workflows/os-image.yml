@@ -97,6 +97,20 @@ jobs:
           AEON_MODEL="$RUNNER_TEMP/aeon-tiny.gguf" AEON_SERIAL=1 AEON_CMDLINE="aeon.selftest=1" \
             os/make-iso.sh "$RUNNER_TEMP/aeon-out" "$RUNNER_TEMP/aeon-test.iso"
 
+      - name: Build the Wi-Fi test ISO (two virtual radios, no model)
+        run: |
+          AEON_SERIAL=1 AEON_CMDLINE="aeon.wifitest=1 mac80211_hwsim.radios=2" \
+            os/make-iso.sh "$RUNNER_TEMP/aeon-out" "$RUNNER_TEMP/aeon-wifi.iso"
+
+      - name: Wi-Fi test - one virtual radio is an access point, the other scans and joins it
+        run: |
+          set -o pipefail
+          ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
+          timeout 600 qemu-system-x86_64 -M pc -m 2048 -smp 2 $ACCEL \
+            -cdrom "$RUNNER_TEMP/aeon-wifi.iso" -boot d -nographic -no-reboot | tee boot-wifi.log || true
+          grep -q "AEON wifi: wlan0" boot-wifi.log
+          grep -q "AEON wifi test: PASS" boot-wifi.log
+
       - name: Boot the ISO in QEMU with BIOS firmware and run the AEON self-test
         run: |
           set -o pipefail

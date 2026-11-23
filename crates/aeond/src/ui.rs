@@ -13,6 +13,8 @@ pub enum Choice {
     Rescan,
     /// Use a hosted model over the network.
     Hosted,
+    /// Connect to a Wi-Fi network.
+    Wifi,
     /// Power off.
     Quit,
 }
@@ -73,7 +75,7 @@ pub fn render_menu(models: &[Found], budget_mb: u64) -> String {
             m.path.display()
         ));
     }
-    s.push_str("\n  Type a number and press Enter.  r = look again   h = hosted model (online)   q = power off\n");
+    s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   h = hosted model (online)   q = power off\n");
     s
 }
 
@@ -84,6 +86,7 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
     match t.as_str() {
         "r" => Some(Choice::Rescan),
         "h" => Some(Choice::Hosted),
+        "w" => Some(Choice::Wifi),
         "q" => Some(Choice::Quit),
         _ => t
             .parse::<usize>()
@@ -116,7 +119,7 @@ pub fn pick_model<R: BufRead, W: Write>(
         }
         writeln!(
             out,
-            "  Please type a number from 1 to {}, r, h or q.",
+            "  Please type a number from 1 to {}, r, w, h or q.",
             models.len()
         )?;
     }
