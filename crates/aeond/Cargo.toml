@@ -9,9 +9,12 @@ publish.workspace = true
 [dependencies]
 aeon-hw = { path = "../aeon-hw" }
 aeon-gguf = { path = "../aeon-gguf" }
+aeon-http = { path = "../aeon-http" }
+aeon-hosted = { path = "../aeon-hosted" }
+aeon-interface = { path = "../aeon-interface" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs"] }
+nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "term"] }
 
 [lints]
 workspace = true

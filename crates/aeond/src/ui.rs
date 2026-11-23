@@ -11,6 +11,8 @@ pub enum Choice {
     Model(usize),
     /// Look again for models (a USB stick may have been inserted).
     Rescan,
+    /// Use a hosted model over the network.
+    Hosted,
     /// Power off.
     Quit,
 }
@@ -71,7 +73,7 @@ pub fn render_menu(models: &[Found], budget_mb: u64) -> String {
             m.path.display()
         ));
     }
-    s.push_str("\n  Type a number and press Enter.  r = look again   q = power off\n");
+    s.push_str("\n  Type a number and press Enter.  r = look again   h = hosted model (online)   q = power off\n");
     s
 }
 
@@ -81,6 +83,7 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
     let t = line.trim().to_ascii_lowercase();
     match t.as_str() {
         "r" => Some(Choice::Rescan),
+        "h" => Some(Choice::Hosted),
         "q" => Some(Choice::Quit),
         _ => t
             .parse::<usize>()
@@ -113,7 +116,7 @@ pub fn pick_model<R: BufRead, W: Write>(
         }
         writeln!(
             out,
-            "  Please type a number from 1 to {}, r or q.",
+            "  Please type a number from 1 to {}, r, h or q.",
             models.len()
         )?;
     }

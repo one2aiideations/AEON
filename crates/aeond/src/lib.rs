@@ -15,11 +15,16 @@
 //! A filesystem labelled `AEON-DATA` (see [`persist`]) is mounted read-write to keep settings
 //! and chat history across reboots; without one nothing is saved.
 //!
+//! A hosted model ([`hosted`]) can be chosen instead of a local one: the person enters the
+//! provider, model and API key, agrees that messages leave the machine, and messages are washed
+//! of secrets first. Nothing is sent without that consent.
+//!
 //! Ported from the retired C `userspace/aeond`.
 #![forbid(unsafe_code)]
 
 pub mod args;
 pub mod fslabel;
+pub mod hosted;
 pub mod http;
 pub mod models;
 pub mod net;
