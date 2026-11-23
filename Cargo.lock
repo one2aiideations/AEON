@@ -186,6 +186,7 @@ version = "0.1.0"
 name = "aeon-crm"
 version = "0.1.0"
 dependencies = [
+ "aeon-auth",
  "aeon-interface",
 ]
 
