@@ -232,11 +232,29 @@ impl Crm {
 
     /// Check a permission; a denial is audited.
     pub(crate) fn guard(&mut self, ctx: &Ctx, perm: &str, subject: &str) -> Result<()> {
+        self.guard_amount(ctx, perm, subject, None)
+    }
+
+    /// Like [`Crm::guard`], also telling the authority how much money (minor units) is
+    /// involved so amount limits apply. Without a gate the amount is not used.
+    pub(crate) fn guard_amount(
+        &mut self,
+        ctx: &Ctx,
+        perm: &str,
+        subject: &str,
+        amount: Option<i64>,
+    ) -> Result<()> {
         if ctx.tenant.trim().is_empty() || ctx.user.trim().is_empty() {
             return Err(Error::Invalid("tenant and user are required".into()));
         }
         let verdict = match self.gate.as_mut() {
-            Some(g) => g.check(&ctx.tenant, &ctx.user, perm, ctx.now),
+            Some(g) => g.check(
+                &ctx.tenant,
+                &ctx.user,
+                perm,
+                amount.and_then(|a| u64::try_from(a).ok()),
+                ctx.now,
+            ),
             None if ctx.allows(perm) => Ok(()),
             None => Err(format!("missing permission {perm}")),
         };

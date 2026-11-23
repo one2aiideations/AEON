@@ -219,7 +219,7 @@ impl Crm {
         deal_name: &str,
         amount: Money,
     ) -> Result<(String, String, String)> {
-        self.guard(ctx, "crm.lead.convert", id)?;
+        self.guard_amount(ctx, "crm.lead.convert", id, Some(amount.minor))?;
         let lead = self.lead(ctx, id)?.clone();
         match &lead.status {
             LeadStatus::Converted {

@@ -53,8 +53,10 @@ impl Crm {
     /// `reason`). Closing as won needs an amount above zero and, at or above the configured
     /// threshold, another person's approval: the call then returns [`Outcome::Pending`].
     ///
+    /// Closing as won additionally needs `crm.opportunity.close`, checked with the deal amount.
+    ///
     /// # Errors
-    /// [`Error::Denied`] without `crm.opportunity.advance`; [`Error::NotFound`];
+    /// [`Error::Denied`] without `crm.opportunity.advance` (or `crm.opportunity.close` to win); [`Error::NotFound`];
     /// [`Error::State`] for a closed opportunity or a skipped stage; [`Error::Invalid`] for a
     /// lost move without a reason or a won move with a zero amount.
     pub fn advance(
@@ -85,6 +87,7 @@ impl Crm {
             if o.amount.minor == 0 {
                 return Err(Error::Invalid("a won opportunity needs an amount".into()));
             }
+            self.guard_amount(ctx, "crm.opportunity.close", id, Some(o.amount.minor))?;
             if o.amount.minor >= self.cfg.approval_threshold_minor {
                 return Ok(Outcome::Pending {
                     approval: self.request_close(ctx, id),

@@ -162,7 +162,7 @@ impl Crm {
         due: u64,
         amount: Money,
     ) -> Result<String> {
-        self.guard(ctx, "crm.renewal.create", account)?;
+        self.guard_amount(ctx, "crm.renewal.create", account, Some(amount.minor))?;
         self.account_of(ctx, account)?;
         let id = self.next_id("ren");
         self.renewals.insert(

@@ -7,11 +7,19 @@ use std::sync::{Arc, Mutex};
 
 /// Decides whether a user may perform a CRM action in a tenant.
 pub trait Authorizer {
-    /// `Ok` to allow, `Err(reason)` to deny.
+    /// `Ok` to allow, `Err(reason)` to deny. `amount` is the money involved in minor units,
+    /// when the action moves any, so limit rules can be enforced.
     ///
     /// # Errors
     /// The reason for the denial.
-    fn check(&mut self, tenant: &str, user: &str, action: &str, now: u64) -> Result<(), String>;
+    fn check(
+        &mut self,
+        tenant: &str,
+        user: &str,
+        action: &str,
+        amount: Option<u64>,
+        now: u64,
+    ) -> Result<(), String>;
 }
 
 /// An [`Authorizer`] backed by an [`Authority`]. The authority is shared, so the code that
@@ -44,7 +52,14 @@ impl AuthorityGate {
 }
 
 impl Authorizer for AuthorityGate {
-    fn check(&mut self, tenant: &str, user: &str, action: &str, now: u64) -> Result<(), String> {
+    fn check(
+        &mut self,
+        tenant: &str,
+        user: &str,
+        action: &str,
+        amount: Option<u64>,
+        now: u64,
+    ) -> Result<(), String> {
         let node = self
             .nodes
             .get(tenant)
@@ -58,7 +73,7 @@ impl Authorizer for AuthorityGate {
                 node,
                 kind: "crm".into(),
                 attrs: BTreeMap::new(),
-                amount: None,
+                amount,
             },
         };
         // A poisoned lock means another thread panicked mid-decision: fail closed.
@@ -79,7 +94,8 @@ impl Authorizer for AuthorityGate {
 mod tests {
     use super::*;
     use crate::leads::LeadInput;
-    use crate::{Config, Crm, Ctx, Error};
+    use crate::model::{Money, Stage};
+    use crate::{Config, Crm, Ctx, Error, Outcome};
     use aeon_auth::org::Level;
     use aeon_auth::policy::{Effect, Rule};
     use aeon_auth::principal::Kind;
@@ -108,10 +124,25 @@ mod tests {
         a.directory
             .create("eve", "acme", Kind::Human, &["guest"], &[])
             .unwrap();
-        a.add_rule(rule("rep-write", Effect::Allow, "rep", "crm.*"), 1)
-            .unwrap();
+        // A rule without an amount condition matches only calls that carry no amount.
+        for (id, action) in [
+            ("rep-lead", "crm.lead.create"),
+            ("rep-qual", "crm.lead.qualify"),
+            ("rep-adv", "crm.opportunity.advance"),
+        ] {
+            a.add_rule(rule(id, Effect::Allow, "rep", action), 1)
+                .unwrap();
+        }
         a.add_rule(rule("no-approve", Effect::Deny, "rep", "crm.approve"), 1)
             .unwrap();
+        for (id, action, max) in [
+            ("rep-conv", "crm.lead.convert", 1_000_000),
+            ("rep-close", "crm.opportunity.close", 100_000),
+        ] {
+            let mut r = rule(id, Effect::Allow, "rep", action);
+            r.conditions = vec![aeon_auth::policy::Cond::AmountAtMost(max)];
+            a.add_rule(r, 1).unwrap();
+        }
         let a = Arc::new(Mutex::new(a));
         let mut crm = Crm::new(Config::default());
         crm.set_authorizer(Box::new(
@@ -171,5 +202,42 @@ mod tests {
         assert!(a.lock().unwrap().verify_audit().is_ok());
         assert!(a.lock().unwrap().audit().len() > 5);
         assert!(crm.audit().verify().is_ok());
+    }
+
+    fn deal(crm: &mut Crm, c: &Ctx, email: &str, minor: i64) -> Result<String, Error> {
+        let l = crm.capture_lead(c, lead(email), "")?;
+        crm.qualify_lead(c, &l, None)?;
+        Ok(crm
+            .convert_lead(c, &l, "D", Money::new(minor, "USD").unwrap())?
+            .2)
+    }
+
+    #[test]
+    fn amount_limits_reach_the_authority() {
+        let (mut crm, _a) = setup();
+        let ann = Ctx::new("acme", "ann", &[], 10);
+        // conversion above the limit is refused, at the limit it passes
+        let r = deal(&mut crm, &ann, "big@x.com", 1_000_001);
+        assert!(matches!(r, Err(Error::Denied(_))), "{r:?}");
+        let small = deal(&mut crm, &ann, "s@x.com", 100_000).unwrap();
+        let mid = deal(&mut crm, &ann, "m@x.com", 100_001).unwrap();
+        for o in [&small, &mid] {
+            for s in [Stage::Qualified, Stage::Proposal, Stage::Negotiation] {
+                crm.advance(&ann, o, s, None).unwrap();
+            }
+        }
+        // closing is limited to 100_000 by the rule, whatever the CRM's own threshold
+        assert!(matches!(
+            crm.advance(&ann, &mid, Stage::ClosedWon, None),
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            crm.advance(&ann, &small, Stage::ClosedWon, None).unwrap(),
+            Outcome::Done(Stage::ClosedWon)
+        );
+        assert_eq!(
+            crm.opportunity(&ann, &mid).unwrap().stage,
+            Stage::Negotiation
+        );
     }
 }
