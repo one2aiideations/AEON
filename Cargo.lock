@@ -245,6 +245,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-http"
+version = "0.1.0"
+dependencies = [
+ "aeon-pki",
+ "aeon-tls",
+]
+
+[[package]]
 name = "aeon-hw"
 version = "0.1.0"
 
