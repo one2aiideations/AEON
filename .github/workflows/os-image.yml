@@ -101,7 +101,7 @@ jobs:
       - name: Boot the ISO in QEMU with UEFI firmware and run the AEON self-test
         run: |
           set -o pipefail
-          OVMF="$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd 2>/dev/null | head -1)"
+          OVMF="$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd 2>/dev/null | head -1 || true)"
           [ -n "$OVMF" ] || { echo "no OVMF firmware found"; exit 1; }
           ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
           timeout 1500 qemu-system-x86_64 -M q35 -m 2048 -smp 2 $ACCEL -bios "$OVMF" \
