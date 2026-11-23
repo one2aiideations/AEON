@@ -9,10 +9,16 @@ AEON_LLAMA_CPP_SITE = $(call github,ggml-org,llama.cpp,$(AEON_LLAMA_CPP_VERSION)
 AEON_LLAMA_CPP_LICENSE = MIT
 AEON_LLAMA_CPP_LICENSE_FILES = LICENSE
 
-# Offline, portable CPU build (no host-specific instructions, no downloads at build time).
+# Offline CPU build with no downloads at build time. Not tuned to the build machine (GGML_NATIVE
+# off) but compiled for AVX2/FMA (x86-64-v3, Intel Haswell 2013 / AMD Excavator 2015 or newer):
+# without these, inference is several times slower. Older CPUs get a warning from aeond.
 AEON_LLAMA_CPP_CONF_OPTS = \
 	-DBUILD_SHARED_LIBS=ON \
 	-DGGML_NATIVE=OFF \
+	-DGGML_AVX2=ON \
+	-DGGML_FMA=ON \
+	-DGGML_F16C=ON \
+	-DGGML_BMI2=ON \
 	-DGGML_OPENMP=OFF \
 	-DLLAMA_OPENSSL=OFF \
 	-DLLAMA_BUILD_TESTS=OFF \

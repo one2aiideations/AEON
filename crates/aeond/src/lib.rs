@@ -16,7 +16,9 @@
 
 pub mod args;
 pub mod http;
+pub mod models;
 pub mod system;
+pub mod ui;
 
 use std::path::{Path, PathBuf};
 

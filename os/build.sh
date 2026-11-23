@@ -21,7 +21,7 @@ fi
 make -C "$BR" BR2_EXTERNAL="$HERE/buildroot" O="$OUT" qemu_x86_64_defconfig
 cat "$HERE/buildroot/configs/aeon_x86_64.fragment" >> "$OUT/.config"
 make -C "$BR" O="$OUT" olddefconfig
-for opt in BR2_PACKAGE_AEON_LLAMA_CPP BR2_TARGET_ROOTFS_CPIO BR2_INIT_NONE; do
+for opt in BR2_PACKAGE_AEON_LLAMA_CPP BR2_TARGET_ROOTFS_CPIO BR2_INIT_NONE BR2_LINUX_KERNEL_USE_DEFCONFIG; do
     grep -q "^$opt=y" "$OUT/.config" || { echo "config check failed: $opt"; exit 1; }
 done
 make -C "$BR" O="$OUT" -j"$(nproc)"
