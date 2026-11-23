@@ -167,6 +167,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-compress"
+version = "0.1.0"
+
+[[package]]
 name = "aeon-core"
 version = "0.1.0"
 
@@ -193,12 +197,22 @@ name = "aeon-engine"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-forge"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "aeon-gate"
 version = "0.1.0"
 
 [[package]]
 name = "aeon-gguf"
 version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
 
 [[package]]
 name = "aeon-hw"
@@ -210,6 +224,22 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "sha2",
+]
+
+[[package]]
+name = "aeon-interface"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "aeon-llm"
+version = "0.1.0"
+dependencies = [
+ "aeon-engine",
+ "aeon-gguf",
+ "aeon-quant",
 ]
 
 [[package]]
@@ -237,6 +267,9 @@ dependencies = [
 [[package]]
 name = "aeon-memory"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "aeon-mesh"
@@ -277,6 +310,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "aeon-quant"
+version = "0.1.0"
+dependencies = [
+ "aeon-gguf",
 ]
 
 [[package]]
@@ -327,6 +367,24 @@ version = "0.1.0"
 [[package]]
 name = "aeon-theory"
 version = "0.1.0"
+
+[[package]]
+name = "aeon-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "aeon-gguf",
+]
+
+[[package]]
+name = "aeon-topstar"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "uuid",
+]
 
 [[package]]
 name = "aeon-web"

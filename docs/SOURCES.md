@@ -45,3 +45,7 @@ These were checked against tests written alongside them, **not** against a refer
 2. Check whether a crate here already covers it (`PORT_STATUS.md`, this file).
 3. Port the behaviour, not the file layout; add tests that would fail if the behaviour were wrong; run `cargo fmt`, `cargo clippy -D warnings`, `cargo test`.
 4. Add a line here.
+
+## LibreOne (interface)
+
+`sources/LibreOne-main` is about 600 lines of Python contract stubs plus a product README; 243 of its files are tests. It was used as the specification for `aeon-interface`. Bugs in the stubs not carried over: dataclass defaults such as `id: UUID = new_id()` are evaluated once, so all instances share one id; approvals could be decided by anyone and reused; `data_washing` only matched `key=value`. Unverified: no application uses the interface yet, and the washing patterns have not been tested against real data.
