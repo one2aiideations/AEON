@@ -81,3 +81,34 @@ Domain core from `crates/aeon-crm/AEON-CRM.md` with ideas from the owner's AEONC
 ## os/: wired network
 
 `aeond::net` finds Ethernet adapters in `/sys/class/net` (hardware-backed, not wireless/bridge/tunnel), waits for carrier, runs BusyBox `udhcpc` (its default script sets address, route and resolv.conf) and prints the result; the clock is set from the RTC with `hwclock`. Image changes: kernel NIC and USB-Ethernet drivers, a BusyBox fragment (`ip`, `udhcpc`, `hwclock`, `ping`, `nslookup`), `ca-certificates`, and a post-build check that fails the build if the tools are missing. CI gives the BIOS boot an Intel e1000 and the UEFI boot an e1000e on QEMU's user network and expects `eth0 10.0.2.15/24, dns 10.0.2.3`. Not done: Wi-Fi, static addresses or IPv6, NTP (it would contact the internet, so it waits for the hosted-model step), a retry when a cable is plugged in later, a network screen. Which real NICs work is unverified.
+
+## aeon-crypto (new): primitives for the in-house TLS client
+
+Decision: AEON writes its own HTTPS client for hosted models instead of adding curl or rustls. This is step 1: HMAC/HKDF (over the `sha2` crate), `HKDF-Expand-Label`, ChaCha20, Poly1305, ChaCha20-Poly1305 and X25519. Checked against RFC 4231, 5869, 7748, 8439 and 8448 vectors, plus 129 randomised vectors from OpenSSL (`tools/gen_vectors.py`, `tests/cross_check.rs`). Not audited for side channels. Still to build, in order: X.509 parsing, ECDSA P-256/P-384 and RSA signature verification, the TLS 1.3 client (handshake, records, certificate and hostname checks), an HTTP/1.1 client with streaming, then key storage and the hosted-model backend. Until certificate verification exists, nothing may connect to the internet.
+
+## aeon-pki (certificates for the in-house TLS client, step 2)
+
+Own implementation, no new dependencies beyond the SHA-2 crate already used:
+
+- `bignum`: unsigned big integers (Knuth division, modular power and inverse). Public data only, not constant time.
+- `der`: strict DER reader (definite and minimal lengths, no trailing data).
+- `x509`: v3 certificates: names, validity, key, SAN (DNS, IP), basic constraints, key usage, extended key usage; unknown critical extensions are refused. Signature algorithms: RSA PKCS#1 v1.5 and PSS, ECDSA, with SHA-256/384/512 (SHA-1 and MD5 are refused). Keys: RSA 2048 to 8192 bits, ECDSA P-256 and P-384.
+- `ecdsa`, `rsa`: signature verification.
+- `verify`: chain building to a trust store (signatures, validity, CA and path-length rules, server-auth purpose), host name matching by SAN only, wildcard only as a whole left-most label.
+- `pem`: PEM bundles, so `/etc/ssl/certs/ca-certificates.crt` loads as the trust store (116 of 120 certificates of a typical bundle load; the rest use unsupported algorithms or curves).
+
+Checked against 288 OpenSSL signature vectors (96 valid, 192 altered), chains generated with OpenSSL (EC, RSA, PSS; wrong name, expired, not yet valid, forged root, missing intermediate, path length, client-only purpose, unknown critical extension, tampering). Not covered yet: name constraints and revocation (CRL/OCSP); a certificate that uses them as critical is refused. Next: the TLS 1.3 client itself.
+
+## aeon-tls (own TLS 1.3 client, step 3)
+
+`Connection::connect(stream, &Config)` runs a TLS 1.3 handshake over any `Read + Write` and then behaves as a stream. One cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519, SNI for DNS hosts. The server's chain is checked with `aeon-pki` (trusted root, validity, CA rules, host name by SAN), the CertificateVerify signature must match the leaf key (ECDSA P-256/P-384, RSA-PSS SHA-256/384), and Finished is verified. Handles tickets (ignored), KeyUpdate in both directions, `close_notify`; a close without it is reported as an error (truncation). Not supported: HelloRetryRequest, resumption, 0-RTT, client certificates, AES-GCM-only servers.
+
+Tested against a real `openssl s_server` over loopback (skipped when openssl is absent): ECDSA and RSA servers, a 1.5 MB transfer with key updates, wrong host name, untrusted root, empty trust store, and a server that only offers AES-GCM (refused). Key-schedule values are exercised end to end by the interop; no separate published trace is checked in. Hand-written crypto: not audited for side channels.
+
+Next: HTTP/1.1 client with streaming (step 4), then key storage and the hosted-model backend (step 5).
+
+## aeon-http (own HTTP/1.1 client, step 4)
+
+`Client::request(&Request)` resolves, connects (timeouts), runs `aeon-tls` for `https` with the system CA bundle (`Client::system()`), and returns the status, headers and a streaming `Body` (`Read`). One request per connection. Bodies: Content-Length, chunked (extensions and trailers accepted), or until close; a truncated body is an `UnexpectedEof` error. Strict parsing: CRLF only, no folded headers, bad or conflicting lengths and Content-Length together with chunked are refused, head size capped. Header injection in requests is refused. Plain `http` is allowed only to loopback; redirects are not followed.
+
+Tested with canned responses (valid and malformed), a loopback server streaming chunked events, a POST echo, and HTTPS to a real `openssl s_server` through the in-house TLS (plus a wrong trust store). Next: API key storage on AEON-DATA and the hosted-model backend (step 5).

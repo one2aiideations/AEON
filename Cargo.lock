@@ -191,6 +191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-crypto"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "aeon-data"
 version = "0.1.0"
 dependencies = [
@@ -235,6 +242,14 @@ name = "aeon-gguf"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+]
+
+[[package]]
+name = "aeon-http"
+version = "0.1.0"
+dependencies = [
+ "aeon-pki",
+ "aeon-tls",
 ]
 
 [[package]]
@@ -317,6 +332,14 @@ name = "aeon-orchestra"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-pki"
+version = "0.1.0"
+dependencies = [
+ "aeon-crypto",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-project"
 version = "0.1.0"
 dependencies = [
@@ -390,6 +413,15 @@ version = "0.1.0"
 [[package]]
 name = "aeon-theory"
 version = "0.1.0"
+
+[[package]]
+name = "aeon-tls"
+version = "0.1.0"
+dependencies = [
+ "aeon-crypto",
+ "aeon-pki",
+ "sha2",
+]
 
 [[package]]
 name = "aeon-tokenizer"

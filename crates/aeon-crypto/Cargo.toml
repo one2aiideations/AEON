@@ -1,0 +1,13 @@
+[package]
+name = "aeon-crypto"
+version = "0.1.0"
+description = "AEON's own cryptographic primitives for the TLS client: HMAC and HKDF over SHA-256, ChaCha20-Poly1305, X25519"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true
