@@ -98,3 +98,9 @@ Checked against 288 OpenSSL signature vectors (96 valid, 192 altered), chains ge
 Tested against a real `openssl s_server` over loopback (skipped when openssl is absent): ECDSA and RSA servers, a 1.5 MB transfer with key updates, wrong host name, untrusted root, empty trust store, and a server that only offers AES-GCM (refused). Key-schedule values are exercised end to end by the interop; no separate published trace is checked in. Hand-written crypto: not audited for side channels.
 
 Next: HTTP/1.1 client with streaming (step 4), then key storage and the hosted-model backend (step 5).
+
+## aeon-http (own HTTP/1.1 client, step 4)
+
+`Client::request(&Request)` resolves, connects (timeouts), runs `aeon-tls` for `https` with the system CA bundle (`Client::system()`), and returns the status, headers and a streaming `Body` (`Read`). One request per connection. Bodies: Content-Length, chunked (extensions and trailers accepted), or until close; a truncated body is an `UnexpectedEof` error. Strict parsing: CRLF only, no folded headers, bad or conflicting lengths and Content-Length together with chunked are refused, head size capped. Header injection in requests is refused. Plain `http` is allowed only to loopback; redirects are not followed.
+
+Tested with canned responses (valid and malformed), a loopback server streaming chunked events, a POST echo, and HTTPS to a real `openssl s_server` through the in-house TLS (plus a wrong trust store). Next: API key storage on AEON-DATA and the hosted-model backend (step 5).
