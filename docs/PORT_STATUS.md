@@ -56,3 +56,7 @@ Those were written in the C era; treat statements about "C core" as historical.
 | `AEONONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `aeon-auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme AEONONE documents** |
 | AEONONE repository (`CMKIXVI/aeonone`) | none | **not available** (not in `sources/`, not reachable from this account); nothing derived from its code |
 | Login, MFA, SSO, sessions, persistence, admin APIs, policy lifecycle | none | not implemented |
+
+## aeon-gateway (new, not a port)
+
+Newline-delimited JSON over a Unix socket (mode 0600) so applications and agents outside the console can use `aeon-interface` with streamed replies. Own JSON reader/writer, no new dependencies. Open: no real model backend attached (the `Backend` trait is for `aeond`'s llama-server client), caller identity is claimed not authenticated (`aeon-auth` envelopes not wired in), one connection served at a time, never run outside tests.
