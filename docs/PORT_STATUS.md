@@ -39,3 +39,11 @@ public APIs. **Differential tests against the C code (same input through both, o
 `AEON_RUST_PLAN.md` (migration rules), `AEON_OS_ARCHITECTURE.md`, `AEON_OS_ROADMAP.md`, `AEON_KERNEL_STRATEGY.md`,
 `AEON_ENGINE_PLAN.md`, `AEON_APP_LAYER.md`, `AEON_THEORY_NATIVE.md`, `EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md`.
 Those were written in the C era; treat statements about "C core" as historical.
+
+## Main interface (LibreOne)
+
+| Source | Rust | Status |
+|---|---|---|
+| LibreOne `libreone/` contracts (message, session, intent, artifacts, approval, policy, capabilities, routing, data_washing, audit, workflow, limits, retry, sandbox policy) | `aeon-interface` | ported and tightened; unit tested; **not yet wired to a UI or to any application** |
+| LibreOne README scope (multimodal ingestion, connectors, MCP, enterprise identity, observability) | none | product vision only; no code in the source to port |
+| `libreone/native/aeon_contract.py` | none | superseded: AEON itself is the native layer |
