@@ -15,7 +15,8 @@ sudo dd if=.aeon-out/images/aeon.iso of=/dev/sdX bs=4M conv=fsync status=progres
 ```
 
 CI builds `aeon.iso` on every change to `os/` or `crates/aeond` and uploads it as the
-`aeon-x86_64-image` artifact, so you can skip the local build. Check the device name with `lsblk`
+`aeon-iso` artifact (just `aeon.iso`; boot logs, screenshots and kernel parts are in `aeon-debug`), so you
+can skip the local build. Write it as a raw disk image (`dd`, Rufus in DD Image mode, balenaEtcher). Check the device name with `lsblk`
 before `dd`: it overwrites the target completely.
 
 On the PC: disable **Secure Boot** (the kernel is not signed), boot from the USB stick, and pick
@@ -86,14 +87,33 @@ done: anything on a physical PC, and speed or memory behaviour with a real model
 Known limits of this stage:
 - Text interface on the console. There is no graphical chat window yet.
 - CPU inference only, and the engine needs an AVX2 CPU (2013 or newer); aeond warns otherwise.
-- Wired Ethernet only (no Wi-Fi), no GPU acceleration, no Secure Boot, no installer: it runs from the stick
+- Wired Ethernet and Wi-Fi (WPA/WPA2 personal and open networks), no GPU acceleration, no Secure Boot, no installer: it runs from the stick
   and keeps nothing between boots unless an `AEON-DATA` partition is present (see above).
 - Keyboards: USB, PS/2 and I2C-HID are built in; layout is US.
 - aeond has no SIGTERM handling and does not reap orphaned processes.
 
 ## Hosted models (optional, online)
 
-With a network cable connected, press `h` in the model list to chat with a hosted model instead of a local one:
+With a network cable connected (or after connecting Wi-Fi with `w`), press `h` in the model list to chat with a hosted model instead of a local one:
 enter the provider's API address (https), the model name and your API key, and agree that messages leave the
 computer. The key is typed hidden and can be saved on the AEON-DATA partition (anyone with that stick can read
 it). Emails, card numbers and passwords are replaced before sending. Local models never touch the network.
+
+## Screen on real PCs
+
+The serial-console boot tests cannot show a black screen. CI also boots the release ISO with a virtual
+display (BIOS and UEFI) and fails when nothing is drawn (`os/tools/screencheck.py`, screenshots in the
+`aeon-debug` artifact). The kernel hands the firmware framebuffer to `efifb`/`vesafb` (not `simpledrm`)
+so the text console works on UEFI PCs; the build fails if the kernel configuration loses those options.
+If a PC still shows nothing, pick "AEON (verbose boot messages)" or "safe graphics" in the GRUB menu.
+
+## Wi-Fi
+
+Press `w` in the model list: AEON scans, you pick a network by number, type the password (hidden) and it
+connects with `wpa_supplicant` and asks for an address (DHCP). Kernel drivers and firmware for common Intel,
+Realtek, MediaTek and Atheros chips are in the image (Broadcom chips need proprietary firmware and are not).
+Not supported: WPA3-only and enterprise (802.1X) networks, hidden networks, remembering networks between boots.
+Passwords go only to a mode-0600 file in RAM. CI tests the whole path on two virtual radios
+(`mac80211_hwsim`): one is an access point, the other scans, must refuse a wrong password and join with the
+right one. Real radios are not tested. The clock matters for hosted models: certificates are checked
+against the date, which AEON takes from the hardware clock (no network time yet).
