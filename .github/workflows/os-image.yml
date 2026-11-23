@@ -108,13 +108,15 @@ jobs:
           mke2fs -q -F -t ext4 -L AEON-DATA "$DATA"
           timeout 1500 qemu-system-x86_64 -M pc -m 2048 -smp 2 $ACCEL \
             -device ich9-ahci,id=ahci -drive if=none,id=data,file="$DATA",format=raw \
-            -device ide-hd,drive=data,bus=ahci.0 \
+            -device ide-hd,drive=data,bus=ahci.0 -nic user,model=e1000 \
             -cdrom "$RUNNER_TEMP/aeon-test.iso" -boot d -nographic -no-reboot | tee boot-bios.log || true
           grep -q "AEON hardware:" boot-bios.log
           grep -q "AEON ready" boot-bios.log
           grep -q "AEON chat reply:" boot-bios.log
           grep -q "AEON selftest: PASS" boot-bios.log
           grep -q "AEON: saving settings and chat history to /aeon/data" boot-bios.log
+          # QEMU's built-in network gives 10.0.2.15 with DNS 10.0.2.3 over DHCP (Intel e1000).
+          grep -q "AEON network: eth0 10.0.2.15/24, dns 10.0.2.3" boot-bios.log
           grep -q "AEON data: saved settings and chat log" boot-bios.log
           # Read the disk back on the host: the data must really be on it.
           debugfs -R "cat /settings" "$DATA" | grep -q "^selftest=ok$"
@@ -127,13 +129,15 @@ jobs:
           OVMF="$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd 2>/dev/null | head -1 || true)"
           [ -n "$OVMF" ] || { echo "no OVMF firmware found"; exit 1; }
           ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
-          timeout 1500 qemu-system-x86_64 -M q35 -m 2048 -smp 2 $ACCEL -bios "$OVMF" \
+          timeout 1500 qemu-system-x86_64 -M q35 -m 2048 -smp 2 $ACCEL -bios "$OVMF" -nic user,model=e1000e \
             -cdrom "$RUNNER_TEMP/aeon-test.iso" -boot d -nographic -no-reboot | tee boot-uefi.log || true
           grep -q "AEON hardware:" boot-uefi.log
           grep -q "AEON ready" boot-uefi.log
           grep -q "AEON chat reply:" boot-uefi.log
           grep -q "AEON selftest: PASS" boot-uefi.log
           grep -q "nothing will be saved after power-off" boot-uefi.log
+          # A second driver (Intel e1000e) on the UEFI machine.
+          grep -q "AEON network: eth0 10.0.2.15/24, dns 10.0.2.3" boot-uefi.log
           echo "The ISO booted under BIOS and UEFI, served a chat reply and passed the self-test"
 
       - name: Upload image and boot log

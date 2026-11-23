@@ -45,6 +45,16 @@ partitions and asks you to retype the device name). Or format a partition yourse
 label `AEON-DATA`. Chat logs are plain text on that disk: anyone with the stick can read them.
 Nothing is saved to the main image, and without the partition AEON says so at boot.
 
+## Network
+
+Wired Ethernet comes up by itself: AEON waits a few seconds for a cable, asks the local network
+for an address with DHCP and prints one line, for example
+`AEON network: eth0 192.168.1.20/24, dns 192.168.1.1`, or says it is offline. Intel, Realtek,
+Broadcom and Atheros adapters and common USB Ethernet dongles are built in. AEON only asks your
+network for an address; it does not contact the internet by itself, and the assistant is still
+told it runs offline. The system clock is set from the PC's hardware clock (no network time yet).
+**Wi-Fi is not supported yet**: it needs wireless drivers, firmware files and a connect screen.
+
 Self-test without a keyboard: `aeon.selftest=1` on the kernel command line loads the baked-in
 model, sends one prompt and powers off. CI boots the ISO under BIOS and UEFI this way.
 
@@ -64,7 +74,7 @@ model). RAM must hold the model; give QEMU more memory with `-m` in `os/run-qemu
 | `buildroot/` | Buildroot external tree: package `aeon-llama-cpp`; config fragments; post-build installs aeond |
 | `buildroot/configs/aeon_x86_64.fragment` | Options merged onto Buildroot's `qemu_x86_64_defconfig` |
 | `buildroot/board/aeon/linux-aeon.fragment` | Kernel options (initramfs, devtmpfs, serial console, DRM) |
-| `../crates/aeond/` | The init (Rust): mounts, console, loopback, hardware plan, server supervision, chat, self-test |
+| `../crates/aeond/` | The init (Rust): mounts, console, loopback, wired network, hardware plan, server supervision, chat, self-test |
 | `tools/make_tiny_gguf.py` | Writes a tiny llama-architecture GGUF for tests |
 | `tools/make-data-partition.sh` | Formats an existing partition as the AEON-DATA partition |
 
@@ -76,7 +86,7 @@ done: anything on a physical PC, and speed or memory behaviour with a real model
 Known limits of this stage:
 - Text interface on the console. There is no graphical chat window yet.
 - CPU inference only, and the engine needs an AVX2 CPU (2013 or newer); aeond warns otherwise.
-- No Wi-Fi or network, no GPU acceleration, no Secure Boot, no installer: it runs from the stick
+- Wired Ethernet only (no Wi-Fi), no GPU acceleration, no Secure Boot, no installer: it runs from the stick
   and keeps nothing between boots unless an `AEON-DATA` partition is present (see above).
 - Keyboards: USB, PS/2 and I2C-HID are built in; layout is US.
 - aeond has no SIGTERM handling and does not reap orphaned processes.

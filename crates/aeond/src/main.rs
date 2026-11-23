@@ -4,6 +4,7 @@
 use aeon_hw::{Hw, Plan};
 use aeond::args::{Args, DEFAULT_MODEL_DIR};
 use aeond::models::{describe, discover, Found};
+use aeond::net;
 use aeond::persist::{self, Store};
 use aeond::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
 use aeond::{cmdline_has, find_model, http, system};
@@ -321,6 +322,12 @@ fn main() -> ExitCode {
     say(&hw.format(&plan));
     if cfg!(target_arch = "x86_64") && !hw.avx2 {
         say("AEON warning: this CPU has no AVX2; the inference engine is built for AVX2 and may crash.");
+    }
+    if pid1 {
+        if net::clock_from_rtc() {
+            say("AEON clock: set from the hardware clock");
+        }
+        say(&net::bring_up_wired(3).summary());
     }
     let store = open_store(pid1);
     if args.selftest {

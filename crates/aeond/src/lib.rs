@@ -9,18 +9,20 @@
 //! compatible `/health` and `/completion`); it is replaced by `aeon-engine`
 //! once that can run a full model.
 //!
+//! Wired networking ([`net`]) is brought up with DHCP from the local network; nothing contacts the
+//! internet by itself.
+//!
 //! A filesystem labelled `AEON-DATA` (see [`persist`]) is mounted read-write to keep settings
 //! and chat history across reboots; without one nothing is saved.
 //!
-//! Ported from the retired C `userspace/aeond`. Not yet ported: bringing up
-//! the loopback interface (needs an ioctl; the image's network config must
-//! do it for now).
+//! Ported from the retired C `userspace/aeond`.
 #![forbid(unsafe_code)]
 
 pub mod args;
 pub mod fslabel;
 pub mod http;
 pub mod models;
+pub mod net;
 pub mod persist;
 pub mod system;
 pub mod ui;
