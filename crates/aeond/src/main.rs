@@ -69,6 +69,12 @@ fn launch(a: &Args, model: &Path, plan: &Plan, pid1: bool) -> Result<Child, Stri
     } else {
         let _ = child.kill();
         let _ = child.wait();
+        let log = std::fs::read_to_string(log_path(pid1)).unwrap_or_default();
+        say(&format!(
+            "---- last lines of {} ----\n{}\n----",
+            log_path(pid1),
+            aeond::tail_lines(&log, 20)
+        ));
         Err(format!("the model did not load (see {})", log_path(pid1)))
     }
 }

@@ -25,6 +25,13 @@ use std::path::{Path, PathBuf};
 /// Version string printed at boot.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Last `n` lines of `text`, for showing the end of a log on the console.
+#[must_use]
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// True when the kernel command line contains `word` as a whole token.
 #[must_use]
 pub fn cmdline_has(cmdline: &str, word: &str) -> bool {
@@ -47,6 +54,13 @@ pub fn find_model(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tails_a_log() {
+        assert_eq!(tail_lines("a\nb\nc\nd", 2), "c\nd");
+        assert_eq!(tail_lines("a\nb", 10), "a\nb");
+        assert_eq!(tail_lines("", 3), "");
+    }
 
     #[test]
     fn cmdline_tokens() {

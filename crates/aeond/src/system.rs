@@ -7,6 +7,11 @@
 #[must_use]
 pub fn early_setup() -> Vec<String> {
     use nix::mount::{mount, MsFlags};
+    // The kernel starts init with no PATH, so child programs (ip, llama-server) would not be found.
+    std::env::set_var(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     let mut warn = Vec::new();
     for (src, dst, fs) in [
         ("proc", "/proc", "proc"),
