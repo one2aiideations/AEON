@@ -183,6 +183,13 @@ name = "aeon-core"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-crm"
+version = "0.1.0"
+dependencies = [
+ "aeon-interface",
+]
+
+[[package]]
 name = "aeon-data"
 version = "0.1.0"
 dependencies = [
