@@ -402,6 +402,7 @@ version = "0.1.0"
 name = "aeond"
 version = "0.1.0"
 dependencies = [
+ "aeon-gguf",
  "aeon-hw",
  "nix",
 ]
