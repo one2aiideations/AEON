@@ -245,6 +245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-hosted"
+version = "0.1.0"
+dependencies = [
+ "aeon-gateway",
+ "aeon-http",
+ "aeon-pki",
+]
+
+[[package]]
 name = "aeon-http"
 version = "0.1.0"
 dependencies = [

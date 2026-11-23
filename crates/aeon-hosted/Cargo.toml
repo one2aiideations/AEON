@@ -1,0 +1,17 @@
+[package]
+name = "aeon-hosted"
+version = "0.1.0"
+description = "Hosted-model chat client (OpenAI-compatible, streaming) over AEON's own HTTPS, with API key storage"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aeon-http = { path = "../aeon-http" }
+aeon-gateway = { path = "../aeon-gateway" }
+
+[dev-dependencies]
+aeon-pki = { path = "../aeon-pki" }
+
+[lints]
+workspace = true
