@@ -35,6 +35,7 @@ pub mod lineedit;
 pub mod models;
 pub mod net;
 pub mod persist;
+pub mod procparse;
 pub mod sntp;
 pub mod system;
 pub mod textwrap;
