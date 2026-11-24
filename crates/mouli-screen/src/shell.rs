@@ -47,8 +47,21 @@ impl Shell {
         Self::default()
     }
 
-    fn current(&mut self) -> &mut dyn Screen {
-        match self.active {
+    /// The screen for `tab`.
+    pub fn screen(&self, tab: Tab) -> &dyn Screen {
+        match tab {
+            Tab::Chat => &self.chat,
+            Tab::Models => &self.models,
+            Tab::Approvals => &self.approvals,
+            Tab::Audit => &self.audit,
+            Tab::Security => &self.security,
+            Tab::Review => &self.review,
+        }
+    }
+
+    /// The screen for `tab`, to send it keys.
+    pub fn screen_mut(&mut self, tab: Tab) -> &mut dyn Screen {
+        match tab {
             Tab::Chat => &mut self.chat,
             Tab::Models => &mut self.models,
             Tab::Approvals => &mut self.approvals,
@@ -58,15 +71,12 @@ impl Shell {
         }
     }
 
+    fn current(&mut self) -> &mut dyn Screen {
+        self.screen_mut(self.active)
+    }
+
     fn current_ref(&self) -> &dyn Screen {
-        match self.active {
-            Tab::Chat => &self.chat,
-            Tab::Models => &self.models,
-            Tab::Approvals => &self.approvals,
-            Tab::Audit => &self.audit,
-            Tab::Security => &self.security,
-            Tab::Review => &self.review,
-        }
+        self.screen(self.active)
     }
 
     /// Handles a key: global keys first (F1 to F6 switch screens), then the active screen.

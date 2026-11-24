@@ -1,0 +1,13 @@
+[package]
+name = "mouli-desk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-DESK: a classic-desktop GUI (windows, menu bar, icons, mouse pointer) drawn in software; the MOULI screens run inside its windows"
+
+[dependencies]
+mouli-screen = { path = "../mouli-screen" }
+
+[lints]
+workspace = true

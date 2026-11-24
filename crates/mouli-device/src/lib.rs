@@ -145,7 +145,8 @@ impl<B: Backend> Device<B> {
             | Action::RescanModels
             | Action::Wifi
             | Action::Hosted
-            | Action::HardwareInfo) => Outcome::Host(other),
+            | Action::HardwareInfo
+            | Action::SwitchUser) => Outcome::Host(other),
         }
     }
 

@@ -2670,6 +2670,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-desk"
+version = "0.1.0"
+dependencies = [
+ "mouli-screen",
+]
+
+[[package]]
 name = "mouli-device"
 version = "0.1.0"
 dependencies = [
