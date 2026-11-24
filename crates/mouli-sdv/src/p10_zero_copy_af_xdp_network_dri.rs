@@ -121,6 +121,9 @@ pub struct XdpRing {
     cached_producer: AtomicU32,
 }
 
+// SAFETY: sound only under the single-producer / single-consumer contract documented on
+// `produce` and `consume`: at most one thread produces and at most one consumes, and the
+// atomics order each slot's hand-over.
 unsafe impl Sync for XdpRing {}
 
 impl XdpRing {
@@ -134,7 +137,7 @@ impl XdpRing {
         }
     }
 
-    /// Enqueue a descriptor into the ring (Producer API)
+    /// Enqueue a descriptor into the ring (Producer API). At most ONE thread may produce.
     pub fn produce(&self, desc: &XdpDesc) -> Result<(), XdpError> {
         let prod = self.producer.load(Ordering::Relaxed);
         let cons = self.consumer.load(Ordering::Acquire);
@@ -144,14 +147,17 @@ impl XdpRing {
         }
 
         let idx = (prod as usize) % XDP_RING_DEPTH;
-        let ring = unsafe { &mut *self.entries.get() };
-        ring[idx] = *desc;
+        // SAFETY: single-producer ring. The slot at `prod` is not visible to the consumer until
+        // the Release store below, and the capacity check above guarantees the consumer is done
+        // with it. Only this one slot is touched, through a raw pointer, so no reference to the
+        // whole array exists that could overlap the consumer's access to a different slot.
+        unsafe { self.entries.get().cast::<XdpDesc>().add(idx).write(*desc) };
 
         self.producer.store(prod.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
-    /// Dequeue a descriptor from the ring (Consumer API)
+    /// Dequeue a descriptor from the ring (Consumer API). At most ONE thread may consume.
     pub fn consume(&self) -> Result<XdpDesc, XdpError> {
         let cons = self.consumer.load(Ordering::Relaxed);
         let prod = self.producer.load(Ordering::Acquire);
@@ -161,8 +167,10 @@ impl XdpRing {
         }
 
         let idx = (cons as usize) % XDP_RING_DEPTH;
-        let ring = unsafe { &*self.entries.get() };
-        let desc = ring[idx];
+        // SAFETY: single-consumer ring. The Acquire load of `producer` above makes the producer's
+        // write to this slot visible, and the producer will not reuse the slot until the Release
+        // store of `consumer` below. Only this slot is read, through a raw pointer.
+        let desc = unsafe { self.entries.get().cast::<XdpDesc>().add(idx).read() };
 
         self.consumer.store(cons.wrapping_add(1), Ordering::Release);
         Ok(desc)
@@ -884,5 +892,45 @@ mod tests {
         let processed = engine.process_rx_cycle(1_000);
         assert!(processed.is_ok());
         assert_eq!(engine.rx_ring.consume(), Err(XdpError::RingEmpty));
+    }
+
+    #[test]
+    fn xdp_ring_between_a_producer_and_a_consumer_thread() {
+        static RING: XdpRing = XdpRing::new();
+        const N: u32 = 100_000;
+        let producer = std::thread::spawn(|| {
+            let mut i = 0;
+            while i < N {
+                let d = XdpDesc {
+                    addr: u64::from(i),
+                    len: i,
+                    flags: !i,
+                };
+                if RING.produce(&d).is_ok() {
+                    i += 1;
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let consumer = std::thread::spawn(|| {
+            let mut expected = 0;
+            while expected < N {
+                match RING.consume() {
+                    Ok(d) => {
+                        assert_eq!(
+                            (d.addr, d.len, d.flags),
+                            (u64::from(expected), expected, !expected),
+                            "descriptor {expected} corrupted or out of order"
+                        );
+                        expected += 1;
+                    }
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+        });
+        producer.join().unwrap();
+        consumer.join().unwrap();
+        assert_eq!(RING.consume(), Err(XdpError::RingEmpty));
     }
 }
