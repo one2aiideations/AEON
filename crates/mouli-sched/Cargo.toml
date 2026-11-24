@@ -1,0 +1,10 @@
+[package]
+name = "mouli-sched"
+version = "0.1.0"
+description = "MOULI heterogeneous compute placement with thermal-aware migration (CPU, iGPU, dGPU, NPU)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "mouli-agents"
+version = "0.1.0"
+description = "MOULI scheduled agents: schedules, due queue, runner and tamper-evident audit log"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "mouli-web"
+version = "0.1.0"
+description = "MOULI browser agent layer: readable text, page intents, consent-gated actions, rate limits"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

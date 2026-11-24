@@ -1,0 +1,16 @@
+[package]
+name = "mouli-ops"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-BUSINESS operations engine: sales, procurement, inventory, manufacturing, HR, projects and service"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

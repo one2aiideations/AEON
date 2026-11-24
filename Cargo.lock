@@ -125,26 +125,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-adapters"
+name = "mouli-adapters"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-agents"
+name = "mouli-agents"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-auth"
+name = "mouli-auth"
 version = "0.1.0"
 dependencies = [
- "aeon-interface",
+ "mouli-interface",
  "sha2",
 ]
 
 [[package]]
-name = "aeon-biz"
+name = "mouli-biz"
 version = "0.13.0"
 dependencies = [
  "base64 0.22.1",
@@ -157,7 +157,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-business"
+name = "mouli-business"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -174,11 +174,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-cognition"
+name = "mouli-cognition"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-comms"
+name = "mouli-comms"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
@@ -188,30 +188,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-compress"
+name = "mouli-compress"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-core"
+name = "mouli-core"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-crm"
+name = "mouli-crm"
 version = "0.1.0"
 dependencies = [
- "aeon-auth",
- "aeon-interface",
+ "mouli-auth",
+ "mouli-interface",
 ]
 
 [[package]]
-name = "aeon-crypto"
+name = "mouli-crypto"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-data"
+name = "mouli-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -229,57 +229,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-engine"
+name = "mouli-engine"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-forge"
+name = "mouli-forge"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-gate"
+name = "mouli-gate"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-gateway"
+name = "mouli-gateway"
 version = "0.1.0"
 dependencies = [
- "aeon-interface",
+ "mouli-interface",
 ]
 
 [[package]]
-name = "aeon-gguf"
+name = "mouli-gguf"
 version = "0.1.0"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
-name = "aeon-hosted"
+name = "mouli-hosted"
 version = "0.1.0"
 dependencies = [
- "aeon-gateway",
- "aeon-http",
- "aeon-pki",
+ "mouli-gateway",
+ "mouli-http",
+ "mouli-pki",
 ]
 
 [[package]]
-name = "aeon-http"
+name = "mouli-http"
 version = "0.1.0"
 dependencies = [
- "aeon-pki",
- "aeon-tls",
+ "mouli-pki",
+ "mouli-tls",
 ]
 
 [[package]]
-name = "aeon-hw"
+name = "mouli-hw"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-identity"
+name = "mouli-identity"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
@@ -287,26 +287,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-interface"
+name = "mouli-interface"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-llm"
+name = "mouli-llm"
 version = "0.1.0"
 dependencies = [
- "aeon-engine",
- "aeon-gguf",
- "aeon-quant",
+ "mouli-engine",
+ "mouli-gguf",
+ "mouli-quant",
 ]
 
 [[package]]
-name = "aeon-mail"
+name = "mouli-mail"
 version = "0.1.0"
 dependencies = [
- "aeon-web",
+ "mouli-web",
  "argon2",
  "async-trait",
  "axum",
@@ -325,32 +325,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-memory"
+name = "mouli-memory"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-mesh"
+name = "mouli-mesh"
 version = "0.1.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
-name = "aeon-model"
+name = "mouli-model"
 version = "0.1.0"
 dependencies = [
- "aeon-tensor",
+ "mouli-tensor",
 ]
 
 [[package]]
-name = "aeon-neuro"
+name = "mouli-neuro"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-ops"
+name = "mouli-ops"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
@@ -360,19 +360,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-orchestra"
+name = "mouli-orchestra"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-pki"
+name = "mouli-pki"
 version = "0.1.0"
 dependencies = [
- "aeon-crypto",
+ "mouli-crypto",
  "sha2",
 ]
 
 [[package]]
-name = "aeon-project"
+name = "mouli-project"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -391,41 +391,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-quant"
+name = "mouli-quant"
 version = "0.1.0"
 dependencies = [
- "aeon-gguf",
+ "mouli-gguf",
 ]
 
 [[package]]
-name = "aeon-runtime"
+name = "mouli-runtime"
 version = "0.1.0"
 dependencies = [
- "aeon-cognition",
- "aeon-engine",
+ "mouli-cognition",
+ "mouli-engine",
 ]
 
 [[package]]
-name = "aeon-sched"
+name = "mouli-sched"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-sheet"
+name = "mouli-sheet"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-store"
+name = "mouli-store"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-studio"
+name = "mouli-studio"
 version = "0.1.0"
 dependencies = [
- "aeon-sheet",
+ "mouli-sheet",
 ]
 
 [[package]]
-name = "aeon-system"
+name = "mouli-system"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -439,31 +439,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-tensor"
+name = "mouli-tensor"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-theory"
+name = "mouli-theory"
 version = "0.1.0"
 
 [[package]]
-name = "aeon-tls"
+name = "mouli-tls"
 version = "0.1.0"
 dependencies = [
- "aeon-crypto",
- "aeon-pki",
+ "mouli-crypto",
+ "mouli-pki",
  "sha2",
 ]
 
 [[package]]
-name = "aeon-tokenizer"
+name = "mouli-tokenizer"
 version = "0.1.0"
 dependencies = [
- "aeon-gguf",
+ "mouli-gguf",
 ]
 
 [[package]]
-name = "aeon-topstar"
+name = "mouli-topstar"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -474,7 +474,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-update"
+name = "mouli-update"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
@@ -482,19 +482,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aeon-web"
+name = "mouli-web"
 version = "0.1.0"
 
 [[package]]
-name = "aeond"
+name = "moulid"
 version = "0.1.0"
 dependencies = [
- "aeon-gguf",
- "aeon-hosted",
- "aeon-http",
- "aeon-hw",
- "aeon-interface",
- "aeon-pki",
+ "mouli-gguf",
+ "mouli-hosted",
+ "mouli-http",
+ "mouli-hw",
+ "mouli-interface",
+ "mouli-pki",
  "nix",
 ]
 

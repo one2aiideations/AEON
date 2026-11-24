@@ -1,7 +1,7 @@
 """
 Write a tiny random-weight llama-architecture GGUF (about 1 MB) for boot and CI tests.
 The output is gibberish by design; the test only checks that the full path
-(aeond -> llama-server -> model -> reply) works offline.
+(moulid -> llama-server -> model -> reply) works offline.
 
     python os/tools/make_tiny_gguf.py OUT.gguf [--gguf-py PATH_TO_llama.cpp/gguf-py]
 """
@@ -19,7 +19,7 @@ if a.gguf_py:
     sys.path.insert(0, a.gguf_py)
 import gguf  # noqa: E402
 
-V_WORDS = ["▁the", "▁a", "▁and", "▁model", "▁AEON", "▁is", "▁ready", "▁hello", "▁world", "▁.", "▁answer"]
+V_WORDS = ["▁the", "▁a", "▁and", "▁model", "▁MOULI", "▁is", "▁ready", "▁hello", "▁world", "▁.", "▁answer"]
 tokens = ["<unk>", "<s>", "</s>"] + [f"<0x{i:02X}>" for i in range(256)] + V_WORDS
 types = [2, 3, 3] + [6] * 256 + [1] * len(V_WORDS)   # unknown, control, control, byte..., normal
 scores = [0.0, 0.0, 0.0] + [-1000.0] * 256 + [-float(i) for i in range(len(V_WORDS))]
@@ -30,7 +30,7 @@ def w(*shape):
     return (rng.standard_normal(shape) * 0.05).astype(np.float32)
 
 wr = gguf.GGUFWriter(a.out, "llama")
-wr.add_name("aeon-tiny-test")
+wr.add_name("mouli-tiny-test")
 wr.add_context_length(n_ctx)
 wr.add_embedding_length(n_embd)
 wr.add_block_count(n_layer)

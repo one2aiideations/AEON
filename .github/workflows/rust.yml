@@ -1,4 +1,4 @@
-name: AEON Rust workspace
+name: MOULI Rust workspace
 
 "on":
   push:
@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: aeon-rust-${{ github.ref }}
+  group: mouli-rust-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
