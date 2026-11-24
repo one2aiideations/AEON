@@ -4,6 +4,7 @@
 //! is described from its GGUF header so the picker can show architecture, size and whether it
 //! fits in memory.
 
+use crate::gguf_info::{self, estimate_ram, file_type_name, GgufInfo};
 use aeon_gguf::parse_header_only;
 use std::fs::File;
 use std::io::Read;
@@ -27,6 +28,8 @@ pub struct Found {
     pub arch: Option<String>,
     /// Trained context length when present.
     pub context: Option<u32>,
+    /// What the header says about the model (layers, width, quantisation), when readable.
+    pub gguf: Option<GgufInfo>,
 }
 
 impl Found {
@@ -36,10 +39,27 @@ impl Found {
         self.size.div_ceil(1 << 20)
     }
 
-    /// Whether the file fits the memory budget (megabytes).
+    /// Megabytes of memory needed to run it with a `ctx` token context: the file, the attention
+    /// cache and runtime overhead when the header is understood; the file size alone otherwise.
     #[must_use]
-    pub fn fits(&self, budget_mb: u64) -> bool {
-        self.size_mb() <= budget_mb
+    pub fn needs_mb(&self, ctx: u32) -> u64 {
+        self.gguf.as_ref().map_or_else(
+            || self.size_mb(),
+            |g| estimate_ram(g, self.size, u64::from(ctx)).div_ceil(1 << 20),
+        )
+    }
+
+    /// Whether it fits the memory budget (megabytes) with a `ctx` token context.
+    #[must_use]
+    pub fn fits(&self, budget_mb: u64, ctx: u32) -> bool {
+        self.needs_mb(ctx) <= budget_mb
+    }
+
+    /// The quantisation, for example `Q4_K_M`, when the header says.
+    #[must_use]
+    pub fn quant(&self) -> Option<&'static str> {
+        let name = file_type_name(self.gguf.as_ref()?.file_type?);
+        (name != "unknown").then_some(name)
     }
 }
 
@@ -73,6 +93,7 @@ pub fn describe(path: &Path) -> Option<Found> {
         name,
         arch,
         context,
+        gguf: gguf_info::parse(&head).ok(),
     })
 }
 
@@ -247,9 +268,30 @@ mod tests {
             (f.name.as_str(), f.arch.as_deref(), f.context),
             ("Tiny Test", Some("llama"), Some(2048))
         );
-        assert!(f.size > 16 && f.fits(1) && !f.fits(0));
+        // No layer/width metadata: file size plus the fixed 256 MB runtime overhead.
+        assert!(f.size > 16 && f.needs_mb(2048) == 257 || f.needs_mb(2048) == 256);
+        assert!(f.fits(1000, 2048) && !f.fits(100, 2048));
         std::fs::write(d.join("noname.gguf"), tiny_gguf(None)).unwrap();
         assert_eq!(describe(&d.join("noname.gguf")).unwrap().name, "noname");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn memory_need_grows_with_context_and_names_the_quantisation() {
+        let d = tmp("ram");
+        let mut w = GgufWriter::new();
+        w.add_metadata("general.architecture", Value::String("llama".into()));
+        w.add_metadata("general.file_type", Value::U32(7));
+        w.add_metadata("llama.block_count", Value::U32(32));
+        w.add_metadata("llama.embedding_length", Value::U32(4096));
+        w.add_tensor("t", &[4], GgmlType::F32, vec![0; 16]).unwrap();
+        std::fs::write(d.join("big.gguf"), w.finish().unwrap()).unwrap();
+        let f = describe(&d.join("big.gguf")).unwrap();
+        assert_eq!(f.quant(), Some("Q8_0"));
+        // KV cache: 4 bytes x 32 layers x 4096 wide per token of context = 0.5 MB.
+        let (small, large) = (f.needs_mb(1024), f.needs_mb(4096));
+        assert_eq!(large - small, 1536, "3072 more tokens at 0.5 MB each");
+        assert!(f.fits(large, 4096) && !f.fits(small, 4096));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

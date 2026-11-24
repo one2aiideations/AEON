@@ -52,7 +52,7 @@ pub enum End {
 
 /// Text of the picker.
 #[must_use]
-pub fn render_menu(models: &[Found], budget_mb: u64) -> String {
+pub fn render_menu(models: &[Found], budget_mb: u64, ctx: u32) -> String {
     let mut s = String::from("\n  Choose a model\n  --------------\n");
     if models.is_empty() {
         s.push_str(
@@ -60,19 +60,26 @@ pub fn render_menu(models: &[Found], budget_mb: u64) -> String {
         );
     }
     for (i, m) in models.iter().enumerate() {
-        let fit = if m.fits(budget_mb) {
+        let fit = if m.fits(budget_mb, ctx) {
             "fits in memory"
         } else {
             "TOO BIG for this machine's free memory"
         };
+        let needs = if m.gguf.is_some() {
+            format!(", needs ~{} MB", m.needs_mb(ctx))
+        } else {
+            String::new()
+        };
         s.push_str(&format!(
-            "  {:>2}) {}  [{}{} MB, {}]\n      {}\n",
+            "  {:>2}) {}  [{}{}{} MB{}, {}]\n      {}\n",
             i + 1,
             m.name,
             m.arch
                 .as_deref()
                 .map_or(String::new(), |a| format!("{a}, ")),
+            m.quant().map_or(String::new(), |q| format!("{q}, ")),
             m.size_mb(),
+            needs,
             fit,
             m.path.display()
         ));
@@ -106,10 +113,11 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
 pub fn pick_model<R: BufRead, W: Write>(
     models: &[Found],
     budget_mb: u64,
+    ctx: u32,
     input: &mut R,
     out: &mut W,
 ) -> io::Result<Choice> {
-    write!(out, "{}", render_menu(models, budget_mb))?;
+    write!(out, "{}", render_menu(models, budget_mb, ctx))?;
     loop {
         write!(out, "  > ")?;
         out.flush()?;
@@ -267,6 +275,7 @@ mod tests {
             name: name.into(),
             arch: Some("llama".into()),
             context: None,
+            gguf: None,
         }
     }
 
@@ -302,17 +311,17 @@ mod tests {
 
     #[test]
     fn menu_text() {
-        let m = render_menu(&[model("small", 100), model("huge", 90_000)], 4000);
+        let m = render_menu(&[model("small", 100), model("huge", 90_000)], 4000, 2048);
         assert!(m.contains(" 1) small") && m.contains("fits in memory") && m.contains("TOO BIG"));
         assert!(m.contains("/mnt/sda1/small.gguf"));
-        assert!(render_menu(&[], 0).contains("No models found"));
+        assert!(render_menu(&[], 0, 2048).contains("No models found"));
     }
 
     #[test]
     fn picker_retries_until_valid() {
         let ms = [model("a", 1), model("b", 1)];
         let mut out = Vec::new();
-        let c = pick_model(&ms, 100, &mut "9\nzzz\n2\n".as_bytes(), &mut out).unwrap();
+        let c = pick_model(&ms, 100, 2048, &mut "9\nzzz\n2\n".as_bytes(), &mut out).unwrap();
         assert_eq!(c, Choice::Model(1));
         assert_eq!(
             String::from_utf8(out)
@@ -322,12 +331,12 @@ mod tests {
             2
         );
         assert_eq!(
-            pick_model(&ms, 100, &mut "".as_bytes(), &mut Vec::new()).unwrap(),
+            pick_model(&ms, 100, 2048, &mut "".as_bytes(), &mut Vec::new()).unwrap(),
             Choice::Quit,
             "eof quits"
         );
         assert_eq!(
-            pick_model(&[], 100, &mut "r\n".as_bytes(), &mut Vec::new()).unwrap(),
+            pick_model(&[], 100, 2048, &mut "r\n".as_bytes(), &mut Vec::new()).unwrap(),
             Choice::Rescan
         );
     }

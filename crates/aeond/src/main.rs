@@ -225,7 +225,13 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         let choice = if a.model.is_some() && models.len() == 1 {
             Choice::Model(0)
         } else {
-            match pick_model(&models, plan.model_budget_mb, &mut input, &mut out) {
+            match pick_model(
+                &models,
+                plan.model_budget_mb,
+                plan.ctx,
+                &mut input,
+                &mut out,
+            ) {
                 Ok(c) => c,
                 Err(_) => {
                     sleep(Duration::from_secs(1));
