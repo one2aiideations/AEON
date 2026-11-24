@@ -14,6 +14,14 @@ impl IdGen {
         Self::default()
     }
 
+    /// Makes sure identifiers handed out from now on are newer than `id` (a saved identifier such
+    /// as `apr-000007`), so a restored item can never collide with a new one.
+    pub fn observe(&mut self, id: &str) {
+        if let Some(n) = id.rsplit('-').next().and_then(|d| d.parse::<u64>().ok()) {
+            self.next = self.next.max(n);
+        }
+    }
+
     /// Next identifier with the given prefix.
     pub fn next(&mut self, prefix: &str) -> String {
         self.next += 1;
@@ -24,6 +32,15 @@ impl IdGen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_ids_are_never_reused() {
+        let mut g = IdGen::new();
+        g.observe("apr-000007");
+        g.observe("ses-000003");
+        g.observe("junk");
+        assert_eq!(g.next("apr"), "apr-000008");
+    }
 
     #[test]
     fn ids_are_unique_and_prefixed() {

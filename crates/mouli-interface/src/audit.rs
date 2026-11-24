@@ -45,6 +45,14 @@ impl AuditLog {
         Self::default()
     }
 
+    /// A log holding exactly these records, for loading a saved log. Nothing is checked here:
+    /// call [`AuditLog::verify`] to learn whether the chain is intact, and keep a damaged log
+    /// as it is so the damage stays visible.
+    #[must_use]
+    pub fn from_records(records: Vec<AuditRecord>) -> Self {
+        Self { records }
+    }
+
     /// Append a record and return it.
     pub fn append(
         &mut self,

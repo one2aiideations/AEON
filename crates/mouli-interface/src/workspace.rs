@@ -42,6 +42,28 @@ pub enum Reply {
     },
 }
 
+/// A held call in a form that can be saved and restored: everything needed to run it later,
+/// once someone else approves, including who asked and in which role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCall {
+    /// The approval id.
+    pub id: String,
+    /// The tenant of the requester's session.
+    pub tenant: String,
+    /// Who asked.
+    pub user: String,
+    /// The role the requester was acting in.
+    pub role: String,
+    /// The capability to run.
+    pub capability: String,
+    /// Its arguments.
+    pub args: BTreeMap<String, String>,
+    /// The `key=value` text shown to the approver.
+    pub detail: String,
+    /// When it was asked (logical time).
+    pub tick: u64,
+}
+
 struct Held {
     session: String,
     call: Call,
@@ -381,6 +403,86 @@ impl Workspace {
             .put(name, media_type, bytes, t, &mut self.ids)?;
         self.audit.append(t, &user, "artifact.put", &a.id, "ok");
         Ok(a)
+    }
+
+    /// Loads a saved audit log into an empty workspace and continues its logical clock after it.
+    /// The records are kept exactly as saved, even if the chain is damaged: [`Workspace::audit`]
+    /// then reports the damage through `verify`.
+    ///
+    /// # Errors
+    /// [`Error::Conflict`] when this workspace already has audit records.
+    pub fn load_audit(&mut self, records: Vec<crate::audit::AuditRecord>) -> Result<()> {
+        if !self.audit.records().is_empty() {
+            return Err(Error::Conflict("the audit log is not empty".into()));
+        }
+        self.tick = self
+            .tick
+            .max(records.iter().map(|r| r.tick).max().unwrap_or(0));
+        for r in &records {
+            self.ids.observe(&r.subject);
+        }
+        self.audit = AuditLog::from_records(records);
+        Ok(())
+    }
+
+    /// The calls waiting for approval, in a form that can be saved.
+    #[must_use]
+    pub fn export_pending(&self) -> Vec<PendingCall> {
+        self.approvals
+            .pending()
+            .into_iter()
+            .filter_map(|r| {
+                let held = self.held.get(&r.id)?;
+                let s = self.sessions.get(&held.session)?;
+                Some(PendingCall {
+                    id: r.id.clone(),
+                    tenant: s.tenant.clone(),
+                    user: r.requester.clone(),
+                    role: s.role.clone(),
+                    capability: held.call.capability.clone(),
+                    args: held.call.args.clone(),
+                    detail: r.detail.clone(),
+                    tick: r.tick,
+                })
+            })
+            .collect()
+    }
+
+    /// Puts saved calls back in the queue, still waiting. Each gets a fresh session for its
+    /// requester; the original id is kept, and the restore is audited.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for an unknown role or capability, [`Error::Conflict`] for an id that
+    /// is already queued. Calls before the failing one stay restored.
+    pub fn import_pending(&mut self, calls: Vec<PendingCall>) -> Result<()> {
+        for c in calls {
+            if !self.roles.contains_key(&c.role) {
+                return Err(Error::NotFound(format!("role {}", c.role)));
+            }
+            let spec = self.registry.spec(&c.capability)?.clone();
+            self.approvals
+                .restore(&c.id, &spec.name, &c.user, &c.detail, c.tick)?;
+            self.ids.observe(&c.id);
+            let session = self.ids.next("ses");
+            self.sessions.insert(
+                session.clone(),
+                Session::new(session.clone(), &c.tenant, &c.user, &c.role),
+            );
+            self.held.insert(
+                c.id.clone(),
+                Held {
+                    session,
+                    call: Call {
+                        capability: c.capability,
+                        args: c.args,
+                    },
+                },
+            );
+            let t = self.now();
+            self.audit
+                .append(t, &c.user, "approval.restore", &c.id, "pending approval");
+        }
+        Ok(())
     }
 
     /// Approvals waiting for a decision.
@@ -728,5 +830,78 @@ mod tests {
             .unwrap()
             .outcome
             .starts_with("failed"));
+    }
+
+    /// Builds the same workspace again, as a restart would.
+    fn restarted() -> Workspace {
+        let (w, _s) = ws(false);
+        drop(w);
+        let mut w = Workspace::new(Policy::default(), Limits::default()).unwrap();
+        w.add_role(Permissions::new("member", &["note.*"]));
+        w.add_role(Permissions::new("manager", &["note.*", "approve"]));
+        w.register_app(Box::new(Notes { sent: vec![] })).unwrap();
+        w
+    }
+
+    #[test]
+    fn a_held_call_and_the_audit_chain_survive_a_restart() {
+        let (mut before, s) = ws(false);
+        let held = before.submit(T, &s, "/note.send to=bob").unwrap();
+        let Reply::AwaitingApproval { id } = held else {
+            panic!("expected a held call")
+        };
+        let saved_audit = before.audit().records().to_vec();
+        let saved_pending = before.export_pending();
+        assert_eq!(saved_pending.len(), 1);
+        assert_eq!(saved_pending[0].user, "ann");
+        assert_eq!(saved_pending[0].args["to"], "bob");
+
+        let mut after = restarted();
+        after.load_audit(saved_audit.clone()).unwrap();
+        after.import_pending(saved_pending).unwrap();
+        assert_eq!(after.audit().verify(), Ok(()));
+        assert_eq!(after.pending_approvals().len(), 1);
+        assert_eq!(after.approval_requester(&id), Some("ann"));
+
+        // The requester still cannot approve it; a manager can, and it runs once.
+        assert!(after.decide(T, &id, "ann", "member", true).is_err());
+        let done = after.decide(T, &id, "mia", "manager", true).unwrap();
+        assert!(matches!(done, Reply::Done(_)));
+        assert!(after.pending_approvals().is_empty());
+        assert_eq!(after.audit().verify(), Ok(()));
+        assert!(after.audit().records().len() > saved_audit.len());
+        // New ids never collide with restored ones.
+        let sid = after.open_session(T, "ann", "member").unwrap();
+        let again = after.submit(T, &sid, "/note.send to=carol").unwrap();
+        assert!(matches!(&again, Reply::AwaitingApproval { id: n } if *n != id));
+    }
+
+    #[test]
+    fn a_damaged_saved_log_is_loaded_as_it_is_and_reports_the_damage() {
+        let (mut before, s) = ws(false);
+        before.submit(T, &s, "/note.read").unwrap();
+        let mut records = before.audit().records().to_vec();
+        records[1].outcome = "tampered".into();
+        let mut after = restarted();
+        after.load_audit(records.clone()).unwrap();
+        assert_eq!(after.audit().records(), records.as_slice());
+        assert_eq!(after.audit().verify(), Err(1));
+        assert!(after.load_audit(records).is_err(), "only into an empty log");
+    }
+
+    #[test]
+    fn importing_a_call_for_an_unknown_role_or_capability_fails() {
+        let (mut before, s) = ws(false);
+        before.submit(T, &s, "/note.send to=bob").unwrap();
+        let good = before.export_pending();
+        let mut bad_role = good.clone();
+        bad_role[0].role = "nobody".into();
+        let mut bad_cap = good.clone();
+        bad_cap[0].capability = "ghost.run".into();
+        assert!(restarted().import_pending(bad_role).is_err());
+        assert!(restarted().import_pending(bad_cap).is_err());
+        let mut w = restarted();
+        w.import_pending(good.clone()).unwrap();
+        assert!(w.import_pending(good).is_err(), "the same id twice");
     }
 }

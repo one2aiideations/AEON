@@ -79,6 +79,35 @@ impl ApprovalQueue {
         id
     }
 
+    /// Puts a saved request back as pending, under its original id.
+    ///
+    /// # Errors
+    /// [`Error::Conflict`] when the id is already in the queue.
+    pub fn restore(
+        &mut self,
+        id: &str,
+        action: &str,
+        requester: &str,
+        detail: &str,
+        tick: u64,
+    ) -> Result<()> {
+        if self.items.contains_key(id) {
+            return Err(Error::Conflict(format!("approval {id} already exists")));
+        }
+        self.items.insert(
+            id.to_string(),
+            Request {
+                id: id.to_string(),
+                action: action.into(),
+                requester: requester.into(),
+                detail: detail.into(),
+                tick,
+                status: Status::Pending,
+            },
+        );
+        Ok(())
+    }
+
     /// Record a decision.
     ///
     /// # Errors

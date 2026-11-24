@@ -11,7 +11,7 @@
 pub mod chat;
 pub mod keyfile;
 
-pub use chat::{chat_stream, Provider, Secret};
+pub use chat::{chat_stream, chat_stream_until, Provider, Secret};
 
 /// Why a hosted request failed.
 #[derive(Debug)]

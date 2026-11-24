@@ -100,6 +100,25 @@ pub fn chat_stream(
     max_tokens: u32,
     on_token: &mut dyn FnMut(&str),
 ) -> Result<String, Error> {
+    chat_stream_until(client, provider, turns, max_tokens, &mut |piece| {
+        on_token(piece);
+        true
+    })
+}
+
+/// Like [`chat_stream`], but `on_token` returns whether to keep going. Returning `false` stops
+/// reading at once, closes the connection and returns the text received so far as a normal
+/// result: the caller that asked to stop knows the reply is partial.
+///
+/// # Errors
+/// The same as [`chat_stream`].
+pub fn chat_stream_until(
+    client: &Client,
+    provider: &Provider,
+    turns: &[(&str, &str)],
+    max_tokens: u32,
+    on_token: &mut dyn FnMut(&str) -> bool,
+) -> Result<String, Error> {
     let url = Url::parse(&format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
@@ -142,7 +161,7 @@ pub fn chat_stream(
             .and_then(|m| m.str("content"))
             .ok_or(Error::BadReply("no message in the reply"))?
             .to_string();
-        on_token(&text);
+        let _ = on_token(&text);
         return Ok(text);
     }
     read_events(BufReader::new(&mut resp.body), on_token)
@@ -158,7 +177,7 @@ fn first_choice(v: &Value) -> Option<&Value> {
 /// Read server-sent events until `[DONE]` or a finish reason.
 fn read_events<R: Read>(
     mut r: BufReader<R>,
-    on_token: &mut dyn FnMut(&str),
+    on_token: &mut dyn FnMut(&str) -> bool,
 ) -> Result<String, Error> {
     let mut reply = String::new();
     let mut finished = false;
@@ -199,7 +218,9 @@ fn read_events<R: Read>(
                     return Err(Error::BadReply("the reply is too long"));
                 }
                 reply.push_str(piece);
-                on_token(piece);
+                if !on_token(piece) {
+                    return Ok(reply);
+                }
             }
             if matches!(choice.get("finish_reason"), Some(Value::Str(_))) {
                 finished = true;
@@ -260,7 +281,8 @@ mod tests {
                    data: [DONE]\n\n";
         let mut seen = Vec::new();
         let r = read_events(BufReader::new(sse.as_bytes()), &mut |t| {
-            seen.push(t.to_string())
+            seen.push(t.to_string());
+            true
         })
         .unwrap();
         assert_eq!(r, "Hello é 😀");
@@ -268,21 +290,36 @@ mod tests {
     }
 
     #[test]
+    fn returning_false_stops_reading_and_keeps_the_partial_text() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"one \"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"two \"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n";
+        let mut calls = 0;
+        let r = read_events(BufReader::new(sse.as_bytes()), &mut |_| {
+            calls += 1;
+            calls < 2
+        })
+        .unwrap();
+        assert_eq!(r, "one two ", "stopped after the second piece");
+        assert_eq!(calls, 2, "nothing was read after the stop");
+    }
+
+    #[test]
     fn early_end_and_garbage_are_errors() {
         let cut = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
-        assert!(read_events(BufReader::new(cut.as_bytes()), &mut |_| {}).is_err());
+        assert!(read_events(BufReader::new(cut.as_bytes()), &mut |_| true).is_err());
         let bad = "data: {not json}\n\n";
-        assert!(read_events(BufReader::new(bad.as_bytes()), &mut |_| {}).is_err());
+        assert!(read_events(BufReader::new(bad.as_bytes()), &mut |_| true).is_err());
         let err = "data: {\"error\":{\"message\":\"overloaded\"}}\n\n";
         assert!(matches!(
-            read_events(BufReader::new(err.as_bytes()), &mut |_| {}),
+            read_events(BufReader::new(err.as_bytes()), &mut |_| true),
             Err(Error::Api { .. })
         ));
         // finish_reason without [DONE] is accepted
         let ok =
             "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n";
         assert_eq!(
-            read_events(BufReader::new(ok.as_bytes()), &mut |_| {}).unwrap(),
+            read_events(BufReader::new(ok.as_bytes()), &mut |_| true).unwrap(),
             "x"
         );
     }
