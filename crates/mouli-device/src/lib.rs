@@ -54,6 +54,13 @@ pub struct Device<B: Backend> {
     session: String,
     patch: patch::PatchSlot,
     apps: Option<Apps>,
+    store: Option<AppStore>,
+}
+
+/// Where the applications are saved, and what was last written there.
+struct AppStore {
+    dir: std::path::PathBuf,
+    saved: (String, String),
 }
 
 impl<B: Backend> Device<B> {
@@ -79,6 +86,7 @@ impl<B: Backend> Device<B> {
             session,
             patch: patch::PatchSlot::default(),
             apps: None,
+            store: None,
         };
         d.refresh();
         Ok(d)
@@ -89,6 +97,53 @@ impl<B: Backend> Device<B> {
     pub fn attach_apps(&mut self, apps: Apps) {
         self.apps = Some(apps);
         self.refresh();
+    }
+
+    /// Keeps the applications' data in `dir`: loads what is there now, then saves after every
+    /// change. Call after [`Device::attach_apps`].
+    ///
+    /// # Errors
+    /// A message when no applications are attached, or a saved file is damaged (nothing is
+    /// changed and nothing will be overwritten until it is fixed or removed).
+    pub fn keep_apps_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let apps = self
+            .apps
+            .as_ref()
+            .ok_or("no applications are attached")?
+            .clone();
+        apps.load(dir)?;
+        let saved = (
+            mouli_apps::workbook_text(&apps.book.borrow()),
+            apps.doc.borrow().to_container(),
+        );
+        self.store = Some(AppStore {
+            dir: dir.to_path_buf(),
+            saved,
+        });
+        self.refresh();
+        Ok(())
+    }
+
+    /// Writes the applications' data if it changed since the last save.
+    fn save_apps(&mut self) {
+        let (Some(apps), Some(store)) = (&self.apps, &mut self.store) else {
+            return;
+        };
+        let now = (
+            mouli_apps::workbook_text(&apps.book.borrow()),
+            apps.doc.borrow().to_container(),
+        );
+        if now == store.saved {
+            return;
+        }
+        match apps.save(&store.dir) {
+            Ok(()) => store.saved = now,
+            Err(e) => {
+                let msg = format!("Could not save: {e}");
+                self.shell.sheet.message = msg.clone();
+                self.shell.studio.message = msg;
+            }
+        }
     }
 
     /// The workspace (read-only), for status lines and tests.
@@ -296,6 +351,7 @@ impl<B: Backend> Device<B> {
 
         let (score, findings) = security::assess(&self.ws);
         self.shell.security.set(score, findings);
+        self.save_apps();
         self.refresh_apps();
     }
 

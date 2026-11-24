@@ -601,3 +601,71 @@ fn the_applications_are_also_callable_from_the_chat_with_the_same_results() {
         "a chat call also updates the screen"
     );
 }
+
+// ---------------------------------------------------------------- saving
+
+fn data_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("mouli-device-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+fn edits_are_saved_as_they_are_made_and_found_again_after_a_restart() {
+    let dir = data_dir("restart");
+    {
+        let (mut d, _apps) = device_with_apps("owner", "owner");
+        d.keep_apps_in(&dir).unwrap();
+        d.on_key(Key::F(7));
+        type_keys(&mut d, "21");
+        d.on_key(Key::Enter);
+        d.on_key(Key::Down);
+        type_keys(&mut d, "=A1*2");
+        d.on_key(Key::Enter);
+    }
+    // A new device, new workspace, new applications: only the directory carries over.
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    assert_eq!(apps.book.borrow().get_raw(0, 0, 0), None);
+    d.keep_apps_in(&dir).unwrap();
+    assert_eq!(apps.book.borrow().get_raw(0, 1, 0), Some("=A1*2"));
+    d.on_key(Key::F(7));
+    assert_eq!(d.shell.sheet.cells[&(1, 0)].shown, "42");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_edit_is_not_saved() {
+    let dir = data_dir("refused");
+    let (mut d, _apps) = device_with_apps("viewer", "viewer");
+    d.keep_apps_in(&dir).unwrap();
+    d.on_key(Key::F(7));
+    type_keys(&mut d, "99");
+    d.on_key(Key::Enter);
+    let text = std::fs::read_to_string(dir.join("sheet.mouli")).unwrap_or_default();
+    assert!(!text.contains("99"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_damaged_saved_file_is_reported_and_never_overwritten() {
+    let dir = data_dir("damaged");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sheet.mouli"), "not a sheet").unwrap();
+    let (mut d, _apps) = device_with_apps("owner", "owner");
+    assert!(d.keep_apps_in(&dir).is_err());
+    d.on_key(Key::F(7));
+    type_keys(&mut d, "5");
+    d.on_key(Key::Enter);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("sheet.mouli")).unwrap(),
+        "not a sheet"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn keeping_apps_without_attaching_them_is_an_error() {
+    let (ws, _apps) = app_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert!(d.keep_apps_in(&data_dir("none")).is_err());
+}

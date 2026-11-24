@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod sheet;
+mod store;
 mod studio;
 
 use mouli_interface::{Result, Workspace};
@@ -14,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub use sheet::{range_text, SharedBook, SheetApp};
+pub use store::{parse_workbook, workbook_text};
 pub use studio::{SharedDoc, StudioApp};
 
 /// The state of the applications, shared with the screens.
