@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod backoff;
 pub mod civil_time;
 pub mod context;
 pub mod fslabel;
