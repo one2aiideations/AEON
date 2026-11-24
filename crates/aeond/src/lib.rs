@@ -29,6 +29,7 @@ pub mod http;
 pub mod models;
 pub mod net;
 pub mod persist;
+pub mod sntp;
 pub mod system;
 pub mod ui;
 pub mod wifi;
