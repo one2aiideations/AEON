@@ -230,6 +230,24 @@ impl Crm {
         &self.audit
     }
 
+    /// The leads of the caller's tenant, oldest first. Not audited: it only reads.
+    #[must_use]
+    pub fn leads_of(&self, ctx: &Ctx) -> Vec<&Lead> {
+        self.leads
+            .values()
+            .filter(|l| l.tenant == ctx.tenant)
+            .collect()
+    }
+
+    /// The opportunities of the caller's tenant. Not audited: it only reads.
+    #[must_use]
+    pub fn opportunities_of(&self, ctx: &Ctx) -> Vec<&Opportunity> {
+        self.opps
+            .values()
+            .filter(|o| o.tenant == ctx.tenant)
+            .collect()
+    }
+
     pub(crate) fn next_id(&mut self, prefix: &str) -> String {
         self.seq += 1;
         format!("{prefix}-{}", self.seq)

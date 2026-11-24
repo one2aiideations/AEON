@@ -6,6 +6,7 @@
 //! their state in a shared handle so the screens can draw it.
 #![forbid(unsafe_code)]
 
+mod crm;
 mod sheet;
 mod store;
 mod studio;
@@ -14,6 +15,7 @@ use mouli_interface::{Result, Workspace};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+pub use crm::{Clock, CrmApp, SharedCrm};
 pub use sheet::{range_text, SharedBook, SheetApp};
 pub use store::{parse_workbook, workbook_text};
 pub use studio::{SharedDoc, StudioApp};
@@ -39,4 +41,15 @@ pub fn register(ws: &mut Workspace) -> Result<Apps> {
     ws.register_app(Box::new(SheetApp::new(apps.book.clone())))?;
     ws.register_app(Box::new(StudioApp::new(apps.doc.clone())))?;
     Ok(apps)
+}
+
+/// Creates the CRM for `tenant` and registers it with `ws`. `clock` gives the time in unix
+/// seconds (the system clock on a device, a fixed value in tests).
+///
+/// # Errors
+/// The registry's error when a capability name is taken.
+pub fn register_crm(ws: &mut Workspace, tenant: &str, clock: Clock) -> Result<SharedCrm> {
+    let crm = CrmApp::new_crm();
+    ws.register_app(Box::new(CrmApp::new(crm.clone(), tenant, clock)))?;
+    Ok(crm)
 }
