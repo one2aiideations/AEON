@@ -2871,6 +2871,14 @@ name = "mouli-sheet"
 version = "0.1.0"
 
 [[package]]
+name = "mouli-shell"
+version = "0.1.0"
+dependencies = [
+ "mouli-screen",
+ "nix",
+]
+
+[[package]]
 name = "mouli-store"
 version = "0.1.0"
 
