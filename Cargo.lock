@@ -2577,6 +2577,7 @@ dependencies = [
 name = "mouli-apps"
 version = "0.1.0"
 dependencies = [
+ "mouli-crm",
  "mouli-interface",
  "mouli-sheet",
  "mouli-studio",
