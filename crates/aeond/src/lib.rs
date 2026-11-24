@@ -26,6 +26,7 @@ pub mod args;
 pub mod backoff;
 pub mod civil_time;
 pub mod context;
+pub mod download_plan;
 pub mod fslabel;
 pub mod gguf_info;
 pub mod hosted;
