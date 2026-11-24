@@ -474,6 +474,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-update"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
 name = "aeon-web"
 version = "0.1.0"
 
