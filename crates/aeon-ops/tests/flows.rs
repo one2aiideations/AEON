@@ -128,8 +128,15 @@ fn sales_flow_quote_to_cash_with_fifo_cogs() {
         unit_price_minor: 10_000,
         tax_bps: 1000,
     };
-    let order =
-        sales::create_sales_order(&c, &admin(), &cust, &[line.clone()], Some("so-1"), now).unwrap();
+    let order = sales::create_sales_order(
+        &c,
+        &admin(),
+        &cust,
+        std::slice::from_ref(&line),
+        Some("so-1"),
+        now,
+    )
+    .unwrap();
     let again = sales::create_sales_order(&c, &admin(), &cust, &[line], Some("so-1"), now).unwrap();
     assert_eq!(
         order, again,
