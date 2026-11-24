@@ -350,6 +350,16 @@ name = "aeon-neuro"
 version = "0.1.0"
 
 [[package]]
+name = "aeon-ops"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "aeon-orchestra"
 version = "0.1.0"
 
