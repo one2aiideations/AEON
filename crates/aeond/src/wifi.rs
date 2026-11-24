@@ -258,7 +258,9 @@ fn conf_path<R: Runner>(r: &R, iface: &str) -> String {
 /// # Errors
 /// A message when the supplicant cannot start.
 pub fn start<R: Runner>(r: &mut R, iface: &str) -> Result<(), String> {
-    if r.run("wpa_cli", &["-i", iface, "status"]).is_some() {
+    if r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "status"])
+        .is_some()
+    {
         return Ok(());
     }
     let conf = conf_path(r, iface);
@@ -276,18 +278,28 @@ pub fn start<R: Runner>(r: &mut R, iface: &str) -> Result<(), String> {
             &conf,
             "-D",
             "nl80211",
+            "-f",
+            &format!("{}/wpa_supplicant-{iface}.log", r.conf_dir()),
             "-P",
             &format!("{}/wpa_supplicant-{iface}.pid", r.conf_dir()),
         ],
     )
     .ok_or("wpa_supplicant did not start (is the adapter's firmware present?)")?;
     for _ in 0..20 {
-        if r.run("wpa_cli", &["-i", iface, "status"]).is_some() {
+        if r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "status"])
+            .is_some()
+        {
             return Ok(());
         }
         r.pause(Duration::from_millis(250));
     }
-    Err("wpa_supplicant started but does not answer".into())
+    let log = fs::read_to_string(format!("{}/wpa_supplicant-{iface}.log", r.conf_dir()))
+        .unwrap_or_default();
+    let tail: Vec<&str> = log.lines().rev().take(3).collect();
+    Err(format!(
+        "wpa_supplicant started but does not answer ({})",
+        tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+    ))
 }
 
 /// Scan and list networks, retrying while the adapter wakes up.
@@ -297,9 +309,9 @@ pub fn start<R: Runner>(r: &mut R, iface: &str) -> Result<(), String> {
 pub fn scan<R: Runner>(r: &mut R, iface: &str, attempts: u32) -> Result<Vec<Network>, String> {
     start(r, iface)?;
     for _ in 0..attempts {
-        let _ = r.run("wpa_cli", &["-i", iface, "scan"]);
+        let _ = r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "scan"]);
         r.pause(Duration::from_secs(3));
-        if let Some(t) = r.run("wpa_cli", &["-i", iface, "scan_results"]) {
+        if let Some(t) = r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "scan_results"]) {
             let nets = parse_scan(&t);
             if !nets.is_empty() {
                 return Ok(nets);
@@ -324,11 +336,11 @@ pub fn join<R: Runner>(
     let conf = conf_path(r, iface);
     write_private(Path::new(&conf), &config_text(Some(ssid), passphrase)?)
         .map_err(|e| format!("cannot write {conf}: {e}"))?;
-    r.run("wpa_cli", &["-i", iface, "reconfigure"])
+    r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "reconfigure"])
         .ok_or("the supplicant did not accept the settings")?;
     for _ in 0..wait_secs.saturating_mul(2) {
         r.pause(Duration::from_millis(500));
-        if r.run("wpa_cli", &["-i", iface, "status"])
+        if r.run("wpa_cli", &["-p", CTRL_DIR, "-i", iface, "status"])
             .is_some_and(|s| s.lines().any(|l| l == "wpa_state=COMPLETED"))
         {
             return Ok(());
@@ -654,7 +666,10 @@ mod tests {
                 0o600
             );
         }
-        assert!(f.log.iter().any(|l| l == "wpa_cli -i wlan0 reconfigure"));
+        assert!(f
+            .log
+            .iter()
+            .any(|l| l == "wpa_cli -p /run/wpa_supplicant -i wlan0 reconfigure"));
         let _ = fs::remove_dir_all(&f.dir);
     }
 
