@@ -392,3 +392,212 @@ fn bad_diffs_and_misfits_are_reported_without_touching_anything() {
     let escape = "--- a/../../etc/passwd\n+++ b/../../etc/passwd\n@@ -1 +1 @@\n-a\n+b\n";
     assert!(d.propose_patch(dir.path(), escape).is_err());
 }
+
+// ---------------------------------------------------------------- applications
+
+fn app_workspace() -> (Workspace, mouli_apps::Apps) {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_role(Permissions::new("clerk", &["sheet.*", "studio.*"]));
+    ws.add_role(Permissions::new(
+        "viewer",
+        &["sheet.get", "sheet.show", "sheet.list"],
+    ));
+    ws.add_model(model());
+    let apps = mouli_apps::register(&mut ws).unwrap();
+    (ws, apps)
+}
+
+fn device_with_apps(user: &str, role: &str) -> (Device<Echo>, mouli_apps::Apps) {
+    let (ws, apps) = app_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", user, role).unwrap();
+    d.attach_apps(apps.clone());
+    (d, apps)
+}
+
+fn type_keys(d: &mut Device<Echo>, s: &str) {
+    for c in s.chars() {
+        d.on_key(Key::Char(c));
+    }
+}
+
+#[test]
+fn editing_a_cell_goes_through_the_gate_and_the_screen_shows_the_result() {
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(7)); // Sheet
+    type_keys(&mut d, "10");
+    d.on_key(Key::Enter);
+    d.on_key(Key::Down);
+    type_keys(&mut d, "32");
+    d.on_key(Key::Enter);
+    d.on_key(Key::Down);
+    type_keys(&mut d, "=A1+A2");
+    d.on_key(Key::Enter);
+    assert_eq!(apps.book.borrow().get_raw(0, 2, 0), Some("=A1+A2"));
+    let cells = &d.shell.sheet.cells;
+    assert_eq!(cells[&(0, 0)].shown, "10");
+    assert_eq!(cells[&(2, 0)].shown, "42", "the formula was calculated");
+    assert_eq!(cells[&(2, 0)].raw, "=A1+A2");
+    let sets = d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .filter(|r| r.action == "sheet.set" && r.outcome == "ok")
+        .count();
+    assert_eq!(sets, 3, "each edit is in the audit chain");
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+    // Changing an input recalculates the formula on screen.
+    d.on_key(Key::Up);
+    d.on_key(Key::Up);
+    type_keys(&mut d, "20");
+    d.on_key(Key::Enter);
+    assert_eq!(d.shell.sheet.cells[&(2, 0)].shown, "52");
+}
+
+#[test]
+fn a_value_with_quotes_and_spaces_is_stored_exactly_because_the_call_is_structured() {
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(7));
+    type_keys(&mut d, "he said \"hi\" = x");
+    d.on_key(Key::Enter);
+    assert_eq!(
+        apps.book.borrow().get_raw(0, 0, 0),
+        Some("he said \"hi\" = x")
+    );
+}
+
+#[test]
+fn clearing_a_range_needs_a_second_person_and_then_updates_the_screen() {
+    let (mut ws, apps) = app_workspace();
+    // Alice (a clerk) fills two cells and asks to clear them: the clear is held.
+    let alice = ws.open_session("acme", "alice", "clerk").unwrap();
+    ws.submit("acme", &alice, "/sheet.set cell=A1 value=1")
+        .unwrap();
+    ws.submit("acme", &alice, "/sheet.set cell=A2 value=2")
+        .unwrap();
+    let held = ws
+        .submit("acme", &alice, "/sheet.clear range=A1:A2")
+        .unwrap();
+    assert!(matches!(
+        held,
+        mouli_interface::Reply::AwaitingApproval { .. }
+    ));
+    assert_eq!(
+        apps.book.borrow().sheets[0].cells.len(),
+        2,
+        "nothing is erased while held"
+    );
+
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.attach_apps(apps.clone());
+    assert_eq!(d.shell.sheet.cells.len(), 2);
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert_eq!(d.shell.approvals.rows[0].capability, "sheet.clear");
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert!(
+        apps.book.borrow().sheets[0].cells.is_empty(),
+        "approved: erased"
+    );
+    assert!(d.shell.sheet.cells.is_empty(), "and the screen follows");
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "approve" && r.outcome == "approved"));
+}
+
+#[test]
+fn a_clear_asked_for_from_the_chat_by_the_owner_waits_for_someone_else() {
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/sheet.set cell=B2 value=5");
+    type_line(&mut d, "/sheet.clear range=A1:C3");
+    assert_eq!(
+        apps.book.borrow().get_raw(0, 1, 1),
+        Some("5"),
+        "not erased: held"
+    );
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert!(
+        !d.shell.approvals.rows[0].can_decide,
+        "the owner cannot approve their own request"
+    );
+}
+
+#[test]
+fn a_role_without_permission_cannot_edit_and_is_told_why() {
+    let (mut d, apps) = device_with_apps("vic", "viewer");
+    d.on_key(Key::F(7));
+    type_keys(&mut d, "99");
+    d.on_key(Key::Enter);
+    assert!(apps.book.borrow().sheets[0].cells.is_empty());
+    assert!(
+        d.shell.sheet.message.contains("lacks permission sheet.set"),
+        "{}",
+        d.shell.sheet.message
+    );
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "sheet.set" && r.outcome.starts_with("denied")));
+    assert!(d.shell.security.findings.iter().any(|f| f.id == "denied"));
+}
+
+#[test]
+fn a_bad_formula_is_shown_as_an_error_value_and_a_bad_cell_name_cannot_happen_from_the_screen() {
+    let (mut d, _apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(7));
+    type_keys(&mut d, "=1/0");
+    d.on_key(Key::Enter);
+    assert!(d.shell.sheet.cells[&(0, 0)].shown.starts_with('#'));
+    assert!(
+        d.shell.sheet.message.is_empty(),
+        "an error value is not a failed call"
+    );
+}
+
+#[test]
+fn studio_blocks_are_added_from_the_screen_and_shown() {
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(8));
+    type_keys(&mut d, "# Plan");
+    d.on_key(Key::Enter);
+    type_keys(&mut d, "First step.");
+    d.on_key(Key::Enter);
+    assert_eq!(apps.doc.borrow().blocks.len(), 2);
+    assert_eq!(d.shell.studio.blocks.len(), 2);
+    assert!(d.shell.studio.blocks[0].heading && d.shell.studio.blocks[0].text == "Plan");
+    assert!(!d.shell.studio.blocks[1].heading);
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "studio.heading"));
+}
+
+#[test]
+fn the_applications_are_also_callable_from_the_chat_with_the_same_results() {
+    let (mut d, apps) = device_with_apps("owner", "owner");
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/sheet.set cell=A1 value=7");
+    type_line(&mut d, "/sheet.get cell=A1");
+    let last = chat_texts(&d)
+        .into_iter()
+        .rev()
+        .find(|(r, _)| *r == Role::Tool)
+        .unwrap()
+        .1;
+    assert!(last.contains("A1 = 7"), "{last}");
+    assert_eq!(apps.book.borrow().get_raw(0, 0, 0), Some("7"));
+    assert_eq!(
+        d.shell.sheet.cells[&(0, 0)].shown,
+        "7",
+        "a chat call also updates the screen"
+    );
+}

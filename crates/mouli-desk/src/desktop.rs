@@ -14,7 +14,7 @@ use mouli_screen::shell::Shell;
 /// How close together two clicks must be, in milliseconds, to count as a double click.
 pub const DOUBLE_CLICK_MS: u64 = 500;
 /// Spacing of the desktop icons.
-pub const ICON_CELL: i32 = 84;
+pub const ICON_CELL: i32 = 76;
 
 /// A dialog box with a message and an OK button.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +98,14 @@ impl Desktop {
                 label: "Review",
                 tab: Some(Tab::Review),
             },
+            IconSpot {
+                label: "Sheet",
+                tab: Some(Tab::Sheet),
+            },
+            IconSpot {
+                label: "Studio",
+                tab: Some(Tab::Studio),
+            },
         ];
         Self {
             width,
@@ -174,7 +182,7 @@ impl Desktop {
             }
             Command::Help => {
                 self.show_alert(&[
-                    "F1 to F6   open a window",
+                    "F1 to F8   open a window",
                     "Ctrl-N     new conversation",
                     "Ctrl-W     close the window",
                     "Ctrl-Q     shut down",
@@ -239,7 +247,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=6) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
+            Key::F(n @ 1..=8) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
             _ => None,
         };
         if let Some(cmd) = command {

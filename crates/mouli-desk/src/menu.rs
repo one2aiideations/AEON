@@ -125,6 +125,8 @@ impl MenuBar {
                         item("Audit", "F4", Command::Open(Tab::Audit)),
                         item("Security", "F5", Command::Open(Tab::Security)),
                         item("Code Review", "F6", Command::Open(Tab::Review)),
+                        item("Sheet", "F7", Command::Open(Tab::Sheet)),
+                        item("Studio", "F8", Command::Open(Tab::Studio)),
                     ],
                 },
                 Menu {

@@ -189,6 +189,43 @@ impl Workspace {
         self.run(session, &user, &role, call, None)
     }
 
+    /// Runs one capability with structured arguments, through the same gate as [`Workspace::submit`]
+    /// (policy, approval, audit), without building and parsing a text command. A screen that edits
+    /// a cell uses this so a value containing quotes or spaces cannot change what is run.
+    ///
+    /// # Errors
+    /// As for [`Workspace::submit`]; [`Error::Invalid`] for a blank capability name.
+    pub fn call(
+        &mut self,
+        tenant: &str,
+        session: &str,
+        capability: &str,
+        args: BTreeMap<String, String>,
+    ) -> Result<Reply> {
+        if capability.trim().is_empty() {
+            return Err(Error::Invalid("capability name is empty".into()));
+        }
+        let (user, role) = {
+            let s = self.session(tenant, session)?;
+            (s.user.clone(), s.role.clone())
+        };
+        let detail = args
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (t, ids) = (self.now(), &mut self.ids);
+        self.sessions
+            .get_mut(session)
+            .ok_or_else(|| Error::NotFound(format!("session {session}")))?
+            .add(Role::User, &format!("/{capability} {detail}"), t, ids)?;
+        let call = Call {
+            capability: capability.to_string(),
+            args,
+        };
+        self.run(session, &user, &role, call, None)
+    }
+
     fn chat(&mut self, user: &str, text: &str) -> Result<Reply> {
         let mut needs = Needs::default();
         needs.caps.insert("text".into());

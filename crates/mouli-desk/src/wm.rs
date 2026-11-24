@@ -467,10 +467,10 @@ mod tests {
     }
 
     #[test]
-    fn tiling_does_not_overlap_and_cascade_keeps_title_bars_visible() {
+    fn tiling_a_few_windows_does_not_overlap() {
         let mut m = wm();
-        for t in Tab::ALL {
-            m.open(t);
+        for t in &Tab::ALL[..4] {
+            m.open(*t);
         }
         m.tile();
         for (i, a) in m.windows.iter().enumerate() {
@@ -484,6 +484,21 @@ mod tests {
                 );
             }
         }
+        assert!(m
+            .windows
+            .iter()
+            .all(|w| w.outer().right() <= 1024 && w.outer().bottom() <= 768));
+    }
+
+    #[test]
+    fn too_many_windows_to_tile_are_cascaded_with_every_title_bar_visible() {
+        let mut m = wm();
+        for t in Tab::ALL {
+            m.open(t);
+        }
+        m.tile(); // eight windows cannot all be shown at their minimum size
+        let ys: Vec<i32> = m.windows.iter().map(|w| w.y).collect();
+        assert!(ys.windows(2).all(|p| p[1] > p[0]), "cascaded: {ys:?}");
         m.cascade();
         let ys: Vec<i32> = m.windows.iter().map(|w| w.y).collect();
         assert!(ys.windows(2).all(|p| p[1] > p[0]));

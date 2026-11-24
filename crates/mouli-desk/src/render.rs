@@ -152,6 +152,8 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Audit) => &AUDIT,
             Some(Tab::Security) => &SECURITY,
             Some(Tab::Review) => &REVIEW,
+            Some(Tab::Sheet) => &SHEET,
+            Some(Tab::Studio) => &STUDIO,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;

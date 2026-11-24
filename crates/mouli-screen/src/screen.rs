@@ -37,6 +37,13 @@ pub enum Action {
     },
     /// Choose another user to work as.
     SwitchUser,
+    /// Run a capability with these arguments, through the governed gate.
+    Call {
+        /// The capability, for example `sheet.set`.
+        capability: String,
+        /// Its arguments, as name and value.
+        args: Vec<(String, String)>,
+    },
     /// Run a fresh security scan.
     RefreshSecurity,
     /// Apply the patch under review.
@@ -62,17 +69,23 @@ pub enum Tab {
     Security,
     /// Reviewing a proposed code change.
     Review,
+    /// The spreadsheet.
+    Sheet,
+    /// The document editor.
+    Studio,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
         Tab::Audit,
         Tab::Security,
         Tab::Review,
+        Tab::Sheet,
+        Tab::Studio,
     ];
 
     /// The name shown in the tab bar.
@@ -84,10 +97,12 @@ impl Tab {
             Tab::Audit => "Audit",
             Tab::Security => "Security",
             Tab::Review => "Review",
+            Tab::Sheet => "Sheet",
+            Tab::Studio => "Studio",
         }
     }
 
-    /// The function key that opens it (F1 to F6).
+    /// The function key that opens it (F1 to F8).
     pub const fn key(self) -> Key {
         Key::F(self as u8 + 1)
     }
@@ -167,10 +182,20 @@ mod tests {
     fn tabs_map_to_function_keys() {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
-        assert_eq!(Tab::ALL.len(), 6);
+        assert_eq!(Tab::Studio.key(), Key::F(8));
+        assert_eq!(Tab::ALL.len(), 8);
         assert_eq!(
             Tab::ALL.iter().map(|t| t.label()).collect::<Vec<_>>(),
-            vec!["Chat", "Models", "Approvals", "Audit", "Security", "Review"]
+            vec![
+                "Chat",
+                "Models",
+                "Approvals",
+                "Audit",
+                "Security",
+                "Review",
+                "Sheet",
+                "Studio"
+            ]
         );
     }
 

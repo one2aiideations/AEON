@@ -4,7 +4,7 @@ A classic desktop for the MOULI device (windows, menu bar, icons, pointer) drawn
 a pixel canvas: no windowing system, no GPU. Look and feel follow Google's Material Design: dark
 surfaces that lighten with elevation, soft shadows, Roboto text, and the Material colour palette.
 
-- **Windows** with title bars, close and zoom controls, a grow handle and a hint strip. A window shows one of the six MOULI screens, unchanged, drawn in Roboto Mono at 10 by 22 pixels per cell, so windows resize in whole cells.
+- **Windows** with title bars, close and zoom controls, a grow handle and a hint strip. A window shows one of the eight MOULI screens, unchanged, drawn in Roboto Mono at 10 by 22 pixels per cell, so windows resize in whole cells.
 - **Menu bar** (MOULI, File, Edit, View, Window, Help) with pull-down menus, shortcuts, greyed-out items, and press-drag-release selection.
 - **Desktop icons** (double click to open), an **About** box and a **Help** box (modal), a pixel-art **pointer**. Pixel-art icons are still a placeholder for proper vector icons.
 - **Window manager**: front window gets the keys, dragging cannot lose a title bar, zoom restores exactly, tile never overlaps (it cascades when the windows cannot fit).

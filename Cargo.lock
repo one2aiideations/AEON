@@ -2574,6 +2574,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-apps"
+version = "0.1.0"
+dependencies = [
+ "mouli-interface",
+ "mouli-sheet",
+ "mouli-studio",
+]
+
+[[package]]
 name = "mouli-auth"
 version = "0.1.0"
 dependencies = [
@@ -2680,9 +2689,12 @@ dependencies = [
 name = "mouli-device"
 version = "0.1.0"
 dependencies = [
+ "mouli-apps",
  "mouli-code",
+ "mouli-desk",
  "mouli-interface",
  "mouli-screen",
+ "mouli-studio",
  "tempfile",
 ]
 

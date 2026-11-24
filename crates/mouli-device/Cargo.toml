@@ -10,9 +10,12 @@ description = "MOULI-DEVICE: the controller that connects the on-device screens 
 mouli-screen = { path = "../mouli-screen" }
 mouli-interface = { path = "../mouli-interface" }
 mouli-code = { path = "../mouli-code" }
+mouli-apps = { path = "../mouli-apps" }
+mouli-studio = { path = "../mouli-studio" }
 
 [dev-dependencies]
 tempfile = "3"
+mouli-desk = { path = "../mouli-desk" }
 
 [lints]
 workspace = true

@@ -3,7 +3,9 @@
 use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
-use crate::screens::{Approvals, Audit, Chat, ModelPicker, Review, SecurityScreen};
+use crate::screens::{
+    Approvals, Audit, Chat, ModelPicker, Review, SecurityScreen, SheetScreen, StudioScreen,
+};
 
 /// The whole interface.
 #[derive(Debug, Clone)]
@@ -20,6 +22,10 @@ pub struct Shell {
     pub security: SecurityScreen,
     /// The code change under review.
     pub review: Review,
+    /// The spreadsheet.
+    pub sheet: SheetScreen,
+    /// The document editor.
+    pub studio: StudioScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -35,6 +41,8 @@ impl Default for Shell {
             audit: Audit::default(),
             security: SecurityScreen::default(),
             review: Review::default(),
+            sheet: SheetScreen::default(),
+            studio: StudioScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -56,6 +64,8 @@ impl Shell {
             Tab::Audit => &self.audit,
             Tab::Security => &self.security,
             Tab::Review => &self.review,
+            Tab::Sheet => &self.sheet,
+            Tab::Studio => &self.studio,
         }
     }
 
@@ -68,6 +78,8 @@ impl Shell {
             Tab::Audit => &mut self.audit,
             Tab::Security => &mut self.security,
             Tab::Review => &mut self.review,
+            Tab::Sheet => &mut self.sheet,
+            Tab::Studio => &mut self.studio,
         }
     }
 
@@ -106,9 +118,21 @@ impl Shell {
         grid.fill(Rect::new(0, 0, area.w, 1), theme::PANEL);
         grid.text(1, 0, "MOULI", theme::ACCENT, theme::PANEL);
         let mut x = 8;
+        // When every full name does not fit, only the active tab keeps its name; the others show
+        // just their function key, so every screen stays reachable.
+        let full_width: usize = 8 + Tab::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!(" F{} {} ", i + 1, t.label()).chars().count())
+            .sum::<usize>();
+        let compact = full_width + 1 > area.w;
         for (i, tab) in Tab::ALL.iter().enumerate() {
-            let label = format!(" F{} {} ", i + 1, tab.label());
             let on = *tab == self.active;
+            let label = if compact && !on {
+                format!(" F{} ", i + 1)
+            } else {
+                format!(" F{} {} ", i + 1, tab.label())
+            };
             let (fg, bg) = if on {
                 (theme::BG, theme::ACCENT)
             } else {
@@ -169,7 +193,7 @@ mod tests {
     fn the_header_lists_every_screen_and_the_footer_shows_hints() {
         let mut s = Shell::new();
         s.status = "wlan0 connected".into();
-        let t = drawn(&s, 100, 20);
+        let t = drawn(&s, 120, 20);
         let header = t.lines().next().unwrap();
         for tab in Tab::ALL {
             assert!(header.contains(tab.label()), "{header}");
@@ -181,7 +205,7 @@ mod tests {
         let footer = t.lines().nth(19).unwrap();
         assert!(footer.contains("Enter load"), "{footer}");
         s.on_key(Key::F(1));
-        assert!(drawn(&s, 100, 20)
+        assert!(drawn(&s, 120, 20)
             .lines()
             .nth(19)
             .unwrap()
@@ -189,27 +213,40 @@ mod tests {
     }
 
     #[test]
-    fn all_six_tabs_fit_an_80_column_screen() {
-        let t = drawn(&Shell::new(), 80, 20);
+    fn every_tab_stays_reachable_on_an_80_column_screen() {
+        let mut sh = Shell::new();
+        let t = drawn(&sh, 80, 20);
         let header = t.lines().next().unwrap();
-        assert!(header.trim_end().ends_with("F6 Review"), "{header}");
+        for n in 1..=8 {
+            assert!(header.contains(&format!("F{n}")), "F{n} missing: {header}");
+        }
+        assert!(
+            header.contains("F2 Models"),
+            "the active tab keeps its name: {header}"
+        );
         assert!(header.chars().count() <= 80);
+        sh.on_key(Key::F(8));
+        let header = drawn(&sh, 80, 20).lines().next().unwrap().to_string();
+        assert!(
+            header.contains("F8 Studio") && !header.contains("F2 Models"),
+            "{header}"
+        );
     }
 
     #[test]
     fn the_status_is_shown_only_when_it_fits() {
         let mut s = Shell::new();
         s.status = "wlan0 connected".into();
-        let narrow = drawn(&s, 80, 20);
+        let narrow = drawn(&s, 50, 20);
         assert!(
             !narrow.lines().next().unwrap().contains("wlan0"),
-            "no room at 80 columns"
+            "no room at 50 columns"
         );
         assert!(
             !narrow.lines().next().unwrap().contains(".."),
             "no stray dots"
         );
-        assert!(drawn(&s, 100, 20)
+        assert!(drawn(&s, 120, 20)
             .lines()
             .next()
             .unwrap()

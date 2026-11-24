@@ -179,3 +179,43 @@ pub const REVIEW: Icon = [
     "................",
     "................",
 ];
+
+/// Sheet: a table with a header row.
+pub const SHEET: Icon = [
+    "................",
+    "................",
+    ".kkkkkkkkkkkkkk.",
+    ".koookoookooook.",
+    ".koookoookooook.",
+    ".kkkkkkkkkkkkkk.",
+    ".kwwwkwwwkwwwwk.",
+    ".kwwwkwwwkwwwwk.",
+    ".kkkkkkkkkkkkkk.",
+    ".kwwwkwwwkwwwwk.",
+    ".kwwwkwwwkwwwwk.",
+    ".kkkkkkkkkkkkkk.",
+    ".kwwwkwwwkwwwwk.",
+    ".kkkkkkkkkkkkkk.",
+    "................",
+    "................",
+];
+
+/// Studio: a page being written with a pencil.
+pub const STUDIO: Icon = [
+    "................",
+    "..kkkkkkkkkk....",
+    "..kwwwwwwwwk....",
+    "..kwbbbbbbwk....",
+    "..kwbbbbbbwk....",
+    "..kwwwwwwwwk....",
+    "..kwddddddwk....",
+    "..kwwwwwwwwk..k.",
+    "..kwddddddwk.y..",
+    "..kwwwwwwwwky...",
+    "..kwddddddwy....",
+    "..kwwwwwwwyk....",
+    "..kwdddwwywk....",
+    "..kwwwwwkwwk....",
+    "..kkkkkkkkkk....",
+    "................",
+];

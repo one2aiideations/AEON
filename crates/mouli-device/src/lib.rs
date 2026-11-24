@@ -12,6 +12,7 @@
 mod patch;
 mod security;
 
+use mouli_apps::Apps;
 use mouli_interface::routing::Route;
 use mouli_interface::{Reply, Workspace};
 use mouli_screen::key::Key;
@@ -52,6 +53,7 @@ pub struct Device<B: Backend> {
     role: String,
     session: String,
     patch: patch::PatchSlot,
+    apps: Option<Apps>,
 }
 
 impl<B: Backend> Device<B> {
@@ -76,9 +78,17 @@ impl<B: Backend> Device<B> {
             role: role.into(),
             session,
             patch: patch::PatchSlot::default(),
+            apps: None,
         };
         d.refresh();
         Ok(d)
+    }
+
+    /// Connects the applications whose capabilities are registered in the workspace, so the Sheet
+    /// and Studio screens show their real state.
+    pub fn attach_apps(&mut self, apps: Apps) {
+        self.apps = Some(apps);
+        self.refresh();
     }
 
     /// The workspace (read-only), for status lines and tests.
@@ -129,6 +139,10 @@ impl<B: Backend> Device<B> {
                 Outcome::Handled
             }
             Action::RefreshSecurity => Outcome::Handled, // refresh() below recomputes it
+            Action::Call { capability, args } => {
+                self.call(&capability, args);
+                Outcome::Handled
+            }
             Action::ApplyPatch => {
                 self.apply_patch();
                 Outcome::Handled
@@ -183,6 +197,30 @@ impl<B: Backend> Device<B> {
             )),
             Ok(Reply::Refused { by }) => self.notice(&format!("Refused by {by}.")),
             Err(e) => self.notice(&e.to_string()),
+        }
+    }
+
+    /// Shows `text` on the screen of the application that owns `capability` (or in the chat).
+    fn app_message(&mut self, capability: &str, text: &str) {
+        match capability.split('.').next() {
+            Some("sheet") => self.shell.sheet.message = text.to_string(),
+            Some("studio") => self.shell.studio.message = text.to_string(),
+            _ => self.notice(text),
+        }
+    }
+
+    /// Runs a capability a screen asked for, through the same gate as the chat.
+    fn call(&mut self, capability: &str, args: Vec<(String, String)>) {
+        let args = args.into_iter().collect();
+        match self.ws.call(&self.tenant, &self.session, capability, args) {
+            Ok(Reply::Done(_)) => self.app_message(capability, ""),
+            Ok(Reply::AwaitingApproval { id }) => self.app_message(
+                capability,
+                &format!("Held for approval ({id}). Someone else must approve it under Approvals."),
+            ),
+            Ok(Reply::Refused { by }) => self.app_message(capability, &format!("Refused by {by}.")),
+            Ok(Reply::Chat { .. }) => {}
+            Err(e) => self.app_message(capability, &e.to_string()),
         }
     }
 
@@ -258,6 +296,50 @@ impl<B: Backend> Device<B> {
 
         let (score, findings) = security::assess(&self.ws);
         self.shell.security.set(score, findings);
+        self.refresh_apps();
+    }
+
+    /// Copies the applications' state into their screens.
+    fn refresh_apps(&mut self) {
+        use mouli_screen::screens::sheet::{MAX_COLS, MAX_ROWS};
+        use mouli_screen::screens::{SheetCell, StudioBlock};
+        let Some(apps) = &self.apps else { return };
+        {
+            let book = apps.book.borrow();
+            if let Some(sheet) = book.sheets.get(book.active) {
+                let cells = sheet
+                    .cells
+                    .iter()
+                    .filter(|((r, c), _)| *r < MAX_ROWS && *c < MAX_COLS)
+                    .take(20_000)
+                    .map(|(k, cell)| {
+                        (
+                            *k,
+                            SheetCell {
+                                shown: cell.value.display(),
+                                raw: cell.raw.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                self.shell.sheet.set_cells(&sheet.name, cells);
+            }
+        }
+        let doc = apps.doc.borrow();
+        self.shell.studio.blocks = doc
+            .blocks
+            .iter()
+            .map(|b| match b {
+                mouli_studio::Block::Heading(t) => StudioBlock {
+                    heading: true,
+                    text: t.clone(),
+                },
+                mouli_studio::Block::Paragraph(t) => StudioBlock {
+                    heading: false,
+                    text: t.clone(),
+                },
+            })
+            .collect();
     }
 
     /// Puts a proposed change (unified diff text) under review for the files below `root`.
