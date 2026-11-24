@@ -12,6 +12,7 @@
 pub mod admin_reports;
 pub mod api;
 pub mod common;
+pub mod demo;
 pub mod hr;
 pub mod inventory;
 pub mod manufacturing;
