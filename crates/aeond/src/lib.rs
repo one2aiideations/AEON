@@ -37,6 +37,7 @@ pub mod net;
 pub mod persist;
 pub mod sntp;
 pub mod system;
+pub mod textwrap;
 pub mod ui;
 pub mod wifi;
 
