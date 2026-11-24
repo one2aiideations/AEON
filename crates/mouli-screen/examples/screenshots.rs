@@ -4,7 +4,9 @@ use mouli_screen::grid::Grid;
 use mouli_screen::key::Key;
 use mouli_screen::raster::{render, to_png, RasterCfg};
 use mouli_screen::screen::Screen;
-use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, ModelRow, Role};
+use mouli_screen::screens::{
+    ApprovalRow, AuditRow, Chain, Check, FileChange, Finding, ModelRow, Role, Severity,
+};
 use mouli_screen::shell::Shell;
 use std::path::PathBuf;
 
@@ -143,5 +145,74 @@ fn main() -> std::io::Result<()> {
     );
     shell.audit.on_key(Key::Down);
     shot(&shell, &dir, "audit")?;
+
+    shell.on_key(Key::F(5));
+    let fnd = |id: &str, sev: Severity, title: &str, detail: &str, seen: bool| Finding {
+        id: id.into(),
+        severity: sev,
+        title: title.into(),
+        detail: detail.into(),
+        acknowledged: seen,
+    };
+    shell.security.set(
+        68,
+        vec![
+            fnd("case-3", Severity::Low, "New device signed in", "A laptop not seen before signed in from the office network.", true),
+            fnd("case-7", Severity::Critical, "Sign-in after repeated failures", "Five failed sign-ins for owner from 203.0.113.9 within one minute, then a success. Change the password and review the audit log.", false),
+            fnd("case-5", Severity::High, "Large payment held", "pay.send of 1,250,000 USD to a payee not used before is waiting for approval.", false),
+        ],
+    );
+    shell.security.on_key(Key::Down);
+    shot(&shell, &dir, "security")?;
+
+    shell.on_key(Key::F(6));
+    let diff = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    shell.review.set(
+        "Round tax per line, not per invoice",
+        vec![
+            FileChange {
+                path: "crates/mouli-ops/src/sales.rs".into(),
+                added: 4,
+                removed: 2,
+                diff: diff(&[
+                    "--- a/crates/mouli-ops/src/sales.rs",
+                    "+++ b/crates/mouli-ops/src/sales.rs",
+                    "@@ -41,7 +41,9 @@ fn line_tax(line: &Line) -> i64 {",
+                    "     let base = line.qty * line.unit_price;",
+                    "-    let tax = base * rate / 100;",
+                    "-    tax",
+                    "+    // Round half up, per line, in minor units.",
+                    "+    let tax = (base * rate + 50) / 100;",
+                    "+    debug_assert!(tax >= 0);",
+                    "+    tax",
+                ]),
+            },
+            FileChange {
+                path: "crates/mouli-ops/tests/tax.rs".into(),
+                added: 12,
+                removed: 0,
+                diff: diff(&[
+                    "+++ b/crates/mouli-ops/tests/tax.rs",
+                    "+#[test]",
+                    "+fn rounds_half_up() {}",
+                ]),
+            },
+        ],
+        vec![
+            Check {
+                name: "tests".into(),
+                passed: true,
+            },
+            Check {
+                name: "lint".into(),
+                passed: true,
+            },
+            Check {
+                name: "no secrets".into(),
+                passed: true,
+            },
+        ],
+    );
+    shot(&shell, &dir, "review")?;
     Ok(())
 }

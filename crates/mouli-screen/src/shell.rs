@@ -3,7 +3,7 @@
 use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
-use crate::screens::{Approvals, Audit, Chat, ModelPicker};
+use crate::screens::{Approvals, Audit, Chat, ModelPicker, Review, SecurityScreen};
 
 /// The whole interface.
 #[derive(Debug, Clone)]
@@ -16,6 +16,10 @@ pub struct Shell {
     pub approvals: Approvals,
     /// The audit log.
     pub audit: Audit,
+    /// Risks, anomalies and cases.
+    pub security: SecurityScreen,
+    /// The code change under review.
+    pub review: Review,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -29,6 +33,8 @@ impl Default for Shell {
             models: ModelPicker::default(),
             approvals: Approvals::default(),
             audit: Audit::default(),
+            security: SecurityScreen::default(),
+            review: Review::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -47,8 +53,8 @@ impl Shell {
             Tab::Models => &mut self.models,
             Tab::Approvals => &mut self.approvals,
             Tab::Audit => &mut self.audit,
-            // The Security and Review screens are not built yet; they show the model list.
-            Tab::Security | Tab::Review => &mut self.models,
+            Tab::Security => &mut self.security,
+            Tab::Review => &mut self.review,
         }
     }
 
@@ -58,7 +64,8 @@ impl Shell {
             Tab::Models => &self.models,
             Tab::Approvals => &self.approvals,
             Tab::Audit => &self.audit,
-            Tab::Security | Tab::Review => &self.models,
+            Tab::Security => &self.security,
+            Tab::Review => &self.review,
         }
     }
 

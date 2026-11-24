@@ -35,6 +35,8 @@ pub enum Action {
         /// True to approve, false to refuse.
         approve: bool,
     },
+    /// Run a fresh security scan.
+    RefreshSecurity,
     /// Apply the patch under review.
     ApplyPatch,
     /// Undo the patch that was applied.
