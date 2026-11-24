@@ -34,6 +34,7 @@ pub mod known_networks;
 pub mod lineedit;
 pub mod models;
 pub mod net;
+pub mod partition_table;
 pub mod persist;
 pub mod procparse;
 pub mod sntp;
