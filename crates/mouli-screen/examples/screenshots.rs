@@ -4,7 +4,7 @@ use mouli_screen::grid::Grid;
 use mouli_screen::key::Key;
 use mouli_screen::raster::{render, to_png, RasterCfg};
 use mouli_screen::screen::Screen;
-use mouli_screen::screens::{ModelRow, Role};
+use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, ModelRow, Role};
 use mouli_screen::shell::Shell;
 use std::path::PathBuf;
 
@@ -68,5 +68,80 @@ fn main() -> std::io::Result<()> {
         shell.chat.on_key(Key::Char(ch));
     }
     shot(&shell, &dir, "chat")?;
+
+    shell.on_key(Key::F(3));
+    let apr = |id: &str, cap: &str, who: &str, detail: &str, can: bool| ApprovalRow {
+        id: id.into(),
+        capability: cap.into(),
+        requester: who.into(),
+        detail: detail.into(),
+        can_decide: can,
+        why_not: if can {
+            String::new()
+        } else {
+            "You asked for this yourself; someone else must decide it.".into()
+        },
+    };
+    shell.approvals.set_rows(vec![
+        apr(
+            "apr-0007",
+            "mail.send",
+            "alice",
+            "to=finance@example.com subject=\"March invoice run\" attachments=3",
+            true,
+        ),
+        apr(
+            "apr-0008",
+            "files.delete",
+            "owner",
+            "path=/data/reports/2025 recursive=true",
+            false,
+        ),
+        apr(
+            "apr-0009",
+            "pay.send",
+            "carol",
+            "payee=ACME-LTD amount=1250000 currency=USD",
+            true,
+        ),
+    ]);
+    shell.approvals.on_key(Key::Down);
+    shot(&shell, &dir, "approvals")?;
+
+    shell.on_key(Key::F(4));
+    let rec = |seq: u64, t: &str, who: &str, act: &str, out: &str| AuditRow {
+        seq,
+        time: t.into(),
+        actor: who.into(),
+        action: act.into(),
+        target: if act.contains('.') {
+            format!("{act}-{seq}")
+        } else {
+            "-".into()
+        },
+        outcome: out.into(),
+        hash: format!("{:016x}", seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    };
+    shell.audit.set(
+        vec![
+            rec(1, "09:00:02", "owner", "session.open", "ok"),
+            rec(2, "09:00:41", "owner", "chat", "ok via llama-3.2-3b"),
+            rec(3, "09:02:10", "owner", "security.score", "ok"),
+            rec(
+                4,
+                "09:03:55",
+                "owner",
+                "shell",
+                "denied: role owner lacks permission shell",
+            ),
+            rec(5, "09:07:18", "alice", "mail.send", "pending approval"),
+            rec(6, "09:08:30", "bob", "files.delete", "failed: no such file"),
+            rec(7, "09:10:12", "carol", "pay.send", "pending approval"),
+            rec(8, "09:12:47", "owner", "chat", "ok via llama-3.2-3b"),
+        ],
+        Chain::Verified,
+    );
+    shell.audit.on_key(Key::Down);
+    shot(&shell, &dir, "audit")?;
     Ok(())
 }

@@ -3,7 +3,7 @@
 use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
-use crate::screens::{Chat, ModelPicker};
+use crate::screens::{Approvals, Audit, Chat, ModelPicker};
 
 /// The whole interface.
 #[derive(Debug, Clone)]
@@ -12,6 +12,10 @@ pub struct Shell {
     pub chat: Chat,
     /// The model list.
     pub models: ModelPicker,
+    /// Requests held for a decision.
+    pub approvals: Approvals,
+    /// The audit log.
+    pub audit: Audit,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -23,6 +27,8 @@ impl Default for Shell {
         Self {
             chat: Chat::default(),
             models: ModelPicker::default(),
+            approvals: Approvals::default(),
+            audit: Audit::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -37,9 +43,22 @@ impl Shell {
 
     fn current(&mut self) -> &mut dyn Screen {
         match self.active {
-            // The other tabs share the model list's slot until their screens exist.
             Tab::Chat => &mut self.chat,
-            _ => &mut self.models,
+            Tab::Models => &mut self.models,
+            Tab::Approvals => &mut self.approvals,
+            Tab::Audit => &mut self.audit,
+            // The Security and Review screens are not built yet; they show the model list.
+            Tab::Security | Tab::Review => &mut self.models,
+        }
+    }
+
+    fn current_ref(&self) -> &dyn Screen {
+        match self.active {
+            Tab::Chat => &self.chat,
+            Tab::Models => &self.models,
+            Tab::Approvals => &self.approvals,
+            Tab::Audit => &self.audit,
+            Tab::Security | Tab::Review => &self.models,
         }
     }
 
@@ -89,16 +108,10 @@ impl Shell {
         }
         // Body.
         let body = Rect::new(0, 1, area.w, area.h - 2);
-        match self.active {
-            Tab::Chat => self.chat.draw(grid, body),
-            _ => self.models.draw(grid, body),
-        }
+        self.current_ref().draw(grid, body);
         // Footer.
         grid.fill(Rect::new(0, area.h - 1, area.w, 1), theme::PANEL);
-        let hints = match self.active {
-            Tab::Chat => self.chat.hints(),
-            _ => self.models.hints(),
-        };
+        let hints = self.current_ref().hints();
         grid.text_fit(1, area.h - 1, area.w - 2, &hints, theme::DIM, theme::PANEL);
     }
 }
@@ -193,5 +206,52 @@ mod tests {
             let _ = drawn(&s, w, h);
         }
         assert_eq!(drawn(&s, 10, 2).lines().next().unwrap(), "MOULI");
+    }
+
+    #[test]
+    fn approvals_and_audit_have_their_own_screens() {
+        use crate::screens::{ApprovalRow, AuditRow, Chain};
+        let mut s = Shell::new();
+        s.approvals.set_rows(vec![ApprovalRow {
+            id: "apr-1".into(),
+            capability: "mail.send".into(),
+            requester: "alice".into(),
+            detail: "to=bob".into(),
+            can_decide: true,
+            why_not: String::new(),
+        }]);
+        s.audit.set(
+            vec![AuditRow {
+                seq: 1,
+                time: "12:00:00".into(),
+                actor: "owner".into(),
+                action: "chat".into(),
+                target: "-".into(),
+                outcome: "ok".into(),
+                hash: "ab".into(),
+            }],
+            Chain::Verified,
+        );
+        assert_eq!(s.on_key(Key::F(3)), Action::Show(Tab::Approvals));
+        assert!(drawn(&s, 100, 24).contains("Approvals  1 waiting"));
+        assert_eq!(
+            s.on_key(Key::Char('a')),
+            Action::Decide {
+                id: "apr-1".into(),
+                approve: true
+            }
+        );
+        assert!(drawn(&s, 100, 24)
+            .lines()
+            .nth(23)
+            .unwrap()
+            .contains("a approve"));
+        assert_eq!(s.on_key(Key::F(4)), Action::Show(Tab::Audit));
+        let t = drawn(&s, 100, 24);
+        assert!(
+            t.contains("Audit  1 records") && t.contains("Chain verified"),
+            "{t}"
+        );
+        assert!(t.lines().nth(23).unwrap().contains("show problems only"));
     }
 }
