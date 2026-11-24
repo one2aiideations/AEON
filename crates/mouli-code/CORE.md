@@ -4,7 +4,7 @@ This file records what the Rust crate in this folder actually implements. `READM
 `MOULI-CODE.md` are the product specification and say what MOULI-CODE should become; do not read
 them as a statement of what is built.
 
-## Implemented (`mouli-code` crate, no dependencies, no file-system or process access)
+## Implemented (`mouli-code` crate, no dependencies; only `workspace` touches the file system, and nothing runs a process)
 
 | Module | What it does |
 |---|---|
@@ -14,6 +14,7 @@ them as a statement of what is built.
 | `quality` | Patch statistics; test-file detection by path component; hard-coding and special-casing heuristics on ADDED lines only; syntax check of the EDITED files; risk score; blocking versus warning findings. |
 | `minimize` | Delta debugging over hunks with an oracle and a call budget; creations and deletions are never split. |
 | `budget` | Hard limits on iterations, model calls and repair attempts. |
+| `workspace` | The only module that touches the file system: reads text files; applies a checked patch set to a real directory (validated in memory first, atomic temp-file-and-rename writes, permissions kept, automatic restore if a write fails part way); refuses symbolic links, outside paths and non-UTF-8 files; `rollback` undoes exactly the agent's change and refuses if a file was edited afterwards. |
 
 ## How it was checked
 
@@ -22,6 +23,9 @@ them as a statement of what is built.
 * 1,500 randomized edits (including missing final newlines and empty lines) round-trip through
   generate, apply, reverse and render/parse.
 * The quality policy is tested against the patched files, not the originals.
+* `workspace` is tested on real temporary directories: exact apply and rollback, symbolic-link
+  and path escapes, a file edited after the patch, permissions, binary files, a write that fails
+  half way, and eight threads patching one directory.
 
 ## Origin and what was NOT carried over
 
@@ -39,7 +43,5 @@ implements what those pieces were meant to do.
 * Test execution and result parsing (needs a sandboxed process runner).
 * Language-aware syntax checks (only a delimiter-balance guard exists).
 * Model providers, prompting and the agent loop itself.
-* Writing to the real file system, with backup and exact rollback of the agent's own change
-  (the pure `reverse` patch makes this straightforward; the I/O layer is not written).
 * The hard-coding and special-casing checks are heuristics that flag patterns for review; they
   cannot prove a patch is honest.
