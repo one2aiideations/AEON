@@ -138,16 +138,17 @@ impl Desktop {
     /// The dialog's frame and its OK button.
     pub fn alert_rects(&self, alert: &Alert) -> (crate::geom::Rect, crate::geom::Rect) {
         use crate::geom::Rect;
+        use mouli_screen::typeface::ui_medium;
         let longest = alert
             .lines
             .iter()
-            .map(|l| l.chars().count())
+            .map(|l| crate::paint::text_width(ui_medium(), l))
             .max()
-            .unwrap_or(0) as i32;
-        let w = (longest * 16 + 64).max(360).min(self.width - 20);
-        let h = 24 + alert.lines.len() as i32 * 22 + 20 + 30 + 18;
+            .unwrap_or(0);
+        let w = (longest + 56).clamp(340, (self.width - 20).max(340));
+        let h = 24 + alert.lines.len() as i32 * 22 + 16 + 36 + 20;
         let d = Rect::new((self.width - w) / 2, (self.height - h) / 3, w, h);
-        let ok = Rect::new(d.right() - 18 - 90, d.bottom() - 18 - 30, 90, 30);
+        let ok = Rect::new(d.right() - 20 - 88, d.bottom() - 20 - 36, 88, 36);
         (d, ok)
     }
 
@@ -563,12 +564,12 @@ mod tests {
         goto(
             &mut d,
             &mut s,
-            c.x + 36 * 16 + 3,
-            c.y + 12 * 20 + crate::wm::STATUS_H + 2,
+            c.x + 50 * crate::wm::CELL_W + 3,
+            c.y + 12 * crate::wm::CELL_H + crate::wm::STATUS_H + 2,
         );
         d.on_mouse(&mut s, MouseEvent::Up(Button::Left), 21);
         let w = d.wm.top().unwrap();
-        assert_eq!((w.cols, w.rows), (36, 12));
+        assert_eq!((w.cols, w.rows), (50, 12));
     }
 
     #[test]
@@ -776,31 +777,32 @@ mod tests {
         let (mut d, mut s) = setup();
         d.open(&mut s, Tab::Chat);
         d.open(&mut s, Tab::Audit);
-        d.pointer = (700, 600);
+        d.pointer = (700, 650);
         let c = d.render(&s);
         assert_eq!((c.width, c.height), (1024, 768));
-        // The menu bar is light with a dark line under it.
-        assert_eq!(c.get(500, 5), Some(crate::theme::MENUBAR));
-        assert_eq!(c.get(500, MENU_H as usize - 1), Some(crate::theme::DARK));
+        // The menu bar is the base surface with an outline under it; the desktop is the wallpaper.
+        assert_eq!(c.get(500, 5), Some(crate::theme::SURFACE));
+        assert_eq!(c.get(500, MENU_H as usize - 1), Some(crate::theme::OUTLINE));
+        assert_eq!(c.get(5, 700), Some(crate::theme::WALLPAPER));
         // The pointer's tip is black at the hot spot.
-        assert_eq!(c.get(700, 600), Some(0));
-        // The front window's title bar is pinstriped, the one behind it is plain.
+        assert_eq!(c.get(700, 650), Some(0));
+        // The front window's title bar is raised; the one behind it is on the base surface.
         let front = d.wm.top().unwrap().title_bar();
-        let (fx, fy) = ((front.x + 40) as usize, (front.y + 4) as usize);
-        assert_ne!(c.get(fx, fy), c.get(fx, fy + 1), "alternate rows differ");
-        let back = d.wm.windows[0].title_bar();
-        let (bx, by) = ((back.x + 40) as usize, (back.y + 4) as usize);
         assert_eq!(
-            c.get(bx, by),
-            c.get(bx, by + 1),
-            "no stripes on the window behind"
+            c.get((front.x + 60) as usize, (front.y + 4) as usize),
+            Some(crate::theme::SURFACE_HIGH)
+        );
+        let back = d.wm.windows[0].title_bar();
+        assert_eq!(
+            c.get((back.x + 60) as usize, (back.y + 4) as usize),
+            Some(crate::theme::SURFACE)
         );
     }
 
     #[test]
     fn a_windows_content_is_the_screen_drawn_at_the_cell_size() {
         use mouli_screen::grid::Grid;
-        use mouli_screen::raster::{render, RasterCfg};
+        use mouli_screen::raster::render_text;
         use mouli_screen::screen::Screen;
         let (mut d, mut s) = setup();
         s.chat
@@ -810,7 +812,7 @@ mod tests {
         let mut grid = Grid::new(w.cols as usize, w.rows as usize);
         let area = grid.area();
         s.chat.draw(&mut grid, area);
-        let expect = render(&grid, RasterCfg::default());
+        let expect = render_text(&grid);
         let got = d.render(&s);
         let k = w.content();
         for (x, y) in [(0usize, 0usize), (40, 30), (200, 25), (500, 300)] {

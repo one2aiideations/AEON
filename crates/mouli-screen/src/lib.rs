@@ -20,3 +20,4 @@ pub mod raster;
 pub mod screen;
 pub mod screens;
 pub mod shell;
+pub mod typeface;

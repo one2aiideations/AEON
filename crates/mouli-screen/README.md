@@ -3,8 +3,13 @@
 The on-device screens as dependency-free state machines drawn into a character-cell grid:
 Chat (F1), Models (F2), Approvals (F3), Audit (F4), Security (F5), Code review (F6).
 
-`Grid` is rasterised with a public-domain 8x8 font into XRGB8888 or RGB565 pixels, or into a PNG
-(`cargo run -p mouli-screen --example screenshots -- <dir>`). Screens report an `Action`; they never
+`Grid` is rasterised into XRGB8888 or RGB565 pixels, or into a PNG
+(`cargo run -p mouli-screen --example screenshots -- <dir>`). Two renderers exist: `raster::render`
+(the original 8x8 public-domain font, used by the text console path) and `raster::render_text`
+(smooth Roboto Mono from Google, used by the desktop; box lines and blocks are drawn exactly so
+frames have no gaps). The colours are the Material Design dark theme, with a test that every text
+colour has at least 4.5:1 contrast. The embedded glyph atlases in `fonts/` are built by
+`fonts/gen_fonts.py` from Roboto and Roboto Mono (SIL Open Font License, see `fonts/OFL.txt`). Screens report an `Action`; they never
 act themselves. 87 tests, including draw-at-every-size sweeps that must not panic.
 
 On-device screens for MOULI, written as dependency-free Rust. A screen is a state machine that

@@ -5,3 +5,4 @@ target/
 *.safetensors
 *.gguf
 *.bin
+!crates/mouli-screen/fonts/*.bin

@@ -1,31 +1,30 @@
-//! The classic Platinum look: soft greys with white highlights and dark shadows, on a blue-grey
-//! desktop.
+//! Colours from Google's Material Design dark theme (material.io): a dark surface that rises in
+//! lightness with elevation, white text at 87% and 60%, and Blue 200 / Blue 700 as the primary.
+//! They match the screens drawn inside the windows (`mouli_screen::grid::theme`).
 
-/// Desktop pattern, light dot.
-pub const DESKTOP_A: u32 = 0x6C84AC;
-/// Desktop pattern, dark dot.
-pub const DESKTOP_B: u32 = 0x637AA2;
-/// The grey of window frames, menus and buttons.
-pub const FACE: u32 = 0xDDDDDD;
-/// Highlight edge.
-pub const LIGHT: u32 = 0xFFFFFF;
-/// Mid shadow.
-pub const SHADE: u32 = 0xA8A8A8;
-/// Dark shadow.
-pub const DARK: u32 = 0x666666;
-/// Outlines and text.
+/// The desktop behind the windows: Blue Grey 900.
+pub const WALLPAPER: u32 = 0x263238;
+/// The base surface (menu bar, hint strip, windows behind): the dark surface plus a 1dp overlay.
+pub const SURFACE: u32 = 0x1E1E1E;
+/// A raised surface (front window title bar, menus, dialogs): the 8dp overlay.
+pub const SURFACE_HIGH: u32 = 0x2C2C2C;
+/// Thin edges between surfaces.
+pub const OUTLINE: u32 = 0x3F3F3F;
+/// Edge of the front window.
+pub const OUTLINE_ACTIVE: u32 = 0x5A5A5A;
+/// Text and icons on a surface: white at 87%.
+pub const ON_SURFACE: u32 = 0xE0E0E0;
+/// Secondary text: white at about 60%.
+pub const ON_SURFACE_DIM: u32 = 0x9E9E9E;
+/// Disabled text: white at 38%.
+pub const DISABLED: u32 = 0x6C6C6C;
+/// The primary colour on dark surfaces: Blue 200.
+pub const PRIMARY: u32 = 0x90CAF9;
+/// A filled primary control (the OK button, a selected icon): Blue 700, white text on it.
+pub const PRIMARY_FILL: u32 = 0x1976D2;
+/// Text on a filled primary control.
+pub const ON_PRIMARY: u32 = 0xFFFFFF;
+/// A hovered or selected menu item: Blue 400 at 24% over the surface.
+pub const HOVER: u32 = 0x1E3549;
+/// Pure black, for shadows and the pointer outline.
 pub const BLACK: u32 = 0x000000;
-/// Menu bar background.
-pub const MENUBAR: u32 = 0xEEEEEE;
-/// Selected menu item and selected icon.
-pub const SELECT: u32 = 0x3F69B5;
-/// Text on the selection.
-pub const SELECT_TEXT: u32 = 0xFFFFFF;
-/// Disabled text.
-pub const DISABLED: u32 = 0x8C8C8C;
-/// Title bar pinstripe, light line.
-pub const STRIPE_A: u32 = 0xFFFFFF;
-/// Title bar pinstripe, dark line.
-pub const STRIPE_B: u32 = 0xA6A6A6;
-/// The soft shadow under windows and menus.
-pub const SHADOW: u32 = 0x3A4B6B;

@@ -15,28 +15,30 @@ impl Color {
     }
 }
 
-/// The palette. Dark background, one accent colour, and colours that carry meaning (ok, warning,
-/// bad) so a person can read state at a glance.
+/// The palette: Google's Material Design dark theme (material.io, 2014 to 2021 colour system).
+/// A dark surface, one accent, and colours that carry meaning (ok, warning, bad) so a person can
+/// read state at a glance. Every text colour keeps at least 4.5:1 contrast against the surface,
+/// which a test checks.
 pub mod theme {
     use super::Color;
-    /// Screen background.
-    pub const BG: Color = Color(0x0B1020);
-    /// A raised panel's background.
-    pub const PANEL: Color = Color(0x121A2F);
-    /// A selected row's background.
-    pub const SELECT: Color = Color(0x1F3A6B);
-    /// Normal text.
-    pub const TEXT: Color = Color(0xE6EAF2);
-    /// Secondary text.
-    pub const DIM: Color = Color(0x8A94A8);
-    /// Accent (titles, focus).
-    pub const ACCENT: Color = Color(0x4F8CFF);
-    /// Good / allowed / verified.
-    pub const OK: Color = Color(0x3DDC97);
-    /// Needs attention.
-    pub const WARN: Color = Color(0xFFC857);
-    /// Bad / denied / failed.
-    pub const BAD: Color = Color(0xFF5C7A);
+    /// Screen background: the Material dark surface, #121212.
+    pub const BG: Color = Color(0x121212);
+    /// A raised panel's background: the surface with a 1dp elevation overlay.
+    pub const PANEL: Color = Color(0x1E1E1E);
+    /// A selected row's background: Blue 400 at 24% over the surface.
+    pub const SELECT: Color = Color(0x1E3549);
+    /// Normal text: white at 87% (high emphasis) over the surface.
+    pub const TEXT: Color = Color(0xE0E0E0);
+    /// Secondary text: white at about 60% (medium emphasis), Grey 500.
+    pub const DIM: Color = Color(0x9E9E9E);
+    /// Accent (titles, focus): Blue 200, the Material dark primary.
+    pub const ACCENT: Color = Color(0x90CAF9);
+    /// Good / allowed / verified: Green 300.
+    pub const OK: Color = Color(0x81C784);
+    /// Needs attention: Amber 300.
+    pub const WARN: Color = Color(0xFFD54F);
+    /// Bad / denied / failed: Red 300.
+    pub const BAD: Color = Color(0xE57373);
 }
 
 /// One character cell.
@@ -427,5 +429,43 @@ mod tests {
             assert!(line.chars().count() <= 11, "{line:?}");
         }
         assert_eq!(wrap("x", 0), vec!["x"]);
+    }
+
+    /// WCAG relative luminance of a 0xRRGGBB colour.
+    fn luminance(c: u32) -> f64 {
+        let lin = |v: u32| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin((c >> 16) & 0xFF) + 0.7152 * lin((c >> 8) & 0xFF) + 0.0722 * lin(c & 0xFF)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn every_text_colour_is_readable_on_the_surfaces_it_is_used_on() {
+        use super::theme::*;
+        for (name, fg) in [
+            ("TEXT", TEXT),
+            ("DIM", DIM),
+            ("ACCENT", ACCENT),
+            ("OK", OK),
+            ("WARN", WARN),
+            ("BAD", BAD),
+        ] {
+            for (surface, bg) in [("BG", BG), ("PANEL", PANEL)] {
+                let ratio = contrast(fg.0, bg.0);
+                assert!(ratio >= 4.5, "{name} on {surface} is only {ratio:.2}:1");
+            }
+        }
+        // Normal text must also stay readable on a selected row.
+        assert!(contrast(TEXT.0, SELECT.0) >= 4.5);
     }
 }

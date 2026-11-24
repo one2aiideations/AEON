@@ -1,16 +1,17 @@
 //! The menu bar and its pull-down menus.
 
 use crate::geom::Rect;
-use crate::paint::{bevel, fill, hline, outline, text, text_width};
+use crate::paint::{fill, hline, outline, shadow, text, text_width};
 use crate::theme::*;
 use mouli_screen::raster::Canvas;
 use mouli_screen::screen::Tab;
+use mouli_screen::typeface::{ui, ui_medium, ui_small};
 
 /// Height of the menu bar.
-pub const MENU_H: i32 = 24;
+pub const MENU_H: i32 = 32;
 /// Height of one menu item.
-pub const ITEM_H: i32 = 22;
-const SEPARATOR_H: i32 = 10;
+pub const ITEM_H: i32 = 32;
+const SEPARATOR_H: i32 = 13;
 
 /// What choosing a menu item does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +162,7 @@ impl MenuBar {
         self.menus
             .iter()
             .map(|m| {
-                let w = text_width(m.title, 2) + 20;
+                let w = text_width(ui_medium(), m.title) + 28;
                 let r = Rect::new(x, 0, w, MENU_H - 1);
                 x += w;
                 r
@@ -188,10 +189,10 @@ impl MenuBar {
         let label_w = menu
             .items
             .iter()
-            .map(|it| text_width(it.label, 2) + text_width(it.shortcut, 2) + 56)
+            .map(|it| text_width(ui(), it.label) + text_width(ui_small(), it.shortcut) + 64)
             .max()
             .unwrap_or(120)
-            .max(160);
+            .max(200);
         let h: i32 = menu.items.iter().map(Self::item_height).sum::<i32>() + 4;
         let x = title.x.min((self.width - label_w - 4).max(0));
         Rect::new(x, MENU_H - 1, label_w + 4, h)
@@ -224,23 +225,22 @@ impl MenuBar {
     /// Draws the bar, with the open menu's title highlighted, and `status` at the right.
     pub fn draw_bar(&self, c: &mut Canvas, status: &str) {
         let width = c.width as i32;
-        fill(c, Rect::new(0, 0, width, MENU_H), MENUBAR);
-        hline(c, 0, MENU_H - 1, width, DARK);
+        fill(c, Rect::new(0, 0, width, MENU_H), SURFACE);
+        hline(c, 0, MENU_H - 1, width, OUTLINE);
+        let face = ui_medium();
+        let y = (MENU_H - face.line_height) / 2;
         for (i, (m, r)) in self.menus.iter().zip(self.title_rects()).enumerate() {
             let open = self.open == Some(i);
             if open {
-                fill(c, r, SELECT);
+                fill(c, r, HOVER);
             }
-            let colour = if open { SELECT_TEXT } else { BLACK };
-            text(c, r.x + 10, 4, m.title, colour, 2);
-            if i == 0 && !open {
-                // The first menu is drawn bold, as the Apple menu is.
-                text(c, r.x + 11, 4, m.title, colour, 2);
-            }
+            // The first menu carries the brand, in the primary colour.
+            let colour = if i == 0 { PRIMARY } else { ON_SURFACE };
+            text(c, face, r.x + 14, y, m.title, colour);
         }
         if !status.is_empty() {
-            let w = text_width(status, 2);
-            text(c, width - w - 10, 4, status, BLACK, 2);
+            let w = text_width(face, status);
+            text(c, face, width - w - 14, y, status, ON_SURFACE_DIM);
         }
     }
 
@@ -248,10 +248,10 @@ impl MenuBar {
     pub fn draw_dropdown(&self, c: &mut Canvas, has_window: bool) {
         let Some(open) = self.open else { return };
         let d = self.dropdown_rect(open);
-        fill(c, Rect::new(d.x + 3, d.y + 3, d.w, d.h), SHADOW);
-        fill(c, d, MENUBAR);
-        outline(c, d, BLACK);
-        bevel(c, d.inset(1), LIGHT, SHADE);
+        shadow(c, d);
+        fill(c, d, SURFACE_HIGH);
+        outline(c, d, OUTLINE);
+        let (face, small) = (ui(), ui_small());
         for (k, (it, r)) in self.menus[open]
             .items
             .iter()
@@ -259,24 +259,32 @@ impl MenuBar {
             .enumerate()
         {
             let Some(cmd) = it.command else {
-                hline(c, r.x + 4, r.y + r.h / 2, r.w - 8, SHADE);
+                hline(c, r.x + 8, r.y + r.h / 2, r.w - 16, OUTLINE);
                 continue;
             };
             let enabled = Self::enabled(cmd, has_window);
-            let hot = enabled && self.hover == Some(k);
-            if hot {
-                fill(c, r, SELECT);
+            if enabled && self.hover == Some(k) {
+                fill(c, r, HOVER);
             }
-            let colour = if hot {
-                SELECT_TEXT
-            } else if enabled {
-                BLACK
-            } else {
-                DISABLED
-            };
-            text(c, r.x + 12, r.y + 3, it.label, colour, 2);
-            let sw = text_width(it.shortcut, 2);
-            text(c, r.right() - sw - 10, r.y + 3, it.shortcut, colour, 2);
+            let colour = if enabled { ON_SURFACE } else { DISABLED };
+            text(
+                c,
+                face,
+                r.x + 16,
+                r.y + (r.h - face.line_height) / 2,
+                it.label,
+                colour,
+            );
+            let sw = text_width(small, it.shortcut);
+            let dim = if enabled { ON_SURFACE_DIM } else { DISABLED };
+            text(
+                c,
+                small,
+                r.right() - sw - 16,
+                r.y + (r.h - small.line_height) / 2,
+                it.shortcut,
+                dim,
+            );
         }
     }
 }

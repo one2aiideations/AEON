@@ -6,16 +6,16 @@
 use crate::geom::Rect;
 use mouli_screen::screen::Tab;
 
-/// Width of one character cell in pixels (the screens are drawn at 16 by 20).
-pub const CELL_W: i32 = 16;
+/// Width of one character cell in pixels (Roboto Mono at 16 pixels).
+pub const CELL_W: i32 = mouli_screen::typeface::CELL_W as i32;
 /// Height of one character cell in pixels.
-pub const CELL_H: i32 = 20;
+pub const CELL_H: i32 = mouli_screen::typeface::CELL_H as i32;
 /// Height of the title bar.
-pub const TITLE_H: i32 = 22;
+pub const TITLE_H: i32 = 32;
 /// Height of the strip under the content (key hints and the grow box).
-pub const STATUS_H: i32 = 16;
+pub const STATUS_H: i32 = 22;
 /// Smallest window, in cells.
-pub const MIN_COLS: i32 = 30;
+pub const MIN_COLS: i32 = 40;
 /// Smallest window, in rows.
 pub const MIN_ROWS: i32 = 8;
 
@@ -57,16 +57,16 @@ impl Window {
 
     /// The close box.
     pub fn close_box(&self) -> Rect {
-        Rect::new(self.x + 8, self.y + 1 + (TITLE_H - 14) / 2, 14, 14)
+        Rect::new(self.x + 1 + 10, self.y + 1 + (TITLE_H - 16) / 2, 16, 16)
     }
 
     /// The zoom box.
     pub fn zoom_box(&self) -> Rect {
         Rect::new(
-            self.x + 1 + self.cols * CELL_W - 8 - 14,
-            self.y + 1 + (TITLE_H - 14) / 2,
-            14,
-            14,
+            self.x + 1 + self.cols * CELL_W - 10 - 16,
+            self.y + 1 + (TITLE_H - 16) / 2,
+            16,
+            16,
         )
     }
 
@@ -89,7 +89,7 @@ impl Window {
     /// The box in the bottom-right corner that resizes the window.
     pub fn grow_box(&self) -> Rect {
         let s = self.status_strip();
-        Rect::new(s.right() - 16, s.y, 16, STATUS_H)
+        Rect::new(s.right() - STATUS_H, s.y, STATUS_H, STATUS_H)
     }
 }
 
@@ -170,15 +170,15 @@ impl WindowManager {
             return id;
         }
         let n = self.windows.len() as i32;
-        let cols = 48.min(self.max_cols());
-        let rows = 20.min(self.max_rows());
+        let cols = 72.min(self.max_cols());
+        let rows = 22.min(self.max_rows());
         let id = self.next_id;
         self.next_id += 1;
         let mut w = Window {
             id,
             tab,
-            x: 24 + 28 * (n % 8),
-            y: self.menu_h + 12 + 28 * (n % 8),
+            x: 24 + 32 * (n % 8),
+            y: self.menu_h + 12 + 32 * (n % 8),
             cols,
             rows,
             zoomed: false,
@@ -306,10 +306,10 @@ impl WindowManager {
             let (menu_h, mc, mr) = (self.menu_h, self.max_cols(), self.max_rows());
             if let Some(w) = self.get_mut(id) {
                 w.zoomed = false;
-                w.cols = 48.min(mc);
-                w.rows = 20.min(mr);
-                w.x = 24 + 28 * (n % 8);
-                w.y = menu_h + 12 + 28 * (n % 8);
+                w.cols = 72.min(mc);
+                w.rows = 22.min(mr);
+                w.x = 24 + 32 * (n % 8);
+                w.y = menu_h + 12 + 32 * (n % 8);
             }
             self.clamp_into_view(id);
         }

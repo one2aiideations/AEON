@@ -2,6 +2,7 @@
 
 use crate::font::{glyph, GLYPH};
 use crate::grid::Grid;
+use crate::typeface::{blend, draw_glyph, mono, CELL_H, CELL_W};
 
 /// How big to draw each cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +138,119 @@ pub fn render(grid: &Grid, cfg: RasterCfg) -> Canvas {
         height,
         pixels,
     }
+}
+
+/// Fills part of a cell, clipped to the canvas.
+fn fill_px(c: &mut Canvas, x: usize, y: usize, w: usize, h: usize, colour: u32) {
+    for yy in y..(y + h).min(c.height) {
+        for xx in x..(x + w).min(c.width) {
+            c.pixels[yy * c.width + xx] = colour;
+        }
+    }
+}
+
+/// Line strengths (left, right, up, down) of the box-drawing characters the screens use:
+/// 0 none, 1 thin. Double and heavy lines are drawn two pixels thick.
+fn box_arms(ch: char) -> Option<[u8; 4]> {
+    Some(match ch {
+        '\u{2500}' => [1, 1, 0, 0],
+        '\u{2502}' => [0, 0, 1, 1],
+        '\u{250C}' => [0, 1, 0, 1],
+        '\u{2510}' => [1, 0, 0, 1],
+        '\u{2514}' => [0, 1, 1, 0],
+        '\u{2518}' => [1, 0, 1, 0],
+        '\u{251C}' => [0, 1, 1, 1],
+        '\u{2524}' => [1, 0, 1, 1],
+        '\u{252C}' => [1, 1, 0, 1],
+        '\u{2534}' => [1, 1, 1, 0],
+        '\u{253C}' => [1, 1, 1, 1],
+        '\u{2550}' | '\u{2501}' => [2, 2, 0, 0],
+        '\u{2551}' | '\u{2503}' => [0, 0, 2, 2],
+        '\u{2554}' | '\u{250F}' => [0, 2, 0, 2],
+        '\u{2557}' | '\u{2513}' => [2, 0, 0, 2],
+        '\u{255A}' | '\u{2517}' => [0, 2, 2, 0],
+        '\u{255D}' | '\u{251B}' => [2, 0, 2, 0],
+        _ => return None,
+    })
+}
+
+/// Draws box-drawing and block characters exactly, so lines join between cells and bars are
+/// solid. Returns false for characters it does not handle.
+fn paint_special(c: &mut Canvas, x0: usize, y0: usize, cell: crate::grid::Cell) -> bool {
+    let (cw, ch) = (CELL_W, CELL_H);
+    let fg = cell.fg.0;
+    if let Some(arms) = box_arms(cell.ch) {
+        let thick = |w: u8| if w >= 2 { 2 } else { 1 };
+        let [l, r, u, d] = arms;
+        let (cx, cy) = (cw / 2, ch / 2);
+        let (tv, th) = (thick(u.max(d)), thick(l.max(r)));
+        let (xs, ys) = (cx - tv / 2, cy - th / 2);
+        if l > 0 {
+            fill_px(c, x0, y0 + cy - thick(l) / 2, xs + tv, thick(l), fg);
+        }
+        if r > 0 {
+            fill_px(c, x0 + xs, y0 + cy - thick(r) / 2, cw - xs, thick(r), fg);
+        }
+        if u > 0 {
+            fill_px(c, x0 + cx - thick(u) / 2, y0, thick(u), ys + th, fg);
+        }
+        if d > 0 {
+            fill_px(c, x0 + cx - thick(d) / 2, y0 + ys, thick(d), ch - ys, fg);
+        }
+        return true;
+    }
+    let cp = cell.ch as u32;
+    match cp {
+        0x2580 => fill_px(c, x0, y0, cw, ch / 2, fg),
+        0x2581..=0x2587 => {
+            let h = ch * (cp - 0x2580) as usize / 8;
+            fill_px(c, x0, y0 + ch - h, cw, h, fg);
+        }
+        0x2588 => fill_px(c, x0, y0, cw, ch, fg),
+        0x2589..=0x258F => fill_px(c, x0, y0, cw * (0x2590 - cp) as usize / 8, ch, fg),
+        0x2590 => fill_px(c, x0 + cw / 2, y0, cw - cw / 2, ch, fg),
+        0x2591..=0x2593 => {
+            let alpha = [64u8, 128, 192][(cp - 0x2591) as usize];
+            fill_px(c, x0, y0, cw, ch, blend(cell.bg.0, fg, alpha));
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Draws `grid` with Roboto Mono: smooth text in cells of [`CELL_W`] by [`CELL_H`] pixels. Box
+/// lines and blocks are drawn exactly, so frames and bars have no gaps.
+pub fn render_text(grid: &Grid) -> Canvas {
+    let (width, height) = (grid.cols() * CELL_W, grid.rows() * CELL_H);
+    let mut canvas = Canvas {
+        width,
+        height,
+        pixels: vec![0; width * height],
+    };
+    let face = mono();
+    for row in 0..grid.rows() {
+        for col in 0..grid.cols() {
+            let Some(cell) = grid.get(col, row) else {
+                continue;
+            };
+            let (x0, y0) = (col * CELL_W, row * CELL_H);
+            fill_px(&mut canvas, x0, y0, CELL_W, CELL_H, cell.bg.0);
+            if cell.ch == ' ' || paint_special(&mut canvas, x0, y0, cell) {
+                continue;
+            }
+            let ch = if cell.ch.is_control() { ' ' } else { cell.ch };
+            let pen = x0 as i32 + (CELL_W as i32 - face.glyph(ch).advance) / 2;
+            draw_glyph(
+                &mut canvas,
+                face,
+                ch,
+                pen,
+                y0 as i32 + face.ascent,
+                cell.fg.0,
+            );
+        }
+    }
+    canvas
 }
 
 /// CRC-32 (IEEE 802.3) as used by PNG.
@@ -498,5 +612,109 @@ mod tests {
             pixels: Vec::new(),
         });
         assert_eq!(chunks(&png).len(), 3);
+    }
+
+    mod smooth {
+        use super::*;
+        use crate::grid::{theme, Grid};
+
+        fn cell(ch: char) -> Canvas {
+            let mut g = Grid::new(3, 3);
+            g.fill(crate::grid::Rect::new(0, 0, 3, 3), theme::BG);
+            g.put(1, 1, ch, theme::TEXT, theme::BG);
+            render_text(&g)
+        }
+
+        fn px(c: &Canvas, col: usize, row: usize, x: usize, y: usize) -> u32 {
+            c.pixels[(row * CELL_H + y) * c.width + col * CELL_W + x]
+        }
+
+        fn ink(c: &Canvas, col: usize, row: usize) -> usize {
+            (0..CELL_H)
+                .flat_map(|y| (0..CELL_W).map(move |x| (x, y)))
+                .filter(|&(x, y)| px(c, col, row, x, y) != theme::BG.0)
+                .count()
+        }
+
+        #[test]
+        fn the_picture_is_sized_by_the_cell_and_blank_cells_are_background() {
+            let c = cell('A');
+            assert_eq!((c.width, c.height), (3 * CELL_W, 3 * CELL_H));
+            assert_eq!(ink(&c, 0, 0), 0);
+            assert_eq!(ink(&cell(' '), 1, 1), 0);
+        }
+
+        #[test]
+        fn a_letter_is_drawn_smoothly_inside_its_own_cell() {
+            let c = cell('g');
+            assert!(ink(&c, 1, 1) > 10);
+            for (col, row) in [(0, 1), (2, 1), (1, 0), (1, 2)] {
+                assert_eq!(ink(&c, col, row), 0, "ink leaked into cell ({col},{row})");
+            }
+            let shades: std::collections::HashSet<u32> = (0..CELL_H)
+                .flat_map(|y| (0..CELL_W).map(move |x| (x, y)))
+                .map(|(x, y)| px(&c, 1, 1, x, y))
+                .collect();
+            assert!(shades.len() > 3, "anti-aliasing gives in-between colours");
+        }
+
+        #[test]
+        fn vertical_and_horizontal_lines_join_across_cells() {
+            let mut g = Grid::new(2, 2);
+            g.fill(crate::grid::Rect::new(0, 0, 2, 2), theme::BG);
+            g.put(0, 0, '\u{2502}', theme::TEXT, theme::BG);
+            g.put(0, 1, '\u{2502}', theme::TEXT, theme::BG);
+            g.put(1, 0, '\u{2500}', theme::TEXT, theme::BG);
+            let c = render_text(&g);
+            let col = CELL_W / 2;
+            for y in 0..2 * CELL_H {
+                assert_eq!(
+                    c.pixels[y * c.width + col],
+                    theme::TEXT.0,
+                    "gap in the line at row {y}"
+                );
+            }
+            let row = CELL_H / 2;
+            for x in CELL_W..2 * CELL_W {
+                assert_eq!(
+                    c.pixels[row * c.width + x],
+                    theme::TEXT.0,
+                    "gap at column {x}"
+                );
+            }
+        }
+
+        #[test]
+        fn corners_draw_only_their_two_arms() {
+            let c = cell('\u{250C}'); // down and right
+            let (cx, cy) = (CELL_W / 2, CELL_H / 2);
+            assert_eq!(px(&c, 1, 1, cx, cy), theme::TEXT.0);
+            assert_eq!(px(&c, 1, 1, CELL_W - 1, cy), theme::TEXT.0);
+            assert_eq!(px(&c, 1, 1, cx, CELL_H - 1), theme::TEXT.0);
+            assert_eq!(px(&c, 1, 1, 0, cy), theme::BG.0, "no arm to the left");
+            assert_eq!(px(&c, 1, 1, cx, 0), theme::BG.0, "no arm upwards");
+        }
+
+        #[test]
+        fn blocks_fill_exactly_and_shades_blend() {
+            let full = cell('\u{2588}');
+            assert_eq!(ink(&full, 1, 1), CELL_W * CELL_H);
+            let half = cell('\u{2584}');
+            assert_eq!(ink(&half, 1, 1), CELL_W * (CELL_H / 2));
+            assert_eq!(px(&half, 1, 1, 0, CELL_H - 1), theme::TEXT.0);
+            assert_eq!(px(&half, 1, 1, 0, 0), theme::BG.0);
+            let shade = cell('\u{2591}');
+            assert_eq!(
+                px(&shade, 1, 1, 3, 3),
+                blend(theme::BG.0, theme::TEXT.0, 64)
+            );
+        }
+
+        #[test]
+        fn unknown_and_control_characters_do_not_panic() {
+            for ch in ['\u{1F600}', '\u{0}', '\n', '\u{2599}', '\u{256C}', 'é', '€'] {
+                cell(ch);
+            }
+        }
     }
 }

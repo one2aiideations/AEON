@@ -24,17 +24,17 @@ pub const POINTER: [&str; 17] = [
     "......kk...",
 ];
 
-/// Icon palette: `k` black, `w` white, `g` light grey, `d` dark grey, `b` blue, `r` red,
-/// `y` yellow, `o` green.
+/// Icon palette, the Material 500 colours: `k` Grey 900, `w` Grey 50, `g` Grey 400, `d` Grey 600,
+/// `b` Blue, `r` Red, `y` Amber, `o` Green.
 pub const ICON_PALETTE: [(char, u32); 8] = [
-    ('k', 0x000000),
-    ('w', 0xFFFFFF),
-    ('g', 0xD4D4D4),
-    ('d', 0x808080),
-    ('b', 0x3F69B5),
-    ('r', 0xD0443E),
-    ('y', 0xF2C94C),
-    ('o', 0x3DAA6B),
+    ('k', 0x212121),
+    ('w', 0xFAFAFA),
+    ('g', 0xBDBDBD),
+    ('d', 0x757575),
+    ('b', 0x2196F3),
+    ('r', 0xF44336),
+    ('y', 0xFFC107),
+    ('o', 0x4CAF50),
 ];
 
 /// 16 by 16 icon pictures, drawn at twice their size.
