@@ -29,6 +29,7 @@ pub mod hosted;
 pub mod http;
 pub mod hwreport;
 pub mod known_networks;
+pub mod lineedit;
 pub mod models;
 pub mod net;
 pub mod persist;
