@@ -44,6 +44,7 @@ pub mod system;
 pub mod textwrap;
 pub mod ui;
 pub mod wifi;
+pub mod wifi_saved;
 
 use std::path::{Path, PathBuf};
 

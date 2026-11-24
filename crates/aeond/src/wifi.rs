@@ -387,6 +387,7 @@ pub fn connect_flow<I: std::io::BufRead, O: std::io::Write, R: Runner>(
     out: &mut O,
     r: &mut R,
     sys_net: &Path,
+    save_to: Option<&Path>,
 ) -> std::io::Result<Option<net::Link>> {
     use crate::hosted::{ask, ask_secret};
     let ifaces = wireless_interfaces(sys_net);
@@ -463,6 +464,15 @@ pub fn connect_flow<I: std::io::BufRead, O: std::io::Write, R: Runner>(
     match connect(r, iface, &net.ssid, pass.as_deref()) {
         Ok(link) => {
             writeln!(out, "  {}", link.summary())?;
+            if let Some(root) = save_to {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                match crate::wifi_saved::remember(root, &net.ssid, pass.as_deref(), now) {
+                    Ok(()) => writeln!(out, "  Saved: AEON will join this network next time.")?,
+                    Err(e) => writeln!(out, "  (could not save this network: {e})")?,
+                }
+            }
             Ok(Some(link))
         }
         Err(e) => {

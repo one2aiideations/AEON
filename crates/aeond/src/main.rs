@@ -9,6 +9,7 @@ use aeond::net;
 use aeond::persist::{self, Store};
 use aeond::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
 use aeond::wifi;
+use aeond::wifi_saved;
 use aeond::{cmdline_has, find_model, http, system};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -229,6 +230,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     &mut out,
                     &mut wifi::System,
                     Path::new(net::SYS_NET),
+                    store.map(persist::Store::root),
                 );
                 continue;
             }
@@ -365,11 +367,14 @@ fn main() -> ExitCode {
     if cfg!(target_arch = "x86_64") && !hw.avx2 {
         say("AEON warning: this CPU has no AVX2; the inference engine is built for AVX2 and may crash.");
     }
+    let mut wired_up = false;
     if pid1 {
         if net::clock_from_rtc() {
             say("AEON clock: set from the hardware clock");
         }
-        say(&net::bring_up_wired(3).summary());
+        let wired = net::bring_up_wired(3);
+        wired_up = matches!(wired, net::Link::Up { .. });
+        say(&wired.summary());
         let _ = wifi::unblock_radios(Path::new("/sys/class/rfkill"));
         say(&wifi::summary(&wifi::wireless_interfaces(Path::new(
             net::SYS_NET,
@@ -388,6 +393,21 @@ fn main() -> ExitCode {
         }
     }
     let store = open_store(pid1);
+    if pid1 && !wired_up {
+        if let Some(s) = &store {
+            if let Some((ssid, result)) =
+                wifi_saved::auto_connect(&mut wifi::System, Path::new(net::SYS_NET), s.root())
+            {
+                match result {
+                    Ok(link) => say(&format!(
+                        "AEON Wi-Fi: joined saved network {ssid}. {}",
+                        link.summary()
+                    )),
+                    Err(e) => say(&format!("AEON Wi-Fi: saved network {ssid}: {e}")),
+                }
+            }
+        }
+    }
     if args.selftest {
         selftest(&args, &plan, pid1, store.as_ref())
     } else {
