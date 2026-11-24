@@ -183,7 +183,9 @@ pub struct XdpUmemPool {
     allocated_bitmap_hi: AtomicU64,
 }
 
-unsafe impl Sync for XdpUmemPool {}
+// `XdpUmemPool` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl XdpUmemPool {
     pub const fn new() -> Self {
@@ -335,7 +337,9 @@ pub struct AutomotiveIdsEngine {
     ips_drop_counter: AtomicU64,
 }
 
-unsafe impl Sync for AutomotiveIdsEngine {}
+// `AutomotiveIdsEngine` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl AutomotiveIdsEngine {
     pub const fn new() -> Self {
@@ -564,7 +568,9 @@ pub struct SafetyFaultHarness {
     watchdog_suppression: AtomicBool,
 }
 
-unsafe impl Sync for SafetyFaultHarness {}
+// `SafetyFaultHarness` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl SafetyFaultHarness {
     pub const fn new() -> Self {

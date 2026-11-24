@@ -147,7 +147,9 @@ pub struct CameraDmaRingBuffer {
     frame_sequence: AtomicU64,
 }
 
-unsafe impl Sync for CameraDmaRingBuffer {}
+// `CameraDmaRingBuffer` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl CameraDmaRingBuffer {
     pub const fn new() -> Self {
@@ -489,7 +491,9 @@ pub struct WatchdogManager {
     hw_watchdog_pet_inhibited: AtomicBool,
 }
 
-unsafe impl Sync for WatchdogManager {}
+// `WatchdogManager` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl WatchdogManager {
     pub const fn new() -> Self {

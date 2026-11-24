@@ -760,12 +760,15 @@ impl UptaneDualBankController {
 pub struct MouliVehicleOsMasterMonolith {
     pub motion: StanleyMotionController,
     pub uds_server: UdsDiagnosticServer,
-    pub ota_manager: UptaneDualBankController,
+    // Private so the trusted role keys cannot be replaced by swapping the whole controller.
+    ota_manager: UptaneDualBankController,
     pub cycle_counter: AtomicU64,
     pub system_healthy: AtomicBool,
 }
 
 impl MouliVehicleOsMasterMonolith {
+    /// An orchestrator with NO OTA keys provisioned: every software update is refused. Use
+    /// [`Self::new_with_ota_keys`] on a vehicle that is meant to accept updates.
     pub const fn new() -> Self {
         Self {
             motion: StanleyMotionController::new(0.75, 1.2),
@@ -774,6 +777,25 @@ impl MouliVehicleOsMasterMonolith {
             cycle_counter: AtomicU64::new(0),
             system_healthy: AtomicBool::new(true),
         }
+    }
+
+    /// An orchestrator that accepts updates signed by BOTH the Director and the Image
+    /// repository, whose Ed25519 public keys are provisioned here (for example read from the HSM
+    /// or factory-programmed storage at boot).
+    pub const fn new_with_ota_keys(director_key: [u8; 32], image_root_key: [u8; 32]) -> Self {
+        Self {
+            motion: StanleyMotionController::new(0.75, 1.2),
+            uds_server: UdsDiagnosticServer::new(),
+            ota_manager: UptaneDualBankController::new(PartitionBank::BankA, 100)
+                .with_role_keys(director_key, image_root_key),
+            cycle_counter: AtomicU64::new(0),
+            system_healthy: AtomicBool::new(true),
+        }
+    }
+
+    /// The OTA controller (read access; its keys are fixed at construction).
+    pub fn ota(&self) -> &UptaneDualBankController {
+        &self.ota_manager
     }
 
     /// High-frequency real-time orchestrator cycle running at 100 Hz (10ms)
@@ -1044,6 +1066,32 @@ mod tests {
         m.image_root_signature = role(2).sign(&raw).to_bytes();
         assert_eq!(
             ota.verify_manifest_metadata(&m),
+            Err(ota_error::DIRECTOR_SIGNATURE_INVALID)
+        );
+    }
+
+    #[test]
+    fn the_orchestrator_refuses_updates_unless_keys_were_provisioned() {
+        let locked = MouliVehicleOsMasterMonolith::new();
+        assert_eq!(
+            locked.ota().verify_manifest_metadata(&signed_target(101)),
+            Err(ota_error::KEYS_NOT_PROVISIONED)
+        );
+
+        let keyed = MouliVehicleOsMasterMonolith::new_with_ota_keys(
+            role(1).verifying_key().to_bytes(),
+            role(2).verifying_key().to_bytes(),
+        );
+        assert!(keyed
+            .ota()
+            .verify_manifest_metadata(&signed_target(101))
+            .is_ok());
+        assert!(keyed.ota().commit_and_swap_bank(101).is_ok());
+        // An update signed by the wrong authority is still refused on the provisioned vehicle.
+        let mut forged = signed_target(102);
+        forged.director_signature = role(9).sign(&forged.signed_bytes()).to_bytes();
+        assert_eq!(
+            keyed.ota().verify_manifest_metadata(&forged),
             Err(ota_error::DIRECTOR_SIGNATURE_INVALID)
         );
     }

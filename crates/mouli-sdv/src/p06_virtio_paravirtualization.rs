@@ -204,7 +204,9 @@ pub struct Virtqueue {
     lock: AtomicBool,
 }
 
-unsafe impl Sync for Virtqueue {}
+// `Virtqueue` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl Virtqueue {
     pub const fn new(size: u16) -> Self {
@@ -608,7 +610,9 @@ pub struct InterVmMailbox {
     pub slots: UnsafeCell<[InterVmSlot; INTER_VM_QUEUE_CAPACITY]>,
 }
 
-unsafe impl Sync for InterVmMailbox {}
+// `InterVmMailbox` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl InterVmMailbox {
     pub const fn new(doorbell_mmio: u64) -> Self {

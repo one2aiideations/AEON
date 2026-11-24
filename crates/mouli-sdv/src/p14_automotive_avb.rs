@@ -205,7 +205,9 @@ pub struct AvtpStreamReceiver {
     max_transit_time_ns: u32, // Class A AVB: 2ms max latency
 }
 
-unsafe impl Sync for AvtpStreamReceiver {}
+// `AvtpStreamReceiver` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl AvtpStreamReceiver {
     pub const fn new(stream_id: u64, max_transit_time_ns: u32) -> Self {
@@ -397,7 +399,9 @@ pub struct VirtioGpuDriver {
     scanout_active: AtomicBool,
 }
 
-unsafe impl Sync for VirtioGpuDriver {}
+// `VirtioGpuDriver` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl VirtioGpuDriver {
     pub const fn new() -> Self {

@@ -229,7 +229,9 @@ pub struct NvmeIoController {
     doorbell_cq_reg: AtomicU32,
 }
 
-unsafe impl Sync for NvmeIoController {}
+// `NvmeIoController` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl NvmeIoController {
     pub const fn new() -> Self {
@@ -384,7 +386,9 @@ pub struct EventDataRecorder {
     summary: UnsafeCell<EdrCrashSummary>,
 }
 
-unsafe impl Sync for EventDataRecorder {}
+// `EventDataRecorder` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl EventDataRecorder {
     pub const fn new() -> Self {
@@ -518,7 +522,9 @@ pub struct CrashdumpPersistor {
     is_committed: AtomicBool,
 }
 
-unsafe impl Sync for CrashdumpPersistor {}
+// `CrashdumpPersistor` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl CrashdumpPersistor {
     pub const fn new() -> Self {

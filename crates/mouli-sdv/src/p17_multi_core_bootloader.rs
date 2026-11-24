@@ -269,26 +269,31 @@ pub struct VehicleSystemMetrics {
 /// Grand Master Orchestration Monolith holding all subsystem references
 pub struct MouliMasterMonolith {
     pub boot_controller: SmpBootController,
-    pub metrics: UnsafeCell<VehicleSystemMetrics>,
+    /// Core-0-only state: secondary cores use `boot_controller` (atomics only) and never this.
+    metrics: crate::single_context::SingleContext<UnsafeCell<VehicleSystemMetrics>>,
     pub is_running: AtomicBool,
     pub emergency_shutdown_engaged: AtomicBool,
 }
 
-unsafe impl Sync for MouliMasterMonolith {}
+// `MouliMasterMonolith` is `Sync` only because every field is: `boot_controller` and the flags are
+// atomics, and `metrics` sits in a `SingleContext` whose contract (core 0 only) is stated above.
 
 impl MouliMasterMonolith {
     pub const fn new() -> Self {
         Self {
             boot_controller: SmpBootController::new(),
-            metrics: UnsafeCell::new(VehicleSystemMetrics {
-                total_cycles_executed: 0,
-                last_cycle_latency_us: 0,
-                max_cycle_latency_us: 0,
-                aeb_triggers_latched: 0,
-                vss_signal_writes: 0,
-                someip_frames_routed: 0,
-                system_nominal: true,
-            }),
+            // SAFETY: `metrics` is only read or written by the primary core (core 0).
+            metrics: unsafe {
+                crate::single_context::SingleContext::new(UnsafeCell::new(VehicleSystemMetrics {
+                    total_cycles_executed: 0,
+                    last_cycle_latency_us: 0,
+                    max_cycle_latency_us: 0,
+                    aeb_triggers_latched: 0,
+                    vss_signal_writes: 0,
+                    someip_frames_routed: 0,
+                    system_nominal: true,
+                }))
+            },
             is_running: AtomicBool::new(false),
             emergency_shutdown_engaged: AtomicBool::new(false),
         }
@@ -314,7 +319,7 @@ impl MouliMasterMonolith {
             return Err(BootError::AsilDIntegrityViolation);
         }
 
-        let m = unsafe { &mut *self.metrics.get() };
+        let m = unsafe { &mut *self.metrics.get().get() };
         m.total_cycles_executed += 1;
 
         // Emergency validation: Intervene if collision risk detected by perception
@@ -337,12 +342,12 @@ impl MouliMasterMonolith {
             .store(true, Ordering::SeqCst);
         self.is_running.store(false, Ordering::SeqCst);
 
-        let m = unsafe { &mut *self.metrics.get() };
+        let m = unsafe { &mut *self.metrics.get().get() };
         m.system_nominal = false;
     }
 
     pub fn get_metrics(&self) -> VehicleSystemMetrics {
-        unsafe { *self.metrics.get() }
+        unsafe { *self.metrics.get().get() }
     }
 }
 

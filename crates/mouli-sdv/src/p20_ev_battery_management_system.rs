@@ -281,7 +281,9 @@ pub struct PassiveBalancingController {
     is_enabled: AtomicBool,
 }
 
-unsafe impl Sync for PassiveBalancingController {}
+// `PassiveBalancingController` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl PassiveBalancingController {
     pub const fn new() -> Self {
@@ -461,7 +463,9 @@ pub struct ThermalSafetySupervisor {
     runaway_latched: AtomicBool,
 }
 
-unsafe impl Sync for ThermalSafetySupervisor {}
+// `ThermalSafetySupervisor` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl ThermalSafetySupervisor {
     pub const fn new() -> Self {
@@ -531,7 +535,9 @@ pub struct BatteryManagementSystem {
     last_cycle_us: AtomicU64,
 }
 
-unsafe impl Sync for BatteryManagementSystem {}
+// `BatteryManagementSystem` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl BatteryManagementSystem {
     pub const fn new(pack_capacity_ah: f32) -> Self {

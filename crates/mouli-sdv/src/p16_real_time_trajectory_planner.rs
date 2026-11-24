@@ -295,7 +295,9 @@ pub struct LocalCostmap {
     lock: AtomicBool,
 }
 
-unsafe impl Sync for LocalCostmap {}
+// `LocalCostmap` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl LocalCostmap {
     pub const fn new() -> Self {
@@ -456,7 +458,9 @@ pub struct ModelPredictiveController {
     cycle_counter: AtomicU64,
 }
 
-unsafe impl Sync for ModelPredictiveController {}
+// `ModelPredictiveController` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl ModelPredictiveController {
     pub const fn new() -> Self {
@@ -631,7 +635,9 @@ pub struct RealTimeMotionPlanner {
     active_trajectory: UnsafeCell<TrajectoryProfile>,
 }
 
-unsafe impl Sync for RealTimeMotionPlanner {}
+// `RealTimeMotionPlanner` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl RealTimeMotionPlanner {
     pub const fn new() -> Self {

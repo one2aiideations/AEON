@@ -414,7 +414,9 @@ pub struct TopologyRouter {
     lock: AtomicBool,
 }
 
-unsafe impl Sync for TopologyRouter {}
+// `TopologyRouter` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl TopologyRouter {
     pub const fn new() -> Self {
@@ -599,7 +601,9 @@ pub struct LocalizationEstimator {
     last_update_us: AtomicU64,
 }
 
-unsafe impl Sync for LocalizationEstimator {}
+// `LocalizationEstimator` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl LocalizationEstimator {
     pub const fn new() -> Self {

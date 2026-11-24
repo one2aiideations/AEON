@@ -360,7 +360,9 @@ pub struct PcieRootPortController {
     lock: AtomicBool,
 }
 
-unsafe impl Sync for PcieRootPortController {}
+// `PcieRootPortController` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl PcieRootPortController {
     pub const fn new() -> Self {

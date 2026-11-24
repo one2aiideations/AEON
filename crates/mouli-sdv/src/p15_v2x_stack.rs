@@ -640,7 +640,9 @@ pub struct V2xRadioController {
     temp_id_seed: AtomicU32,
 }
 
-unsafe impl Sync for V2xRadioController {}
+// `V2xRadioController` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl V2xRadioController {
     pub const fn new(initial_seed: u32) -> Self {

@@ -529,7 +529,9 @@ pub struct GateDriverInterface {
     is_armed: AtomicBool,
 }
 
-unsafe impl Sync for GateDriverInterface {}
+// `GateDriverInterface` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl GateDriverInterface {
     pub const fn new(clock_freq_hz: u32) -> Self {

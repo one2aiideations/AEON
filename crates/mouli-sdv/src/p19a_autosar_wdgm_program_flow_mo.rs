@@ -291,7 +291,9 @@ pub struct IsoTpReceiver {
     is_active: AtomicBool,
 }
 
-unsafe impl Sync for IsoTpReceiver {}
+// `IsoTpReceiver` is deliberately NOT `Sync`: it mutates interior state through `&self` with no lock, so
+// sharing it between threads or with an interrupt handler would be a data race. A single
+// execution context owns it (or the integrator wraps it in `SingleContext`).
 
 impl IsoTpReceiver {
     pub const fn new() -> Self {
