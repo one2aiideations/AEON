@@ -9,6 +9,8 @@
 // Parameter structs are documented by their field names; see each module's header.
 #![allow(missing_docs)]
 
+pub mod admin_reports;
+pub mod api;
 pub mod common;
 pub mod hr;
 pub mod inventory;

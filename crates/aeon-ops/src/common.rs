@@ -670,7 +670,13 @@ pub fn jopt_int(v: &Value, key: &str) -> Option<i64> {
 }
 /// Optional bool field (default false).
 pub fn jbool(v: &Value, key: &str) -> bool {
-    v.get(key).and_then(Value::as_bool).unwrap_or(false)
+    match v.get(key) {
+        Some(Value::Bool(b)) => *b,
+        // Query strings arrive as text: `?unread_only=true`.
+        Some(Value::String(s)) => matches!(s.as_str(), "true" | "1" | "yes"),
+        Some(Value::Number(n)) => n.as_i64() == Some(1),
+        _ => false,
+    }
 }
 /// Required array field.
 pub fn jarr<'a>(v: &'a Value, key: &str) -> Res<&'a Vec<Value>> {
