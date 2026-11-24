@@ -125,7 +125,8 @@ fn calc_line(
     if !(0..=10_000).contains(&tax_bps) {
         return Err("line tax must be between 0 and 10000 basis points".to_string());
     }
-    let gross = (qty_kth as i128) * (price as i128);
+    // Quantities are thousandths of a unit, so divide by 1000 (the same rule invoices use).
+    let gross = (qty_kth as i128) * (price as i128) / 1000;
     let disc = gross * (disc_pct_kth as i128) / 100_000;
     let net = gross - disc;
     let tax = net * (tax_bps as i128) / 10_000;

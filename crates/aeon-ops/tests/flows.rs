@@ -620,3 +620,64 @@ fn ledger_trait_rejects_unbalanced_entries() {
     };
     assert!(l.post(T, &bad).is_err());
 }
+
+#[test]
+fn quotation_and_order_totals_use_thousandths_of_a_unit() {
+    let c = setup();
+    let now = ts(2026, 3, 2, 10, 0);
+    let it = item(&c, "WIDGET", "FIFO", 0, now);
+    let cust = id(&sales::create_customer(
+        &c,
+        &admin(),
+        &sales::CreateCustomer {
+            code: "C1".into(),
+            name: "Acme".into(),
+            currency: "USD".into(),
+            credit_limit_minor: 0,
+        },
+        now,
+    )
+    .unwrap());
+    // 2 units at 50.00 with 10% line discount and 10% tax: 100.00 - 10.00 = 90.00, tax 9.00, total 99.00.
+    let q = sales::create_quotation(
+        &c,
+        &admin(),
+        &sales::CreateQuotation {
+            customer_id: cust.clone(),
+            opportunity_id: None,
+            lines: vec![sales::QuoteLineIn {
+                item_id: Some(it.clone()),
+                description: "w".into(),
+                qty_kth: 2_000,
+                unit_price_minor: 5_000,
+                discount_pct_kth: 10_000,
+                tax_bps: 1000,
+            }],
+            discount_minor: 0,
+            tax_bps: 0,
+            expiry_days: 30,
+        },
+        None,
+        now,
+    )
+    .unwrap();
+    assert_eq!(q["subtotal_minor"], 9_000);
+    assert_eq!(q["tax_minor"], 900);
+    assert_eq!(q["total_minor"], 9_900);
+    // 20 units at 180.00 with 10% tax is 3,960.00 (396,000 minor), not 396,000,000.
+    let o = sales::create_sales_order(
+        &c,
+        &admin(),
+        &cust,
+        &[sales::OrderLineIn {
+            item_id: it,
+            qty_kth: 20_000,
+            unit_price_minor: 18_000,
+            tax_bps: 1000,
+        }],
+        None,
+        now,
+    )
+    .unwrap();
+    assert_eq!(o["total_minor"], 396_000);
+}

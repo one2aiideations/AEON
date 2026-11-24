@@ -150,6 +150,10 @@ fn quote_to_cash_through_the_api_then_reports() {
     let order = call(&api, "POST", "/sales/orders", json!({"customer_id": cust, "idempotency_key": "k1", "lines": [{"item_id": item, "qty_kth": 4_000, "unit_price_minor": 10_000, "tax_bps": 1000}]})).unwrap();
     let again = call(&api, "POST", "/sales/orders", json!({"customer_id": cust, "idempotency_key": "k1", "lines": [{"item_id": item, "qty_kth": 4_000, "unit_price_minor": 10_000, "tax_bps": 1000}]})).unwrap();
     assert_eq!(order, again);
+    assert_eq!(
+        order["total_minor"], 44_000,
+        "4 units at 100.00 plus 10% tax, the same as the invoice"
+    );
     let oid = order["id"].as_str().unwrap().to_string();
     let d = call(&api, "POST", "/sales/deliveries", json!({"order_id": oid, "warehouse_id": wh, "lines": [{"order_line_no": 1, "qty_kth": 4_000}]})).unwrap();
     call(

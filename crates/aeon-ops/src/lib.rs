@@ -20,4 +20,5 @@ pub mod procurement;
 pub mod projects_service;
 pub mod sales;
 pub mod schema;
+pub mod selftest;
 pub mod server;
