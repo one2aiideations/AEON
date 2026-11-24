@@ -450,6 +450,15 @@ struct NetReport {
 /// Build a report from caller-supplied hardware text and identifiers.
 #[must_use]
 pub fn build(i: &Inputs) -> Report {
+    build_with_classes(i, &[])
+}
+
+/// Like [`build`], with the PCI class code (`PCI_CLASS` in sysfs, for example `0x028000`) of each
+/// entry of `i.pci_ids`, in the same order. Devices missing from the built-in table are then
+/// described by what they are ("Intel wireless network adapter") instead of "unknown device".
+/// A shorter or empty slice is fine; the missing entries stay unknown.
+#[must_use]
+pub fn build_with_classes(i: &Inputs, classes: &[u32]) -> Report {
     let cpu = parse_cpuinfo(i.cpuinfo);
     let memory = parse_meminfo(i.meminfo);
     let dmi = DmiReport {
@@ -457,7 +466,12 @@ pub fn build(i: &Inputs) -> Report {
         product: clean_dmi(i.dmi_product),
         bios: clean_dmi(i.dmi_bios),
     };
-    let pci: Vec<PciReport> = i.pci_ids.iter().map(|&(v, d)| identify_pci(v, d)).collect();
+    let pci: Vec<PciReport> = i
+        .pci_ids
+        .iter()
+        .enumerate()
+        .map(|(n, &(v, d))| identify_pci(v, d, classes.get(n).copied()))
+        .collect();
     let net = group_net_interfaces(i.net_interfaces);
     let block_devices = i
         .block_devices
@@ -573,7 +587,7 @@ fn clean_dmi(value: &str) -> String {
     }
 }
 
-fn identify_pci(vendor: u16, device: u16) -> PciReport {
+fn identify_pci(vendor: u16, device: u16, class_code: Option<u32>) -> PciReport {
     if let Some(&(_, _, name, class, support)) =
         KNOWN
             .iter()
@@ -585,6 +599,17 @@ fn identify_pci(vendor: u16, device: u16) -> PciReport {
             vendor,
             device,
             name: name.to_string(),
+            class,
+            support,
+        };
+    }
+
+    let vendor_label = vendor_name(vendor).unwrap_or("unknown vendor");
+    if let Some((kind, class, support)) = class_code.and_then(generic_by_class) {
+        return PciReport {
+            vendor,
+            device,
+            name: format!("{vendor_label} {kind}"),
             class,
             support,
         };
@@ -607,6 +632,40 @@ fn identify_pci(vendor: u16, device: u16) -> PciReport {
         class: Class::Other,
         support: Support::Unknown,
     }
+}
+
+/// What a device is, from its PCI class code (`0xBBSSPP`: base class, subclass, interface).
+fn generic_by_class(code: u32) -> Option<(&'static str, Class, Support)> {
+    let base = (code >> 16) & 0xff;
+    let sub = (code >> 8) & 0xff;
+    let (kind, class, support) = match (base, sub) {
+        (0x01, 0x08) => ("NVMe storage controller", Class::Storage, Support::Unknown),
+        (0x01, 0x06) => ("SATA storage controller", Class::Storage, Support::Unknown),
+        (0x01, _) => ("storage controller", Class::Storage, Support::Unknown),
+        (0x02, 0x00) => ("Ethernet adapter", Class::Ethernet, Support::Unknown),
+        (0x02, 0x80) => ("wireless network adapter", Class::WiFi, Support::Unknown),
+        (0x02, _) => ("network adapter", Class::Other, Support::Unknown),
+        (0x03, _) => ("graphics adapter", Class::Gpu, NO_GPU),
+        (0x04, _) => ("audio or video device", Class::Other, Support::Unknown),
+        (0x05, _) => ("memory controller", Class::Other, Support::Unknown),
+        (0x06, 0x00) => ("host bridge", Class::Other, Support::Unknown),
+        (0x06, 0x01) => ("ISA bridge", Class::Other, Support::Unknown),
+        (0x06, _) => ("PCI bridge", Class::Other, Support::Unknown),
+        (0x07, _) => ("communication controller", Class::Other, Support::Unknown),
+        (0x08, _) => ("system peripheral", Class::Other, Support::Unknown),
+        (0x0c, 0x03) => ("USB controller", Class::Other, Support::Unknown),
+        (0x0c, 0x05) => ("SMBus controller", Class::Other, Support::Unknown),
+        (0x0c, _) => ("serial bus controller", Class::Other, Support::Unknown),
+        (0x0d, _) => ("wireless controller", Class::Other, Support::Unknown),
+        (0x10, _) => ("encryption controller", Class::Other, Support::Unknown),
+        (0x11, _) => (
+            "signal processing controller",
+            Class::Other,
+            Support::Unknown,
+        ),
+        _ => return None,
+    };
+    Some((kind, class, support))
 }
 
 fn vendor_name(vendor: u16) -> Option<&'static str> {
@@ -683,9 +742,8 @@ fn support_label(support: Support) -> String {
 fn format_pci(device: &PciReport) -> String {
     let raw = format!("{:04x}:{:04x}", device.vendor, device.device);
     format!(
-        "{raw} {} ({}) [{}; {}]",
+        "{raw} {} [{}; {}]",
         device.name,
-        class_label(device.class),
         class_label(device.class),
         support_label(device.support)
     )
@@ -893,12 +951,8 @@ mod tests {
             block_devices: &["/dev/nvme0n1"],
         };
         let rendered = flat(&build(&inputs).render());
-        assert!(
-            rendered.contains("8086:ffff Intel unknown device (Other) [Other; support unknown]")
-        );
-        assert!(
-            rendered.contains("14c3:ffff MediaTek unknown device (Other) [Other; support unknown]")
-        );
+        assert!(rendered.contains("8086:ffff Intel unknown device [Other; support unknown]"));
+        assert!(rendered.contains("14c3:ffff MediaTek unknown device [Other; support unknown]"));
         assert!(rendered.contains("/dev/nvme0n1"));
         assert_render_width(&inputs);
     }
@@ -925,5 +979,62 @@ mod tests {
             ],
         };
         assert_render_width(&inputs);
+    }
+
+    #[test]
+    fn unlisted_devices_are_named_by_class_code() {
+        let ids = [
+            (0x8086, 0x5914),
+            (0x8086, 0xabcd),
+            (0x10ec, 0xffff),
+            (0x10de, 0xffff),
+        ];
+        let classes = [0x060000, 0x028000, 0x020000, 0x030000];
+        let report = build_with_classes(
+            &Inputs {
+                cpuinfo: "processor : 0\nflags : avx2\n",
+                meminfo: "",
+                dmi_vendor: "",
+                dmi_product: "",
+                dmi_bios: "",
+                pci_ids: &ids,
+                net_interfaces: &[],
+                block_devices: &[],
+            },
+            &classes,
+        );
+        let text = report.render();
+        assert!(text.contains("8086:5914 Intel host bridge"), "{text}");
+        assert!(
+            text.contains("Intel wireless network adapter [WiFi;"),
+            "{text}"
+        );
+        assert!(text.contains("Realtek Ethernet adapter"), "{text}");
+        assert!(
+            text.contains("NVIDIA graphics adapter [GPU; not supported"),
+            "{text}"
+        );
+        assert!(text.lines().all(|l| l.chars().count() <= 60), "{text}");
+    }
+
+    #[test]
+    fn a_short_class_list_leaves_the_rest_unknown() {
+        let ids = [(0x8086, 0x5914), (0x8086, 0xabcd)];
+        let report = build_with_classes(
+            &Inputs {
+                cpuinfo: "processor : 0\nflags : avx2\n",
+                meminfo: "",
+                dmi_vendor: "",
+                dmi_product: "",
+                dmi_bios: "",
+                pci_ids: &ids,
+                net_interfaces: &[],
+                block_devices: &[],
+            },
+            &[0x060000],
+        );
+        let text = report.render();
+        assert!(text.contains("Intel host bridge"), "{text}");
+        assert!(text.contains("8086:abcd Intel unknown device"), "{text}");
     }
 }

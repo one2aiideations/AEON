@@ -3,7 +3,7 @@
 //!
 //! Both roots are parameters so the whole thing can be tested against a fake tree.
 
-use crate::hwreport::{build, Inputs};
+use crate::hwreport::{build_with_classes, Inputs};
 use crate::procparse::{is_whole_disk, parse_partitions, parse_pci_id, parse_uevent};
 use std::path::Path;
 
@@ -22,16 +22,21 @@ fn dir_names(path: &Path) -> Vec<String> {
     names
 }
 
-/// PCI `(vendor, device)` pairs from `<sys>/bus/pci/devices/*/uevent`.
-fn pci_ids(sys: &Path) -> Vec<(u16, u16)> {
+/// PCI `(vendor, device)` pairs and class codes from `<sys>/bus/pci/devices/*/uevent`.
+fn pci_devices(sys: &Path) -> (Vec<(u16, u16)>, Vec<u32>) {
     let base = sys.join("bus/pci/devices");
     dir_names(&base)
         .iter()
         .filter_map(|d| {
             let ev = parse_uevent(&read(&base.join(d).join("uevent")));
-            parse_pci_id(ev.get("PCI_ID")?)
+            let ids = parse_pci_id(ev.get("PCI_ID")?)?;
+            let class = ev
+                .get("PCI_CLASS")
+                .and_then(|c| u32::from_str_radix(c.trim(), 16).ok())
+                .unwrap_or(0);
+            Some((ids, class))
         })
-        .collect()
+        .unzip()
 }
 
 /// The report for the machine whose `/proc` and `/sys` are at `proc` and `sys`.
@@ -45,7 +50,7 @@ pub fn report(proc: &Path, sys: &Path) -> String {
         read(&dmi.join("product_name")),
         read(&dmi.join("bios_version")),
     );
-    let pci = pci_ids(sys);
+    let (pci, classes) = pci_devices(sys);
     let nets = dir_names(&sys.join("class/net"));
     let net_refs: Vec<&str> = nets.iter().map(String::as_str).collect();
     let disks: Vec<String> = parse_partitions(&read(&proc.join("partitions")))
@@ -54,16 +59,19 @@ pub fn report(proc: &Path, sys: &Path) -> String {
         .map(|p| p.name)
         .collect();
     let disk_refs: Vec<&str> = disks.iter().map(String::as_str).collect();
-    build(&Inputs {
-        cpuinfo: &cpuinfo,
-        meminfo: &meminfo,
-        dmi_vendor: &vendor,
-        dmi_product: &product,
-        dmi_bios: &bios,
-        pci_ids: &pci,
-        net_interfaces: &net_refs,
-        block_devices: &disk_refs,
-    })
+    build_with_classes(
+        &Inputs {
+            cpuinfo: &cpuinfo,
+            meminfo: &meminfo,
+            dmi_vendor: &vendor,
+            dmi_product: &product,
+            dmi_bios: &bios,
+            pci_ids: &pci,
+            net_interfaces: &net_refs,
+            block_devices: &disk_refs,
+        },
+        &classes,
+    )
     .render()
 }
 
@@ -111,7 +119,7 @@ mod tests {
         put(
             &sys,
             "bus/pci/devices/0000:00:14.3/uevent",
-            "DRIVER=iwlwifi\nPCI_ID=8086:2725\n",
+            "DRIVER=iwlwifi\nPCI_CLASS=28000\nPCI_ID=8086:2725\n",
         );
         let text = report(&proc, &sys);
         assert!(text.contains("Hardware report"));
@@ -122,6 +130,7 @@ mod tests {
             "partitions are not listed as disks: {text}"
         );
         assert!(text.contains("eth0"), "{text}");
+        assert!(text.contains("8086:2725"), "{text}");
         assert!(text.lines().all(|l| l.chars().count() <= 60), "{text}");
     }
 
