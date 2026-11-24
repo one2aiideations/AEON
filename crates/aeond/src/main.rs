@@ -21,6 +21,8 @@ use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are AEON, a helpful assistant running entirely on this computer with no internet connection. Answer clearly and concisely.";
 const REPLY_TOKENS: u32 = 512;
+/// Conversation budget for hosted models (their context is large; this keeps cost sensible).
+const HOSTED_CONTEXT_TOKENS: usize = 6_000;
 
 /// Mount point of the data partition, when there is one (unmounted before power-off).
 static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -270,7 +272,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     &mut input,
                     &mut out,
                     hosted::SYSTEM_PROMPT,
-                    12_000,
+                    HOSTED_CONTEXT_TOKENS,
                 );
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}
@@ -304,7 +306,9 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     }
                 };
                 say("AEON ready");
-                let max_chars = usize::try_from(plan.ctx).unwrap_or(2048).saturating_mul(3);
+                // Keep about 80% of the server's context for the conversation; the rest is for
+                // the reply and for the estimate being rough.
+                let max_tokens = usize::try_from(plan.ctx).unwrap_or(2048).saturating_mul(4) / 5;
                 let end = chat_loop(
                     &mut ServerBackend {
                         port: a.port,
@@ -313,7 +317,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     &mut input,
                     &mut out,
                     SYSTEM_PROMPT,
-                    max_chars,
+                    max_tokens,
                 );
                 stop(&mut child);
                 match end {

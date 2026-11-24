@@ -128,17 +128,48 @@ pub fn pick_model<R: BufRead, W: Write>(
     }
 }
 
-/// Drop the oldest turns until the history fits `max_chars`, always keeping the system prompt
-/// and the newest turn.
-pub fn trim_history(history: &mut Vec<Turn>, max_chars: usize) {
-    let total = |h: &[Turn]| h.iter().map(|t| t.content.len()).sum::<usize>();
-    while total(history) > max_chars {
-        let first = usize::from(history.first().is_some_and(|t| t.role == "system"));
-        if history.len() <= first + 1 {
-            break;
-        }
-        history.remove(first);
+/// Drop the oldest turns until the history fits `max_tokens` (estimated, see
+/// [`crate::context`]), always keeping the system prompt and the newest turn; a newest turn that
+/// is too long on its own is cut. Returns what was done: `(turns dropped, newest turn cut)`.
+pub fn trim_history(history: &mut Vec<Turn>, max_tokens: usize) -> (usize, bool) {
+    use crate::context::{History, Role};
+    let system = history
+        .first()
+        .filter(|t| t.role == "system")
+        .map(|t| t.content.clone());
+    let skip = usize::from(system.is_some());
+    let mut ctx = History::new();
+    for t in history.iter().skip(skip) {
+        let role = if t.role == "assistant" {
+            Role::Assistant
+        } else {
+            Role::User
+        };
+        ctx.push(role, t.content.clone());
     }
+    let fitted = ctx.fit(max_tokens, system.as_deref().unwrap_or(""));
+    if fitted.dropped == 0 && !fitted.truncated {
+        return (0, false);
+    }
+    let mut rebuilt = Vec::with_capacity(fitted.turns.len() + skip);
+    if let Some(content) = system {
+        rebuilt.push(Turn {
+            role: "system",
+            content,
+        });
+    }
+    for t in fitted.turns {
+        rebuilt.push(Turn {
+            role: if t.role == Role::Assistant {
+                "assistant"
+            } else {
+                "user"
+            },
+            content: t.text,
+        });
+    }
+    *history = rebuilt;
+    (fitted.dropped, fitted.truncated)
 }
 
 const HELP: &str = "  /models  choose another model\n  /clear   start a new conversation\n  /help    this list\n  /quit    power off\n";
@@ -152,7 +183,7 @@ pub fn chat_loop<R: BufRead, W: Write, B: Backend>(
     input: &mut R,
     out: &mut W,
     system_prompt: &str,
-    max_chars: usize,
+    max_tokens: usize,
 ) -> io::Result<End> {
     let fresh = || {
         vec![Turn {
@@ -196,7 +227,16 @@ pub fn chat_loop<R: BufRead, W: Write, B: Backend>(
             role: "user",
             content: text.into(),
         });
-        trim_history(&mut history, max_chars);
+        let (dropped, cut) = trim_history(&mut history, max_tokens);
+        if dropped > 0 {
+            writeln!(
+                out,
+                "  (the conversation is long: {dropped} oldest message(s) were forgotten to fit the model's memory)"
+            )?;
+        }
+        if cut {
+            writeln!(out, "  (your message was too long and was shortened)")?;
+        }
         writeln!(out, "aeon> (thinking...)")?;
         out.flush()?;
         match backend.reply(&history) {
@@ -331,19 +371,50 @@ mod tests {
         };
         let mut h = vec![
             t("system", "sys"),
-            t("user", &"a".repeat(50)),
-            t("assistant", &"b".repeat(50)),
-            t("user", &"c".repeat(50)),
+            t("user", &"a".repeat(700)),
+            t("assistant", &"b".repeat(700)),
+            t("user", &"c".repeat(700)),
         ];
-        trim_history(&mut h, 120);
-        assert_eq!(h.len(), 3);
+        // Everything fits: nothing changes.
+        assert_eq!(trim_history(&mut h, 10_000), (0, false));
+        assert_eq!(h.len(), 4);
+        // Room for the system prompt and about one long turn.
+        let (dropped, cut) = trim_history(&mut h, 260);
+        assert_eq!((dropped, cut), (2, false));
+        assert_eq!(h.len(), 2);
         assert_eq!(h[0].role, "system");
-        trim_history(&mut h, 10);
-        assert_eq!(
-            h.len(),
-            2,
-            "never drops the system prompt or the newest turn"
-        );
-        assert_eq!(h[1].content, "c".repeat(50));
+        assert_eq!(h[1].content, "c".repeat(700));
+        // Far too small: the newest turn is cut but kept.
+        let (_, cut) = trim_history(&mut h, 20);
+        assert!(cut);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].role, "system");
+        assert!(h[1].content.ends_with("[cut]"));
+    }
+
+    #[test]
+    fn trimming_never_starts_with_an_assistant_turn() {
+        let t = |r, c: &str| Turn {
+            role: r,
+            content: c.into(),
+        };
+        let mut h = vec![
+            t("system", "sys"),
+            t("user", &"a".repeat(400)),
+            t("assistant", &"b".repeat(400)),
+            t("user", "short"),
+        ];
+        trim_history(&mut h, 60);
+        assert_eq!(h[1].role, "user");
+    }
+
+    #[test]
+    fn long_chats_tell_the_person_what_was_forgotten() {
+        let long = "word ".repeat(200);
+        let script = format!("{long}\n{long}\n{long}\n/quit\n");
+        let (mut b, mut out) = (Echo(vec![]), Vec::new());
+        chat_loop(&mut b, &mut script.as_bytes(), &mut out, "be nice", 600).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("oldest message(s) were forgotten"), "{out}");
     }
 }
