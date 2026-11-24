@@ -393,6 +393,25 @@ impl Workspace {
             .collect()
     }
 
+    /// Who asked for a held call (so a console can refuse to let them approve it).
+    #[must_use]
+    pub fn approval_requester(&self, id: &str) -> Option<&str> {
+        self.approvals.get(id).map(|r| r.requester.as_str())
+    }
+
+    /// Whether the named role exists and holds `permission`.
+    #[must_use]
+    pub fn role_can(&self, role: &str, permission: &str) -> bool {
+        self.roles.get(role).is_some_and(|r| r.can(permission))
+    }
+
+    /// Writes an event from a part of the system outside this workspace (for example a code
+    /// change applied on the device) into the same tamper-evident audit chain.
+    pub fn record_event(&mut self, actor: &str, action: &str, subject: &str, outcome: &str) {
+        let t = self.now();
+        self.audit.append(t, actor, action, subject, outcome);
+    }
+
     /// Status of an approval.
     #[must_use]
     pub fn approval_status(&self, id: &str) -> Option<&Status> {

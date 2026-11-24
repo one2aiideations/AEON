@@ -2671,6 +2671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-device"
+version = "0.1.0"
+dependencies = [
+ "mouli-code",
+ "mouli-interface",
+ "mouli-screen",
+ "tempfile",
+]
+
+[[package]]
 name = "mouli-engine"
 version = "0.1.0"
 
