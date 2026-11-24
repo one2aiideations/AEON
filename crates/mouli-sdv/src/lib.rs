@@ -1,4 +1,7 @@
-//! MOULI-SDV: software-defined-vehicle building blocks.
+//! MOULI-SDV: an AI-native software development environment for vehicles. It provides
+//! building blocks and simulators to develop and verify vehicle software against; it is not a
+//! vehicle operating system to deploy.
+//!
 //!
 //! EXPERIMENTAL. Nothing here is certified to ISO 26262, ISO 21434 or any other standard, and
 //! the safety-level names in module comments (such as "ASIL-D") describe design intent only.

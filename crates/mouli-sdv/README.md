@@ -1,6 +1,9 @@
 # MOULI-SDV
 
-Software-defined-vehicle building blocks in `no_std` Rust: kernel scheduling and lock-free queues,
+An AI-native software development environment for vehicles (software-defined vehicle, SDV). It is
+**not** a vehicle operating system you flash onto a car: it is the environment to develop, simulate
+and verify vehicle software in. It provides `no_std` Rust building blocks and models of the things
+vehicle software runs on: kernel scheduling and lock-free queues,
 vehicle networking (SOME/IP, CAN-FD/XL, ISO-TP, DoIP, TSN), safety supervision (watchdog manager,
 lockstep, DEM), secure communication (SecOC, E2E, Uptane OTA, HSM), storage, perception and
 control (sensor fusion, MPC, motor and battery control), and V2X.
@@ -51,6 +54,13 @@ cargo check -p mouli-sdv --no-default-features   # no_std build (what bare metal
 dependencies). With `std` on, the standard library's methods are used instead.
 
 ## Known limits and open work
+
+* Positioning: the hardware parts (flash, NVMe, DMA, PCIe, gate drivers) are in-memory simulators for
+  development and testing, which is their purpose here. Moving any of this onto a real target
+  would need real drivers, datasheet-checked register layouts and a safety process.
+* "AI-native" is a goal, not yet a feature: the AI-facing parts (perception interfaces, planner,
+  estimators) exist, but there is no model-in-the-loop tooling, scenario generation or
+  agent-facing API in this crate yet.
 
 * About 200 `unsafe` uses remain (`unsafe_code` is allowed crate-wide). Each needs a review for a
   `// SAFETY:` justification; the ones found so far were fixed, but the audit is not finished.
