@@ -125,380 +125,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-adapters"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-agents"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-auth"
-version = "0.1.0"
-dependencies = [
- "mouli-interface",
- "sha2",
-]
-
-[[package]]
-name = "mouli-biz"
-version = "0.13.0"
-dependencies = [
- "base64 0.22.1",
- "chacha20poly1305",
- "ed25519-dalek",
- "rusqlite",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "mouli-business"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "tokio",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "mouli-cognition"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-comms"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "hkdf",
- "sha2",
- "x25519-dalek",
-]
-
-[[package]]
-name = "mouli-compress"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-core"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-crm"
-version = "0.1.0"
-dependencies = [
- "mouli-auth",
- "mouli-interface",
-]
-
-[[package]]
-name = "mouli-crypto"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "redb",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "mouli-engine"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-forge"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-gate"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-gateway"
-version = "0.1.0"
-dependencies = [
- "mouli-interface",
-]
-
-[[package]]
-name = "mouli-gguf"
-version = "0.1.0"
-dependencies = [
- "memmap2",
-]
-
-[[package]]
-name = "mouli-hosted"
-version = "0.1.0"
-dependencies = [
- "mouli-gateway",
- "mouli-http",
- "mouli-pki",
-]
-
-[[package]]
-name = "mouli-http"
-version = "0.1.0"
-dependencies = [
- "mouli-pki",
- "mouli-tls",
-]
-
-[[package]]
-name = "mouli-hw"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-identity"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "sha2",
-]
-
-[[package]]
-name = "mouli-interface"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-llm"
-version = "0.1.0"
-dependencies = [
- "mouli-engine",
- "mouli-gguf",
- "mouli-quant",
-]
-
-[[package]]
-name = "mouli-mail"
-version = "0.1.0"
-dependencies = [
- "mouli-web",
- "argon2",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "hex",
- "mailparse",
- "rand 0.8.8",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mouli-memory"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-mesh"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
-name = "mouli-model"
-version = "0.1.0"
-dependencies = [
- "mouli-tensor",
-]
-
-[[package]]
-name = "mouli-neuro"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-ops"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "mouli-orchestra"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-pki"
-version = "0.1.0"
-dependencies = [
- "mouli-crypto",
- "sha2",
-]
-
-[[package]]
-name = "mouli-project"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "eframe",
- "http-body-util",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "mouli-quant"
-version = "0.1.0"
-dependencies = [
- "mouli-gguf",
-]
-
-[[package]]
-name = "mouli-runtime"
-version = "0.1.0"
-dependencies = [
- "mouli-cognition",
- "mouli-engine",
-]
-
-[[package]]
-name = "mouli-sched"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-sheet"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-store"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-studio"
-version = "0.1.0"
-dependencies = [
- "mouli-sheet",
-]
-
-[[package]]
-name = "mouli-system"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs",
- "eframe",
- "egui",
- "serde",
- "serde_json",
- "sysinfo",
-]
-
-[[package]]
-name = "mouli-tensor"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-theory"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-tls"
-version = "0.1.0"
-dependencies = [
- "mouli-crypto",
- "mouli-pki",
- "sha2",
-]
-
-[[package]]
-name = "mouli-tokenizer"
-version = "0.1.0"
-dependencies = [
- "mouli-gguf",
-]
-
-[[package]]
-name = "mouli-topstar"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "mouli-update"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "sha2",
-]
-
-[[package]]
-name = "mouli-web"
-version = "0.1.0"
-
-[[package]]
-name = "moulid"
-version = "0.1.0"
-dependencies = [
- "mouli-gguf",
- "mouli-hosted",
- "mouli-http",
- "mouli-hw",
- "mouli-interface",
- "mouli-pki",
- "nix",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2930,6 +2556,388 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mouli-adapters"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-agents"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-auth"
+version = "0.1.0"
+dependencies = [
+ "mouli-interface",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-biz"
+version = "0.13.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-business"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-cognition"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-comms"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "hkdf",
+ "sha2",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "mouli-compress"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-core"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-crm"
+version = "0.1.0"
+dependencies = [
+ "mouli-auth",
+ "mouli-interface",
+]
+
+[[package]]
+name = "mouli-crypto"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-engine"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-forge"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-gate"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-gateway"
+version = "0.1.0"
+dependencies = [
+ "mouli-interface",
+]
+
+[[package]]
+name = "mouli-gguf"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
+name = "mouli-hosted"
+version = "0.1.0"
+dependencies = [
+ "mouli-gateway",
+ "mouli-http",
+ "mouli-pki",
+]
+
+[[package]]
+name = "mouli-http"
+version = "0.1.0"
+dependencies = [
+ "mouli-pki",
+ "mouli-tls",
+]
+
+[[package]]
+name = "mouli-hw"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-identity"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-interface"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-llm"
+version = "0.1.0"
+dependencies = [
+ "mouli-engine",
+ "mouli-gguf",
+ "mouli-quant",
+]
+
+[[package]]
+name = "mouli-mail"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "hex",
+ "mailparse",
+ "mouli-web",
+ "rand 0.8.8",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mouli-memory"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-mesh"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "mouli-model"
+version = "0.1.0"
+dependencies = [
+ "mouli-tensor",
+]
+
+[[package]]
+name = "mouli-neuro"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-ops"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-orchestra"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-pki"
+version = "0.1.0"
+dependencies = [
+ "mouli-crypto",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-project"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "eframe",
+ "http-body-util",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-quant"
+version = "0.1.0"
+dependencies = [
+ "mouli-gguf",
+]
+
+[[package]]
+name = "mouli-runtime"
+version = "0.1.0"
+dependencies = [
+ "mouli-cognition",
+ "mouli-engine",
+]
+
+[[package]]
+name = "mouli-sched"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-security"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-sheet"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-store"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-studio"
+version = "0.1.0"
+dependencies = [
+ "mouli-sheet",
+]
+
+[[package]]
+name = "mouli-system"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "eframe",
+ "egui",
+ "serde",
+ "serde_json",
+ "sysinfo",
+]
+
+[[package]]
+name = "mouli-tensor"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-theory"
+version = "0.1.0"
+
+[[package]]
+name = "mouli-tls"
+version = "0.1.0"
+dependencies = [
+ "mouli-crypto",
+ "mouli-pki",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "mouli-gguf",
+]
+
+[[package]]
+name = "mouli-topstar"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "mouli-update"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
+name = "mouli-web"
+version = "0.1.0"
+
+[[package]]
+name = "moulid"
+version = "0.1.0"
+dependencies = [
+ "mouli-gguf",
+ "mouli-hosted",
+ "mouli-http",
+ "mouli-hw",
+ "mouli-interface",
+ "mouli-pki",
+ "nix",
 ]
 
 [[package]]
