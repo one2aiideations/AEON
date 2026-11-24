@@ -26,6 +26,7 @@ pub mod args;
 pub mod fslabel;
 pub mod hosted;
 pub mod http;
+pub mod known_networks;
 pub mod models;
 pub mod net;
 pub mod persist;
