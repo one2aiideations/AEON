@@ -2563,6 +2563,10 @@ name = "mouli-adapters"
 version = "0.1.0"
 
 [[package]]
+name = "mouli-agentmem"
+version = "0.1.0"
+
+[[package]]
 name = "mouli-agents"
 version = "0.1.0"
 dependencies = [
