@@ -1,0 +1,33 @@
+[package]
+name = "mouli-sdv"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-SDV: software-defined-vehicle building blocks (automotive networking, safety supervision, OTA, control). Experimental; not safety-certified."
+
+[features]
+default = ["std"]
+# Use the standard library; turn off for bare-metal (`no_std`) builds.
+std = []
+
+[dependencies]
+# Already approved and used by mouli-update, mouli-biz and mouli-identity; no_std capable.
+ed25519-dalek = { version = "2", default-features = false }
+
+[lints.rust]
+# Hardware-register and lock-free code needs `unsafe`. Each use is reviewed per module; the count
+# is tracked in the crate docs. The soundness problems found so far (uninitialised memory,
+# unchecked untrusted indices, volatile reads) were fixed rather than allowed.
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# Style lints that do not affect correctness in this register-and-ring-buffer style code:
+needless_range_loop = "allow"           # indexed loops mirror hardware tables and are clearer here
+declare_interior_mutable_const = "allow" # `const ZERO: AtomicU8` is the intended array initialiser
+manual_clamp = "allow"                  # explicit branches keep NaN handling visible
+neg_cmp_op_on_partial_ord = "allow"     # `!(x > 0.0)` deliberately treats NaN as failing
+too_many_arguments = "allow"            # register-block constructors and driver entry points
+result_unit_err = "allow"               # error codes are plain integers in this layer
