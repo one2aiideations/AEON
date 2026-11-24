@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod context;
 pub mod fslabel;
 pub mod hosted;
 pub mod http;
