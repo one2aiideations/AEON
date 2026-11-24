@@ -2599,7 +2599,6 @@ name = "mouli-business"
 version = "0.1.0"
 dependencies = [
  "axum",
- "chrono",
  "reqwest",
  "rust_decimal",
  "serde",
@@ -2911,7 +2910,6 @@ dependencies = [
 name = "mouli-system"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "dirs",
  "eframe",

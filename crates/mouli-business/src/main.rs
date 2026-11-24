@@ -1,3 +1,4 @@
+//! MOULI-BUSINESS: the unified agentic business operating system service.
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode},

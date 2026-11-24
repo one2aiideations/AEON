@@ -1,3 +1,4 @@
+//! End-to-end tests of the device controller: chat, approvals, audit, security and patch review.
 use mouli_code::diff::render;
 use mouli_code::make::make_patch;
 use mouli_device::{Backend, Device, Outcome};

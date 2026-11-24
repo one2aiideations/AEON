@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! MOULI-SYSTEM: single-file, read-only system inventory foundation.
+//! All platform-sensitive changes remain disabled until safe adapters exist.
 // MOULI-SYSTEM: single-file, read-only system inventory foundation.
 // All platform-sensitive changes remain disabled until safe adapters exist.
 
