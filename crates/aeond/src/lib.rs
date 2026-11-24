@@ -25,6 +25,7 @@
 pub mod args;
 pub mod context;
 pub mod fslabel;
+pub mod gguf_info;
 pub mod hosted;
 pub mod http;
 pub mod hwreport;
