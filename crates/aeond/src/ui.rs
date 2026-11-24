@@ -15,6 +15,8 @@ pub enum Choice {
     Hosted,
     /// Connect to a Wi-Fi network.
     Wifi,
+    /// Show the hardware report.
+    Info,
     /// Power off.
     Quit,
 }
@@ -75,7 +77,7 @@ pub fn render_menu(models: &[Found], budget_mb: u64) -> String {
             m.path.display()
         ));
     }
-    s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   h = hosted model (online)   q = power off\n");
+    s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   h = hosted model (online)   i = hardware info   q = power off\n");
     s
 }
 
@@ -87,6 +89,7 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
         "r" => Some(Choice::Rescan),
         "h" => Some(Choice::Hosted),
         "w" => Some(Choice::Wifi),
+        "i" => Some(Choice::Info),
         "q" => Some(Choice::Quit),
         _ => t
             .parse::<usize>()
@@ -119,7 +122,7 @@ pub fn pick_model<R: BufRead, W: Write>(
         }
         writeln!(
             out,
-            "  Please type a number from 1 to {}, r, w, h or q.",
+            "  Please type a number from 1 to {}, r, w, h, i or q.",
             models.len()
         )?;
     }
@@ -251,6 +254,7 @@ mod tests {
         assert_eq!(parse_choice(" 2 \n", 3), Some(Choice::Model(1)));
         assert_eq!(parse_choice("R", 0), Some(Choice::Rescan));
         assert_eq!(parse_choice("q", 0), Some(Choice::Quit));
+        assert_eq!(parse_choice(" I \n", 0), Some(Choice::Info));
         for bad in ["0", "4", "-1", "x", ""] {
             assert_eq!(parse_choice(bad, 3), None, "{bad}");
         }

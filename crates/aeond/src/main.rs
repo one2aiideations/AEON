@@ -4,6 +4,7 @@
 use aeon_hw::{Hw, Plan};
 use aeond::args::{Args, DEFAULT_MODEL_DIR};
 use aeond::hosted::{self, HostedBackend};
+use aeond::hwprobe;
 use aeond::models::{describe, discover, Found};
 use aeond::net;
 use aeond::persist::{self, Store};
@@ -224,6 +225,23 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         match choice {
             Choice::Quit => return finish(pid1, 0),
             Choice::Rescan => continue,
+            Choice::Info => {
+                let text = hwprobe::report(Path::new("/proc"), Path::new("/sys"));
+                let _ = writeln!(out, "\n{text}");
+                if let Some(s) = store {
+                    let saved = std::fs::write(s.root().join("hardware-report.txt"), &text);
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        if saved.is_ok() {
+                            "  (also saved on the data disk as hardware-report.txt)"
+                        } else {
+                            "  (could not save a copy)"
+                        }
+                    );
+                }
+                continue;
+            }
             Choice::Wifi => {
                 let _ = wifi::connect_flow(
                     &mut input,

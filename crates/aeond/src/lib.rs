@@ -31,6 +31,7 @@ pub mod fslabel;
 pub mod gguf_info;
 pub mod hosted;
 pub mod http;
+pub mod hwprobe;
 pub mod hwreport;
 pub mod known_networks;
 pub mod lineedit;
