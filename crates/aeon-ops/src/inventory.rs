@@ -72,6 +72,7 @@ pub struct TransferParams {
 }
 
 /// Outcome of a stock issue.
+#[derive(Debug)]
 pub struct IssueOutcome {
     /// Movement row id.
     pub movement_id: String,
