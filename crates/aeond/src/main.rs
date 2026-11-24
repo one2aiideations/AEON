@@ -3,6 +3,7 @@
 
 use aeon_hw::{Hw, Plan};
 use aeond::args::{Args, DEFAULT_MODEL_DIR};
+use aeond::clocksync;
 use aeond::hosted::{self, HostedBackend};
 use aeond::hwprobe;
 use aeond::models::{describe, discover, Found};
@@ -31,6 +32,14 @@ fn say(msg: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{msg}");
     let _ = out.flush();
+}
+
+/// Set the clock from the network and say what happened (HTTPS needs a correct clock).
+fn sync_clock_say() {
+    match clocksync::sync() {
+        Ok(m) => say(&format!("AEON clock: {m}")),
+        Err(e) => say(&format!("AEON clock: not set from the network ({e})")),
+    }
 }
 
 fn log_path(pid1: bool) -> &'static str {
@@ -245,13 +254,16 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 continue;
             }
             Choice::Wifi => {
-                let _ = wifi::connect_flow(
+                let joined = wifi::connect_flow(
                     &mut input,
                     &mut out,
                     &mut wifi::System,
                     Path::new(net::SYS_NET),
                     store.map(persist::Store::root),
                 );
+                if matches!(joined, Ok(Some(_))) {
+                    sync_clock_say();
+                }
                 continue;
             }
             Choice::Hosted => {
@@ -397,6 +409,12 @@ fn main() -> ExitCode {
         let wired = net::bring_up_wired(3);
         wired_up = matches!(wired, net::Link::Up { .. });
         say(&wired.summary());
+        if wired_up {
+            match clocksync::sync() {
+                Ok(m) => say(&format!("AEON clock: {m}")),
+                Err(e) => say(&format!("AEON clock: not set from the network ({e})")),
+            }
+        }
         let _ = wifi::unblock_radios(Path::new("/sys/class/rfkill"));
         say(&wifi::summary(&wifi::wireless_interfaces(Path::new(
             net::SYS_NET,

@@ -25,6 +25,7 @@
 pub mod args;
 pub mod backoff;
 pub mod civil_time;
+pub mod clocksync;
 pub mod context;
 pub mod download_plan;
 pub mod fslabel;
