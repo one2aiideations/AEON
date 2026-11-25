@@ -54,7 +54,7 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) sibling-system adapters and the AI data graph (`graph`: conversations, messages, models, files, tool calls and approvals as typed, timed nodes and edges, saved as an append-only log) |
-| `mouli-systems` | The platform services in one crate: model gateway (`gateway`), identity (`identity`, `auth`), security (`security`, `gate`), scheduler (`sched`), system state (`store`), integrations (`topstar`, `comms`, `mesh`), monitoring (`monitor`) and billing (`billing`) |
+| `mouli-systems` | The platform services in one crate: model gateway (`gateway`), identity (`identity`, `auth`), security (`security`, `gate`), scheduler (`sched`), system state (`store`), integrations (`topstar`, `comms`, `mesh`), monitoring (`monitor`), billing (`billing`), bring-your-own-key vault (`keys`), data washing with GDPR and DPDP profiles (`wash`) and privacy duties (`privacy`) |
 | `mouli-forge`, `mouli-neuro` | Versioned agent manifests, spiking runtime |
 | `mouli-lab` | Aetheron research harness with gradient checks (no real-data results yet) |
 

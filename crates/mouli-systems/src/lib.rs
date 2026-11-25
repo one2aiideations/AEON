@@ -9,11 +9,15 @@
 //! | State | [`store`]: small OS state kept in memory and saved |
 //! | Integrations | [`topstar`] (capabilities, devices, protocol, sessions, execution records), [`comms`] (encrypted messages and calls), [`mesh`] (a user's devices) |
 //! | Monitoring | [`monitor`]: metrics, health checks, alerts, service-level objectives |
-//! | Billing | [`billing`]: usage metering, plans and quotas, price book, invoices |
+//! | Billing | [`billing`]: usage metering, plans and quotas, invoices |
+//! | BYOK key management | [`keys`]: a passphrase-encrypted vault for people's own API keys, bound to hosts, with rotation, limits and an audit trail |
+//! | Data washing | [`wash`]: finds and removes personal data and secrets before text leaves the machine, with GDPR and DPDP profiles |
+//! | Privacy duties | [`privacy`]: consent records, requests from people with deadlines, retention, breach clocks (GDPR and DPDP) |
 //!
 //! The AI runtime, memory, knowledge, workflow engine, queue and automation live in
 //! `mouli-llm` and `mouli-agentic`. Features: `topstar`, `security` and `comms` (all on by default)
-//! (and `identity`, `auth`, `mesh`) bring in their third-party crates; the OS image builds without them.
+//! (and `identity`, `auth`, `mesh`, `billing`, `keys`) bring in their third-party crates; the OS image
+//! builds without them. `wash`, `privacy` and `monitor` need none.
 //!
 //! Merged from ten crates; behaviour and tests are unchanged.
 
@@ -18950,6 +18954,2150 @@ pub mod keys {
             e.fill(&mut b).unwrap();
             assert_ne!(a, b);
             assert_ne!(a, [0u8; 16]);
+        }
+    }
+}
+
+/// Data washing: find personal data and secrets in text and remove, mask or pseudonymise them
+/// before the text leaves the machine, with ready-made profiles for GDPR and DPDP.
+///
+/// What it recognises (by patterns and checksums, not by guessing): private keys, JWTs, secrets
+/// (`password=...` style and known key formats), payment cards (Luhn), Aadhaar numbers
+/// (Verhoeff), IBANs (mod 97), PAN, GSTIN (checksum), IFSC codes, UPI ids, email addresses,
+/// phone numbers and IPv4 addresses.
+///
+/// What it does **not** do: it cannot find names, addresses, or personal facts written in free
+/// text, and it cannot decide what is lawful. A profile is a sensible starting point for the
+/// rules each law describes, not a statement that a product is compliant with the law. Treat it
+/// as a safety net before text leaves the machine, together with your own legal advice.
+///
+/// Actions per kind: keep it, mask it (`[EMAIL]`, irreversible), partly mask it (`XXXX XXXX 1234`,
+/// irreversible), or pseudonymise it with a token (`[EMAIL_1]`) that the same [`wash::Washer`]
+/// can turn back when the person authorises it (GDPR names pseudonymisation explicitly: the
+/// mapping stays with the Washer, in memory, on this machine).
+#[allow(clippy::module_inception)]
+pub mod wash {
+    #![forbid(unsafe_code)]
+
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    /// Largest text washed in one call, in bytes.
+    pub const MAX_TEXT: usize = 4 * 1024 * 1024;
+    /// Most tokens one [`Washer`] hands out; beyond it values are masked instead.
+    pub const MAX_TOKENS: usize = 10_000;
+
+    /// Why washing failed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum WashError {
+        /// The text is longer than [`MAX_TEXT`].
+        TooLarge,
+        /// Restoring pseudonyms needs the person's authorisation.
+        NotAuthorised,
+    }
+
+    impl fmt::Display for WashError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::TooLarge => f.write_str("the text is too large to wash"),
+                Self::NotAuthorised => {
+                    f.write_str("restoring washed values needs the person's authorisation")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for WashError {}
+
+    /// What was found. Earlier kinds win when two overlap.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Kind {
+        /// A PEM private key block.
+        PrivateKey,
+        /// A JSON web token.
+        Jwt,
+        /// A credential: `password=...` or a known key format.
+        Secret,
+        /// A payment card number (13 to 19 digits, Luhn).
+        Card,
+        /// An Aadhaar number (12 digits, Verhoeff).
+        Aadhaar,
+        /// An IBAN (mod 97).
+        Iban,
+        /// A GSTIN (15 characters, checksum).
+        Gstin,
+        /// A PAN (ten characters, `AAAAA9999A`).
+        Pan,
+        /// An IFSC code (`AAAA0XXXXXX`).
+        Ifsc,
+        /// A UPI id (`name@bank`).
+        Upi,
+        /// An email address.
+        Email,
+        /// A telephone number.
+        Phone,
+        /// An IPv4 address.
+        Ip,
+    }
+
+    impl Kind {
+        /// Every kind, highest priority first.
+        pub const ALL: [Kind; 13] = [
+            Kind::PrivateKey,
+            Kind::Jwt,
+            Kind::Secret,
+            Kind::Card,
+            Kind::Aadhaar,
+            Kind::Iban,
+            Kind::Gstin,
+            Kind::Pan,
+            Kind::Ifsc,
+            Kind::Upi,
+            Kind::Email,
+            Kind::Phone,
+            Kind::Ip,
+        ];
+
+        /// The capital-letter name used in replacements (`EMAIL`).
+        #[must_use]
+        pub fn label(self) -> &'static str {
+            match self {
+                Kind::PrivateKey => "PRIVATE_KEY",
+                Kind::Jwt => "JWT",
+                Kind::Secret => "SECRET",
+                Kind::Card => "CARD",
+                Kind::Aadhaar => "AADHAAR",
+                Kind::Iban => "IBAN",
+                Kind::Gstin => "GSTIN",
+                Kind::Pan => "PAN",
+                Kind::Ifsc => "IFSC",
+                Kind::Upi => "UPI",
+                Kind::Email => "EMAIL",
+                Kind::Phone => "PHONE",
+                Kind::Ip => "IP",
+            }
+        }
+    }
+
+    /// What to do with something found.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Action {
+        /// Leave it as it is (it is still counted in the report).
+        Keep,
+        /// Replace it with `[KIND]`. Cannot be undone.
+        Mask,
+        /// Replace most of it with `X`, keeping a few characters people use to recognise it. Cannot
+        /// be undone.
+        Partial,
+        /// Replace it with `[KIND_n]`, the same token for the same value, which the Washer can
+        /// restore when authorised.
+        Token,
+    }
+
+    /// A set of actions, one per kind.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Policy {
+        /// The profile's name.
+        pub name: &'static str,
+        actions: BTreeMap<Kind, Action>,
+    }
+
+    impl Policy {
+        fn build(name: &'static str, list: &[(Kind, Action)]) -> Self {
+            let mut actions: BTreeMap<Kind, Action> =
+                Kind::ALL.iter().map(|k| (*k, Action::Keep)).collect();
+            for (k, a) in list {
+                actions.insert(*k, *a);
+            }
+            Self { name, actions }
+        }
+
+        /// Secrets only: keys, passwords, tokens and private keys are masked, nothing else is
+        /// touched.
+        #[must_use]
+        pub fn secrets_only() -> Self {
+            Self::build(
+                "secrets only",
+                &[
+                    (Kind::PrivateKey, Action::Mask),
+                    (Kind::Jwt, Action::Mask),
+                    (Kind::Secret, Action::Mask),
+                ],
+            )
+        }
+
+        /// A starting point for the EU General Data Protection Regulation: identifiers that point
+        /// to a person (email, phone, IP address, IBAN) are **pseudonymised** (GDPR Article 4(5)),
+        /// card numbers and secrets are masked.
+        #[must_use]
+        pub fn gdpr() -> Self {
+            Self::build(
+                "GDPR",
+                &[
+                    (Kind::PrivateKey, Action::Mask),
+                    (Kind::Jwt, Action::Mask),
+                    (Kind::Secret, Action::Mask),
+                    (Kind::Card, Action::Mask),
+                    (Kind::Iban, Action::Token),
+                    (Kind::Email, Action::Token),
+                    (Kind::Phone, Action::Token),
+                    (Kind::Ip, Action::Token),
+                ],
+            )
+        }
+
+        /// A starting point for India's Digital Personal Data Protection Act: Aadhaar numbers are
+        /// masked in the usual way (the first eight digits hidden), PAN, GSTIN, UPI ids, email,
+        /// phone and IP addresses are pseudonymised, cards and secrets are masked. IFSC codes name
+        /// a bank branch, not a person, and are kept.
+        #[must_use]
+        pub fn dpdp() -> Self {
+            Self::build(
+                "DPDP",
+                &[
+                    (Kind::PrivateKey, Action::Mask),
+                    (Kind::Jwt, Action::Mask),
+                    (Kind::Secret, Action::Mask),
+                    (Kind::Card, Action::Mask),
+                    (Kind::Aadhaar, Action::Partial),
+                    (Kind::Pan, Action::Token),
+                    (Kind::Gstin, Action::Token),
+                    (Kind::Upi, Action::Token),
+                    (Kind::Email, Action::Token),
+                    (Kind::Phone, Action::Token),
+                    (Kind::Ip, Action::Token),
+                ],
+            )
+        }
+
+        /// Everything found is masked, for text that goes to a service nobody vouches for.
+        #[must_use]
+        pub fn strict() -> Self {
+            let all: Vec<(Kind, Action)> = Kind::ALL.iter().map(|k| (*k, Action::Mask)).collect();
+            Self::build("strict", &all)
+        }
+
+        /// Both laws at once: the stricter action of the two for each kind (masking beats a token,
+        /// a token beats keeping).
+        #[must_use]
+        pub fn gdpr_and_dpdp() -> Self {
+            let (g, d) = (Self::gdpr(), Self::dpdp());
+            let rank = |a: Action| match a {
+                Action::Keep => 0,
+                Action::Token => 1,
+                Action::Partial => 2,
+                Action::Mask => 3,
+            };
+            let list: Vec<(Kind, Action)> = Kind::ALL
+                .iter()
+                .map(|k| {
+                    let (a, b) = (g.action(*k), d.action(*k));
+                    (*k, if rank(a) >= rank(b) { a } else { b })
+                })
+                .collect();
+            Self::build("GDPR and DPDP", &list)
+        }
+
+        /// This policy with a different action for one kind.
+        #[must_use]
+        pub fn with(mut self, kind: Kind, action: Action) -> Self {
+            self.actions.insert(kind, action);
+            self
+        }
+
+        /// The action for a kind.
+        #[must_use]
+        pub fn action(&self, kind: Kind) -> Action {
+            self.actions.get(&kind).copied().unwrap_or(Action::Keep)
+        }
+    }
+
+    // ------------------------------------------------------------------ checksums
+
+    /// The Luhn check used by payment cards.
+    #[must_use]
+    pub fn luhn_ok(digits: &str) -> bool {
+        if digits.len() < 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let mut sum = 0u32;
+        for (i, b) in digits.bytes().rev().enumerate() {
+            let mut n = u32::from(b - b'0');
+            if i % 2 == 1 {
+                n *= 2;
+                if n > 9 {
+                    n -= 9;
+                }
+            }
+            sum += n;
+        }
+        sum.is_multiple_of(10)
+    }
+
+    /// The Verhoeff check used by Aadhaar numbers.
+    #[must_use]
+    pub fn verhoeff_ok(digits: &str) -> bool {
+        const D: [[u8; 10]; 10] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+            [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+            [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+            [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+            [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+            [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+            [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+            [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+            [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+        ];
+        const P: [[u8; 10]; 8] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+            [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+            [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+            [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+            [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+            [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+            [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+        ];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let mut c = 0u8;
+        for (i, b) in digits.bytes().rev().enumerate() {
+            c = D[usize::from(c)][usize::from(P[i % 8][usize::from(b - b'0')])];
+        }
+        c == 0
+    }
+
+    /// The mod-97 check of an IBAN (spaces removed, upper case).
+    #[must_use]
+    pub fn iban_ok(compact: &str) -> bool {
+        if !(15..=34).contains(&compact.len())
+            || !compact
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+        let b = compact.as_bytes();
+        if !b[0].is_ascii_uppercase()
+            || !b[1].is_ascii_uppercase()
+            || !b[2].is_ascii_digit()
+            || !b[3].is_ascii_digit()
+        {
+            return false;
+        }
+        let mut rem = 0u32;
+        for &c in b[4..].iter().chain(b[..4].iter()) {
+            let v = if c.is_ascii_digit() {
+                u32::from(c - b'0')
+            } else {
+                u32::from(c - b'A') + 10
+            };
+            rem = if v >= 10 {
+                (rem * 100 + v) % 97
+            } else {
+                (rem * 10 + v) % 97
+            };
+        }
+        rem == 1
+    }
+
+    fn gstin_ok(s: &[u8]) -> bool {
+        const CH: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        if s.len() != 15 || !s.iter().all(|c| CH.contains(c)) {
+            return false;
+        }
+        let state = u32::from(s[0] - b'0') * 10 + u32::from(s[1].wrapping_sub(b'0'));
+        if !s[0].is_ascii_digit()
+            || !s[1].is_ascii_digit()
+            || !((1..=38).contains(&state) || state == 97 || state == 99)
+        {
+            return false;
+        }
+        if !pan_ok(&s[2..12]) || s[12] == b'0' || s[13] != b'Z' {
+            return false;
+        }
+        let mut total = 0usize;
+        for (i, c) in s[..14].iter().enumerate() {
+            let v = CH.iter().position(|x| x == c).unwrap_or(0) * if i % 2 == 0 { 1 } else { 2 };
+            total += v / 36 + v % 36;
+        }
+        CH[(36 - total % 36) % 36] == s[14]
+    }
+
+    fn pan_ok(s: &[u8]) -> bool {
+        s.len() == 10
+            && s[..5].iter().all(u8::is_ascii_uppercase)
+            && s[5..9].iter().all(u8::is_ascii_digit)
+            && s[9].is_ascii_uppercase()
+            && b"ABCFGHLJPT".contains(&s[3])
+    }
+
+    // ------------------------------------------------------------------ finding things
+
+    type Span = (Kind, usize, usize);
+
+    fn word(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+    }
+
+    fn secrets(text: &str, out: &mut Vec<Span>) {
+        const KEYWORDS: [&str; 9] = [
+            "api_key",
+            "api-key",
+            "apikey",
+            "secret",
+            "password",
+            "passwd",
+            "token",
+            "private_key",
+            "access_key",
+        ];
+        let b = text.as_bytes();
+        let lc = text.to_ascii_lowercase();
+        for kw in KEYWORDS {
+            for (i, _) in lc.match_indices(kw) {
+                let mut j = i + kw.len();
+                while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                    j += 1;
+                }
+                if j >= b.len() || (b[j] != b':' && b[j] != b'=') {
+                    continue;
+                }
+                j += 1;
+                while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                    j += 1;
+                }
+                let quote = (j < b.len() && (b[j] == b'"' || b[j] == b'\'')).then(|| b[j]);
+                if quote.is_some() {
+                    j += 1;
+                }
+                let start = j;
+                while j < b.len()
+                    && match quote {
+                        Some(q) => b[j] != q && b[j] != b'\n',
+                        None => !b[j].is_ascii_whitespace() && b[j] != b',' && b[j] != b';',
+                    }
+                {
+                    j += 1;
+                }
+                if j > start {
+                    out.push((Kind::Secret, start, j));
+                }
+            }
+        }
+        let is_tail = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+        let formats: [(&str, usize); 11] = [
+            ("sk-", 20),
+            ("gsk_", 20),
+            ("ghp_", 30),
+            ("gho_", 30),
+            ("ghs_", 30),
+            ("github_pat_", 30),
+            ("AKIA", 16),
+            ("AIza", 30),
+            ("xoxb-", 20),
+            ("xoxp-", 20),
+            ("glpat-", 20),
+        ];
+        for (prefix, min_tail) in formats {
+            for (i, _) in text.match_indices(prefix) {
+                if i > 0 && word(b[i - 1]) {
+                    continue;
+                }
+                let mut j = i + prefix.len();
+                while j < b.len() && is_tail(b[j]) {
+                    j += 1;
+                }
+                if j - i - prefix.len() >= min_tail {
+                    out.push((Kind::Secret, i, j));
+                }
+            }
+        }
+        // JSON web tokens: three base64url parts, the first starting `eyJ`.
+        for (i, _) in text.match_indices("eyJ") {
+            if i > 0 && (word(b[i - 1]) || b[i - 1] == b'.') {
+                continue;
+            }
+            let mut j = i;
+            let mut parts = 0;
+            loop {
+                let s = j;
+                while j < b.len() && (word(b[j]) || b[j] == b'_' || b[j] == b'-') {
+                    j += 1;
+                }
+                if j - s < 8 {
+                    break;
+                }
+                parts += 1;
+                if parts == 3 {
+                    break;
+                }
+                if j < b.len() && b[j] == b'.' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if parts == 3 {
+                out.push((Kind::Jwt, i, j));
+            }
+        }
+        // PEM private keys.
+        for (i, _) in text.match_indices("-----BEGIN ") {
+            let rest = &text[i..];
+            let Some(line_end) = rest
+                .find("-----\n")
+                .or_else(|| rest.find("-----\r"))
+                .map(|p| p + 5)
+            else {
+                continue;
+            };
+            if !rest[..line_end].contains("PRIVATE KEY") {
+                continue;
+            }
+            let end = rest.find("-----END ").map_or(text.len(), |p| {
+                rest[p + 9..]
+                    .find("-----")
+                    .map_or(text.len(), |q| i + p + 9 + q + 5)
+            });
+            out.push((Kind::PrivateKey, i, end));
+        }
+    }
+
+    fn emails(text: &str, out: &mut Vec<Span>) {
+        const PSP: [&str; 24] = [
+            "upi",
+            "ybl",
+            "ibl",
+            "axl",
+            "paytm",
+            "apl",
+            "okhdfcbank",
+            "okaxis",
+            "oksbi",
+            "okicici",
+            "hdfcbank",
+            "icici",
+            "sbi",
+            "axisbank",
+            "kotak",
+            "yesbank",
+            "idfcbank",
+            "pnb",
+            "boi",
+            "fbl",
+            "airtel",
+            "jio",
+            "postbank",
+            "aubank",
+        ];
+        let b = text.as_bytes();
+        for (at, _) in text.match_indices('@') {
+            let mut s = at;
+            while s > 0 && (word(b[s - 1]) || matches!(b[s - 1], b'.' | b'_' | b'%' | b'+' | b'-'))
+            {
+                s -= 1;
+            }
+            let mut e = at + 1;
+            while e < b.len() && (word(b[e]) || matches!(b[e], b'.' | b'-')) {
+                e += 1;
+            }
+            while e > at + 1 && matches!(b[e - 1], b'.' | b'-') {
+                e -= 1;
+            }
+            let local = at - s;
+            let domain = &text[at + 1..e];
+            if local == 0 || local > 64 || domain.is_empty() {
+                continue;
+            }
+            if domain.contains('.') {
+                let tld = domain.rsplit('.').next().unwrap_or("");
+                if tld.len() >= 2
+                    && tld.bytes().all(|c| c.is_ascii_alphabetic())
+                    && !domain.contains("..")
+                {
+                    out.push((Kind::Email, s, e));
+                }
+            } else if local >= 2 && PSP.contains(&domain.to_ascii_lowercase().as_str()) {
+                out.push((Kind::Upi, s, e));
+            }
+        }
+    }
+
+    /// Digit runs: groups of digits with single spaces or dashes between them. Each run is the list
+    /// of its groups as `(start, end)` byte ranges.
+    fn digit_runs(b: &[u8]) -> Vec<Vec<(usize, usize)>> {
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i].is_ascii_digit() || (i > 0 && (word(b[i - 1]) || b[i - 1] == b'+')) {
+                i += 1;
+                continue;
+            }
+            let mut groups = Vec::new();
+            let mut j = i;
+            loop {
+                let s = j;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                groups.push((s, j));
+                if j + 1 < b.len() && (b[j] == b' ' || b[j] == b'-') && b[j + 1].is_ascii_digit() {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j >= b.len() || !word(b[j]) {
+                runs.push(groups);
+            }
+            i = j.max(i + 1);
+        }
+        runs
+    }
+
+    /// Looks at one run of digit groups (a window of a longer run) for a card, Aadhaar or phone.
+    fn classify_digits(digits: &str, lens: &[usize], s: usize, e: usize, out: &mut Vec<Span>) {
+        let d = digits.as_bytes();
+        let mobile = |i: usize| (b'6'..=b'9').contains(&d[i]);
+        let uniform4 = lens.iter().all(|g| *g == 4) || lens.len() == 1;
+        if (13..=19).contains(&d.len()) && luhn_ok(digits) {
+            out.push((Kind::Card, s, e));
+        } else if d.len() == 12
+            && (b'2'..=b'9').contains(&d[0])
+            && (lens == [12] || lens == [4, 4, 4])
+            && verhoeff_ok(digits)
+        {
+            out.push((Kind::Aadhaar, s, e));
+        } else if (d.len() == 10 && mobile(0) && (lens == [10] || lens == [5, 5]))
+            || (d.len() == 10 && lens == [3, 3, 4])
+            || (d.len() == 12 && digits.starts_with("91") && mobile(2) && uniform4)
+            || (d.len() == 11 && digits.starts_with('0') && mobile(1))
+        {
+            out.push((Kind::Phone, s, e));
+        }
+    }
+
+    fn numbers(text: &str, out: &mut Vec<Span>) {
+        let b = text.as_bytes();
+        for groups in digit_runs(b) {
+            // Every window of consecutive groups with at most 19 digits, so two numbers written side
+            // by side are both found, and a very long run costs nothing.
+            for g0 in 0..groups.len() {
+                let mut digits = String::new();
+                let mut lens = Vec::new();
+                for &(s, e) in &groups[g0..] {
+                    if digits.len() + (e - s) > 19 {
+                        break;
+                    }
+                    digits.push_str(&text[s..e]);
+                    lens.push(e - s);
+                    classify_digits(&digits, &lens, groups[g0].0, e, out);
+                }
+            }
+        }
+        // International numbers: `+` then 8 to 15 digits with spaces, dashes, dots or brackets.
+        for (at, _) in text.match_indices('+') {
+            if at > 0 && word(b[at - 1]) {
+                continue;
+            }
+            let mut j = at + 1;
+            let mut digits = 0;
+            let mut last_digit = at;
+            while j < b.len()
+                && digits < 16
+                && (b[j].is_ascii_digit() || matches!(b[j], b' ' | b'-' | b'.' | b'(' | b')'))
+            {
+                if b[j].is_ascii_digit() {
+                    digits += 1;
+                    last_digit = j;
+                }
+                j += 1;
+            }
+            let end = last_digit + 1;
+            if (8..=15).contains(&digits)
+                && b[at + 1].is_ascii_digit()
+                && (end >= b.len() || !word(b[end]))
+            {
+                out.push((Kind::Phone, at, end));
+            }
+        }
+    }
+
+    fn codes(text: &str, out: &mut Vec<Span>) {
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if !word(b[i]) || (i > 0 && word(b[i - 1])) {
+                i += 1;
+                continue;
+            }
+            let mut e = i;
+            while e < b.len() && word(b[e]) {
+                e += 1;
+            }
+            let w = &b[i..e];
+            if w.len() == 15 && gstin_ok(w) {
+                out.push((Kind::Gstin, i, e));
+            } else if w.len() == 10 && pan_ok(w) {
+                out.push((Kind::Pan, i, e));
+            } else if w.len() == 11
+                && w[..4].iter().all(u8::is_ascii_uppercase)
+                && w[4] == b'0'
+                && w[5..]
+                    .iter()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            {
+                out.push((Kind::Ifsc, i, e));
+            }
+            i = e;
+        }
+    }
+
+    fn ibans(text: &str, out: &mut Vec<Span>) {
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i + 4 < b.len() {
+            if !(b[i].is_ascii_uppercase()
+                && b[i + 1].is_ascii_uppercase()
+                && b[i + 2].is_ascii_digit()
+                && b[i + 3].is_ascii_digit())
+                || (i > 0 && word(b[i - 1]))
+            {
+                i += 1;
+                continue;
+            }
+            // Collect up to 34 letters and digits, skipping single spaces between groups.
+            let mut chars: Vec<(usize, u8)> = Vec::new();
+            let mut j = i;
+            while j < b.len() && chars.len() < 34 {
+                if b[j].is_ascii_uppercase() || b[j].is_ascii_digit() {
+                    chars.push((j, b[j]));
+                    j += 1;
+                } else if b[j] == b' '
+                    && j + 1 < b.len()
+                    && (b[j + 1].is_ascii_uppercase() || b[j + 1].is_ascii_digit())
+                {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            for l in (15..=chars.len()).rev() {
+                let compact: String = chars[..l].iter().map(|c| char::from(c.1)).collect();
+                let end = chars[l - 1].0 + 1;
+                if iban_ok(&compact) && (end >= b.len() || !word(b[end])) {
+                    out.push((Kind::Iban, i, end));
+                    break;
+                }
+            }
+            i += 2;
+        }
+    }
+
+    fn ips(text: &str, out: &mut Vec<Span>) {
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i].is_ascii_digit()
+                || (i > 0
+                    && (word(b[i - 1]) || (b[i - 1] == b'.' && i > 1 && b[i - 2].is_ascii_digit())))
+            {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            let mut octets = 0;
+            let mut ok = true;
+            loop {
+                let s = j;
+                while j < b.len() && b[j].is_ascii_digit() && j - s < 4 {
+                    j += 1;
+                }
+                let o = &text[s..j];
+                if o.is_empty()
+                    || o.len() > 3
+                    || (o.len() > 1 && o.starts_with('0'))
+                    || o.parse::<u16>().map_or(true, |v| v > 255)
+                {
+                    ok = false;
+                    break;
+                }
+                octets += 1;
+                if octets == 4 {
+                    break;
+                }
+                if j < b.len() && b[j] == b'.' {
+                    j += 1;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok
+                && (j >= b.len()
+                    || (!word(b[j])
+                        && !(b[j] == b'.' && j + 1 < b.len() && b[j + 1].is_ascii_digit())))
+            {
+                out.push((Kind::Ip, i, j));
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Everything sensitive in `text`, as non-overlapping `(kind, start, end)` spans sorted by
+    /// position. When two overlap, the earlier kind in [`Kind::ALL`] wins, then the longer span.
+    #[must_use]
+    pub fn scan(text: &str) -> Vec<(Kind, usize, usize)> {
+        let mut all: Vec<Span> = Vec::new();
+        secrets(text, &mut all);
+        emails(text, &mut all);
+        numbers(text, &mut all);
+        codes(text, &mut all);
+        ibans(text, &mut all);
+        ips(text, &mut all);
+        all.retain(|(_, s, e)| {
+            s < e && *e <= text.len() && text.is_char_boundary(*s) && text.is_char_boundary(*e)
+        });
+        all.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then((b.2 - b.1).cmp(&(a.2 - a.1)))
+                .then(a.1.cmp(&b.1))
+        });
+        let mut kept: Vec<Span> = Vec::new();
+        for s in all {
+            if !kept.iter().any(|k| s.1 < k.2 && k.1 < s.2) {
+                kept.push(s);
+            }
+        }
+        kept.sort_by_key(|s| s.1);
+        kept
+    }
+
+    // ------------------------------------------------------------------ washing
+
+    /// One thing found and what was done about it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Hit {
+        /// What it was.
+        pub kind: Kind,
+        /// Where it was in the original text.
+        pub start: usize,
+        /// Where it ended.
+        pub end: usize,
+        /// What was done.
+        pub action: Action,
+    }
+
+    /// The result of washing.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Washed {
+        /// The text with replacements made.
+        pub text: String,
+        /// Everything found, in order of position.
+        pub hits: Vec<Hit>,
+    }
+
+    impl Washed {
+        /// How many of each kind were found (never the values), for logs and consent records.
+        #[must_use]
+        pub fn report(&self) -> BTreeMap<Kind, usize> {
+            let mut m = BTreeMap::new();
+            for h in &self.hits {
+                *m.entry(h.kind).or_insert(0) += 1;
+            }
+            m
+        }
+
+        /// Whether anything other than `Keep` was changed.
+        #[must_use]
+        pub fn changed(&self) -> bool {
+            self.hits.iter().any(|h| h.action != Action::Keep)
+        }
+    }
+
+    /// Replaces all but the last `keep` letters and digits with `X`, leaving separators.
+    fn mask_keep_last(s: &str, keep: usize) -> String {
+        let total = s.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+        let mut seen = 0;
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    seen += 1;
+                    if seen > total.saturating_sub(keep) {
+                        c
+                    } else {
+                        'X'
+                    }
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    fn partial(kind: Kind, original: &str) -> String {
+        match kind {
+            Kind::Card | Kind::Aadhaar | Kind::Phone => mask_keep_last(original, 4),
+            Kind::Iban => {
+                let head: String = original.chars().take(4).collect();
+                let rest: String = original.chars().skip(4).collect();
+                format!("{head}{}", mask_keep_last(&rest, 4))
+            }
+            Kind::Email => match original.split_once('@') {
+                Some((l, d)) => {
+                    let first: String = l.chars().take(1).collect();
+                    format!("{first}***@{d}")
+                }
+                None => format!("[{}]", kind.label()),
+            },
+            _ => format!("[{}]", kind.label()),
+        }
+    }
+
+    /// Washes text under a [`Policy`] and remembers the tokens it handed out.
+    #[derive(Debug, Clone)]
+    pub struct Washer {
+        policy: Policy,
+        tokens: BTreeMap<String, String>,
+        by_value: BTreeMap<(Kind, String), String>,
+        counters: BTreeMap<Kind, u32>,
+    }
+
+    impl Washer {
+        /// A washer for `policy`.
+        #[must_use]
+        pub fn new(policy: Policy) -> Self {
+            Self {
+                policy,
+                tokens: BTreeMap::new(),
+                by_value: BTreeMap::new(),
+                counters: BTreeMap::new(),
+            }
+        }
+
+        /// The policy in use.
+        #[must_use]
+        pub fn policy(&self) -> &Policy {
+            &self.policy
+        }
+
+        fn token_for(&mut self, kind: Kind, value: &str) -> String {
+            if let Some(t) = self.by_value.get(&(kind, value.to_string())) {
+                return t.clone();
+            }
+            if self.tokens.len() >= MAX_TOKENS {
+                return format!("[{}]", kind.label());
+            }
+            let n = self.counters.entry(kind).or_insert(0);
+            *n += 1;
+            let t = format!("[{}_{}]", kind.label(), n);
+            self.tokens.insert(t.clone(), value.to_string());
+            self.by_value.insert((kind, value.to_string()), t.clone());
+            t
+        }
+
+        /// Washes `text`.
+        ///
+        /// # Errors
+        /// [`WashError::TooLarge`] for text over [`MAX_TEXT`] bytes.
+        pub fn wash(&mut self, text: &str) -> Result<Washed, WashError> {
+            if text.len() > MAX_TEXT {
+                return Err(WashError::TooLarge);
+            }
+            let mut out = String::with_capacity(text.len());
+            let mut hits = Vec::new();
+            let mut at = 0;
+            for (kind, s, e) in scan(text) {
+                let action = self.policy.action(kind);
+                let original = &text[s..e];
+                out.push_str(&text[at..s]);
+                match action {
+                    Action::Keep => out.push_str(original),
+                    Action::Mask => {
+                        out.push('[');
+                        out.push_str(kind.label());
+                        out.push(']');
+                    }
+                    Action::Partial => out.push_str(&partial(kind, original)),
+                    Action::Token => {
+                        let t = self.token_for(kind, original);
+                        out.push_str(&t);
+                    }
+                }
+                hits.push(Hit {
+                    kind,
+                    start: s,
+                    end: e,
+                    action,
+                });
+                at = e;
+            }
+            out.push_str(&text[at..]);
+            Ok(Washed { text: out, hits })
+        }
+
+        /// Puts the original values back in place of this washer's tokens (for example in a model's
+        /// reply that mentions `[EMAIL_1]`). Only tokens this washer handed out are replaced.
+        ///
+        /// # Errors
+        /// [`WashError::NotAuthorised`] unless `authorised` is true.
+        pub fn restore(&self, text: &str, authorised: bool) -> Result<String, WashError> {
+            if !authorised {
+                return Err(WashError::NotAuthorised);
+            }
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text;
+            while let Some(i) = rest.find('[') {
+                out.push_str(&rest[..i]);
+                let tail = &rest[i..];
+                match tail
+                    .find(']')
+                    .map(|j| &tail[..=j])
+                    .and_then(|t| self.tokens.get(t).map(|v| (t.len(), v)))
+                {
+                    Some((len, value)) => {
+                        out.push_str(value);
+                        rest = &tail[len..];
+                    }
+                    None => {
+                        out.push('[');
+                        rest = &tail[1..];
+                    }
+                }
+            }
+            out.push_str(rest);
+            Ok(out)
+        }
+
+        /// How many tokens are held.
+        #[must_use]
+        pub fn token_count(&self) -> usize {
+            self.tokens.len()
+        }
+
+        /// Forgets every token (the values are gone from memory as far as this washer is concerned).
+        pub fn forget(&mut self) {
+            self.tokens.clear();
+            self.by_value.clear();
+            self.counters.clear();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn kinds(t: &str) -> Vec<(Kind, String)> {
+            scan(t)
+                .into_iter()
+                .map(|(k, s, e)| (k, t[s..e].to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn the_checksums_accept_real_numbers_and_refuse_near_misses() {
+            assert!(luhn_ok("4111111111111111") && luhn_ok("5500005555555559"));
+            assert!(
+                !luhn_ok("4111111111111112")
+                    && !luhn_ok("411111111111")
+                    && !luhn_ok("41111111111a1111")
+            );
+            assert!(verhoeff_ok("234567890124") && verhoeff_ok("987654321096"));
+            assert!(!verhoeff_ok("234567890125") && !verhoeff_ok("") && !verhoeff_ok("12a4"));
+            assert!(iban_ok("GB82WEST12345698765432") && iban_ok("DE89370400440532013000"));
+            assert!(
+                !iban_ok("GB82WEST12345698765433")
+                    && !iban_ok("GB82")
+                    && !iban_ok("gb82west12345698765432")
+            );
+            assert!(gstin_ok(b"27AAPFU0939F1ZV") && gstin_ok(b"29ABCPE1234F1Z7"));
+            assert!(
+                !gstin_ok(b"27AAPFU0939F1ZW")
+                    && !gstin_ok(b"99AAPFU0939F1ZV")
+                    && !gstin_ok(b"00AAPFU0939F1ZV")
+            );
+            assert!(pan_ok(b"ABCPE1234F") && !pan_ok(b"ABCDE1234F") && !pan_ok(b"abcpe1234f"));
+        }
+
+        #[test]
+        fn each_kind_is_found_in_ordinary_text() {
+            let cases = [
+                ("mail me at jane.doe+x@example.co.uk please", Kind::Email, "jane.doe+x@example.co.uk"),
+                ("card 4111 1111 1111 1111 expires", Kind::Card, "4111 1111 1111 1111"),
+                ("card 4111-1111-1111-1111.", Kind::Card, "4111-1111-1111-1111"),
+                ("Aadhaar: 2345 6789 0124 ok", Kind::Aadhaar, "2345 6789 0124"),
+                ("id 234567890124", Kind::Aadhaar, "234567890124"),
+                ("pay GB82 WEST 1234 5698 7654 32 now", Kind::Iban, "GB82 WEST 1234 5698 7654 32"),
+                ("iban DE89370400440532013000.", Kind::Iban, "DE89370400440532013000"),
+                ("GSTIN 27AAPFU0939F1ZV here", Kind::Gstin, "27AAPFU0939F1ZV"),
+                ("PAN ABCPE1234F here", Kind::Pan, "ABCPE1234F"),
+                ("IFSC HDFC0001234 branch", Kind::Ifsc, "HDFC0001234"),
+                ("pay ramesh@okhdfcbank today", Kind::Upi, "ramesh@okhdfcbank"),
+                ("call +91 98765 43210 now", Kind::Phone, "+91 98765 43210"),
+                ("call 9876543210 now", Kind::Phone, "9876543210"),
+                ("call 98765 43210 now", Kind::Phone, "98765 43210"),
+                ("call +44 20 7946 0958 now", Kind::Phone, "+44 20 7946 0958"),
+                ("call 555-123-4567 now", Kind::Phone, "555-123-4567"),
+                ("server 192.168.1.20 is down", Kind::Ip, "192.168.1.20"),
+                ("see 10.0.0.1.", Kind::Ip, "10.0.0.1"),
+                ("password: hunter2hunter2", Kind::Secret, "hunter2hunter2"),
+                ("API_KEY=\"abc def ghi\"", Kind::Secret, "abc def ghi"),
+                ("key sk-abcdefghijklmnopqrstuv end", Kind::Secret, "sk-abcdefghijklmnopqrstuv"),
+                ("aws AKIAABCDEFGHIJKLMNOP end", Kind::Secret, "AKIAABCDEFGHIJKLMNOP"),
+                ("Authorization eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk ok", Kind::Jwt, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            ];
+            for (text, kind, value) in cases {
+                assert_eq!(kinds(text), vec![(kind, value.to_string())], "{text}");
+            }
+            let pem = "key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\nafter";
+            let f = kinds(pem);
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0].0, Kind::PrivateKey);
+            assert!(f[0].1.starts_with("-----BEGIN") && f[0].1.ends_with("PRIVATE KEY-----"));
+        }
+
+        #[test]
+        fn ordinary_text_and_look_alikes_are_left_alone() {
+            for t in [
+                "Hello, how are you? Order #12345 shipped on 2024-03-15.",
+                "version 1.2.3.4.5 released",
+                "1.2.3 and 300.1.1.1 and 01.02.03.04",
+                "call 12345",
+                "4111 1111 1111 1112",
+                "234567890125",
+                "ABCDE1234F",
+                "user@localhost",
+                "a@b",
+                "@@@@",
+                "me@example.c",
+                "price 1,234,567.89",
+                "sk-short",
+                "password is long",
+                "token",
+                "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
+                "IBAN GB82 WEST 1234 5698 7654 33",
+                "eyJabc.def.ghi",
+            ] {
+                assert!(kinds(t).is_empty(), "{t:?} -> {:?}", kinds(t));
+            }
+        }
+
+        #[test]
+        fn overlaps_resolve_to_the_more_specific_kind() {
+            // A GSTIN contains a PAN; the PAN inside is not reported separately.
+            assert_eq!(
+                kinds("27AAPFU0939F1ZV"),
+                vec![(Kind::Gstin, "27AAPFU0939F1ZV".into())]
+            );
+            // A valid card number is not also a phone number.
+            assert_eq!(kinds("4111111111111111")[0].0, Kind::Card);
+            // The email wins over the phone-like digits inside it.
+            assert_eq!(
+                kinds("9876543210@example.com"),
+                vec![(Kind::Email, "9876543210@example.com".into())]
+            );
+            // A secret value that contains an email-like part is one secret.
+            let f = kinds("password=jane@example.com");
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0].0, Kind::Secret);
+        }
+
+        #[test]
+        fn the_gdpr_profile_pseudonymises_identifiers_and_masks_cards_and_secrets() {
+            let mut w = Washer::new(Policy::gdpr());
+            let r = w
+                .wash("Mail jane@example.com or +44 20 7946 0958, again jane@example.com. Card 4111 1111 1111 1111, ip 10.0.0.7, password=hunter2hunter2")
+                .unwrap();
+            assert_eq!(
+                r.text,
+                "Mail [EMAIL_1] or [PHONE_1], again [EMAIL_1]. Card [CARD], ip [IP_1], password=[SECRET]"
+            );
+            assert_eq!(r.report()[&Kind::Email], 2);
+            assert_eq!(w.token_count(), 3);
+            assert!(r.changed());
+            // The reply mentions a token; restoring needs authorisation.
+            assert_eq!(
+                w.restore("Write to [EMAIL_1].", false),
+                Err(WashError::NotAuthorised)
+            );
+            assert_eq!(
+                w.restore("Write to [EMAIL_1].", true).unwrap(),
+                "Write to jane@example.com."
+            );
+            assert_eq!(
+                w.restore("[CARD] [EMAIL_9] [EMAIL_1] [ [x] ]", true)
+                    .unwrap(),
+                "[CARD] [EMAIL_9] jane@example.com [ [x] ]"
+            );
+        }
+
+        #[test]
+        fn the_dpdp_profile_partly_masks_aadhaar_and_pseudonymises_indian_identifiers() {
+            let mut w = Washer::new(Policy::dpdp());
+            let r = w
+                .wash("Aadhaar 2345 6789 0124, PAN ABCPE1234F, GSTIN 27AAPFU0939F1ZV, UPI ramesh@okhdfcbank, IFSC HDFC0001234, +91 98765 43210")
+                .unwrap();
+            assert_eq!(
+                r.text,
+                "Aadhaar XXXX XXXX 0124, PAN [PAN_1], GSTIN [GSTIN_1], UPI [UPI_1], IFSC HDFC0001234, [PHONE_1]"
+            );
+            let ifsc = r.hits.iter().find(|h| h.kind == Kind::Ifsc).unwrap();
+            assert_eq!(ifsc.action, Action::Keep, "kept, but counted");
+            assert_eq!(r.report()[&Kind::Ifsc], 1);
+            assert!(
+                !r.text.contains("2345") && !r.text.contains("6789"),
+                "the first eight digits are gone"
+            );
+        }
+
+        #[test]
+        fn the_combined_and_other_profiles_behave_as_described() {
+            let both = Policy::gdpr_and_dpdp();
+            assert_eq!(both.action(Kind::Aadhaar), Action::Partial);
+            assert_eq!(both.action(Kind::Card), Action::Mask);
+            assert_eq!(both.action(Kind::Email), Action::Token);
+            assert_eq!(both.action(Kind::Ifsc), Action::Keep);
+            let s = Washer::new(Policy::secrets_only())
+                .wash("mail a@b.com secret=abcdef1234 and 9876543210")
+                .unwrap();
+            assert_eq!(s.text, "mail a@b.com secret=[SECRET] and 9876543210");
+            let strict = Washer::new(Policy::strict())
+                .wash("a@b.com 10.0.0.1 HDFC0001234")
+                .unwrap();
+            assert_eq!(strict.text, "[EMAIL] [IP] [IFSC]");
+            let custom = Washer::new(Policy::gdpr().with(Kind::Email, Action::Partial))
+                .wash("jane@example.com")
+                .unwrap();
+            assert_eq!(custom.text, "j***@example.com");
+        }
+
+        #[test]
+        fn partial_masking_keeps_only_what_people_use_to_recognise_a_value() {
+            let w = |p: Policy, t: &str| Washer::new(p).wash(t).unwrap().text;
+            let p = Policy::build(
+                "t",
+                &[
+                    (Kind::Card, Action::Partial),
+                    (Kind::Phone, Action::Partial),
+                    (Kind::Iban, Action::Partial),
+                ],
+            );
+            assert_eq!(w(p.clone(), "4111-1111-1111-1111"), "XXXX-XXXX-XXXX-1111");
+            assert_eq!(w(p.clone(), "+91 98765 43210"), "+XX XXXXX X3210");
+            assert_eq!(
+                w(p, "GB82 WEST 1234 5698 7654 32"),
+                "GB82 XXXX XXXX XXXX XX54 32"
+            );
+        }
+
+        #[test]
+        fn washing_twice_changes_nothing_more_and_a_clean_text_is_returned_unchanged() {
+            let mut w = Washer::new(Policy::gdpr_and_dpdp());
+            let first = w
+                .wash("jane@example.com 4111 1111 1111 1111 2345 6789 0124 secret=abcdef1234")
+                .unwrap();
+            let second = Washer::new(Policy::gdpr_and_dpdp())
+                .wash(&first.text)
+                .unwrap();
+            assert_eq!(first.text, second.text);
+            let clean = "Nothing to see here, 42 apples.";
+            let r = w.wash(clean).unwrap();
+            assert_eq!(r.text, clean);
+            assert!(!r.changed() && r.hits.is_empty());
+        }
+
+        #[test]
+        fn tokens_are_stable_per_value_and_bounded() {
+            let mut w = Washer::new(Policy::gdpr());
+            let r = w.wash("a@x.com b@x.com a@x.com").unwrap();
+            assert_eq!(r.text, "[EMAIL_1] [EMAIL_2] [EMAIL_1]");
+            w.forget();
+            assert_eq!(w.token_count(), 0);
+            assert_eq!(
+                w.restore("[EMAIL_1]", true).unwrap(),
+                "[EMAIL_1]",
+                "forgotten tokens restore to nothing"
+            );
+            let mut big = Washer::new(Policy::gdpr());
+            let mut text = String::new();
+            for i in 0..(MAX_TOKENS + 5) {
+                text.push_str(&format!("u{i}@x.com "));
+            }
+            let r = big.wash(&text).unwrap();
+            assert_eq!(big.token_count(), MAX_TOKENS);
+            assert!(
+                r.text.ends_with("[EMAIL] "),
+                "beyond the limit values are masked, not leaked"
+            );
+            assert!(!r.text.contains("@x.com"));
+        }
+
+        #[test]
+        fn hostile_and_unusual_text_never_panics_or_leaves_invalid_output() {
+            let mut w = Washer::new(Policy::strict());
+            let nasty = [
+                "",
+                "@",
+                "+",
+                "-----BEGIN PRIVATE KEY-----",
+                "-----BEGIN PRIVATE KEY-----\nabc",
+                "eyJ.eyJ.eyJ",
+                "日本語@例え.jp 電話 090-1234-5678",
+                "ünïcode@exämple.com a@é.com",
+                "🙂 4111 1111 1111 1111 🙂",
+                "%%%%%%%%%%@%%%%%%%%",
+                "password=",
+                "password:\n",
+                "9999999999999999999999999999999999999999999999999999999999999999999999999999",
+                "1.2.3.",
+                "...1.2.3.4...",
+            ];
+            for t in nasty {
+                let r = w.wash(t).unwrap();
+                assert!(std::str::from_utf8(r.text.as_bytes()).is_ok());
+            }
+            // Pseudo-random mixtures of the interesting characters.
+            let alphabet: Vec<char> = "0123456789 -+.@_%=:\n\tabcXYZ日é$".chars().collect();
+            let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+            for _ in 0..300 {
+                let mut s = String::new();
+                for _ in 0..200 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    s.push(alphabet[(x % alphabet.len() as u64) as usize]);
+                }
+                let r = w.wash(&s).unwrap();
+                for h in &r.hits {
+                    assert!(
+                        h.start < h.end
+                            && h.end <= s.len()
+                            && s.is_char_boundary(h.start)
+                            && s.is_char_boundary(h.end)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn very_large_inputs_are_handled_in_reasonable_time_and_the_limit_holds() {
+            let mut w = Washer::new(Policy::strict());
+            let long_digits = "1".repeat(2_000_000);
+            let t = std::time::Instant::now();
+            assert!(w.wash(&long_digits).unwrap().hits.is_empty());
+            let many_at = "a@".repeat(500_000);
+            w.wash(&many_at).unwrap();
+            let dots = "1.".repeat(500_000);
+            w.wash(&dots).unwrap();
+            assert!(t.elapsed().as_secs() < 20, "took {:?}", t.elapsed());
+            assert_eq!(w.wash(&"x".repeat(MAX_TEXT + 1)), Err(WashError::TooLarge));
+            assert!(w.wash(&"x".repeat(MAX_TEXT)).is_ok());
+        }
+    }
+}
+
+/// Privacy obligations: consent, requests from people about their data, retention and breach
+/// clocks, for GDPR and DPDP.
+///
+/// This is bookkeeping, not legal advice. It records who agreed to what, works out when a reply to
+/// a request or a notification is due, and finds records past their retention. The **time limits
+/// are defaults to be confirmed with your own legal advice** (laws, rules and guidance change,
+/// and some limits depend on circumstances); every limit can be changed. Nothing here makes a
+/// product compliant on its own.
+#[allow(clippy::module_inception)]
+pub mod privacy {
+    #![forbid(unsafe_code)]
+
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    /// Seconds in a day.
+    pub const DAY: u64 = 86_400;
+    /// Most consent records kept.
+    pub const MAX_CONSENTS: usize = 100_000;
+    /// Most open requests kept.
+    pub const MAX_REQUESTS: usize = 100_000;
+
+    /// Why a privacy call was refused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PrivacyError {
+        /// An input is invalid (the text says which).
+        Invalid(&'static str),
+        /// A limit was reached (the text says which).
+        Full(&'static str),
+        /// No such request.
+        NotFound,
+        /// The request is already closed, or was already extended.
+        State(&'static str),
+    }
+
+    impl fmt::Display for PrivacyError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Invalid(w) => write!(f, "invalid {w}"),
+                Self::Full(w) => write!(f, "limit reached: {w}"),
+                Self::NotFound => f.write_str("no such request"),
+                Self::State(w) => f.write_str(w),
+            }
+        }
+    }
+
+    impl std::error::Error for PrivacyError {}
+
+    /// Which law a record falls under.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Regime {
+        /// The EU General Data Protection Regulation.
+        Gdpr,
+        /// India's Digital Personal Data Protection Act, 2023.
+        Dpdp,
+    }
+
+    /// The legal ground for using personal data.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Basis {
+        /// The person agreed (GDPR Article 6(1)(a); DPDP consent).
+        Consent,
+        /// Needed for a contract.
+        Contract,
+        /// Needed to meet a legal duty.
+        LegalObligation,
+        /// Needed to protect someone's life.
+        VitalInterests,
+        /// Needed for a public task.
+        PublicTask,
+        /// A legitimate interest (GDPR only).
+        LegitimateInterests,
+        /// One of the "certain legitimate uses" the DPDP Act allows without consent.
+        LegitimateUse,
+    }
+
+    fn name_ok(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 100 && !s.chars().any(char::is_control)
+    }
+
+    /// What to record when someone agrees.
+    #[derive(Debug, Clone, Copy)]
+    pub struct NewConsent<'a> {
+        /// Who agreed (an id, not a name).
+        pub principal: &'a str,
+        /// What for.
+        pub purpose: &'a str,
+        /// The law.
+        pub regime: Regime,
+        /// The ground.
+        pub basis: Basis,
+        /// Which version of the notice they were shown.
+        pub notice_version: &'a str,
+        /// The language of the notice.
+        pub language: &'a str,
+    }
+
+    /// One recorded agreement.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Consent {
+        /// Who agreed (an id, not a name).
+        pub principal: String,
+        /// What for (`chat_history`, `hosted_models`, ...).
+        pub purpose: String,
+        /// The law.
+        pub regime: Regime,
+        /// The ground.
+        pub basis: Basis,
+        /// Which version of the notice they were shown.
+        pub notice_version: String,
+        /// The language of the notice.
+        pub language: String,
+        /// When they agreed.
+        pub given_at: u64,
+        /// When they took it back.
+        pub withdrawn_at: Option<u64>,
+    }
+
+    /// The record of consents.
+    #[derive(Debug, Clone, Default)]
+    pub struct ConsentLedger {
+        records: Vec<Consent>,
+    }
+
+    impl ConsentLedger {
+        /// An empty ledger.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Records an agreement.
+        ///
+        /// # Errors
+        /// [`PrivacyError`] for empty or odd names, a basis the law does not have, or when the
+        /// ledger is full.
+        pub fn give(&mut self, c: &NewConsent<'_>, now: u64) -> Result<(), PrivacyError> {
+            let (principal, purpose, regime, basis) = (c.principal, c.purpose, c.regime, c.basis);
+            let (notice_version, language) = (c.notice_version, c.language);
+            if ![principal, purpose, notice_version, language]
+                .iter()
+                .all(|s| name_ok(s))
+            {
+                return Err(PrivacyError::Invalid("name"));
+            }
+            if regime == Regime::Gdpr && basis == Basis::LegitimateUse {
+                return Err(PrivacyError::Invalid("basis for GDPR"));
+            }
+            if regime == Regime::Dpdp && basis == Basis::LegitimateInterests {
+                return Err(PrivacyError::Invalid("basis for DPDP"));
+            }
+            if self.records.len() >= MAX_CONSENTS {
+                return Err(PrivacyError::Full("consents"));
+            }
+            self.records.push(Consent {
+                principal: principal.into(),
+                purpose: purpose.into(),
+                regime,
+                basis,
+                notice_version: notice_version.into(),
+                language: language.into(),
+                given_at: now,
+                withdrawn_at: None,
+            });
+            Ok(())
+        }
+
+        /// Records that `principal` took back their agreement for `purpose`. Withdrawing is as easy
+        /// as giving: one call. Returns how many agreements were withdrawn.
+        pub fn withdraw(&mut self, principal: &str, purpose: &str, now: u64) -> usize {
+            let mut n = 0;
+            for c in &mut self.records {
+                if c.principal == principal && c.purpose == purpose && c.withdrawn_at.is_none() {
+                    c.withdrawn_at = Some(now);
+                    n += 1;
+                }
+            }
+            n
+        }
+
+        /// Whether `principal` has a current agreement for `purpose` at `now` (given, and not
+        /// withdrawn). Uses that rest on another basis are not decided here.
+        #[must_use]
+        pub fn allows(&self, principal: &str, purpose: &str, now: u64) -> bool {
+            self.records.iter().any(|c| {
+                c.principal == principal
+                    && c.purpose == purpose
+                    && c.basis == Basis::Consent
+                    && c.given_at <= now
+                    && c.withdrawn_at.is_none_or(|w| w > now)
+            })
+        }
+
+        /// Everything recorded about one person, oldest first.
+        #[must_use]
+        pub fn history(&self, principal: &str) -> Vec<&Consent> {
+            self.records
+                .iter()
+                .filter(|c| c.principal == principal)
+                .collect()
+        }
+
+        /// Removes everything recorded about one person (after an erasure request). Returns how
+        /// many records went.
+        pub fn erase(&mut self, principal: &str) -> usize {
+            let before = self.records.len();
+            self.records.retain(|c| c.principal != principal);
+            before - self.records.len()
+        }
+    }
+
+    /// What a person asks for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum RequestKind {
+        /// See the data held about them.
+        Access,
+        /// Correct data.
+        Correction,
+        /// Erase data.
+        Erasure,
+        /// Receive their data in a usable form (GDPR).
+        Portability,
+        /// Limit how data is used (GDPR).
+        Restriction,
+        /// Object to a use (GDPR).
+        Objection,
+        /// Complain to the data fiduciary (DPDP).
+        Grievance,
+        /// Name someone to act for them (DPDP).
+        Nomination,
+    }
+
+    impl RequestKind {
+        /// Whether the law provides this request.
+        #[must_use]
+        pub fn allowed_under(self, r: Regime) -> bool {
+            matches!(
+                (self, r),
+                (Self::Access | Self::Correction | Self::Erasure, _)
+                    | (
+                        Self::Portability | Self::Restriction | Self::Objection,
+                        Regime::Gdpr
+                    )
+                    | (Self::Grievance | Self::Nomination, Regime::Dpdp)
+            )
+        }
+    }
+
+    /// How long the response may take, in days.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Deadlines {
+        /// Days to answer.
+        pub respond_days: u64,
+        /// Extra days allowed once, with a reason (0 when none).
+        pub extension_days: u64,
+    }
+
+    impl Deadlines {
+        /// GDPR Article 12(3): one month (30 days here), extendable by two months for complex or
+        /// numerous requests.
+        #[must_use]
+        pub fn gdpr_default() -> Self {
+            Self {
+                respond_days: 30,
+                extension_days: 60,
+            }
+        }
+
+        /// A default for DPDP: 90 days, the period set for resolving grievances in the Rules. Check
+        /// the current Rules and guidance, which may set other periods for other requests.
+        #[must_use]
+        pub fn dpdp_default() -> Self {
+            Self {
+                respond_days: 90,
+                extension_days: 0,
+            }
+        }
+    }
+
+    /// Where a request stands.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Status {
+        /// Received, not answered.
+        Open,
+        /// Answered.
+        Closed(u64),
+    }
+
+    /// A request from a person.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Request {
+        /// A running number.
+        pub id: u64,
+        /// Who asked.
+        pub principal: String,
+        /// What they asked.
+        pub kind: RequestKind,
+        /// The law.
+        pub regime: Regime,
+        /// When it arrived.
+        pub received: u64,
+        /// When an answer is due.
+        pub due: u64,
+        /// Whether the deadline was extended, and why.
+        pub extended: Option<String>,
+        /// Where it stands.
+        pub status: Status,
+    }
+
+    /// The queue of requests.
+    #[derive(Debug, Clone)]
+    pub struct RequestQueue {
+        requests: Vec<Request>,
+        next: u64,
+        gdpr: Deadlines,
+        dpdp: Deadlines,
+    }
+
+    impl Default for RequestQueue {
+        fn default() -> Self {
+            Self::new(Deadlines::gdpr_default(), Deadlines::dpdp_default())
+        }
+    }
+
+    impl RequestQueue {
+        /// A queue with the given deadlines for each law.
+        #[must_use]
+        pub fn new(gdpr: Deadlines, dpdp: Deadlines) -> Self {
+            Self {
+                requests: Vec::new(),
+                next: 1,
+                gdpr,
+                dpdp,
+            }
+        }
+
+        /// Opens a request and works out when it is due.
+        ///
+        /// # Errors
+        /// [`PrivacyError`] for a bad name, a request the law does not provide, or a full queue.
+        pub fn open(
+            &mut self,
+            principal: &str,
+            kind: RequestKind,
+            regime: Regime,
+            now: u64,
+        ) -> Result<u64, PrivacyError> {
+            if !name_ok(principal) {
+                return Err(PrivacyError::Invalid("principal"));
+            }
+            if !kind.allowed_under(regime) {
+                return Err(PrivacyError::Invalid("request for that law"));
+            }
+            if self.requests.len() >= MAX_REQUESTS {
+                return Err(PrivacyError::Full("requests"));
+            }
+            let d = if regime == Regime::Gdpr {
+                self.gdpr
+            } else {
+                self.dpdp
+            };
+            let id = self.next;
+            self.next += 1;
+            self.requests.push(Request {
+                id,
+                principal: principal.into(),
+                kind,
+                regime,
+                received: now,
+                due: now.saturating_add(d.respond_days.saturating_mul(DAY)),
+                extended: None,
+                status: Status::Open,
+            });
+            Ok(id)
+        }
+
+        fn find(&mut self, id: u64) -> Result<&mut Request, PrivacyError> {
+            self.requests
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or(PrivacyError::NotFound)
+        }
+
+        /// Extends the deadline once, where the law allows it, with a reason.
+        ///
+        /// # Errors
+        /// [`PrivacyError`] when the request is closed, already extended, the law gives no
+        /// extension, or the reason is empty.
+        pub fn extend(&mut self, id: u64, reason: &str) -> Result<u64, PrivacyError> {
+            if !name_ok(reason) {
+                return Err(PrivacyError::Invalid("reason"));
+            }
+            let (gdpr, dpdp) = (self.gdpr, self.dpdp);
+            let r = self.find(id)?;
+            let d = if r.regime == Regime::Gdpr { gdpr } else { dpdp };
+            if r.status != Status::Open {
+                return Err(PrivacyError::State("the request is closed"));
+            }
+            if r.extended.is_some() {
+                return Err(PrivacyError::State("the request was already extended"));
+            }
+            if d.extension_days == 0 {
+                return Err(PrivacyError::State(
+                    "the law gives no extension for this request",
+                ));
+            }
+            r.due = r.due.saturating_add(d.extension_days.saturating_mul(DAY));
+            r.extended = Some(reason.chars().take(100).collect());
+            Ok(r.due)
+        }
+
+        /// Records the answer.
+        ///
+        /// # Errors
+        /// [`PrivacyError::NotFound`] or [`PrivacyError::State`] when already closed.
+        pub fn close(&mut self, id: u64, now: u64) -> Result<(), PrivacyError> {
+            let r = self.find(id)?;
+            if r.status != Status::Open {
+                return Err(PrivacyError::State("the request is already closed"));
+            }
+            r.status = Status::Closed(now);
+            Ok(())
+        }
+
+        /// Open requests past their deadline at `now`, most overdue first.
+        #[must_use]
+        pub fn overdue(&self, now: u64) -> Vec<&Request> {
+            let mut v: Vec<&Request> = self
+                .requests
+                .iter()
+                .filter(|r| r.status == Status::Open && r.due < now)
+                .collect();
+            v.sort_by_key(|r| r.due);
+            v
+        }
+
+        /// Open requests due within `days` days (and not yet overdue), soonest first.
+        #[must_use]
+        pub fn due_within(&self, now: u64, days: u64) -> Vec<&Request> {
+            let limit = now.saturating_add(days.saturating_mul(DAY));
+            let mut v: Vec<&Request> = self
+                .requests
+                .iter()
+                .filter(|r| r.status == Status::Open && r.due >= now && r.due <= limit)
+                .collect();
+            v.sort_by_key(|r| r.due);
+            v
+        }
+
+        /// All requests of one person.
+        #[must_use]
+        pub fn of(&self, principal: &str) -> Vec<&Request> {
+            self.requests
+                .iter()
+                .filter(|r| r.principal == principal)
+                .collect()
+        }
+    }
+
+    /// How long each category of record may be kept.
+    #[derive(Debug, Clone, Default)]
+    pub struct Retention {
+        days: BTreeMap<String, u64>,
+    }
+
+    impl Retention {
+        /// No rules yet.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Sets how long records of `category` may be kept.
+        ///
+        /// # Errors
+        /// [`PrivacyError::Invalid`] for an odd name or a zero period.
+        pub fn rule(mut self, category: &str, days: u64) -> Result<Self, PrivacyError> {
+            if !name_ok(category) || days == 0 {
+                return Err(PrivacyError::Invalid("retention rule"));
+            }
+            self.days.insert(category.into(), days);
+            Ok(self)
+        }
+
+        /// The ids of records past their retention at `now`: `records` are `(id, category,
+        /// created)`. A category with no rule is never reported (nothing says it must go).
+        #[must_use]
+        pub fn due_for_erasure<'a>(
+            &self,
+            records: &'a [(String, String, u64)],
+            now: u64,
+        ) -> Vec<&'a str> {
+            records
+                .iter()
+                .filter(|(_, cat, created)| {
+                    self.days
+                        .get(cat)
+                        .is_some_and(|d| now.saturating_sub(*created) > d.saturating_mul(DAY))
+                })
+                .map(|(id, _, _)| id.as_str())
+                .collect()
+        }
+    }
+
+    /// A personal data breach.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Breach {
+        /// The law.
+        pub regime: Regime,
+        /// When the organisation became aware of it.
+        pub aware_at: u64,
+        /// How many people may be affected.
+        pub affected: u64,
+    }
+
+    impl Breach {
+        /// When the authority must be told: 72 hours after becoming aware. This is GDPR Article
+        /// 33; for DPDP it is the period for the detailed report to the Data Protection Board under
+        /// the Rules (a first intimation is due without delay). Confirm the current Rules.
+        #[must_use]
+        pub fn authority_deadline(&self) -> u64 {
+            self.aware_at.saturating_add(72 * 3_600)
+        }
+
+        /// What to tell the affected people, in one sentence.
+        #[must_use]
+        pub fn people_note(&self) -> &'static str {
+            match self.regime {
+                Regime::Gdpr => "Tell affected people without undue delay when the breach is likely to put them at high risk.",
+                Regime::Dpdp => "Tell each affected person without delay, in plain language, what happened and what they can do.",
+            }
+        }
+
+        /// Whether the authority deadline has passed at `now`.
+        #[must_use]
+        pub fn overdue(&self, now: u64) -> bool {
+            now > self.authority_deadline()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn nc<'a>(
+            principal: &'a str,
+            purpose: &'a str,
+            regime: Regime,
+            basis: Basis,
+            notice_version: &'a str,
+            language: &'a str,
+        ) -> NewConsent<'a> {
+            NewConsent {
+                principal,
+                purpose,
+                regime,
+                basis,
+                notice_version,
+                language,
+            }
+        }
+
+        fn give(l: &mut ConsentLedger, p: &str, purpose: &str, now: u64) {
+            l.give(
+                &nc(p, purpose, Regime::Dpdp, Basis::Consent, "v1", "en"),
+                now,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn consent_is_given_checked_and_withdrawn() {
+            let mut l = ConsentLedger::new();
+            assert!(!l.allows("u1", "hosted_models", 10));
+            give(&mut l, "u1", "hosted_models", 10);
+            assert!(
+                !l.allows("u1", "hosted_models", 9),
+                "not before it was given"
+            );
+            assert!(l.allows("u1", "hosted_models", 10));
+            assert!(!l.allows("u1", "other_purpose", 10));
+            assert!(!l.allows("u2", "hosted_models", 10));
+            assert_eq!(l.withdraw("u1", "hosted_models", 20), 1);
+            assert!(
+                l.allows("u1", "hosted_models", 15),
+                "it held until withdrawn"
+            );
+            assert!(!l.allows("u1", "hosted_models", 20));
+            assert_eq!(
+                l.withdraw("u1", "hosted_models", 30),
+                0,
+                "already withdrawn"
+            );
+            give(&mut l, "u1", "hosted_models", 40);
+            assert!(l.allows("u1", "hosted_models", 41), "they can agree again");
+            assert_eq!(l.history("u1").len(), 2);
+        }
+
+        #[test]
+        fn only_consent_counts_as_consent_and_the_basis_must_fit_the_law() {
+            let mut l = ConsentLedger::new();
+            l.give(&nc("u", "p", Regime::Gdpr, Basis::Contract, "v1", "en"), 0)
+                .unwrap();
+            assert!(!l.allows("u", "p", 5), "a contract basis is not consent");
+            assert!(l
+                .give(
+                    &nc("u", "p", Regime::Gdpr, Basis::LegitimateUse, "v1", "en"),
+                    0
+                )
+                .is_err());
+            assert!(l
+                .give(
+                    &nc(
+                        "u",
+                        "p",
+                        Regime::Dpdp,
+                        Basis::LegitimateInterests,
+                        "v1",
+                        "en"
+                    ),
+                    0
+                )
+                .is_err());
+            assert!(l
+                .give(
+                    &nc("u", "p", Regime::Dpdp, Basis::LegitimateUse, "v1", "en"),
+                    0
+                )
+                .is_ok());
+            for (a, b, c, d) in [
+                ("", "p", "v1", "en"),
+                ("u", "", "v1", "en"),
+                ("u", "p", "", "en"),
+                ("u", "p", "v1", ""),
+                ("u\n", "p", "v1", "en"),
+            ] {
+                assert!(
+                    l.give(&nc(a, b, Regime::Gdpr, Basis::Consent, c, d), 0)
+                        .is_err(),
+                    "{a:?} {b:?} {c:?} {d:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn erasing_a_person_removes_their_consent_records_only() {
+            let mut l = ConsentLedger::new();
+            give(&mut l, "u1", "a", 1);
+            give(&mut l, "u1", "b", 1);
+            give(&mut l, "u2", "a", 1);
+            assert_eq!(l.erase("u1"), 2);
+            assert!(l.history("u1").is_empty());
+            assert_eq!(l.history("u2").len(), 1);
+            assert_eq!(l.erase("nobody"), 0);
+        }
+
+        #[test]
+        fn requests_get_the_right_deadline_for_each_law() {
+            let mut q = RequestQueue::default();
+            let g = q
+                .open("u1", RequestKind::Access, Regime::Gdpr, 1_000)
+                .unwrap();
+            let d = q
+                .open("u2", RequestKind::Grievance, Regime::Dpdp, 1_000)
+                .unwrap();
+            let by = |id| q.of(if id == g { "u1" } else { "u2" })[0].due;
+            assert_eq!(by(g), 1_000 + 30 * DAY);
+            assert_eq!(by(d), 1_000 + 90 * DAY);
+            // Requests the law does not provide are refused.
+            assert!(q
+                .open("u", RequestKind::Portability, Regime::Dpdp, 0)
+                .is_err());
+            assert!(q
+                .open("u", RequestKind::Grievance, Regime::Gdpr, 0)
+                .is_err());
+            assert!(q
+                .open("u", RequestKind::Nomination, Regime::Gdpr, 0)
+                .is_err());
+            assert!(q
+                .open("u", RequestKind::Objection, Regime::Dpdp, 0)
+                .is_err());
+            assert!(q.open("", RequestKind::Access, Regime::Gdpr, 0).is_err());
+            for k in [
+                RequestKind::Access,
+                RequestKind::Correction,
+                RequestKind::Erasure,
+            ] {
+                assert!(k.allowed_under(Regime::Gdpr) && k.allowed_under(Regime::Dpdp));
+            }
+        }
+
+        #[test]
+        fn a_gdpr_request_can_be_extended_once_and_a_dpdp_one_not_by_default() {
+            let mut q = RequestQueue::default();
+            let g = q.open("u1", RequestKind::Erasure, Regime::Gdpr, 0).unwrap();
+            assert_eq!(q.extend(g, "complex request"), Ok((30 + 60) * DAY));
+            assert!(matches!(q.extend(g, "again"), Err(PrivacyError::State(_))));
+            assert!(q.extend(g, "").is_err());
+            let d = q.open("u2", RequestKind::Access, Regime::Dpdp, 0).unwrap();
+            assert!(matches!(
+                q.extend(d, "why not"),
+                Err(PrivacyError::State(_))
+            ));
+            q.close(g, 5).unwrap();
+            assert!(matches!(q.close(g, 6), Err(PrivacyError::State(_))));
+            assert_eq!(q.extend(999, "x"), Err(PrivacyError::NotFound));
+            let c = q.open("u3", RequestKind::Access, Regime::Gdpr, 0).unwrap();
+            q.close(c, 1).unwrap();
+            assert!(matches!(q.extend(c, "late"), Err(PrivacyError::State(_))));
+        }
+
+        #[test]
+        fn overdue_and_upcoming_requests_are_listed_in_order() {
+            let mut q = RequestQueue::new(
+                Deadlines {
+                    respond_days: 10,
+                    extension_days: 0,
+                },
+                Deadlines::dpdp_default(),
+            );
+            let a = q.open("a", RequestKind::Access, Regime::Gdpr, 0).unwrap();
+            let b = q
+                .open("b", RequestKind::Access, Regime::Gdpr, 5 * DAY)
+                .unwrap();
+            let c = q
+                .open("c", RequestKind::Access, Regime::Gdpr, 50 * DAY)
+                .unwrap();
+            let now = 20 * DAY;
+            assert_eq!(
+                q.overdue(now).iter().map(|r| r.id).collect::<Vec<_>>(),
+                vec![a, b]
+            );
+            assert!(q.due_within(now, 5).is_empty());
+            assert_eq!(
+                q.due_within(now, 50)
+                    .iter()
+                    .map(|r| r.id)
+                    .collect::<Vec<_>>(),
+                vec![c]
+            );
+            q.close(a, now).unwrap();
+            assert_eq!(
+                q.overdue(now).iter().map(|r| r.id).collect::<Vec<_>>(),
+                vec![b],
+                "answered ones are not overdue"
+            );
+        }
+
+        #[test]
+        fn retention_names_only_what_has_outlived_its_rule() {
+            let r = Retention::new()
+                .rule("chat", 30)
+                .unwrap()
+                .rule("logs", 7)
+                .unwrap();
+            let recs = vec![
+                ("c1".to_string(), "chat".to_string(), 0),
+                ("c2".to_string(), "chat".to_string(), 20 * DAY),
+                ("l1".to_string(), "logs".to_string(), 0),
+                ("x1".to_string(), "unruled".to_string(), 0),
+            ];
+            assert_eq!(r.due_for_erasure(&recs, 31 * DAY), vec!["c1", "l1"]);
+            assert_eq!(
+                r.due_for_erasure(&recs, 30 * DAY),
+                vec!["l1"],
+                "exactly 30 days is still allowed"
+            );
+            assert!(r.due_for_erasure(&recs, 0).is_empty());
+            assert!(Retention::new().rule("", 1).is_err());
+            assert!(Retention::new().rule("chat", 0).is_err());
+        }
+
+        #[test]
+        fn a_breach_has_a_seventy_two_hour_authority_clock() {
+            let b = Breach {
+                regime: Regime::Gdpr,
+                aware_at: 1_000,
+                affected: 5,
+            };
+            assert_eq!(b.authority_deadline(), 1_000 + 72 * 3_600);
+            assert!(!b.overdue(1_000 + 72 * 3_600));
+            assert!(b.overdue(1_000 + 72 * 3_600 + 1));
+            assert!(b.people_note().contains("high risk"));
+            let d = Breach {
+                regime: Regime::Dpdp,
+                ..b
+            };
+            assert!(d.people_note().contains("without delay"));
+            assert_eq!(
+                Breach {
+                    aware_at: u64::MAX,
+                    ..d
+                }
+                .authority_deadline(),
+                u64::MAX,
+                "no wrap-around"
+            );
         }
     }
 }
