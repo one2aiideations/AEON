@@ -83,22 +83,6 @@ impl Desktop {
                 tab: Some(Tab::Models),
             },
             IconSpot {
-                label: "Approvals",
-                tab: Some(Tab::Approvals),
-            },
-            IconSpot {
-                label: "Audit",
-                tab: Some(Tab::Audit),
-            },
-            IconSpot {
-                label: "Security",
-                tab: Some(Tab::Security),
-            },
-            IconSpot {
-                label: "Review",
-                tab: Some(Tab::Review),
-            },
-            IconSpot {
                 label: "Sheet",
                 tab: Some(Tab::Sheet),
             },
@@ -499,9 +483,9 @@ mod tests {
     #[test]
     fn a_double_click_on_an_icon_opens_its_window_a_single_click_only_selects() {
         let (mut d, mut s) = setup();
-        let (x, y) = centre(d.icon_rect(4)); // Audit
+        let (x, y) = centre(d.icon_rect(3)); // Sheet
         assert_eq!(click(&mut d, &mut s, x, y, 1000), Action::None);
-        assert_eq!(d.selected_icon, Some(4));
+        assert_eq!(d.selected_icon, Some(3));
         assert!(d.wm.top().is_none());
         // Too slow to be a double click.
         click(&mut d, &mut s, x, y, 1000 + DOUBLE_CLICK_MS + 50);
@@ -510,9 +494,9 @@ mod tests {
         let a = click(&mut d, &mut s, x, y, 5000);
         assert_eq!(a, Action::None);
         let a = click(&mut d, &mut s, x, y, 5200);
-        assert_eq!(a, Action::Show(Tab::Audit));
-        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Audit));
-        assert_eq!(s.active, Tab::Audit);
+        assert_eq!(a, Action::Show(Tab::Sheet));
+        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Sheet));
+        assert_eq!(s.active, Tab::Sheet);
     }
 
     #[test]
@@ -605,12 +589,51 @@ mod tests {
     }
 
     #[test]
+    fn governance_windows_are_off_the_desktop_but_still_reachable() {
+        let (mut d, mut s) = setup();
+        let labels: Vec<&str> = d.icons.iter().map(|i| i.label).collect();
+        for gone in ["Approvals", "Audit", "Security", "Review"] {
+            assert!(
+                !labels.contains(&gone),
+                "{gone} is not a desktop icon: {labels:?}"
+            );
+        }
+        for kept in ["Chat", "Models", "Sheet", "Studio", "Code", "Player"] {
+            assert!(labels.contains(&kept), "{kept} stays: {labels:?}");
+        }
+        // The keys still open them.
+        for (n, tab) in [
+            (3u8, Tab::Approvals),
+            (4, Tab::Audit),
+            (5, Tab::Security),
+            (6, Tab::Review),
+        ] {
+            d.on_key(&mut s, Key::F(n));
+            assert_eq!(d.wm.top().map(|w| w.tab), Some(tab), "F{n}");
+        }
+        // The View menu lists them under a greyed "Admin" heading.
+        let view = &d.menu.menus[3];
+        let titles: Vec<&str> = view.items.iter().map(|i| i.label).collect();
+        let admin = titles.iter().position(|l| *l == "Admin").unwrap();
+        assert!(
+            view.items[admin].command == Some(crate::menu::Command::Nothing),
+            "the heading does nothing"
+        );
+        for l in ["Approvals", "Audit", "Security", "Code Review"] {
+            assert!(
+                titles.iter().position(|x| *x == l).unwrap() > admin,
+                "{l} is below the Admin heading"
+            );
+        }
+    }
+
+    #[test]
     fn menus_open_on_click_choose_items_and_ignore_disabled_ones() {
         let (mut d, mut s) = setup();
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[4]; // Security
+        let item = d.menu.item_rects(3)[10]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);

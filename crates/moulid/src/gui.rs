@@ -751,6 +751,16 @@ impl ModelsInfo {
     }
 }
 
+/// The text at the right of the menu bar: the product name, and a reminder when requests wait for
+/// a second person's approval (the Approvals window is not on the desktop).
+fn status_text(base: &str, pending: usize) -> String {
+    match pending {
+        0 => base.to_string(),
+        1 => format!("{base}  |  1 waiting for approval (F3)"),
+        n => format!("{base}  |  {n} waiting for approval (F3)"),
+    }
+}
+
 /// Fills the Models window and the chat title from `info`.
 fn show_models(shell: &mut Shell, info: &ModelsInfo) {
     shell.models.rows = info.rows.clone();
@@ -806,11 +816,12 @@ where
         i32::try_from(w).unwrap_or(1024),
         i32::try_from(h).unwrap_or(768),
     );
-    desktop.status = if saving {
-        "MOULI OS".into()
+    let base_status = if saving {
+        "MOULI OS".to_string()
     } else {
-        "MOULI OS - nothing is saved (no MOULI-DATA disk)".into()
+        "MOULI OS - nothing is saved (no MOULI-DATA disk)".to_string()
     };
+    desktop.status = base_status.clone();
     show_models(&mut device.shell, models);
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
@@ -918,6 +929,7 @@ where
                 },
             }
         }
+        desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
         display.present(&desktop.render(&device.shell))?;
     }
 }
@@ -1557,5 +1569,12 @@ mod tests {
             Role::Notice,
             "an unknown command is explained, not sent to the model"
         );
+    }
+
+    #[test]
+    fn the_menu_bar_reminds_when_approvals_are_waiting() {
+        assert_eq!(status_text("MOULI OS", 0), "MOULI OS");
+        assert!(status_text("MOULI OS", 1).contains("1 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", 3).contains("3 waiting for approval (F3)"));
     }
 }
