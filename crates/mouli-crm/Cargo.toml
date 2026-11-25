@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-mouli-auth = { path = "../mouli-auth" }
+mouli-systems = { path = "../mouli-systems", default-features = false, features = ["auth"] }
 mouli-interface = { path = "../mouli-interface" }
 
 [lints]

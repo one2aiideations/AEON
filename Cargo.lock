@@ -2580,14 +2580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-auth"
-version = "0.1.0"
-dependencies = [
- "mouli-interface",
- "sha2",
-]
-
-[[package]]
 name = "mouli-biz"
 version = "0.13.0"
 dependencies = [
@@ -2621,21 +2613,11 @@ name = "mouli-code"
 version = "0.1.0"
 
 [[package]]
-name = "mouli-comms"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "hkdf",
- "sha2",
- "x25519-dalek",
-]
-
-[[package]]
 name = "mouli-crm"
 version = "0.1.0"
 dependencies = [
- "mouli-auth",
  "mouli-interface",
+ "mouli-systems",
 ]
 
 [[package]]
@@ -2692,23 +2674,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-gate"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-gateway"
-version = "0.1.0"
-dependencies = [
- "mouli-interface",
-]
-
-[[package]]
 name = "mouli-hosted"
 version = "0.1.0"
 dependencies = [
- "mouli-gateway",
  "mouli-http",
  "mouli-pki",
+ "mouli-systems",
 ]
 
 [[package]]
@@ -2722,14 +2693,6 @@ dependencies = [
 [[package]]
 name = "mouli-hw"
 version = "0.1.0"
-
-[[package]]
-name = "mouli-identity"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "sha2",
-]
 
 [[package]]
 name = "mouli-interface"
@@ -2769,13 +2732,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "mouli-mesh"
-version = "0.1.0"
-dependencies = [
- "sha2",
 ]
 
 [[package]]
@@ -2824,10 +2780,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-sched"
-version = "0.1.0"
-
-[[package]]
 name = "mouli-screen"
 version = "0.1.0"
 
@@ -2836,14 +2788,6 @@ name = "mouli-sdv"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
-]
-
-[[package]]
-name = "mouli-security"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -2857,10 +2801,6 @@ dependencies = [
  "mouli-screen",
  "nix",
 ]
-
-[[package]]
-name = "mouli-store"
-version = "0.1.0"
 
 [[package]]
 name = "mouli-studio"
@@ -2883,23 +2823,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-systems"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hkdf",
+ "mouli-interface",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "uuid",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "mouli-tls"
 version = "0.1.0"
 dependencies = [
  "mouli-crypto",
  "mouli-pki",
  "sha2",
-]
-
-[[package]]
-name = "mouli-topstar"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "uuid",
 ]
 
 [[package]]

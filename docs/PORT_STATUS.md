@@ -14,15 +14,15 @@ public APIs. **Differential tests against the C code (same input through both, o
 | `aeon_nvme_storage`, `aeon_nvme_queue_read` | `mouli-llm::weights::block` | ported (software block source; no NVMe hardware path) |
 | `aeon_expert_store` | `mouli-llm::weights::experts` | ported |
 | `aeon_transformer_compute` | `mouli-llm::kernels::ops` | ported (CPU reference kernels) |
-| `aeon_identity`, `aeon_identity_crypto` | `mouli-identity::registry` (`ed25519-dalek`, `sha2`) | ported |
-| `aeon_friction` | `mouli-identity::friction` | ported |
-| `aeon_semantic_frame`, `aeon_semantic_gate`, `aeon_semantic_wire` | `mouli-identity::{semantic, gate, wire}` | ported |
-| `aeon_syscall` (`submit_semantic`), `aeon_process_gate`, `aeon_io_gate`, `aeon_net_policy` | `mouli-identity::gate` | ported |
-| `aeon_ebpf_boundary` (classification), `aeon_kernel_adapter` (hooks) | `mouli-identity::hooks` | classification and hook bookkeeping ported; **attaching real eBPF/netfilter hooks stays kernel-side** |
+| `aeon_identity`, `aeon_identity_crypto` | `mouli-systems::identity::registry` (`ed25519-dalek`, `sha2`) | ported |
+| `aeon_friction` | `mouli-systems::identity::friction` | ported |
+| `aeon_semantic_frame`, `aeon_semantic_gate`, `aeon_semantic_wire` | `mouli-systems::identity::{semantic, gate, wire}` | ported |
+| `aeon_syscall` (`submit_semantic`), `aeon_process_gate`, `aeon_io_gate`, `aeon_net_policy` | `mouli-systems::identity::gate` | ported |
+| `aeon_ebpf_boundary` (classification), `aeon_kernel_adapter` (hooks) | `mouli-systems::identity::hooks` | classification and hook bookkeeping ported; **attaching real eBPF/netfilter hooks stays kernel-side** |
 | `aeon_cognitive_core`, `aeon_cognitive_engine` | `mouli-agentic::cognition`, `mouli-agentic::kernel` | ported |
 | `aeon_runtime`, `aeon_system_embodiment` (actions, sensors, tools, memory region check) | `mouli-agentic::runtime::{action, sensors, tools}`, `mouli-llm::tensor::arena` | ported |
 | `aeon_detect_cpu_caps` | `mouli-hw` (`parse_cpuinfo`, `probe`, `plan`) | ported (reads `/proc`, not compile-time flags) |
-| `aeon_topstar_contract` | `mouli-agentic::adapters::topstar`, and the fuller `mouli-topstar` crate | ported |
+| `aeon_topstar_contract` | `mouli-agentic::adapters::topstar`, and the fuller `mouli-systems::topstar` crate | ported |
 | `userspace/aeond` | `moulid` | ported; HTTP surface not diffed against C |
 | `aeon_kernel_device` (character device and ioctl) | none | **non-Rust by design**: Linux kernel module (track K0/K2) |
 | `aeon_uefi_network` (probe, TLS POST) | none | **non-Rust for now**: UEFI boot environment; a `no_std` Rust port belongs to the kernel track |
@@ -52,27 +52,27 @@ Those were written in the C era; treat statements about "C core" as historical.
 
 | Source | Rust | Status |
 |---|---|---|
-| `MOULI-AUTH.md` capability map: tenancy and org hierarchy, RBAC/ABAC policy, maker-checker with limits and escalation, tamper-evident audit | `mouli-auth` | core built from the spec; 21 unit tests |
-| `AEONONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `mouli-auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme MOULI-AUTH documents** |
+| `MOULI-AUTH.md` capability map: tenancy and org hierarchy, RBAC/ABAC policy, maker-checker with limits and escalation, tamper-evident audit | `mouli-systems::auth` | core built from the spec; 21 unit tests |
+| `AEONONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `mouli-systems::auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme MOULI-AUTH documents** |
 | MOULI-AUTH repository (`CMKIXVI/aeonone`) | none | **not available** (not in `sources/`, not reachable from this account); nothing derived from its code |
 | Login, MFA, SSO, sessions, persistence, admin APIs, policy lifecycle | none | not implemented |
 
 ## mouli-gateway (new, not a port)
 
-Newline-delimited JSON over a Unix socket (mode 0600) so applications and agents outside the console can use `mouli-interface` with streamed replies. Own JSON reader/writer, no new dependencies. Open: no real model backend attached (the `Backend` trait is for `moulid`'s llama-server client), caller identity is claimed not authenticated (`mouli-auth` envelopes not wired in), one connection served at a time, never run outside tests.
+Newline-delimited JSON over a Unix socket (mode 0600) so applications and agents outside the console can use `mouli-interface` with streamed replies. Own JSON reader/writer, no new dependencies. Open: no real model backend attached (the `Backend` trait is for `moulid`'s llama-server client), caller identity is claimed not authenticated (`mouli-systems::auth` envelopes not wired in), one connection served at a time, never run outside tests.
 
 ## mouli-crm (new from spec, not a port)
 
-Domain core from `crates/mouli-crm/MOULI-CRM.md` with ideas from the owner's AEONCRM prototype: lead capture/dedupe/scoring/assignment/conversion, governed pipeline with approval for large wins and exact-money forecast, cases with SLAs, renewals, explainable account health, timeline with provenance, consent. 15 unit tests. Gaps: in-memory only (MOULI-DATA not wired), string permissions (not `mouli-auth` decisions), library not the single-file executable the spec asks for, no campaigns/journeys, quotes, knowledge base, deal-risk models, import/export/erasure. Not used with real data.
+Domain core from `crates/mouli-crm/MOULI-CRM.md` with ideas from the owner's AEONCRM prototype: lead capture/dedupe/scoring/assignment/conversion, governed pipeline with approval for large wins and exact-money forecast, cases with SLAs, renewals, explainable account health, timeline with provenance, consent. 15 unit tests. Gaps: in-memory only (MOULI-DATA not wired), string permissions (not `mouli-systems::auth` decisions), library not the single-file executable the spec asks for, no campaigns/journeys, quotes, knowledge base, deal-risk models, import/export/erasure. Not used with real data.
 
 ### mouli-crm: mouli-auth gate
 
-`mouli_crm::authorizer::AuthorityGate` hands every CRM permission check to an `mouli-auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Not passed yet: amount and attribute conditions, signed envelopes, `mouli-auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
+`mouli_crm::authorizer::AuthorityGate` hands every CRM permission check to an `mouli-systems::auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Not passed yet: amount and attribute conditions, signed envelopes, `mouli-systems::auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
 
 ### mouli-crm: marketing
 
 `mouli_crm::marketing`: segments (leads or contacts, score and source filters), campaigns with `{name}` templates and a minimum gap between contacts, a read-only send plan that lists who is skipped and why (no or withdrawn consent, contacted too recently, already sent), approval of a send by a second person, and execution through a `Channel` trait that re-plans at send time and never double-sends on retry. 5 tests. Not done: journeys, real email/SMS adapters, unsubscribe links, quiet hours, A/B variants, attribution, an agent that drafts campaigns (it would call these same governed operations).
-`mouli_crm::authorizer::AuthorityGate` hands every CRM permission check to an `mouli-auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Deal, conversion and renewal amounts are passed so `AmountAtMost` rules work; winning a deal now also needs `crm.opportunity.close` (checked with the amount). Not passed yet: attribute conditions, signed envelopes, `mouli-auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
+`mouli_crm::authorizer::AuthorityGate` hands every CRM permission check to an `mouli-systems::auth` `Authority` (action `crm.*` on a `crm` resource at the tenant's configured org node). With a gate installed, `Ctx.perms` is ignored. One test covers allow, deny-overrides, unknown principal, other tenant and deactivation. Deal, conversion and renewal amounts are passed so `AmountAtMost` rules work; winning a deal now also needs `crm.opportunity.close` (checked with the amount). Not passed yet: attribute conditions, signed envelopes, `mouli-systems::auth` maker-checker tiers (the CRM keeps its own four-eyes rule).
 
 ## os/: persistence (MOULI-DATA)
 

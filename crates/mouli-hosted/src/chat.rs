@@ -1,8 +1,8 @@
 //! The chat request and its streamed reply.
 
 use crate::Error;
-use mouli_gateway::json::{self, obj, s, Value};
 use mouli_http::{Client, Request, Url};
+use mouli_systems::gateway::json::{self, obj, s, Value};
 use std::io::{BufRead, BufReader, Read};
 
 /// Longest reply accepted, in bytes.

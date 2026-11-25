@@ -104,7 +104,7 @@ write, map, unmap, and so on). Rules:
 
 - Fixed-priority classes with round-robin inside a class; later a deadline class for inference and audio.
 - Per-CPU run queues, wake-up IPIs, tickless idle at K4.
-- Thermal and placement hints from `mouli-sched` arrive as scheduler-handle calls from user space.
+- Thermal and placement hints from `mouli-systems::sched` arrive as scheduler-handle calls from user space.
 - Monotonic clock from TSC or HPET, calibrated at boot; wall clock supplied by a user-mode time service
   (the SNTP code in `moulid` is reused).
 

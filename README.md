@@ -16,9 +16,6 @@ runs `moulid`'s own console.
 | `moulid` | Init (PID 1), console, networking, Wi-Fi, persistence, inference-server supervisor |
 | `mouli-hw` | Hardware probe and run plan |
 | `mouli-update` | Signed OS updates, A/B slots, boot counting and rollback |
-| `mouli-sched` | CPU/iGPU/dGPU/NPU placement with thermal-aware migration |
-| `mouli-store` | Durable system state: key-value map with a checksummed log |
-| `mouli-mesh` | Device mesh: node health, fault-tolerant dispatch, file sync |
 | `mouli-sdv` | Experimental software-defined-vehicle development environment (not safety-certified) |
 
 ## Models and inference
@@ -34,17 +31,13 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `mouli-interface` | The governed workspace: sessions, intents, policy, approvals, data washing, routing, audit |
-| `mouli-gateway` | Local socket protocol so other programs and agents can use the workspace |
-| `mouli-auth` | Tenants, principals, deny-by-default policy, maker-checker approvals |
-| `mouli-gate`, `mouli-identity` | Permission gate for AI actions; DIDs, signed frames, human-presence checks |
 | `mouli-apps` | Sheet, Studio, CRM and Code as governed capabilities |
 | `mouli-sheet`, `mouli-studio` | Spreadsheet core; documents (the other engines are fail-closed stubs) |
 | `mouli-crm` | CRM domain: leads, pipeline with approvals, cases, renewals, consent |
 | `mouli-code` | Unified-diff engine, patch policy, atomic apply and exact rollback |
 | `mouli-project` | Project management: tasks, dependencies, critical path, kanban |
-| `mouli-mail`, `mouli-web`, `mouli-comms` | Mail server, browser agent layer, encrypted messaging |
+| `mouli-mail`, `mouli-web` | Mail server, browser agent layer |
 | `mouli-biz`, `mouli-business`, `mouli-ops`, `mouli-data`, `mouli-system` | Business, operations, data and control-centre applications |
-| `mouli-security` | Detection rules, anomaly scoring, cases and evidence |
 
 ## Screens and desktop
 
@@ -61,7 +54,8 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) sibling-system adapters and the AI data graph (`graph`: conversations, messages, models, files, tool calls and approvals as typed, timed nodes and edges, saved as an append-only log) |
-| `mouli-forge`, `mouli-topstar`, `mouli-neuro` | Versioned agent manifests, TOPSTAR domain model, spiking runtime |
+| `mouli-systems` | The platform services in one crate: model gateway (`gateway`), identity (`identity`, `auth`), security (`security`, `gate`), scheduler (`sched`), system state (`store`), integrations (`topstar`, `comms`, `mesh`), monitoring (`monitor`) and billing (`billing`) |
+| `mouli-forge`, `mouli-neuro` | Versioned agent manifests, spiking runtime |
 | `mouli-lab` | Aetheron research harness with gradient checks (no real-data results yet) |
 
 ## Product specifications (no code yet)
