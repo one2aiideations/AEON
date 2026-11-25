@@ -139,6 +139,67 @@ fn remove_dots(path: &str) -> String {
     }
 }
 
+/// Whether a host name is this machine or something on the person's own network: `localhost`,
+/// loopback, private, link-local and shared address ranges, `.local` and `.internal` names, and
+/// numeric spellings (`2130706433`, `0x7f.1`) that hide an address.
+#[must_use]
+pub fn is_local_host(host: &str) -> bool {
+    let h = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h.ends_with(".lan")
+        || h.ends_with(".home.arpa")
+    {
+        return true;
+    }
+    if h.contains(':') {
+        // IPv6: loopback, unspecified, unique local (fc00::/7), link local (fe80::/10), and
+        // IPv4 addresses written inside IPv6.
+        let first = h.split(':').next().unwrap_or("");
+        let v = u32::from_str_radix(first, 16).unwrap_or(0);
+        return h == "::1"
+            || h == "::"
+            || (0xfc00..=0xfdff).contains(&v)
+            || (0xfe80..=0xfebf).contains(&v)
+            || h.starts_with("::ffff:")
+            || h.starts_with("::");
+    }
+    let numeric = !h.is_empty()
+        && h.chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == 'x')
+        && (h.chars().all(|c| c.is_ascii_digit() || c == '.')
+            || h.starts_with("0x")
+            || h.contains(".0x"));
+    if numeric {
+        let parts: Vec<&str> = h.split('.').collect();
+        if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+            let o: Vec<u8> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+            return o[0] == 127
+                || o[0] == 10
+                || o[0] == 0
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 100 && (64..=127).contains(&o[1]));
+        }
+        // Any other all-number spelling is a trick to hide an address.
+        return true;
+    }
+    false
+}
+
+/// Whether a page at `from` may be sent to `to` by a redirect or load something from it: a page
+/// on the internet may not reach into the machine or the local network.
+#[must_use]
+pub fn may_reach(from: &Address, to: &Address) -> bool {
+    !is_local_host(&to.host) || is_local_host(&from.host)
+}
+
 /// Reads what a person typed in the address bar: a full address, a host name (`https://` is
 /// assumed), or, if it does not look like an address, `None`.
 #[must_use]
@@ -262,12 +323,18 @@ impl History {
 #[must_use]
 pub fn subresources(html: &str, base: &str) -> (Vec<String>, Vec<String>) {
     let dom = Dom::parse(html);
+    let origin = Address::parse(base);
+    let allowed = |a: &Address| origin.as_ref().is_none_or(|o| may_reach(o, a));
     let mut css = Vec::new();
     let mut js = Vec::new();
     for n in dom.find_all("link") {
         let rel = dom.attr(n, "rel").unwrap_or("").to_ascii_lowercase();
         if rel.split_whitespace().any(|r| r == "stylesheet") {
-            if let Some(a) = dom.attr(n, "href").and_then(|h| resolve(base, h)) {
+            if let Some(a) = dom
+                .attr(n, "href")
+                .and_then(|h| resolve(base, h))
+                .filter(&allowed)
+            {
                 let u = a.without_fragment();
                 if !css.contains(&u) && css.len() < MAX_SUBRESOURCES {
                     css.push(u);
@@ -276,7 +343,11 @@ pub fn subresources(html: &str, base: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     for n in dom.find_all("script") {
-        if let Some(a) = dom.attr(n, "src").and_then(|h| resolve(base, h)) {
+        if let Some(a) = dom
+            .attr(n, "src")
+            .and_then(|h| resolve(base, h))
+            .filter(&allowed)
+        {
             let u = a.without_fragment();
             if !js.contains(&u) && js.len() < MAX_SUBRESOURCES {
                 js.push(u);
@@ -593,6 +664,7 @@ pub fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn image_refs(html: &str, base: &str) -> Vec<(String, String)> {
     let dom = Dom::parse(html);
+    let origin = Address::parse(base);
     let mut out: Vec<(String, String)> = Vec::new();
     for n in dom.find_all("img") {
         let Some(raw) = dom.attr(n, "src") else {
@@ -603,7 +675,9 @@ pub fn image_refs(html: &str, base: &str) -> Vec<(String, String)> {
         }
         let target = if raw.trim_start().to_ascii_lowercase().starts_with("data:") {
             raw.trim().to_string()
-        } else if let Some(a) = resolve(base, raw) {
+        } else if let Some(a) =
+            resolve(base, raw).filter(|a| origin.as_ref().is_none_or(|o| may_reach(o, a)))
+        {
             a.without_fragment()
         } else {
             continue;
@@ -1086,5 +1160,79 @@ mod tests {
             "{}",
             m.len()
         );
+    }
+
+    #[test]
+    fn local_and_private_hosts_are_recognised_and_a_public_page_cannot_reach_them() {
+        for local in [
+            "localhost",
+            "LOCALHOST",
+            "app.localhost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "[::1]",
+            "[fe80::1]",
+            "[fd12:3456::1]",
+            "[::ffff:127.0.0.1]",
+            "printer.local",
+            "nas.internal",
+            "router.lan",
+            "2130706433",
+            "0x7f.0.0.1",
+            "017700000001",
+            "1.2.3",
+            "router.home.arpa",
+            "localhost.",
+        ] {
+            assert!(is_local_host(local), "{local}");
+        }
+        for public in [
+            "example.com",
+            "93.184.216.34",
+            "172.32.0.1",
+            "172.15.0.1",
+            "192.169.0.1",
+            "8.8.8.8",
+            "[2606:4700::1]",
+            "a.b.co",
+            "xn--nxasmq6b.com",
+            "100.63.0.1",
+        ] {
+            assert!(!is_local_host(public), "{public}");
+        }
+        let at = |u: &str| Address::parse(u).unwrap();
+        assert!(!may_reach(
+            &at("https://evil.com/"),
+            &at("http://127.0.0.1:8080/")
+        ));
+        assert!(!may_reach(
+            &at("https://evil.com/"),
+            &at("http://192.168.0.1/admin")
+        ));
+        assert!(may_reach(
+            &at("https://evil.com/"),
+            &at("https://example.org/")
+        ));
+        assert!(
+            may_reach(&at("http://localhost:3000/"), &at("http://127.0.0.1:8080/")),
+            "a page you opened on this machine may use it"
+        );
+        // Pictures, styles and scripts pointing inside the network are not even asked for.
+        let html = "<link rel=stylesheet href='http://192.168.0.1/a.css'><link rel=stylesheet href='https://ok.com/b.css'><script src='http://localhost/x.js'></script><img src='http://127.0.0.1/p.png'><img src='/fine.png'>";
+        let (css, js) = subresources(html, "https://site.org/");
+        assert_eq!(
+            (css, js),
+            (vec!["https://ok.com/b.css".to_string()], Vec::new())
+        );
+        assert_eq!(image_refs(html, "https://site.org/").len(), 1);
+        let (css, _) = subresources(html, "http://localhost:3000/");
+        assert_eq!(css.len(), 2, "a local page may use local resources");
     }
 }

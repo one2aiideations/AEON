@@ -108,6 +108,11 @@ pub fn load<F: Fetcher>(fetcher: &F, url: &str) -> Result<Loaded, String> {
                 .to_string();
             let next = browser::resolve(&current, &loc)
                 .ok_or("the site redirected to an address that cannot be opened")?;
+            if let Some(from) = Address::parse(&current) {
+                if !browser::may_reach(&from, &next) {
+                    return Err("the site tried to send you to an address on your own computer or network, so the browser stopped".into());
+                }
+            }
             current = next.without_fragment();
             continue;
         }
@@ -278,6 +283,18 @@ mod tests {
                 b"",
             ),
             ("https://none.com/", 302, &[], b""),
+            (
+                "https://sneaky.com/",
+                302,
+                &[("Location", "http://127.0.0.1:8080/admin")],
+                b"",
+            ),
+            (
+                "https://sneaky2.com/",
+                302,
+                &[("Location", "http://router.local/")],
+                b"",
+            ),
         ]);
         assert_eq!(
             load(&f, "https://a.com/").unwrap().url,
@@ -292,6 +309,19 @@ mod tests {
         assert!(load(&f, "https://none.com/")
             .unwrap_err()
             .contains("without saying where"));
+        assert!(load(&f, "https://sneaky.com/")
+            .unwrap_err()
+            .contains("your own computer or network"));
+        assert!(load(&f, "https://sneaky2.com/")
+            .unwrap_err()
+            .contains("your own computer or network"));
+        assert!(
+            !f.asked
+                .borrow()
+                .iter()
+                .any(|u| u.contains("127.0.0.1") || u.contains("router.local")),
+            "the local address was never contacted"
+        );
     }
 
     #[test]
