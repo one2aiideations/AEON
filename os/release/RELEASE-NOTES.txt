@@ -5,7 +5,7 @@ Author: Chandra Mouli Krishna Moorthy - cmklive@gmail.com
 
 ## What this release is
 
-A bootable image of @PRODUCT_NAME@ for 64-bit PCs. It starts from a USB stick (BIOS and UEFI), shows the MOULI logo, probes the hardware, lets you pick a language model from a disk or USB stick, and chats with it on the console, locally and offline. Optionally it connects over Ethernet or Wi-Fi, and can chat with a hosted model after you agree that messages leave the computer.
+A bootable, Linux-based image of @PRODUCT_NAME@ for 64-bit PCs. It starts from a USB stick (BIOS and UEFI), shows the MOULI logo, probes the hardware, lets you pick a language model from a disk or USB stick, and chats with it locally and offline, in a graphical desktop window (or on the text console if no screen or input device can be used). Optionally it connects over Ethernet or Wi-Fi, and can chat with a hosted model after you agree that messages leave the computer.
 
 ISO SHA-256: @ISO_SHA256@
 
@@ -23,7 +23,8 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - Start-up logo with the product and author details.
 - Hardware report and automatic choice of threads and context size.
 - Model menu listing every .gguf file on any disk or USB stick, with a memory check.
-- Chat with commands /models, /clear and /quit.
+- Graphical desktop drawn on the screen's framebuffer: menu bar, icons and windows, with the chat in a window. Keyboard (US layout) and a USB or PS/2 mouse. Keys: Enter sends, Ctrl+L starts a new chat, F1 to F10 open windows, Ctrl+Q shuts down. Add mouli.text=1 to the kernel command line for the text chat only.
+- Text chat with commands /models, /clear and /quit when the desktop is not used.
 - Optional MOULI-DATA partition that keeps the last model used and the chat logs.
 - Wired network by DHCP, clock set from the network, Wi-Fi setup screen, hosted-model chat with key entry and washing of emails, card numbers and passwords.
 
@@ -32,11 +33,15 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - Automated tests of the Rust code (unit and integration).
 - The image is built and started in QEMU under BIOS and UEFI with a very small test model. The test checks the start-up output, a chat reply, saving to a MOULI-DATA disk and reading it back, wired networking, and Wi-Fi against virtual radios.
 - The screen is checked with a virtual display under BIOS and UEFI.
-- It has NOT been tested on real PCs, with real Wi-Fi radios, or for speed and memory with a full-size model.
+- The desktop was tested in QEMU with a virtual screen, keyboard and mouse: it drew, took typed text, answered through the model and followed mouse movement.
+- The text chat (version 1.0) was reported working by the author on one 2017 MacBook Air with a Qwen model. The desktop has NOT yet been tried on a real PC.
+- It has NOT been tested with real Wi-Fi radios, or for speed and memory with a full-size model.
 
 ## Known limitations
 
-- Text interface only. The desktop and application screens that exist in the source are not part of this image yet.
+- In the desktop only the Chat window is connected. The other windows (Sheet, Studio, Code, Player, Approvals and so on) open but are not connected to their applications yet, and there is no sound or video.
+- Choosing a model is still done in the text menu before the desktop starts.
+- Touchpads that report absolute positions are not used; plug in a USB mouse. The keyboard layout is US.
 - CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
 - Secure Boot must be off. There is no installer: it runs from the stick and keeps nothing unless a MOULI-DATA partition is present.
 - US keyboard layout only.

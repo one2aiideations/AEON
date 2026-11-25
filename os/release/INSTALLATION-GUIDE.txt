@@ -55,6 +55,7 @@ Windows. Use Rufus or balenaEtcher. In Rufus choose the ISO and, when asked, pic
 - Turn Secure Boot off in the firmware settings. The MOULI kernel is not signed, so a computer with Secure Boot on will refuse to start it.
 - Start the computer and open the one-time boot menu (usually F12, F10, F9, Esc or F2 at power-on) and choose the USB stick. Both BIOS and UEFI start-up are supported.
 - In the MOULI menu choose "MOULI". If the screen stays blank, restart and choose "safe graphics" or "verbose boot messages".
+- After you pick a model, the MOULI desktop appears. Type in the Chat window; use a USB or PS/2 mouse if you like. F1 to F10 open windows, Ctrl+L starts a new chat, Ctrl+Q shuts down. If the desktop cannot start, or if you add mouli.text=1 to the kernel command line, the text chat is used instead.
 
 ## 5. First start
 
