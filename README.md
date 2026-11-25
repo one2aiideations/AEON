@@ -56,6 +56,7 @@ runs `moulid`'s own console.
 | `mouli-desk` | Classic desktop (windows, menu bar, icons, pointer) drawn in software |
 | `mouli-device` | Controller joining the screens to the governed workspace |
 | `mouli-shell` | Runs the screens on a Linux framebuffer and keyboard |
+| `mouli-player` | Video and YouTube player core: safe address parsing, queue, hands-free Shorts autoplay, player state machine, mpv control (no decoder or screen yet) |
 
 ## Agents, memory and research
 

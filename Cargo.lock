@@ -2849,6 +2849,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-player"
+version = "0.1.0"
+
+[[package]]
 name = "mouli-project"
 version = "0.1.0"
 dependencies = [
