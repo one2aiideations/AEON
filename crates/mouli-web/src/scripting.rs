@@ -1073,6 +1073,8 @@ impl Scripting {
         let dom = Dom::parse(html);
         let scripts = dom.inline_scripts();
         let mut interp = Interp::new();
+        // Measured: about 3 KB of stack per call level in release builds (21 KB in debug).
+        interp.max_depth = 48;
         let proto = interp.new_obj();
         let host: H = Rc::new(RefCell::new(Host {
             dom,

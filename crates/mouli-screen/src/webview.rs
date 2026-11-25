@@ -789,7 +789,12 @@ impl Page {
     /// Parses `html` and lays it out for a window `w` pixels wide and `h` tall.
     #[must_use]
     pub fn load(html: &str, w: f32, h: f32) -> Self {
-        let dom = Dom::parse(html);
+        Self::from_dom(Dom::parse(html), w, h)
+    }
+
+    /// Lays out a document that is already built (for example one a script has changed).
+    #[must_use]
+    pub fn from_dom(dom: Dom, w: f32, h: f32) -> Self {
         let viewport = Viewport {
             w: w.max(50.0),
             h: h.max(50.0),
@@ -810,6 +815,12 @@ impl Page {
             .collect();
         let styles = compute(dom, &sheets, vp, st);
         layout(dom, &styles, &WebFonts, vp)
+    }
+
+    /// Replaces the document (after scripts changed it) and lays it out again.
+    pub fn set_dom(&mut self, dom: Dom) {
+        self.dom = dom;
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default());
     }
 
     /// Lays the page out again for a new window size (after the window is resized).

@@ -10,8 +10,12 @@ use crate::key::Key;
 use crate::raster::Canvas;
 use crate::screen::{Action, Screen};
 use crate::webview::Page;
+use mouli_web::interp::Value;
 use mouli_web::markdown;
+use mouli_web::scripting::Scripting;
 use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Instant;
 
 /// How a file is previewed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +71,24 @@ fn source_to_html(kind: Kind, path: Option<&str>, text: &str) -> String {
     }
 }
 
+/// The scripts running on the current page, if it has any.
+#[derive(Clone, Default)]
+struct Live(Option<Rc<RefCell<Scripting>>>);
+
+impl std::fmt::Debug for Live {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Live({})",
+            if self.0.is_some() { "scripts" } else { "none" }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct State {
+    live: Live,
+    last_tick: Option<Instant>,
     path: Option<String>,
     hash: u64,
     len: usize,
@@ -97,7 +117,15 @@ impl PreviewScreen {
             let kind = kind_of(path);
             let html = source_to_html(kind, path, text);
             let moved_file = s.path.as_deref() != path;
-            s.page = Some(Page::load(&html, w as f32, h as f32));
+            if kind == Kind::Html && html.to_ascii_lowercase().contains("<script") {
+                let sc = Scripting::new(&html);
+                s.page = Some(Page::from_dom(sc.snapshot(), w as f32, h as f32));
+                s.live = Live(Some(Rc::new(RefCell::new(sc))));
+                s.last_tick = Some(Instant::now());
+            } else {
+                s.page = Some(Page::load(&html, w as f32, h as f32));
+                s.live = Live(None);
+            }
             s.hash = hh;
             s.len = text.len();
             s.path = path.map(str::to_string);
@@ -136,9 +164,81 @@ impl PreviewScreen {
         }
     }
 
-    /// A click at (`x`, `y`) inside the preview. Returns what was learned: `#anchor` links scroll
-    /// the page; other links are reported in [`PreviewScreen::message`].
+    /// Takes the changes scripts made into the page. Call with the state borrowed.
+    fn refresh(s: &mut State) {
+        let Some(live) = s.live.0.clone() else { return };
+        let mut sc = live.borrow_mut();
+        if sc.take_dirty() {
+            let dom = sc.snapshot();
+            if let Some(p) = s.page.as_mut() {
+                p.set_dom(dom);
+            }
+            let max = s.page.as_ref().map_or(0.0, Page::max_scroll);
+            s.scroll = s.scroll.clamp(0.0, max);
+        }
+    }
+
+    /// Whether the page has scripts waiting on timers (the desktop then wakes up regularly).
+    #[must_use]
+    pub fn wants_ticks(&self) -> bool {
+        self.state
+            .borrow()
+            .live
+            .0
+            .as_ref()
+            .is_some_and(|l| l.borrow().pending_timers() > 0)
+    }
+
+    /// Lets time pass for the page's scripts; returns `true` if the picture changed.
+    pub fn tick(&self) -> bool {
+        let mut s = self.state.borrow_mut();
+        let Some(live) = s.live.0.clone() else {
+            return false;
+        };
+        let now = Instant::now();
+        let ms = s
+            .last_tick
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f64() * 1000.0)
+            .min(1000.0);
+        s.last_tick = Some(now);
+        let ran = live.borrow_mut().advance(ms);
+        let dirty = live.borrow_mut().take_dirty();
+        if dirty {
+            let dom = live.borrow().snapshot();
+            if let Some(p) = s.page.as_mut() {
+                p.set_dom(dom);
+            }
+        }
+        ran > 0 && dirty
+    }
+
+    /// What the page's scripts have written to the console.
+    #[must_use]
+    pub fn console(&self) -> Vec<String> {
+        self.state
+            .borrow()
+            .live
+            .0
+            .as_ref()
+            .map(|l| l.borrow().console().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A click at (`x`, `y`) inside the preview. Scripts see it first; if they do not prevent it,
+    /// `#anchor` links scroll the page and other links are reported in [`PreviewScreen::message`].
     pub fn click(&mut self, x: f32, y: f32) {
+        {
+            let mut s = self.state.borrow_mut();
+            let hit = s.page.as_ref().and_then(|p| p.element_at(x, y, s.scroll));
+            if let (Some(node), Some(live)) = (hit, s.live.0.clone()) {
+                let ok = live.borrow_mut().dispatch(node, "click");
+                Self::refresh(&mut s);
+                if !ok {
+                    self.message.clear();
+                    return;
+                }
+            }
+        }
         let mut s = self.state.borrow_mut();
         let Some(page) = s.page.as_ref() else { return };
         let Some(href) = page.link_at(x, y, s.scroll) else {
@@ -172,6 +272,29 @@ impl PreviewScreen {
 impl Screen for PreviewScreen {
     fn on_key(&mut self, key: Key) -> Action {
         let mut s = self.state.borrow_mut();
+        if let Some(live) = s.live.0.clone() {
+            let name = match key {
+                Key::Char(c) => c.to_string(),
+                Key::Enter => "Enter".into(),
+                Key::Esc => "Escape".into(),
+                Key::Tab => "Tab".into(),
+                Key::Backspace => "Backspace".into(),
+                Key::Up => "ArrowUp".into(),
+                Key::Down => "ArrowDown".into(),
+                Key::Left => "ArrowLeft".into(),
+                Key::Right => "ArrowRight".into(),
+                _ => String::new(),
+            };
+            if !name.is_empty() {
+                let ok =
+                    live.borrow_mut()
+                        .dispatch_fields(0, "keydown", &[("key", Value::str(&name))]);
+                Self::refresh(&mut s);
+                if !ok {
+                    return Action::None;
+                }
+            }
+        }
         let view = s.size.1 as f32;
         let max = s.page.as_ref().map_or(0.0, Page::max_scroll);
         let step = match key {
@@ -319,6 +442,47 @@ mod tests {
         assert!(ink(&txt) > 50);
         let empty = drawn(&PreviewScreen::default(), None, "");
         assert!(ink(&empty) > 100, "an empty preview explains itself");
+    }
+
+    #[test]
+    fn scripts_on_a_page_react_to_clicks_and_timers() {
+        let html = "<body style=\"margin:0;background:#f00\"><div style=\"height:200px\"></div><script>\
+            document.body.addEventListener('click', () => { document.body.style.background = '#00f'; });\
+            setTimeout(() => { document.body.style.background = '#0f0'; }, 200);\
+            </script></body>";
+        let mut s = PreviewScreen::default();
+        let a = drawn(&s, Some("a.html"), html);
+        assert_eq!(
+            a.get(5, 5),
+            Some(0x00FF_0000),
+            "scripts ran and the first picture is the start state"
+        );
+        assert!(s.wants_ticks());
+        s.click(50.0, 50.0);
+        let b = drawn(&s, Some("a.html"), html);
+        assert_eq!(
+            b.get(5, 5),
+            Some(0x0000_00FF),
+            "a click reached the page's listener"
+        );
+        // Time passing runs the timer (the real clock is used, so wait a little longer than it).
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        assert!(s.tick(), "the timer changed the picture");
+        let c = drawn(&s, Some("a.html"), html);
+        assert_eq!(c.get(5, 5), Some(0x0000_FF00));
+        assert!(!s.wants_ticks());
+        assert!(s.console().is_empty());
+        // A page without scripts has none of this.
+        let plain = PreviewScreen::default();
+        drawn(&plain, Some("b.html"), "<p>x</p>");
+        assert!(!plain.wants_ticks() && !plain.tick());
+        // A script error is kept for the person, not thrown away.
+        let bad = PreviewScreen::default();
+        drawn(&bad, Some("c.html"), "<p>x</p><script>nope()</script>");
+        assert!(bad
+            .console()
+            .iter()
+            .any(|l| l.contains("nope is not defined")));
     }
 
     #[test]

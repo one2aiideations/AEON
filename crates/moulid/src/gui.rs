@@ -962,10 +962,25 @@ where
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     display.present(&desktop.render(&device.shell))?;
     loop {
-        let Ok(first) = rx.recv() else {
-            return Ok(End::Eof);
-        };
-        let mut batch = vec![first];
+        let mut batch = Vec::new();
+        if device.shell.preview.wants_ticks() {
+            // A page with timers: wake up often enough to run them.
+            match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(first) => batch.push(first),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if device.shell.preview.tick() {
+                        display.present(&desktop.render(&device.shell))?;
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(End::Eof),
+            }
+        } else {
+            let Ok(first) = rx.recv() else {
+                return Ok(End::Eof);
+            };
+            batch.push(first);
+        }
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
             if batch.len() >= 256 {

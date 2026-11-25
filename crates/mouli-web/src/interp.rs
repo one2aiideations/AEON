@@ -3049,3 +3049,35 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod stack_probe {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    #[ignore = "measurement"]
+    fn probe() {
+        let r = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let lo = Rc::new(Cell::new(usize::MAX));
+                let hi = Rc::new(Cell::new(0usize));
+                let (l, h) = (lo.clone(), hi.clone());
+                let mut i = Interp::new();
+                let f = i.native("probe", move |_, _, _| {
+                    let x = 0u8;
+                    let a = std::ptr::addr_of!(x) as usize;
+                    l.set(l.get().min(a));
+                    h.set(h.get().max(a));
+                    Ok(Value::Undefined)
+                });
+                i.set_global("probe", f);
+                i.run("function f(n) { if (!n) { probe(); return 0 } probe(); return f(n - 1) + 1 } f(60)").unwrap();
+                (hi.get() - lo.get()) / 60
+            })
+            .unwrap()
+            .join();
+        println!("stack per JS call level: {} bytes", r.unwrap());
+    }
+}
