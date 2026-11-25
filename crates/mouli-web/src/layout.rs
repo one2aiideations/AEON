@@ -3060,6 +3060,44 @@ impl Ctx<'_> {
     }
 }
 
+/// The border box of an element in page coordinates, if it has a box.
+#[must_use]
+pub fn node_rect(layout: &Layout, node: NodeId) -> Option<Rect> {
+    fn walk(b: &LBox, ox: f32, oy: f32, node: NodeId) -> Option<Rect> {
+        let (x, y) = (ox + b.rect.x, oy + b.rect.y);
+        if b.node == Some(node) {
+            return Some(Rect {
+                x,
+                y,
+                w: b.rect.w,
+                h: b.rect.h,
+            });
+        }
+        for c in &b.children {
+            if let Some(r) = walk(c, x, y, node) {
+                return Some(r);
+            }
+        }
+        let (cx, cy) = (x + b.content_x(), y + b.content_y());
+        for l in &b.lines {
+            for it in &l.items {
+                if let Item::Atomic {
+                    x: ix,
+                    y: iy,
+                    b: ab,
+                } = it
+                {
+                    if let Some(r) = walk(ab, cx + ix, cy + l.y + iy, node) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+        None
+    }
+    walk(&layout.root, 0.0, 0.0, node)
+}
+
 /// Finds the element (innermost first) under a point, in page coordinates.
 #[must_use]
 pub fn hit_test(layout: &Layout, x: f32, y: f32) -> Option<NodeId> {

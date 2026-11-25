@@ -85,11 +85,13 @@ pub enum Tab {
     Player,
     /// What is on the data disk.
     Storage,
+    /// A rendered preview of the file open in the code editor.
+    Preview,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -101,6 +103,7 @@ impl Tab {
         Tab::Editor,
         Tab::Player,
         Tab::Storage,
+        Tab::Preview,
     ];
 
     /// The name shown in the tab bar.
@@ -117,10 +120,11 @@ impl Tab {
             Tab::Editor => "Code",
             Tab::Player => "Player",
             Tab::Storage => "Storage",
+            Tab::Preview => "Preview",
         }
     }
 
-    /// The function key that opens it (F1 to F11).
+    /// The function key that opens it (F1 to F12).
     pub const fn key(self) -> Key {
         Key::F(self as u8 + 1)
     }
@@ -201,8 +205,9 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 11);
+        assert_eq!(Tab::ALL.len(), 12);
         assert_eq!(Tab::Storage.key(), Key::F(11));
+        assert_eq!(Tab::Preview.key(), Key::F(12));
         assert_eq!(Tab::Editor.key(), Key::F(9));
         assert_eq!(Tab::Player.key(), Key::F(10));
         assert_eq!(
@@ -218,7 +223,8 @@ mod tests {
                 "Studio",
                 "Code",
                 "Player",
-                "Storage"
+                "Storage",
+                "Preview"
             ]
         );
     }

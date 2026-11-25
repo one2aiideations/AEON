@@ -10,7 +10,7 @@ use crate::typeface::{self, blend, Face};
 use mouli_web::css::{State, Stylesheet};
 use mouli_web::display::{paint, Op};
 use mouli_web::dom::{Dom, NodeId};
-use mouli_web::layout::{hit_test, layout, FontSpec, Fonts, Layout, MarkerKind, Rect};
+use mouli_web::layout::{hit_test, layout, node_rect, FontSpec, Fonts, Layout, MarkerKind, Rect};
 use mouli_web::style::{compute, BorderStyle, Gradient, Viewport};
 
 /// Measures text with the embedded faces, for layout.
@@ -864,6 +864,18 @@ impl Page {
     #[must_use]
     pub fn element_at(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y + scroll_y)
+    }
+
+    /// The page position (top edge) of the element with this `id`, for `#anchor` links.
+    #[must_use]
+    pub fn anchor_y(&self, id: &str) -> Option<f32> {
+        let n = self.dom.by_id(id).or_else(|| {
+            self.dom
+                .find_all("a")
+                .into_iter()
+                .find(|&a| self.dom.attr(a, "name") == Some(id))
+        })?;
+        node_rect(&self.layout, n).map(|r| r.y)
     }
 
     /// The `href` of the link under a point, if any.

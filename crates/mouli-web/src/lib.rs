@@ -23,6 +23,7 @@ pub mod gate;
 pub mod html;
 pub mod intents;
 pub mod layout;
+pub mod markdown;
 pub mod rate;
 pub mod readable;
 pub mod style;

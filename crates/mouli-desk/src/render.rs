@@ -79,10 +79,19 @@ fn draw_window(c: &mut Canvas, w: &Window, active: bool, shell: &Shell) {
 
     // The screen inside the window, in Roboto Mono.
     let k = w.content();
-    let mut grid = Grid::new(w.cols as usize, w.rows as usize);
-    let area = grid.area();
-    shell.screen(w.tab).draw(&mut grid, area);
-    blit(c, &render_text(&grid), k.x, k.y, k);
+    if w.tab == Tab::Preview {
+        // The preview is a picture, not a grid of characters.
+        fill(c, k, 0xFFFF_FFFF);
+        let text = shell.editor.text();
+        shell
+            .preview
+            .draw_pixels(c, (k.x, k.y, k.w, k.h), (shell.editor.path(), &text));
+    } else {
+        let mut grid = Grid::new(w.cols as usize, w.rows as usize);
+        let area = grid.area();
+        shell.screen(w.tab).draw(&mut grid, area);
+        blit(c, &render_text(&grid), k.x, k.y, k);
+    }
 
     // The strip under it: key hints, and the grow handle.
     let s = w.status_strip();
@@ -159,6 +168,7 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Editor) => &CODE,
             Some(Tab::Player) => &PLAYER,
             Some(Tab::Storage) => &DISK,
+            Some(Tab::Preview) => &CODE,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;

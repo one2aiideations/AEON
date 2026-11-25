@@ -272,7 +272,7 @@ impl Desktop {
             }
             Command::Help => {
                 self.show_alert(&[
-                    "F1 Chat  F2 Models  F9 Code  F11 Storage",
+                    "F1 Chat  F2 Models  F9 Code  F11 Storage  F12 Preview",
                     "Ctrl-N     new conversation",
                     "Ctrl-W     close the window",
                     "Ctrl-Q     shut down",
@@ -343,7 +343,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=11) => Tab::ALL
+            Key::F(n @ 1..=12) => Tab::ALL
                 .get(usize::from(n) - 1)
                 .filter(|t| !MOVED_OUT.contains(t))
                 .map(|t| Command::Open(*t)),
@@ -466,7 +466,15 @@ impl Desktop {
                 self.focus(shell, id);
                 self.press = Some(Press::Resize(id));
             }
-            Some(Hit::Content { id, .. } | Hit::Frame(id)) => self.focus(shell, id),
+            Some(Hit::Content { id, .. }) => {
+                self.focus(shell, id);
+                if let Some(w) = self.wm.get(id).filter(|w| w.tab == Tab::Preview) {
+                    // Links in the preview are followed by position, in pixels.
+                    let k = w.content();
+                    shell.preview.click((px - k.x) as f32, (py - k.y) as f32);
+                }
+            }
+            Some(Hit::Frame(id)) => self.focus(shell, id),
             None => return self.click_desktop(shell, px, py, now_ms),
         }
         Action::None
@@ -635,6 +643,79 @@ mod tests {
     }
 
     #[test]
+    fn f12_opens_a_large_preview_that_shows_the_file_open_in_code() {
+        let (mut d, mut s) = setup();
+        s.editor
+            .load(
+                "page.html",
+                "<body style=\"margin:0;background:#ff0000\"><p>hi</p></body>",
+            )
+            .unwrap();
+        assert_eq!(d.on_key(&mut s, Key::F(12)), Action::Show(Tab::Preview));
+        let w = d.wm.top().unwrap();
+        assert_eq!(w.tab, Tab::Preview);
+        assert!(
+            w.cols >= 90 && w.rows >= 28,
+            "a preview window is larger than the usual: {}x{}",
+            w.cols,
+            w.rows
+        );
+        let k = w.content();
+        let c = d.render(&s);
+        let at = |x: i32, y: i32| c.get(x as usize, y as usize).unwrap();
+        assert_eq!(
+            at(k.x + k.w - 5, k.y + k.h - 5),
+            0x00FF_0000,
+            "the page is drawn as pixels inside the window"
+        );
+        // Editing the file changes the preview on the next draw.
+        s.editor
+            .load(
+                "page.html",
+                "<body style=\"margin:0;background:#0000ff\"></body>",
+            )
+            .unwrap();
+        let c = d.render(&s);
+        assert_eq!(
+            c.get((k.x + k.w - 5) as usize, (k.y + k.h - 5) as usize),
+            Some(0x0000_00FF)
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_link_in_the_preview_is_reported_and_other_windows_are_unaffected() {
+        let (mut d, mut s) = setup();
+        s.editor
+            .load("p.html", "<body style=\"margin:0\"><p style=\"margin:0;font-size:20px\"><a href=\"https://example.com/z\">link</a></p></body>")
+            .unwrap();
+        d.on_key(&mut s, Key::F(12));
+        let _ = d.render(&s); // lays the page out for the window
+        let k = d.wm.top().unwrap().content();
+        click(&mut d, &mut s, k.x + 6, k.y + 8, 0);
+        assert!(
+            s.preview.message.starts_with("Link: https://example.com/z"),
+            "{:?}",
+            s.preview.message
+        );
+        // Clicking in the chat window does not touch the preview.
+        d.open(&mut s, Tab::Chat);
+        s.preview.message.clear();
+        let c = d.wm.top().unwrap().content();
+        click(&mut d, &mut s, c.x + 5, c.y + 5, 500);
+        assert!(s.preview.message.is_empty());
+    }
+
+    #[test]
+    fn the_view_menu_lists_the_preview() {
+        let (d, _) = setup();
+        let view = &d.menu.menus[3];
+        assert!(view
+            .items
+            .iter()
+            .any(|i| i.label == "Preview" && i.shortcut == "F12"));
+    }
+
+    #[test]
     fn clicking_empty_desktop_deselects() {
         let (mut d, mut s) = setup();
         let (x, y) = centre(d.icon_rect(1));
@@ -771,7 +852,7 @@ mod tests {
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[8]; // Admin > Security
+        let item = d.menu.item_rects(3)[9]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);

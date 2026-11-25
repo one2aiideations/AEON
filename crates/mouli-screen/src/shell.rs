@@ -4,8 +4,8 @@ use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
 use crate::screens::{
-    Approvals, Audit, Chat, EditorScreen, ModelPicker, PlayerScreen, Review, SecurityScreen,
-    SheetScreen, StorageScreen, StudioScreen,
+    Approvals, Audit, Chat, EditorScreen, ModelPicker, PlayerScreen, PreviewScreen, Review,
+    SecurityScreen, SheetScreen, StorageScreen, StudioScreen,
 };
 
 /// The whole interface.
@@ -33,6 +33,8 @@ pub struct Shell {
     pub player: PlayerScreen,
     /// What is on the data disk.
     pub storage: StorageScreen,
+    /// The rendered preview of the open file.
+    pub preview: PreviewScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -53,6 +55,7 @@ impl Default for Shell {
             editor: EditorScreen::default(),
             player: PlayerScreen::default(),
             storage: StorageScreen::default(),
+            preview: PreviewScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -79,6 +82,7 @@ impl Shell {
             Tab::Editor => &self.editor,
             Tab::Player => &self.player,
             Tab::Storage => &self.storage,
+            Tab::Preview => &self.preview,
         }
     }
 
@@ -96,6 +100,7 @@ impl Shell {
             Tab::Editor => &mut self.editor,
             Tab::Player => &mut self.player,
             Tab::Storage => &mut self.storage,
+            Tab::Preview => &mut self.preview,
         }
     }
 
@@ -209,7 +214,7 @@ mod tests {
     fn the_header_lists_every_screen_and_the_footer_shows_hints() {
         let mut s = Shell::new();
         s.status = "wlan0 connected".into();
-        let t = drawn(&s, 160, 20);
+        let t = drawn(&s, 200, 20);
         let header = t.lines().next().unwrap();
         for tab in Tab::ALL {
             assert!(header.contains(tab.label()), "{header}");
@@ -221,7 +226,7 @@ mod tests {
         let footer = t.lines().nth(19).unwrap();
         assert!(footer.contains("Enter load"), "{footer}");
         s.on_key(Key::F(1));
-        assert!(drawn(&s, 160, 20)
+        assert!(drawn(&s, 200, 20)
             .lines()
             .nth(19)
             .unwrap()
@@ -262,7 +267,7 @@ mod tests {
             !narrow.lines().next().unwrap().contains(".."),
             "no stray dots"
         );
-        assert!(drawn(&s, 160, 20)
+        assert!(drawn(&s, 200, 20)
             .lines()
             .next()
             .unwrap()

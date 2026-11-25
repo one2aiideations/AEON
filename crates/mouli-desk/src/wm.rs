@@ -170,8 +170,13 @@ impl WindowManager {
             return id;
         }
         let n = self.windows.len() as i32;
-        let cols = 72.min(self.max_cols());
-        let rows = 22.min(self.max_rows());
+        let (want_cols, want_rows) = if tab == Tab::Preview {
+            (100, 32)
+        } else {
+            (72, 22)
+        };
+        let cols = want_cols.min(self.max_cols());
+        let rows = want_rows.min(self.max_rows());
         let id = self.next_id;
         self.next_id += 1;
         let mut w = Window {
