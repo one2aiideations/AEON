@@ -4,14 +4,18 @@
 //! Hosted mode is the one place MOULI sends what the person types off the machine, so it is
 //! explicit: nothing connects until the person has typed `yes` to a plain statement of where the
 //! messages go. Emails, card numbers and passwords or API keys found in the messages are replaced
-//! before sending (the safety net of `mouli-interface::wash`, which can miss free-text secrets).
+//! before sending by the washer of `mouli-systems` (policy: GDPR and DPDP together): emails, phone
+//! numbers and IP addresses become pseudonyms that are put back in the reply; card, bank and ID
+//! numbers (Aadhaar, PAN, IBAN, GSTIN, UPI) and credentials are masked. It cannot see names or
+//! addresses written as plain text.
 
 use crate::persist::Store;
 use crate::ui::{Backend, Turn};
 use mouli_hosted::{chat_stream, keyfile, Error, Provider, Secret};
 use mouli_http::{Client, Url};
-use mouli_interface::wash::{wash, Mode, Vault};
+use mouli_systems::wash::{Action, Kind, Policy, Washer};
 pub use mouli_utility::prompt::{ask, ask_secret};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 /// Provider name used for the key file.
@@ -32,12 +36,13 @@ pub fn consent_text(host: &str, saving_key: bool) -> String {
         "\n  Hosted model\n  ------------\n\
          \x20 Your messages will leave this computer: they are sent over an encrypted connection to\n\
          \x20 {host}, which will read them and may keep them under its own terms.\n\
-         \x20 Emails, card numbers and passwords/API keys are replaced before sending, but names,\n\
-         \x20 addresses and other personal text are not.\n\
+         \x20 Emails, phone numbers, IP addresses, card, bank and ID numbers (such as Aadhaar and PAN)\n\
+         \x20 and passwords/API keys are replaced before sending, but names, addresses and other\n\
+         \x20 personal text are not.\n\
          {}\
          \x20 Type /models at any time to go back to local models.\n",
         if saving_key {
-            "  The API key is saved on the MOULI-DATA partition; anyone who has that stick can read it.\n"
+            "  The API key is saved on the MOULI-DATA partition, encrypted with your passphrase.\n"
         } else {
             "  The API key is kept in memory only and is gone when you power off.\n"
         }
@@ -107,7 +112,38 @@ pub fn setup<R: BufRead, W: Write>(
     let mut key: Option<Secret> = None;
     let mut key_saved = false;
     if let Some(s) = store {
-        if let Ok(Some(l)) = keyfile::load(&key_dir(s), PROVIDER_NAME) {
+        if keyfile::sealed_exists(&key_dir(s), PROVIDER_NAME) {
+            let Some(a) = ask(input, out, "  A saved API key was found. Use it? [Y/n] > ")? else {
+                return Ok(None);
+            };
+            if !a.eq_ignore_ascii_case("n") {
+                for attempt in 1..=3 {
+                    let Some(p) = ask_secret(
+                        input,
+                        out,
+                        "  Passphrase for the saved key (typing is hidden) > ",
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    match keyfile::load_sealed(&key_dir(s), PROVIDER_NAME, &p) {
+                        Ok(Some(k)) => {
+                            key = Some(k);
+                            key_saved = true;
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            writeln!(
+                                out,
+                                "  {e}{}",
+                                if attempt < 3 { "; try again." } else { "." }
+                            )?;
+                        }
+                    }
+                }
+            }
+        } else if let Ok(Some(l)) = keyfile::load(&key_dir(s), PROVIDER_NAME) {
             let Some(a) = ask(input, out, "  A saved API key was found. Use it? [Y/n] > ")? else {
                 return Ok(None);
             };
@@ -137,13 +173,38 @@ pub fn setup<R: BufRead, W: Write>(
             let a = ask(
                 input,
                 out,
-                "  Save the key on the data partition for next time? [y/N] > ",
+                "  Save the key on the data partition for next time, encrypted? [y/N] > ",
             )?
             .unwrap_or_default();
             if a.eq_ignore_ascii_case("y") {
-                match keyfile::save(&key_dir(s), PROVIDER_NAME, &key) {
-                    Ok(()) => key_saved = true,
-                    Err(e) => writeln!(out, "  The key could not be saved: {e}")?,
+                let min = keyfile::MIN_PASSPHRASE;
+                while let Some(p) = ask_secret(
+                    input,
+                    out,
+                    &format!(
+                        "  Choose a passphrase of at least {min} characters (typing is hidden) > "
+                    ),
+                )? {
+                    if p.is_empty() {
+                        writeln!(out, "  The key was not saved.")?;
+                        break;
+                    }
+                    if p.chars().count() < min {
+                        writeln!(out, "  That is too short.")?;
+                        continue;
+                    }
+                    let Some(again) = ask_secret(input, out, "  Type it again > ")? else {
+                        break;
+                    };
+                    if again != p {
+                        writeln!(out, "  The two did not match.")?;
+                        continue;
+                    }
+                    match keyfile::save_sealed(&key_dir(s), PROVIDER_NAME, &key, &p) {
+                        Ok(()) => key_saved = true,
+                        Err(e) => writeln!(out, "  The key could not be saved: {e}")?,
+                    }
+                    break;
                 }
             }
         }
@@ -174,7 +235,7 @@ pub fn setup<R: BufRead, W: Write>(
 pub struct HostedBackend {
     client: Client,
     provider: Provider,
-    vault: Vault,
+    washer: Washer,
     log: Option<(Store, String)>,
 }
 
@@ -195,7 +256,7 @@ impl HostedBackend {
         Self {
             client,
             provider,
-            vault: Vault::new(),
+            washer: Washer::new(Policy::gdpr_and_dpdp()),
             log: store.map(|s| (s.clone(), s.new_session())),
         }
     }
@@ -218,19 +279,22 @@ fn explain(e: &Error) -> String {
 
 impl Backend for HostedBackend {
     fn reply(&mut self, history: &[Turn]) -> Result<String, String> {
-        let mut removed = 0;
-        let washed: Vec<(&str, String)> = history
-            .iter()
-            .map(|t| {
-                if t.role == "user" {
-                    let w = wash(&t.content, Mode::Redact, &mut self.vault);
-                    removed += w.findings.len();
-                    (t.role, w.text)
-                } else {
-                    (t.role, t.content.clone())
+        let mut found: BTreeMap<Kind, usize> = BTreeMap::new();
+        let mut washed: Vec<(&str, String)> = Vec::with_capacity(history.len());
+        for t in history {
+            if t.role == "user" {
+                let w = self
+                    .washer
+                    .wash(&t.content)
+                    .map_err(|_| "A message is too large to send.".to_string())?;
+                for h in w.hits.iter().filter(|h| h.action != Action::Keep) {
+                    *found.entry(h.kind).or_insert(0) += 1;
                 }
-            })
-            .collect();
+                washed.push((t.role, w.text));
+            } else {
+                washed.push((t.role, t.content.clone()));
+            }
+        }
         if let Some(last) = history.last() {
             self.record(last.role, &last.content);
         }
@@ -244,13 +308,21 @@ impl Backend for HostedBackend {
         )
         .map_err(|e| explain(&e))?;
         self.record("assistant", &answer);
+        // The model may refer to a pseudonym such as [EMAIL_1]; the person wrote the original, so
+        // it is put back for them to read (it never left this computer).
+        let answer = self.washer.restore(&answer, true).unwrap_or(answer);
         // Counts every washed item in the history, so the note repeats while it stays in view.
-        if removed > 0 {
-            Ok(format!(
-                "(sensitive items removed before sending: {removed})\n{answer}"
-            ))
-        } else {
+        if found.is_empty() {
             Ok(answer)
+        } else {
+            let list: Vec<String> = found
+                .iter()
+                .map(|(k, n)| format!("{n} {}", k.label()))
+                .collect();
+            Ok(format!(
+                "(replaced before sending: {})\n{answer}",
+                list.join(", ")
+            ))
         }
     }
 }
@@ -284,7 +356,7 @@ mod tests {
         let d = tmp("a");
         let store = Store::open(&d).unwrap();
         let (r, out) = run_setup(
-            "https://api.example.com/v1\nsmall-1\nsk-live-123456\ny\nyes\n",
+            "https://api.example.com/v1\nsmall-1\nsk-live-123456\ny\nhunter2hunter2\nhunter2hunter2\nyes\n",
             Some(&store),
         );
         let (p, saved) = r.expect("set up");
@@ -293,17 +365,51 @@ mod tests {
             (p.base_url.as_str(), p.model.as_str()),
             ("https://api.example.com/v1", "small-1")
         );
-        assert!(!out.contains("sk-live-123456"));
+        assert!(!out.contains("sk-live-123456") && !out.contains("hunter2hunter2"));
+        assert!(
+            !std::fs::read_to_string(d.join("keys").join("hosted.sealed"))
+                .unwrap_or_default()
+                .contains("sk-live")
+        );
         assert!(out.contains("api.example.com") && out.contains("leave this computer"));
         assert_eq!(
             store.settings().get("hosted.model").map(String::as_str),
             Some("small-1")
         );
         // second time: saved key and defaults are offered
-        let (r, out) = run_setup("\n\n\nyes\n", Some(&store));
+        let (r, out) = run_setup("\n\n\nhunter2hunter2\nyes\n", Some(&store));
         let (p, saved) = r.expect("second setup");
         assert!(saved && p.key.expose() == "sk-live-123456", "{out}");
         assert_eq!(p.model, "small-1");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_passphrase_flow_rejects_short_and_mismatched_ones_and_wrong_ones_at_unlock() {
+        let d = tmp("pp");
+        let store = Store::open(&d).unwrap();
+        // Short, then mismatched, then good; nothing is saved until both entries agree.
+        let (r, out) = run_setup(
+            "https://api.example.com/v1\nm1\nsk-zzz-999\ny\nshort\nabcdefgh1\nabcdefgh2\ngoodpass99\ngoodpass99\nyes\n",
+            Some(&store),
+        );
+        assert!(r.is_some_and(|(_, saved)| saved), "{out}");
+        assert!(
+            out.contains("too short") && out.contains("did not match"),
+            "{out}"
+        );
+        // Unlocking: a wrong passphrase may be retried, three failures fall back to asking for the key.
+        let (r, out) = run_setup("\n\n\nnope\ngoodpass99\nyes\n", Some(&store));
+        let (p, saved) = r.expect("unlocked");
+        assert!(saved && p.key.expose() == "sk-zzz-999", "{out}");
+        assert!(out.contains("try again"), "{out}");
+        let (r, out) = run_setup("\n\n\na\nb\nc\nsk-new-1\nn\nyes\n", Some(&store));
+        let (p, saved) = r.expect("a new key after three failures");
+        assert!(!saved && p.key.expose() == "sk-new-1", "{out}");
+        // Declining the saved key asks for a new one; an empty passphrase means do not save.
+        let (r, out) = run_setup("\n\nn\nsk-other\ny\n\nyes\n", Some(&store));
+        let (p, saved) = r.expect("not saved");
+        assert!(!saved && p.key.expose() == "sk-other", "{out}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -370,7 +476,7 @@ mod tests {
         ];
         let reply = b.reply(&history).unwrap();
         assert!(
-            reply.contains("sensitive items removed") && reply.ends_with("ok"),
+            reply.contains("replaced before sending: 1 SECRET, 1 EMAIL") && reply.ends_with("ok"),
             "{reply}"
         );
         let body = t.join().unwrap();
@@ -378,7 +484,10 @@ mod tests {
             !body.contains("jo@example.com") && !body.contains("hunter2"),
             "{body}"
         );
-        assert!(body.contains("REDACTED"));
+        assert!(
+            body.contains("[SECRET]") && body.contains("[EMAIL_1]"),
+            "{body}"
+        );
         // nothing listening any more: a readable error, not a panic
         let err = b.reply(&history).unwrap_err();
         assert!(

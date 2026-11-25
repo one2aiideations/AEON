@@ -13,6 +13,7 @@ mouli-agentic = { path = "../mouli-agentic" }
 mouli-http = { path = "../mouli-http" }
 mouli-web = { path = "../mouli-web" }
 mouli-hosted = { path = "../mouli-hosted" }
+mouli-systems = { path = "../mouli-systems", default-features = false }
 mouli-interface = { path = "../mouli-interface" }
 sha2 = "0.10"
 mouli-screen = { path = "../mouli-screen" }
