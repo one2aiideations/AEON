@@ -45,6 +45,16 @@ CONFIG_HID_GENERIC=y
 CONFIG_I2C_HID_ACPI=y
 CONFIG_USB_HID=y
 
+# Pointing devices: mice, pointing sticks and touchpads. Apple trackpads (USB, and the Magic
+# Trackpad/Mouse over USB), multitouch HID pads, and the Elan and Synaptics pads common in PCs.
+# Bluetooth is not built, so Bluetooth mice and trackpads are not usable yet.
+CONFIG_MOUSE_BCM5974=y
+CONFIG_HID_MULTITOUCH=y
+CONFIG_HID_MAGICMOUSE=y
+CONFIG_MOUSE_PS2_ELANTECH=y
+CONFIG_MOUSE_PS2_TRACKPOINT=y
+CONFIG_MOUSE_ELAN_I2C=y
+
 # Storage and buses: where the model files live.
 CONFIG_PCI=y
 CONFIG_ACPI=y

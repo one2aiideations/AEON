@@ -337,7 +337,10 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     None
                 } else {
                     match gui::start(store.map(persist::Store::root)) {
-                        Ok(s) => Some(s),
+                        Ok(s) => {
+                            say(&s.inputs().line());
+                            Some(s)
+                        }
                         Err(e) => {
                             say(&format!("MOULI: no desktop ({e}); using the text chat"));
                             None

@@ -11,7 +11,7 @@
 
 use crate::ui::{trim_history, Backend, End, Turn};
 use mouli_desk::desktop::Desktop;
-use mouli_desk::input::{EvdevDecoder, MouseEvent};
+use mouli_desk::input::{EvdevDecoder, MouseEvent, TouchpadDecoder};
 use mouli_device::{Backend as DeviceBackend, Device, Outcome};
 use mouli_interface::routing::{ModelEntry, Route};
 use mouli_interface::{Permissions, Policy, Workspace};
@@ -33,6 +33,8 @@ pub const FB_DEVICE: &str = "/dev/fb0";
 pub const FB_SYS: &str = "/sys/class/graphics/fb0";
 /// Where the kernel offers input devices.
 pub const INPUT_DIR: &str = "/dev/input";
+/// Where the kernel describes input devices.
+pub const INPUT_SYS: &str = "/sys/class/input";
 
 /// The smallest screen the desktop can use.
 const MIN_W: usize = 640;
@@ -314,44 +316,168 @@ pub enum Ev {
     Reply(Result<String, String>),
 }
 
-/// Opens every `event*` device in `dir` and forwards what it reports on `tx`. Returns how many
-/// devices are being read. Each device has its own reader thread, which ends when the device goes
-/// away or the receiver is dropped.
-pub fn spawn_inputs(dir: &Path, tx: &Sender<Ev>) -> usize {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return 0;
+/// What an input device can be used for, from the kernel's capability words.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Roles {
+    /// Letter keys: a keyboard.
+    pub keyboard: bool,
+    /// Relative X and Y: a mouse or a pointing stick.
+    pub mouse: bool,
+    /// Absolute X and Y with finger touch, not a touchscreen: a touchpad.
+    pub touchpad: bool,
+}
+
+impl Roles {
+    /// Whether the device is of any use here.
+    pub fn any(self) -> bool {
+        self.keyboard || self.mouse || self.touchpad
+    }
+}
+
+/// Whether bit `n` is set in a sysfs capability string such as `"10000 0 0"` (hexadecimal words
+/// of 64 bits, the most significant first).
+pub fn cap_bit(words: &str, n: usize) -> bool {
+    let all: Vec<&str> = words.split_whitespace().collect();
+    let Some(word) = all.len().checked_sub(1 + n / 64).and_then(|i| all.get(i)) else {
+        return false;
     };
-    let mut count = 0;
-    for entry in rd.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("event") {
+    u64::from_str_radix(word, 16).is_ok_and(|w| (w >> (n % 64)) & 1 == 1)
+}
+
+/// Works out what a device is from its `rel`, `abs`, `key` and `properties` capability strings.
+pub fn classify(rel: &str, abs: &str, key: &str, props: &str) -> Roles {
+    const KEY_ENTER: usize = 28;
+    const KEY_A: usize = 30;
+    const BTN_TOUCH: usize = 0x14a;
+    const INPUT_PROP_DIRECT: usize = 1;
+    let has_xy =
+        |w: &str| (cap_bit(w, 0) && cap_bit(w, 1)) || (cap_bit(w, 0x35) && cap_bit(w, 0x36));
+    Roles {
+        keyboard: cap_bit(key, KEY_A) && cap_bit(key, KEY_ENTER),
+        mouse: cap_bit(rel, 0) && cap_bit(rel, 1),
+        touchpad: has_xy(abs) && cap_bit(key, BTN_TOUCH) && !cap_bit(props, INPUT_PROP_DIRECT),
+    }
+}
+
+/// The input devices found, for the boot message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputSummary {
+    /// Keyboards.
+    pub keyboards: Vec<String>,
+    /// Mice and pointing sticks.
+    pub mice: Vec<String>,
+    /// Touchpads.
+    pub touchpads: Vec<String>,
+}
+
+impl InputSummary {
+    /// Whether anything can move the pointer.
+    pub fn has_pointer(&self) -> bool {
+        !self.mice.is_empty() || !self.touchpads.is_empty()
+    }
+
+    /// One line for the console.
+    pub fn line(&self) -> String {
+        let part = |label: &str, v: &[String]| {
+            if v.is_empty() {
+                format!("{label}: none")
+            } else {
+                format!("{label}: {}", v.join(", "))
+            }
+        };
+        format!(
+            "MOULI input: {}; {}; {}",
+            part("keyboard", &self.keyboards),
+            part("mouse", &self.mice),
+            part("touchpad", &self.touchpads)
+        )
+    }
+}
+
+/// Opens every `event*` device in `dir` that is a keyboard, mouse or touchpad (judged from `sys`,
+/// the kernel's `/sys/class/input`) and forwards what it reports on `tx`. A device whose
+/// capabilities cannot be read is treated as a keyboard and a mouse. Touchpad movement is scaled
+/// to a screen `screen_w` pixels wide. Each device has its own reader thread, which ends when the
+/// device goes away or the receiver is dropped.
+pub fn spawn_inputs(dir: &Path, sys: &Path, screen_w: i32, tx: &Sender<Ev>) -> InputSummary {
+    let mut summary = InputSummary::default();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return summary;
+    };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let node = entry.file_name().to_string_lossy().into_owned();
+        if !node.starts_with("event") {
+            continue;
+        }
+        let base = sys.join(&node).join("device");
+        let read = |rel: &str| std::fs::read_to_string(base.join(rel)).ok();
+        let name = read("name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| node.clone());
+        let roles = match (read("capabilities/key"), read("capabilities/rel")) {
+            (None, None) => Roles {
+                keyboard: true,
+                mouse: true,
+                touchpad: false,
+            },
+            (key, rel) => classify(
+                rel.as_deref().unwrap_or(""),
+                &read("capabilities/abs").unwrap_or_default(),
+                key.as_deref().unwrap_or(""),
+                &read("properties").unwrap_or_default(),
+            ),
+        };
+        if !roles.any() {
             continue;
         }
         let Ok(mut file) = File::open(entry.path()) else {
             continue;
         };
+        if roles.keyboard {
+            summary.keyboards.push(name.clone());
+        }
+        if roles.mouse {
+            summary.mice.push(name.clone());
+        }
+        if roles.touchpad {
+            summary.touchpads.push(name.clone());
+        }
         let tx = tx.clone();
-        count += 1;
         std::thread::spawn(move || {
-            let (mut mouse, mut keys) = (EvdevDecoder::new(EV_SIZE), KeyDecoder::new());
+            let mut mouse = EvdevDecoder::new(EV_SIZE);
+            let mut pad = TouchpadDecoder::new(EV_SIZE, screen_w);
+            let mut keys = KeyDecoder::new();
             let mut buf = [0u8; EV_SIZE * 32];
             while let Ok(n) = file.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                for m in mouse.feed(&buf[..n]) {
+                let mut moved = Vec::new();
+                if roles.mouse {
+                    moved.extend(mouse.feed(&buf[..n]));
+                }
+                if roles.touchpad {
+                    moved.extend(pad.feed(&buf[..n]));
+                }
+                for m in moved {
                     if tx.send(Ev::Mouse(m)).is_err() {
                         return;
                     }
                 }
-                for k in keys.feed(&buf[..n]) {
-                    if tx.send(Ev::Key(k)).is_err() {
-                        return;
+                if roles.keyboard {
+                    for k in keys.feed(&buf[..n]) {
+                        if tx.send(Ev::Key(k)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
         });
     }
-    count
+    summary
 }
 
 // ------------------------------------------------------------------ console
@@ -485,6 +611,7 @@ pub struct Session<D: Display> {
     rx: Receiver<Ev>,
     device: Device<NoRoute>,
     saving: bool,
+    inputs: InputSummary,
 }
 
 impl<D: Display> Session<D> {
@@ -496,7 +623,13 @@ impl<D: Display> Session<D> {
             rx,
             device,
             saving: false,
+            inputs: InputSummary::default(),
         }
+    }
+
+    /// The input devices found, for the boot message.
+    pub fn inputs(&self) -> &InputSummary {
+        &self.inputs
     }
 }
 
@@ -508,12 +641,14 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     let display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
     let device = build_device(data_dir)?;
     let (tx, rx) = channel();
-    let n = spawn_inputs(Path::new(INPUT_DIR), &tx);
-    if n == 0 {
-        return Err("no keyboard or mouse device found in /dev/input".into());
+    let width = i32::try_from(display.size().0).unwrap_or(1024);
+    let inputs = spawn_inputs(Path::new(INPUT_DIR), Path::new(INPUT_SYS), width, &tx);
+    if inputs.keyboards.is_empty() && !inputs.has_pointer() {
+        return Err("no keyboard, mouse or touchpad found in /dev/input".into());
     }
     let mut s = Session::new(display, tx, rx, device);
     s.saving = data_dir.is_some();
+    s.inputs = inputs;
     Ok(s)
 }
 
@@ -549,6 +684,7 @@ where
         rx,
         mut device,
         saving,
+        inputs,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -563,6 +699,13 @@ where
     };
     device.shell.chat.model = model_name.into();
     desktop.open(&mut device.shell, Tab::Chat);
+    if !inputs.has_pointer() {
+        device.shell.chat.push(
+            Role::Notice,
+            "No mouse or touchpad found. Plug in a USB mouse, or use the keyboard: F1 to F10 open windows, Ctrl+Q shuts down.",
+        );
+    }
+    device.shell.chat.push(Role::Notice, &inputs.line());
     let mut history = fresh(system_prompt);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
@@ -854,7 +997,13 @@ mod tests {
     #[test]
     fn missing_input_directory_means_no_devices() {
         let (tx, _rx) = channel();
-        assert_eq!(spawn_inputs(Path::new("/nonexistent-mouli-input"), &tx), 0);
+        let none = spawn_inputs(
+            Path::new("/nonexistent-mouli-input"),
+            Path::new("/nonexistent-sys"),
+            1280,
+            &tx,
+        );
+        assert_eq!(none, InputSummary::default());
     }
 
     #[test]
@@ -868,7 +1017,8 @@ mod tests {
         std::fs::write(dir.join("event0"), &data).unwrap();
         std::fs::write(dir.join("mouse0"), b"ignored").unwrap();
         let (tx, rx) = channel();
-        assert_eq!(spawn_inputs(&dir, &tx), 1, "only event* files are read");
+        let found = spawn_inputs(&dir, Path::new("/nonexistent-sys"), 1280, &tx);
+        assert_eq!(found.keyboards.len(), 1, "only event* files are read");
         let mut keys = 0;
         let mut moves = 0;
         for _ in 0..2 {
@@ -1020,5 +1170,79 @@ mod tests {
         let mut b = NoVideo;
         let src = mouli_player::source::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
         assert!(b.load(&src).unwrap_err().contains("no video player"));
+    }
+
+    #[test]
+    fn capability_bits_are_read_from_the_sysfs_words() {
+        assert!(cap_bit("10000 0 0", 128 + 16));
+        assert!(!cap_bit("10000 0 0", 16));
+        assert!(cap_bit("3", 0) && cap_bit("3", 1) && !cap_bit("3", 2));
+        assert!(!cap_bit("", 0));
+        assert!(!cap_bit("zz", 0));
+        assert!(!cap_bit("3", 5000), "a bit beyond the words is clear");
+    }
+
+    #[test]
+    fn devices_are_classified_by_what_they_can_do() {
+        let letters = "ffffffffffffffff";
+        // A keyboard: letter and Enter keys.
+        let kb = classify("", "", letters, "0");
+        assert!(kb.keyboard && !kb.mouse && !kb.touchpad);
+        // A mouse: relative X and Y, and a few buttons (BTN_LEFT is bit 0x110 = 272).
+        let mouse = classify("143", "", "1f0000 0 0 0 0", "0");
+        assert!(mouse.mouse && !mouse.keyboard && !mouse.touchpad);
+        // A touchpad: absolute X and Y, and BTN_TOUCH (bit 0x14a = 330, word 5 from the right).
+        let pad = classify("", "3", "400 0 0 0 0 0", "5");
+        assert!(pad.touchpad && !pad.mouse);
+        // A touchscreen has the DIRECT property and is left alone.
+        let screen = classify("", "3", "400 0 0 0 0 0", "2");
+        assert!(!screen.touchpad);
+        // Multitouch-only pads (MT position axes 0x35 and 0x36 = 53, 54).
+        let mt = classify("", "60000000000000", "400 0 0 0 0 0", "1");
+        assert!(mt.touchpad);
+        // Power and lid switches are not input for us.
+        assert!(!classify("", "", "0", "0").any());
+    }
+
+    #[test]
+    fn the_input_summary_names_what_was_found() {
+        let mut s = InputSummary::default();
+        assert!(!s.has_pointer());
+        assert!(s.line().contains("touchpad: none"));
+        s.keyboards.push("AT keyboard".into());
+        s.touchpads.push("Apple trackpad".into());
+        assert!(s.has_pointer());
+        assert_eq!(
+            s.line(),
+            "MOULI input: keyboard: AT keyboard; mouse: none; touchpad: Apple trackpad"
+        );
+    }
+
+    #[test]
+    fn devices_are_opened_only_when_the_kernel_says_they_are_input_we_use() {
+        let root = tmp("sysdev");
+        let (dev, sys) = (root.join("dev"), root.join("sys"));
+        for (node, name, key, rel, abs) in [
+            ("event0", "Test keyboard", "ffffffffffffffff", "0", "0"),
+            ("event1", "Test mouse", "1f0000 0 0 0 0", "143", "0"),
+            ("event2", "Power Button", "0", "0", "0"),
+            ("event3", "Test pad", "400 0 0 0 0 0", "0", "3"),
+        ] {
+            std::fs::create_dir_all(dev.clone()).unwrap();
+            std::fs::write(dev.join(node), b"").unwrap();
+            let caps = sys.join(node).join("device/capabilities");
+            std::fs::create_dir_all(&caps).unwrap();
+            std::fs::write(sys.join(node).join("device/name"), format!("{name}\n")).unwrap();
+            std::fs::write(sys.join(node).join("device/properties"), "5\n").unwrap();
+            for (f, v) in [("key", key), ("rel", rel), ("abs", abs)] {
+                std::fs::write(caps.join(f), format!("{v}\n")).unwrap();
+            }
+        }
+        let (tx, _rx) = channel();
+        let s = spawn_inputs(&dev, &sys, 1280, &tx);
+        assert_eq!(s.keyboards, vec!["Test keyboard"]);
+        assert_eq!(s.mice, vec!["Test mouse"]);
+        assert_eq!(s.touchpads, vec!["Test pad"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
