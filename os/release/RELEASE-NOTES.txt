@@ -23,7 +23,8 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - Start-up logo with the product and author details.
 - Hardware report and automatic choice of threads and context size.
 - Model menu listing every .gguf file on any disk or USB stick, with a memory check.
-- Graphical desktop drawn on the screen's framebuffer: menu bar, icons and windows, with the chat in a window. Keyboard (US layout) and a USB or PS/2 mouse. Keys: Enter sends, Ctrl+L starts a new chat, F1 to F10 open windows, Ctrl+Q shuts down. Add mouli.text=1 to the kernel command line for the text chat only.
+- Graphical desktop drawn on the screen's framebuffer: menu bar, icons and windows, with the chat in a window. Keyboard (US layout), a USB or PS/2 mouse, touchpads (Apple, Elan, Synaptics and multitouch pads: move, tap to click, press to click, two-finger scroll) and Bluetooth mice and trackpads. Mice and touchpads plugged in or connected after the desktop started are picked up, and the chat window lists the input devices found. Keys: Enter sends, Ctrl+L starts a new chat, F1 to F10 open windows, Ctrl+Q shuts down. Add mouli.text=1 to the kernel command line for the text chat only.
+- Bluetooth: press b in the model menu to scan, pair, trust and connect a mouse or trackpad that pairs without a code (BlueZ). With a MOULI-DATA partition the pairing is kept in plain text on it and reconnects at the next start.
 - With a MOULI-DATA partition, the Sheet and Studio documents are saved under apps/ and the Code window opens the folder projects/ on it. Without one nothing is saved, and the desktop says so.
 - Text chat with commands /models, /clear and /quit when the desktop is not used.
 - Optional MOULI-DATA partition that keeps the last model used and the chat logs.
@@ -42,7 +43,7 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 
 - In the desktop the Chat, Sheet, Studio, Code, Approvals, Audit and Security windows are connected to the governed workspace (policy, approvals, audit chain). The Player window keeps a queue but there is no video player, sound or browser in this image, so nothing can be played. The CRM has no window yet.
 - Choosing a model is still done in the text menu before the desktop starts.
-- Touchpads that report absolute positions are not used; plug in a USB mouse. The keyboard layout is US.
+- Touchpads and Bluetooth are NEW and have not been tried on real hardware: only generated finger events and a virtual setup were tested. The pointer scale on a touchpad is learned, so the first sweep across the pad may overshoot. Bluetooth needs an adapter whose firmware is built in or included (CSR and Intel adapters work; many Broadcom and some Realtek ones need a firmware file that is not in this image). Keyboards that ask you to type a code, headsets and audio are not supported. The keyboard layout is US.
 - CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
 - Secure Boot must be off. There is no installer: it runs from the stick and keeps nothing unless a MOULI-DATA partition is present.
 - US keyboard layout only.

@@ -27,7 +27,7 @@ concurrency:
 env:
   BR_VERSION: "2026.02.3"
   # The version in the release folder name and documents (MOULI-OS-Release-v<version>).
-  MOULI_RELEASE_VERSION: "1.1"
+  MOULI_RELEASE_VERSION: "1.2"
   BR2_DL_DIR: ${{ github.workspace }}/../br-dl
 
 jobs:
