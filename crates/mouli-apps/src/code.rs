@@ -226,6 +226,9 @@ impl CodeState {
     /// A message when the text is unchanged, another file's change is held, or the proposal is
     /// refused (see [`CodeState::propose`]).
     pub fn edit(&mut self, path: &str, new_text: &str) -> std::result::Result<String, String> {
+        if new_text.len() as u64 > MAX_FILE {
+            return Err(format!("The text is larger than {} KB.", MAX_FILE / 1024));
+        }
         let rel = safe_relative_path(path)
             .map_err(|e| format!("{e:?}"))?
             .to_string();
@@ -642,6 +645,14 @@ mod tests {
         assert!(e.contains("rolled back"), "{e}");
         st.rollback().unwrap();
         st.edit("src/main.rs", "x\n").unwrap();
+    }
+
+    #[test]
+    fn an_oversized_edit_is_refused_before_any_work_is_done() {
+        let (_d, mut st) = project();
+        let big = "x\n".repeat(MAX_FILE as usize);
+        assert!(st.edit("src/lib.rs", &big).unwrap_err().contains("larger"));
+        assert!(st.view().is_none());
     }
 
     #[test]

@@ -165,6 +165,11 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// The id of the conversation the device is working in.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
     /// The workspace (read-only), for status lines and tests.
     pub fn workspace(&self) -> &Workspace {
         &self.ws

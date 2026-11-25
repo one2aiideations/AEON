@@ -67,6 +67,41 @@ pub struct PendingCall {
 struct Held {
     session: String,
     call: Call,
+    /// True when the call came from a screen or an agent with structured arguments, so the
+    /// conversation shows an abbreviated line instead of the full arguments and output.
+    brief: bool,
+}
+
+/// Longest value, in characters, shown in the conversation or to an approver for a structured call.
+const BRIEF_VALUE: usize = 120;
+/// Longest tool output, in characters, shown in the conversation for a structured call.
+const BRIEF_OUTPUT: usize = 240;
+
+/// `text` on one line and cut to `max` characters; when cut, the full size is appended. The
+/// conversation is sent to models and saved to disk, so a whole file must not be copied into it.
+fn brief_text(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    format!("{cut}... ({} bytes)", text.len())
+}
+
+fn args_line(args: &BTreeMap<String, String>, brief: bool) -> String {
+    args.iter()
+        .map(|(k, v)| {
+            if brief {
+                format!("{k}={}", brief_text(v, BRIEF_VALUE))
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The main interface state.
@@ -186,7 +221,7 @@ impl Workspace {
             capability: intent.name,
             args: intent.params,
         };
-        self.run(session, &user, &role, call, None)
+        self.run(session, &user, &role, call, None, false)
     }
 
     /// Runs one capability with structured arguments, through the same gate as [`Workspace::submit`]
@@ -205,15 +240,13 @@ impl Workspace {
         if capability.trim().is_empty() {
             return Err(Error::Invalid("capability name is empty".into()));
         }
+        let size: usize = args.iter().map(|(k, v)| k.len() + v.len()).sum();
+        self.limits.check_input(size)?;
         let (user, role) = {
             let s = self.session(tenant, session)?;
             (s.user.clone(), s.role.clone())
         };
-        let detail = args
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let detail = args_line(&args, true);
         let (t, ids) = (self.now(), &mut self.ids);
         self.sessions
             .get_mut(session)
@@ -223,7 +256,7 @@ impl Workspace {
             capability: capability.to_string(),
             args,
         };
-        self.run(session, &user, &role, call, None)
+        self.run(session, &user, &role, call, None, true)
     }
 
     fn chat(&mut self, user: &str, text: &str) -> Result<Reply> {
@@ -275,6 +308,7 @@ impl Workspace {
         role: &str,
         call: Call,
         spend: Option<&str>,
+        brief: bool,
     ) -> Result<Reply> {
         let t = self.now();
         let spec = match self.registry.spec(&call.capability) {
@@ -297,12 +331,7 @@ impl Workspace {
                 return Err(Error::Denied(why));
             }
             (Verdict::NeedsApproval, None) => {
-                let detail = call
-                    .args
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let detail = args_line(&call.args, brief);
                 let id = self
                     .approvals
                     .request(&spec.name, user, &detail, t, &mut self.ids);
@@ -313,6 +342,7 @@ impl Workspace {
                     Held {
                         session: session.to_string(),
                         call,
+                        brief,
                     },
                 );
                 return Ok(Reply::AwaitingApproval { id });
@@ -328,9 +358,14 @@ impl Workspace {
             Ok(out) => {
                 let t = self.now();
                 if let Some(s) = self.sessions.get_mut(session) {
+                    let shown = if brief {
+                        brief_text(&out.text, BRIEF_OUTPUT)
+                    } else {
+                        out.text.clone()
+                    };
                     let _ = s.add(
                         Role::Tool,
-                        &format!("{}: {}", spec.name, out.text),
+                        &format!("{}: {shown}", spec.name),
                         t,
                         &mut self.ids,
                     );
@@ -402,7 +437,14 @@ impl Workspace {
             .get(id)
             .map(|r| r.requester.clone())
             .unwrap_or_default();
-        self.run(&session, &requester, &requester_role, h.call, Some(id))
+        self.run(
+            &session,
+            &requester,
+            &requester_role,
+            h.call,
+            Some(id),
+            h.brief,
+        )
     }
 
     /// Record the model's answer to a [`Reply::Chat`].
@@ -513,6 +555,7 @@ impl Workspace {
                         capability: c.capability,
                         args: c.args,
                     },
+                    brief: true,
                 },
             );
             let t = self.now();
@@ -940,5 +983,108 @@ mod tests {
         let mut w = restarted();
         w.import_pending(good.clone()).unwrap();
         assert!(w.import_pending(good).is_err(), "the same id twice");
+    }
+
+    fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_structured_call_does_not_copy_its_whole_arguments_or_output_into_the_conversation() {
+        let (mut w, s) = ws(false);
+        let big = "x".repeat(50_000);
+        let r = w.call(T, &s, "note.read", args(&[("body", &big)])).unwrap();
+        assert!(matches!(r, Reply::Done(_)));
+        let lines: Vec<String> = w
+            .session(T, &s)
+            .unwrap()
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(
+            lines.iter().all(|l| l.len() < 400),
+            "{:?}",
+            lines.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert!(lines[0].contains("50000 bytes"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_held_structured_call_shows_the_approver_a_short_line_but_runs_with_the_full_arguments() {
+        let (mut w, s) = ws(false);
+        let to = format!("{}@x.io", "a".repeat(5_000));
+        let Reply::AwaitingApproval { id } =
+            w.call(T, &s, "note.send", args(&[("to", &to)])).unwrap()
+        else {
+            panic!("expected a hold");
+        };
+        let detail = w.pending_approvals()[0].2.to_string();
+        assert!(detail.len() < 300, "{}", detail.len());
+        let Reply::Done(o) = w.decide(T, &id, "mia", "manager", true).unwrap() else {
+            panic!("expected it to run");
+        };
+        assert_eq!(
+            o.text,
+            format!("sent to {to}"),
+            "the application got every character"
+        );
+        let last = w
+            .session(T, &s)
+            .unwrap()
+            .messages()
+            .last()
+            .unwrap()
+            .content
+            .clone();
+        assert!(last.len() < 400, "{}", last.len());
+        assert!(w.export_pending().is_empty());
+    }
+
+    #[test]
+    fn a_typed_command_still_shows_everything_in_the_conversation() {
+        let (mut w, s) = ws(false);
+        let to = format!("{}@x.io", "b".repeat(2_000));
+        w.submit(T, &s, &format!("/note.send to={to}")).unwrap();
+        let first = w.session(T, &s).unwrap().messages()[0].content.clone();
+        assert!(first.contains(&to));
+    }
+
+    #[test]
+    fn a_structured_call_with_oversized_arguments_is_refused_before_anything_happens() {
+        let policy = Policy::default();
+        let limits = Limits {
+            max_input_bytes: 100,
+            ..Limits::default()
+        };
+        let mut w = Workspace::new(policy, limits).unwrap();
+        w.add_role(Permissions::new("member", &["note.*"]));
+        w.register_app(Box::new(Notes { sent: vec![] })).unwrap();
+        let s = w.open_session(T, "ann", "member").unwrap();
+        let before = w.audit().records().len();
+        let e = w.call(T, &s, "note.read", args(&[("a", &"y".repeat(101))]));
+        assert!(matches!(e, Err(Error::Limit(_))), "{e:?}");
+        assert_eq!(
+            w.audit().records().len(),
+            before,
+            "not even audited as a call"
+        );
+        assert!(w.session(T, &s).unwrap().messages().is_empty());
+        assert!(w.call(T, &s, "note.read", args(&[("a", "ok")])).is_ok());
+    }
+
+    #[test]
+    fn brief_text_cuts_by_characters_flattens_lines_and_keeps_short_text() {
+        assert_eq!(brief_text("short", 10), "short");
+        assert_eq!(brief_text("a\nb\tc", 10), "a b c");
+        let multi = "\u{e9}".repeat(300);
+        let cut = brief_text(&multi, 5);
+        assert!(
+            cut.starts_with("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}...") && cut.contains("600 bytes"),
+            "{cut}"
+        );
     }
 }

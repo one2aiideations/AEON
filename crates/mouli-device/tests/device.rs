@@ -915,3 +915,26 @@ fn a_second_edit_of_another_file_is_refused_while_one_is_under_review() {
         d.shell.editor.message
     );
 }
+
+#[test]
+fn reading_a_file_in_the_editor_does_not_copy_it_into_the_conversation() {
+    let (dir, _diff, _new) = project();
+    let big = format!("// {}\n", "z".repeat(40)).repeat(1_000);
+    std::fs::write(dir.path().join("src/big.rs"), &big).unwrap();
+    let mut d = editor_device(&dir, "dana", "dev");
+    d.on_key(Key::F(9));
+    d.on_key(Key::Enter); // src/big.rs sorts first
+    assert_eq!(d.shell.editor.path(), Some("src/big.rs"));
+    assert_eq!(d.shell.editor.text(), big);
+    // The chat (which is sent to models and saved) holds only short lines.
+    let longest = d
+        .workspace()
+        .session("acme", d.session())
+        .unwrap()
+        .messages()
+        .iter()
+        .map(|m| m.content.len())
+        .max()
+        .unwrap_or(0);
+    assert!(longest < 500, "{longest}");
+}
