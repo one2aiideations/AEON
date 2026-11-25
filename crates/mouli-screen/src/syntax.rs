@@ -16,6 +16,18 @@ pub enum Lang {
     Toml,
     /// Markdown text.
     Markdown,
+    /// HTML pages.
+    Html,
+    /// CSS style sheets.
+    Css,
+    /// JavaScript.
+    JavaScript,
+    /// JSON data.
+    Json,
+    /// Python.
+    Python,
+    /// Shell scripts.
+    Shell,
     /// Anything else.
     Plain,
 }
@@ -32,7 +44,22 @@ impl Lang {
             Some("rs") => Lang::Rust,
             Some("toml") => Lang::Toml,
             Some("md" | "markdown") => Lang::Markdown,
+            Some("html" | "htm" | "xhtml") => Lang::Html,
+            Some("css") => Lang::Css,
+            Some("js" | "mjs" | "cjs") => Lang::JavaScript,
+            Some("json") => Lang::Json,
+            Some("py") => Lang::Python,
+            Some("sh" | "bash") => Lang::Shell,
             _ => Lang::Plain,
+        }
+    }
+
+    /// The text that starts a line comment, if the language has one.
+    pub const fn line_comment(self) -> Option<&'static str> {
+        match self {
+            Lang::Rust | Lang::JavaScript => Some("// "),
+            Lang::Toml | Lang::Python | Lang::Shell => Some("# "),
+            _ => None,
         }
     }
 
@@ -42,6 +69,12 @@ impl Lang {
             Lang::Rust => "Rust",
             Lang::Toml => "TOML",
             Lang::Markdown => "Markdown",
+            Lang::Html => "HTML",
+            Lang::Css => "CSS",
+            Lang::JavaScript => "JavaScript",
+            Lang::Json => "JSON",
+            Lang::Python => "Python",
+            Lang::Shell => "Shell",
             Lang::Plain => "Text",
         }
     }
@@ -260,6 +293,270 @@ fn classify_markdown(chars: &[char], kinds: &mut [Kind]) {
     }
 }
 
+const JS_KEYWORDS: [&str; 36] = [
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "while",
+];
+
+const PY_KEYWORDS: [&str; 30] = [
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "if", "import", "in", "is", "lambda",
+    "None", "not", "or", "pass", "return", "True", "try", "while",
+];
+
+const SH_KEYWORDS: [&str; 16] = [
+    "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "local",
+    "return", "then", "until", "while",
+];
+
+/// Colours a line of a C-like or scripting language: comments, strings, numbers and keywords.
+fn classify_generic(
+    chars: &[char],
+    kinds: &mut [Kind],
+    keywords: &[&str],
+    comment: &str,
+    quotes: &[char],
+) {
+    let cm: Vec<char> = comment.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !cm.is_empty() && chars[i..].starts_with(&cm) {
+            fill(kinds, i, chars.len(), Kind::Comment);
+            return;
+        }
+        if comment == "//" && c == '/' && chars.get(i + 1) == Some(&'*') {
+            let end = (i + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '*' && chars[j + 1] == '/')
+                .map_or(chars.len(), |j| j + 2);
+            fill(kinds, i, end, Kind::Comment);
+            i = end;
+        } else if quotes.contains(&c) {
+            let end = string_end(chars, i, c);
+            fill(kinds, i, end, Kind::Str);
+            i = end;
+        } else if c.is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len()
+                && (is_word(chars[j])
+                    || (chars[j] == '.' && chars.get(j + 1).is_some_and(char::is_ascii_digit)))
+            {
+                j += 1;
+            }
+            fill(kinds, i, j, Kind::Number);
+            i = j;
+        } else if is_word(c) || c == '$' {
+            let mut j = i + 1;
+            while j < chars.len() && (is_word(chars[j]) || chars[j] == '$') {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            let k = if keywords.contains(&word.as_str()) {
+                Kind::Keyword
+            } else if word.chars().next().is_some_and(char::is_uppercase) {
+                Kind::Type
+            } else {
+                Kind::Plain
+            };
+            fill(kinds, i, j, k);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn classify_json(chars: &[char], kinds: &mut [Kind]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            let end = string_end(chars, i, '"');
+            // A string followed by a colon is a key.
+            let after = chars[end.min(chars.len())..]
+                .iter()
+                .find(|c| !c.is_whitespace());
+            fill(
+                kinds,
+                i,
+                end,
+                if after == Some(&':') {
+                    Kind::Key
+                } else {
+                    Kind::Str
+                },
+            );
+            i = end;
+        } else if c.is_ascii_digit()
+            || (c == '-' && chars.get(i + 1).is_some_and(char::is_ascii_digit))
+        {
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j].is_ascii_digit() || matches!(chars[j], '.' | 'e' | 'E' | '+' | '-'))
+            {
+                j += 1;
+            }
+            fill(kinds, i, j, Kind::Number);
+            i = j;
+        } else if is_word(c) {
+            let mut j = i;
+            while j < chars.len() && is_word(chars[j]) {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            if matches!(word.as_str(), "true" | "false" | "null") {
+                fill(kinds, i, j, Kind::Keyword);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn classify_css(chars: &[char], kinds: &mut [Kind]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let end = (i + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '*' && chars[j + 1] == '/')
+                .map_or(chars.len(), |j| j + 2);
+            fill(kinds, i, end, Kind::Comment);
+            i = end;
+        } else if c == '"' || c == '\'' {
+            let end = string_end(chars, i, c);
+            fill(kinds, i, end, Kind::Str);
+            i = end;
+        } else if c.is_ascii_digit()
+            || (c == '#' && chars[..i].contains(&':') && !chars[i..].contains(&'{'))
+        {
+            let mut j = i + 1;
+            while j < chars.len() && (is_word(chars[j]) || chars[j] == '.' || chars[j] == '%') {
+                j += 1;
+            }
+            fill(kinds, i, j, Kind::Number);
+            i = j;
+        } else if c == '.' || c == '#' || c == '@' {
+            let mut j = i + 1;
+            while j < chars.len() && (is_word(chars[j]) || chars[j] == '-') {
+                j += 1;
+            }
+            fill(
+                kinds,
+                i,
+                j,
+                if c == '@' { Kind::Keyword } else { Kind::Type },
+            );
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // `property: value` lines inside a rule: colour the property name.
+    let first = chars.iter().position(|c| !c.is_whitespace());
+    if let (Some(f), Some(colon)) = (first, chars.iter().position(|c| *c == ':')) {
+        let name: String = chars[f..colon].iter().collect();
+        if colon > f
+            && name
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '-')
+            && chars.contains(&';')
+        {
+            fill(kinds, f, f + name.trim_end().chars().count(), Kind::Key);
+        }
+    }
+}
+
+fn classify_html(chars: &[char], kinds: &mut [Kind]) {
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i..].starts_with(&['<', '!', '-', '-']) {
+            let end = (i + 4..chars.len().saturating_sub(2))
+                .find(|&j| chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>')
+                .map_or(chars.len(), |j| j + 3);
+            fill(kinds, i, end, Kind::Comment);
+            i = end;
+        } else if chars[i] == '<'
+            && chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/' || *c == '!')
+        {
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '/' | '!' | '-'))
+            {
+                j += 1;
+            }
+            fill(kinds, i, j, Kind::Keyword);
+            // Attributes up to the closing `>`.
+            while j < chars.len() && chars[j] != '>' {
+                if chars[j] == '"' || chars[j] == '\'' {
+                    let end = string_end(chars, j, chars[j]);
+                    fill(kinds, j, end, Kind::Str);
+                    j = end;
+                } else if is_word(chars[j]) || chars[j] == '-' {
+                    let st = j;
+                    while j < chars.len() && (is_word(chars[j]) || chars[j] == '-') {
+                        j += 1;
+                    }
+                    fill(kinds, st, j, Kind::Key);
+                } else {
+                    j += 1;
+                }
+            }
+            if j < chars.len() {
+                fill(kinds, j, j + 1, Kind::Keyword);
+                j += 1;
+            }
+            i = j;
+        } else if chars[i] == '&' {
+            let end = (i + 1..(i + 10).min(chars.len()))
+                .find(|&j| chars[j] == ';')
+                .map_or(i + 1, |j| j + 1);
+            fill(kinds, i, end, Kind::Number);
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// The kind of every character of `line`.
 pub fn classify(lang: Lang, line: &[char]) -> Vec<Kind> {
     let mut kinds = vec![Kind::Plain; line.len()];
@@ -267,6 +564,14 @@ pub fn classify(lang: Lang, line: &[char]) -> Vec<Kind> {
         Lang::Rust => classify_rust(line, &mut kinds),
         Lang::Toml => classify_toml(line, &mut kinds),
         Lang::Markdown => classify_markdown(line, &mut kinds),
+        Lang::Html => classify_html(line, &mut kinds),
+        Lang::Css => classify_css(line, &mut kinds),
+        Lang::Json => classify_json(line, &mut kinds),
+        Lang::JavaScript => {
+            classify_generic(line, &mut kinds, &JS_KEYWORDS, "//", &['"', '\'', '`'])
+        }
+        Lang::Python => classify_generic(line, &mut kinds, &PY_KEYWORDS, "#", &['"', '\'']),
+        Lang::Shell => classify_generic(line, &mut kinds, &SH_KEYWORDS, "#", &['"', '\'']),
         Lang::Plain => {}
     }
     kinds
@@ -419,6 +724,68 @@ mod tests {
             let (a, b) = (lum(k.colour()), lum(theme::BG));
             let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
             assert!(ratio >= 4.5, "{k:?} {ratio}");
+        }
+    }
+
+    #[test]
+    fn web_and_scripting_languages_are_coloured() {
+        assert_eq!(Lang::of("a/index.html"), Lang::Html);
+        assert_eq!(Lang::of("x.CSS"), Lang::Css);
+        assert_eq!(Lang::of("app.js"), Lang::JavaScript);
+        assert_eq!(Lang::of("data.json"), Lang::Json);
+        assert_eq!(Lang::of("tool.py"), Lang::Python);
+        assert_eq!(Lang::of("run.sh"), Lang::Shell);
+        let js = "const n = 42; // note";
+        assert_eq!(at(Lang::JavaScript, js, "const"), Kind::Keyword);
+        assert_eq!(at(Lang::JavaScript, js, "42"), Kind::Number);
+        assert_eq!(at(Lang::JavaScript, js, "note"), Kind::Comment);
+        assert_eq!(at(Lang::JavaScript, "let s = `a//b`;", "//b"), Kind::Str);
+        assert_eq!(at(Lang::Python, "def f(): # c", "def"), Kind::Keyword);
+        assert_eq!(at(Lang::Python, "def f(): # c", "# c"), Kind::Comment);
+        assert_eq!(at(Lang::Shell, "if [ -f x ]; then", "then"), Kind::Keyword);
+        let h = "<a href=\"/x\" id=y>t &amp; u</a><!-- c -->";
+        assert_eq!(at(Lang::Html, h, "<a"), Kind::Keyword);
+        assert_eq!(at(Lang::Html, h, "href"), Kind::Key);
+        assert_eq!(at(Lang::Html, h, "\"/x\""), Kind::Str);
+        assert_eq!(at(Lang::Html, h, "&amp;"), Kind::Number);
+        assert_eq!(at(Lang::Html, h, "<!-- c -->"), Kind::Comment);
+        assert_eq!(at(Lang::Html, h, "t &"), Kind::Plain);
+        let j = "  \"name\": \"x\", \"n\": -1.5, \"ok\": true";
+        assert_eq!(at(Lang::Json, j, "\"name\""), Kind::Key);
+        assert_eq!(at(Lang::Json, j, "\"x\""), Kind::Str);
+        assert_eq!(at(Lang::Json, j, "-1.5"), Kind::Number);
+        assert_eq!(at(Lang::Json, j, "true"), Kind::Keyword);
+        let c = "  color: #fff; /* c */";
+        assert_eq!(at(Lang::Css, c, "color"), Kind::Key);
+        assert_eq!(at(Lang::Css, c, "#fff"), Kind::Number);
+        assert_eq!(at(Lang::Css, c, "/* c */"), Kind::Comment);
+        assert_eq!(at(Lang::Css, ".box { margin: 0 }", ".box"), Kind::Type);
+        assert_eq!(Lang::Rust.line_comment(), Some("// "));
+        assert_eq!(Lang::Html.line_comment(), None);
+        // Half-written lines never panic.
+        for l in [
+            "<",
+            "<a href=\"",
+            "&",
+            "\"",
+            "/*",
+            "`",
+            "#",
+            ":",
+            "{",
+            "\\",
+            "<!--",
+        ] {
+            for lang in [
+                Lang::Html,
+                Lang::Css,
+                Lang::JavaScript,
+                Lang::Json,
+                Lang::Python,
+                Lang::Shell,
+            ] {
+                let _ = kinds(lang, l);
+            }
         }
     }
 }

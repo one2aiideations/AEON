@@ -4,8 +4,14 @@
 //! the change to be proposed (`code.edit`), and the proposal then waits on the Review screen for a
 //! second person's approval. So an edit made here cannot reach the files by itself.
 //!
-//! Limits, stated plainly: there is no selection or clipboard yet, a character is one cell wide,
-//! and colouring works one line at a time (see [`crate::syntax`]).
+//! Editing help: a selection (Ctrl-T marks where it starts, moving the cursor extends it, Ctrl-A
+//! selects everything) with copy, cut and paste inside the editor, brackets and quotes that close
+//! themselves, automatic indentation, the matching bracket shown, go to line, duplicate and delete
+//! line, and line comments toggled by language.
+//!
+//! Limits, stated plainly: the clipboard is the editor's own (nothing is shared with other
+//! windows), a character is one cell wide, and colouring works one line at a time (see
+//! [`crate::syntax`]).
 
 use crate::grid::{theme, Grid, Rect};
 use crate::key::Key;
@@ -154,6 +160,9 @@ pub struct EditorScreen {
     last: Option<Edit>,
     find: Option<String>,
     last_find: String,
+    goto: Option<String>,
+    mark: Option<(usize, usize)>,
+    clipboard: String,
     discard: Option<usize>,
     top: Cell<usize>,
     left: Cell<usize>,
@@ -185,6 +194,8 @@ impl EditorScreen {
         self.redo.clear();
         self.last = None;
         self.find = None;
+        self.goto = None;
+        self.mark = None;
         self.discard = None;
         self.top.set(0);
         self.left.set(0);
@@ -241,6 +252,7 @@ impl EditorScreen {
     fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
             self.redo.push(self.buf.snapshot());
+            self.mark = None;
             self.buf.restore(prev);
             self.dirty = true;
             self.last = None;
@@ -252,12 +264,273 @@ impl EditorScreen {
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
             self.undo.push(self.buf.snapshot());
+            self.mark = None;
             self.buf.restore(next);
             self.dirty = true;
             self.last = None;
         } else {
             self.message = "Nothing to redo.".into();
         }
+    }
+
+    fn lang(&self) -> Lang {
+        self.path.as_deref().map_or(Lang::Plain, Lang::of)
+    }
+
+    /// The selected range as (row, column) pairs, first to last.
+    fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let m = self.mark?;
+        let c = (self.buf.row, self.buf.col);
+        if m == c {
+            None
+        } else if m < c {
+            Some((m, c))
+        } else {
+            Some((c, m))
+        }
+    }
+
+    fn selected_text(&self) -> String {
+        let Some(((r1, c1), (r2, c2))) = self.selection() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for (r, line) in self.buf.lines.iter().enumerate().take(r2 + 1).skip(r1) {
+            let from = if r == r1 { c1.min(line.len()) } else { 0 };
+            let to = if r == r2 {
+                c2.min(line.len())
+            } else {
+                line.len()
+            };
+            out.extend(&line[from..to.max(from)]);
+            if r != r2 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Removes the selection (one undo step). True when there was one.
+    fn delete_selection(&mut self) -> bool {
+        let Some(((r1, c1), (r2, c2))) = self.selection() else {
+            self.mark = None;
+            return false;
+        };
+        self.begin_edit(Edit::Other);
+        let tail: Vec<char> = self.buf.lines[r2][c2.min(self.buf.lines[r2].len())..].to_vec();
+        self.buf.lines[r1].truncate(c1);
+        self.buf.lines[r1].extend(tail);
+        self.buf.lines.drain(r1 + 1..=r2);
+        self.buf.row = r1;
+        self.buf.col = c1;
+        self.mark = None;
+        true
+    }
+
+    /// Puts text at the cursor (replacing the selection). Refuses text that would break the limits.
+    fn insert_text(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n");
+        if text.is_empty() {
+            return;
+        }
+        let parts: Vec<&str> = text.split('\n').collect();
+        let extra = parts.len() - 1;
+        let (sel_lines, cur_len) = match self.selection() {
+            Some(((r1, c1), (r2, c2))) => {
+                (r2 - r1, c1 + self.buf.lines[r2].len().saturating_sub(c2))
+            }
+            None => (0, self.buf.line_len()),
+        };
+        if self.buf.lines.len() + extra - sel_lines > MAX_LINES
+            || parts.iter().any(|p| p.chars().count() > MAX_LINE)
+            || cur_len + parts[0].chars().count() > MAX_LINE
+        {
+            self.message = "That text is too large to put here.".into();
+            return;
+        }
+        self.delete_selection();
+        self.begin_edit(Edit::Other);
+        let (r, c) = (self.buf.row, self.buf.col);
+        let tail = self.buf.lines[r].split_off(c);
+        self.buf.lines[r].extend(parts[0].chars());
+        let mut row = r;
+        for p in &parts[1..] {
+            row += 1;
+            self.buf.lines.insert(row, p.chars().collect());
+        }
+        self.buf.col = self.buf.lines[row].len();
+        self.buf.row = row;
+        self.buf.lines[row].extend(tail);
+        self.mark = None;
+    }
+
+    /// Types one character, with the help a code editor gives: a closing bracket or quote is
+    /// added, typing over a closer that is already there just moves past it, and a closing `}` at
+    /// the start of a line steps back one level.
+    fn type_char(&mut self, c: char) {
+        if self.selection().is_some() {
+            self.delete_selection();
+        }
+        self.mark = None;
+        let (r, col) = (self.buf.row, self.buf.col);
+        let line = &self.buf.lines[r];
+        let next = line.get(col).copied();
+        let prev = col.checked_sub(1).and_then(|p| line.get(p).copied());
+        if matches!(c, ')' | ']' | '}' | '"' | '`' | '\'') && next == Some(c) {
+            self.buf.col += 1;
+            self.last = None;
+            return;
+        }
+        if c == '}' && col >= TAB_WIDTH && line[..col].iter().all(|x| *x == ' ') {
+            self.begin_edit(Edit::Other);
+            self.buf.lines[r].drain(col - TAB_WIDTH..col);
+            self.buf.col -= TAB_WIDTH;
+        }
+        let rust = self.lang() == Lang::Rust;
+        let pair = match c {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            '"' | '`' if !prev.is_some_and(char::is_alphanumeric) => Some(c),
+            '\'' if !rust && !prev.is_some_and(char::is_alphanumeric) => Some(c),
+            _ => None,
+        };
+        let room =
+            next.is_none_or(|n| n.is_whitespace() || matches!(n, ')' | ']' | '}' | ',' | ';'));
+        self.insert(c);
+        if let (Some(p), true) = (pair, room) {
+            if self.buf.line_len() < MAX_LINE {
+                let (r, col) = (self.buf.row, self.buf.col);
+                self.buf.lines[r].insert(col, p);
+            }
+        }
+    }
+
+    /// The bracket that goes with the one at (or just before) the cursor.
+    fn bracket_match(&self) -> Option<((usize, usize), (usize, usize))> {
+        let line = &self.buf.lines[self.buf.row];
+        let at = |c: usize| line.get(c).copied().filter(|ch| "()[]{}".contains(*ch));
+        let col = if at(self.buf.col).is_some() {
+            self.buf.col
+        } else if self.buf.col > 0 && at(self.buf.col - 1).is_some() {
+            self.buf.col - 1
+        } else {
+            return None;
+        };
+        let ch = line[col];
+        let (open, close, forward) = match ch {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            _ => ('{', '}', false),
+        };
+        let (mut depth, mut budget) = (0i32, 20_000usize);
+        let (mut r, mut c) = (self.buf.row, col);
+        loop {
+            // Step to the next character in the scanning direction.
+            if forward {
+                c += 1;
+                while c >= self.buf.lines[r].len() {
+                    r += 1;
+                    c = 0;
+                    if r >= self.buf.lines.len() {
+                        return None;
+                    }
+                    if self.buf.lines[r].is_empty() {
+                        continue;
+                    }
+                }
+            } else if c == 0 {
+                loop {
+                    if r == 0 {
+                        return None;
+                    }
+                    r -= 1;
+                    if !self.buf.lines[r].is_empty() {
+                        c = self.buf.lines[r].len() - 1;
+                        break;
+                    }
+                }
+            } else {
+                c -= 1;
+            }
+            budget -= 1;
+            if budget == 0 {
+                return None;
+            }
+            let x = self.buf.lines[r][c];
+            if x == if forward { open } else { close } {
+                depth += 1;
+            } else if x == if forward { close } else { open } {
+                if depth == 0 {
+                    return Some(((self.buf.row, col), (r, c)));
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    fn duplicate_line(&mut self) {
+        if self.buf.lines.len() >= MAX_LINES {
+            self.message = format!("A file cannot have more than {MAX_LINES} lines.");
+            return;
+        }
+        self.begin_edit(Edit::Other);
+        let line = self.buf.lines[self.buf.row].clone();
+        self.buf.lines.insert(self.buf.row + 1, line);
+        self.buf.row += 1;
+        self.mark = None;
+    }
+
+    fn delete_line(&mut self) {
+        self.begin_edit(Edit::Other);
+        if self.buf.lines.len() == 1 {
+            self.buf.lines[0].clear();
+        } else {
+            self.buf.lines.remove(self.buf.row);
+        }
+        self.buf.clamp();
+        self.buf.col = 0;
+        self.mark = None;
+    }
+
+    /// Comments out or restores the selected lines (or the current one).
+    fn toggle_comment(&mut self) {
+        let Some(prefix) = self.lang().line_comment() else {
+            self.message = "This kind of file has no line comment.".into();
+            return;
+        };
+        let bare: Vec<char> = prefix.trim_end().chars().collect();
+        let (r1, r2) = match self.selection() {
+            Some(((a, _), (b, _))) => (a, b),
+            None => (self.buf.row, self.buf.row),
+        };
+        let indent = |l: &Vec<char>| l.iter().take_while(|c| **c == ' ' || **c == '\t').count();
+        let all_commented = (r1..=r2).all(|r| {
+            let l = &self.buf.lines[r];
+            l.iter().all(|c| c.is_whitespace()) || l[indent(l)..].starts_with(&bare)
+        });
+        self.begin_edit(Edit::Other);
+        for l in self.buf.lines.iter_mut().take(r2 + 1).skip(r1) {
+            let ind = indent(l);
+            if l.iter().all(|c| c.is_whitespace()) {
+                continue;
+            }
+            if all_commented {
+                let mut end = ind + bare.len();
+                if l.get(end) == Some(&' ') {
+                    end += 1;
+                }
+                l.drain(ind..end);
+            } else if l.len() + prefix.len() <= MAX_LINE {
+                for (k, ch) in prefix.chars().enumerate() {
+                    l.insert(ind + k, ch);
+                }
+            }
+        }
+        self.buf.clamp();
     }
 
     fn insert(&mut self, c: char) {
@@ -278,6 +551,10 @@ impl EditorScreen {
     }
 
     fn newline(&mut self) {
+        if self.selection().is_some() {
+            self.delete_selection();
+        }
+        self.mark = None;
         if self.buf.lines.len() >= MAX_LINES {
             self.message = format!("A file cannot have more than {MAX_LINES} lines.");
             return;
@@ -290,17 +567,57 @@ impl EditorScreen {
             .copied()
             .take(c)
             .collect();
+        let before_last = self.buf.lines[r][..c]
+            .iter()
+            .rev()
+            .find(|ch| !ch.is_whitespace())
+            .copied();
+        let opens = matches!(before_last, Some('{' | '(' | '['))
+            || (self.lang() == Lang::Python && before_last == Some(':'));
         let rest = self.buf.lines[r].split_off(c);
-        let mut next = indent.clone();
-        next.extend(rest);
-        self.buf.lines.insert(r + 1, next);
+        // Between an opener and its closer, the closer goes on a line of its own.
+        let split_pair = matches!(
+            (before_last, rest.first()),
+            (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+        ) && self.buf.lines[r].last() == before_last.as_ref();
+        let mut inner = indent.clone();
+        if opens && indent.len() + TAB_WIDTH <= MAX_LINE {
+            inner.extend(std::iter::repeat_n(' ', TAB_WIDTH));
+        }
+        let mut next = inner.clone();
+        if split_pair && self.buf.lines.len() < MAX_LINES - 1 {
+            self.buf.lines.insert(r + 1, next);
+            let mut closer = indent.clone();
+            closer.extend(rest);
+            self.buf.lines.insert(r + 2, closer);
+        } else {
+            next.extend(rest);
+            self.buf.lines.insert(r + 1, next);
+        }
         self.buf.row += 1;
-        self.buf.col = indent.len();
+        self.buf.col = inner.len();
     }
 
     fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (r, c) = (self.buf.row, self.buf.col);
-        if c > 0 {
+        let line = &self.buf.lines[r];
+        let pair = c > 0
+            && matches!(
+                (line.get(c - 1), line.get(c)),
+                (Some('('), Some(')'))
+                    | (Some('['), Some(']'))
+                    | (Some('{'), Some('}'))
+                    | (Some('"'), Some('"'))
+                    | (Some('`'), Some('`'))
+            );
+        if pair {
+            self.begin_edit(Edit::Other);
+            self.buf.lines[r].drain(c - 1..=c);
+            self.buf.col -= 1;
+        } else if c > 0 {
             self.begin_edit(Edit::Other);
             self.buf.lines[r].remove(c - 1);
             self.buf.col -= 1;
@@ -319,6 +636,9 @@ impl EditorScreen {
     }
 
     fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (r, c) = (self.buf.row, self.buf.col);
         if c < self.buf.lines[r].len() {
             self.begin_edit(Edit::Other);
@@ -484,8 +804,11 @@ impl EditorScreen {
 
     fn key_in_text(&mut self, key: Key) -> Action {
         match key {
-            Key::Char(c) => self.insert(c),
-            Key::Tab => self.insert_tab(),
+            Key::Char(c) => self.type_char(c),
+            Key::Tab => {
+                self.delete_selection();
+                self.insert_tab();
+            }
             Key::Enter => self.newline(),
             Key::Backspace => self.backspace(),
             Key::Delete => self.delete(),
@@ -497,7 +820,53 @@ impl EditorScreen {
             | Key::End
             | Key::PageUp
             | Key::PageDown => self.move_cursor(key),
-            Key::Esc => self.focus = Focus::Files,
+            Key::Esc => {
+                if self.mark.take().is_none() {
+                    self.focus = Focus::Files;
+                }
+            }
+            Key::Ctrl('t') => {
+                self.mark = if self.mark.is_some() {
+                    None
+                } else {
+                    Some((self.buf.row, self.buf.col))
+                };
+            }
+            Key::Ctrl('a') => {
+                self.mark = Some((0, 0));
+                self.buf.row = self.buf.lines.len() - 1;
+                self.buf.col = self.buf.line_len();
+            }
+            Key::Ctrl('c') | Key::Ctrl('x') => {
+                let cut = key == Key::Ctrl('x');
+                if self.selection().is_some() {
+                    self.clipboard = self.selected_text();
+                    if cut {
+                        self.delete_selection();
+                    }
+                } else {
+                    self.clipboard = format!(
+                        "{}\n",
+                        self.buf.lines[self.buf.row].iter().collect::<String>()
+                    );
+                    if cut {
+                        self.delete_line();
+                    }
+                }
+                self.message = if cut { "Cut.".into() } else { "Copied.".into() };
+            }
+            Key::Ctrl('v') => {
+                let text = self.clipboard.clone();
+                if text.is_empty() {
+                    self.message = "Nothing to paste.".into();
+                } else {
+                    self.insert_text(&text);
+                }
+            }
+            Key::Ctrl('d') => self.duplicate_line(),
+            Key::Ctrl('k') => self.delete_line(),
+            Key::Ctrl('e') => self.toggle_comment(),
+            Key::Ctrl('g') => self.goto = Some(String::new()),
             Key::Ctrl('z') => self.undo(),
             Key::Ctrl('y') => self.redo(),
             Key::Ctrl('f') => {
@@ -590,6 +959,7 @@ impl EditorScreen {
             return;
         };
         let lang = Lang::of(path);
+        let pair = if focused { self.bracket_match() } else { None };
         let text_w = inner.w - GUTTER;
         let view_h = inner.h;
         self.view_h.set(view_h);
@@ -626,6 +996,31 @@ impl EditorScreen {
                     theme::BG,
                 );
             }
+            if let Some(((r1, c1), (r2, c2))) = self.selection() {
+                if row >= r1 && row <= r2 {
+                    let from = if row == r1 { c1 } else { 0 };
+                    let to = if row == r2 { c2 } else { line.len() + 1 };
+                    for k in from.max(left)..to.min(left + text_w) {
+                        let ch = line.get(k).copied().unwrap_or(' ');
+                        let fg = kinds.get(k).map_or(theme::TEXT, |kd| kd.colour());
+                        g.put(inner.x + GUTTER + k - left, y, ch, fg, theme::SELECT);
+                    }
+                }
+            }
+            if let Some((a, b)) = pair {
+                for (pr, pc) in [a, b] {
+                    if pr == row && pc >= left && pc < left + text_w {
+                        let ch = line.get(pc).copied().unwrap_or(' ');
+                        g.put(
+                            inner.x + GUTTER + pc - left,
+                            y,
+                            ch,
+                            theme::WARN,
+                            theme::SELECT,
+                        );
+                    }
+                }
+            }
             if focused && current {
                 let cx = inner.x + GUTTER + self.buf.col - left;
                 let under = line.get(self.buf.col).copied().unwrap_or(' ');
@@ -638,6 +1033,26 @@ impl EditorScreen {
 
 impl Screen for EditorScreen {
     fn on_key(&mut self, key: Key) -> Action {
+        if let Some(q) = &mut self.goto {
+            match key {
+                Key::Esc => self.goto = None,
+                Key::Char(c) if c.is_ascii_digit() && q.len() < 7 => q.push(c),
+                Key::Backspace => {
+                    q.pop();
+                }
+                Key::Enter => {
+                    let n: usize = q.parse().unwrap_or(0);
+                    self.goto = None;
+                    if n >= 1 {
+                        self.buf.row = (n - 1).min(self.buf.lines.len() - 1);
+                        self.buf.col = 0;
+                        self.last = None;
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.find.is_some() {
             return self.key_in_find(key);
         }
@@ -667,7 +1082,10 @@ impl Screen for EditorScreen {
         } else {
             self.draw_text(g, body);
         }
-        if let Some(q) = &self.find {
+        if let Some(q) = &self.goto {
+            let line = format!("Go to line: {q}_   Enter go  Esc cancel");
+            g.text_fit(area.x, status_y, area.w, &line, theme::ACCENT, theme::BG);
+        } else if let Some(q) = &self.find {
             let line = format!("Find: {q}_   Enter next  Esc close");
             g.text_fit(area.x, status_y, area.w, &line, theme::ACCENT, theme::BG);
         } else if !self.message.is_empty() {
@@ -697,7 +1115,7 @@ impl Screen for EditorScreen {
         match self.focus {
             Focus::Files => "Enter open  Up/Down choose  Tab to text  Ctrl-R refresh".into(),
             Focus::Text => {
-                "Ctrl-S send for review  Ctrl-Z undo  Ctrl-Y redo  Ctrl-F find  Esc files".into()
+                "Ctrl-S send  Z undo  Y redo  F find  G line  T mark  C/X/V copy cut paste  D dup  K del  E comment".into()
             }
         }
     }
@@ -754,11 +1172,11 @@ mod tests {
         assert!(!e.is_dirty());
         e.on_key(Key::End);
         e.on_key(Key::Left);
-        typ(&mut e, "\n    x();\n");
+        typ(&mut e, "\nx();\n");
         assert_eq!(
             e.text(),
-            "fn main() {\n    x();\n    }\n",
-            "the new line keeps the indent"
+            "fn main() {\n    x();\n    \n}\n",
+            "the block is indented, keeps its indent, and the brace gets a line of its own"
         );
         assert!(e.is_dirty());
     }
@@ -1081,5 +1499,203 @@ mod tests {
         assert!(e.hints().contains("Ctrl-S"));
         e.on_key(Key::Esc);
         assert!(e.hints().contains("Enter open"));
+    }
+
+    fn at(e: &EditorScreen) -> (usize, usize) {
+        (e.buf.row, e.buf.col)
+    }
+
+    fn lines(e: &EditorScreen) -> Vec<String> {
+        e.buf.lines.iter().map(|l| l.iter().collect()).collect()
+    }
+
+    #[test]
+    fn brackets_and_quotes_close_themselves_and_typing_over_the_closer_moves_past_it() {
+        let mut e = editor("");
+        typ(&mut e, "f(a[0], \"x\")");
+        assert_eq!(lines(&e), vec!["f(a[0], \"x\")"], "no doubled closers");
+        assert_eq!(at(&e), (0, 12));
+        let mut e = editor("");
+        typ(&mut e, "(");
+        assert_eq!(lines(&e), vec!["()"]);
+        assert_eq!(at(&e), (0, 1));
+        e.on_key(Key::Backspace);
+        assert_eq!(lines(&e), vec![""], "backspace removes the pair");
+        // No pairing before a word, nor for apostrophes in Rust (lifetimes) or after a letter.
+        let mut e = editor("word\n");
+        typ(&mut e, "(");
+        assert_eq!(lines(&e)[0], "(word");
+        let mut e = editor("");
+        typ(&mut e, "&'a x don't");
+        assert_eq!(lines(&e), vec!["&'a x don't"]);
+        // A closing brace at the start of an indented line steps back a level.
+        let mut e = editor("    ");
+        e.on_key(Key::End);
+        typ(&mut e, "}");
+        assert_eq!(lines(&e), vec!["}"]);
+        assert_eq!(at(&e), (0, 1));
+    }
+
+    #[test]
+    fn enter_indents_and_puts_a_closer_on_its_own_line() {
+        let mut e = editor("");
+        typ(&mut e, "fn f() {");
+        assert_eq!(lines(&e), vec!["fn f() {}"]);
+        e.on_key(Key::Enter);
+        assert_eq!(lines(&e), vec!["fn f() {", "    ", "}"]);
+        assert_eq!(at(&e), (1, 4));
+        typ(&mut e, "x();\ny");
+        assert_eq!(lines(&e), vec!["fn f() {", "    x();", "    y", "}"]);
+        // Python opens a block after a colon.
+        let mut p = EditorScreen::default();
+        p.load("a.py", "").unwrap();
+        typ(&mut p, "if x:\n");
+        assert_eq!(at(&p), (1, 4));
+        // Plain text just keeps the indent.
+        let mut t = editor("  abc");
+        t.on_key(Key::End);
+        t.on_key(Key::Enter);
+        assert_eq!(at(&t), (1, 2));
+        t.on_key(Key::Char('z'));
+        t.on_key(Key::Ctrl('z'));
+    }
+
+    #[test]
+    fn marking_selects_and_copy_cut_and_paste_work_across_lines() {
+        let mut e = editor("one\ntwo\nthree\n");
+        e.on_key(Key::Right); // 1 on "one"
+        e.on_key(Key::Ctrl('t'));
+        e.on_key(Key::Down);
+        e.on_key(Key::Right);
+        assert_eq!(e.selected_text(), "ne\ntw");
+        e.on_key(Key::Ctrl('c'));
+        assert_eq!(e.clipboard, "ne\ntw");
+        assert!(!e.is_dirty(), "copying changes nothing");
+        e.on_key(Key::Ctrl('x'));
+        assert_eq!(lines(&e), vec!["oo", "three"]);
+        assert_eq!(at(&e), (0, 1));
+        e.on_key(Key::Ctrl('v'));
+        assert_eq!(lines(&e), vec!["one", "two", "three"]);
+        assert_eq!(e.text(), "one\ntwo\nthree\n");
+        e.on_key(Key::Ctrl('z'));
+        e.on_key(Key::Ctrl('z'));
+        assert_eq!(
+            lines(&e),
+            vec!["one", "two", "three"],
+            "paste and cut are one undo step each"
+        );
+        // Typing over a selection replaces it; Delete and Backspace remove it; Escape drops it.
+        let mut e = editor("hello world\n");
+        e.on_key(Key::Ctrl('t'));
+        for _ in 0..5 {
+            e.on_key(Key::Right);
+        }
+        e.on_key(Key::Char('J'));
+        assert_eq!(lines(&e)[0], "J world");
+        e.on_key(Key::Ctrl('a'));
+        assert_eq!(e.selected_text(), "J world");
+        e.on_key(Key::Esc);
+        assert_eq!(
+            e.focus(),
+            Focus::Text,
+            "the first Escape only clears the selection"
+        );
+        assert!(e.selection().is_none());
+        e.on_key(Key::Ctrl('a'));
+        e.on_key(Key::Backspace);
+        assert_eq!(lines(&e), vec![""]);
+        // Copy and cut without a selection work on the whole line.
+        let mut e = editor("a\nb\n");
+        e.on_key(Key::Ctrl('x'));
+        assert_eq!(lines(&e), vec!["b"]);
+        e.on_key(Key::Ctrl('v'));
+        assert_eq!(lines(&e), vec!["a", "b"]);
+        // Pasting nothing or too much is refused.
+        let mut e = editor("x\n");
+        e.on_key(Key::Ctrl('v'));
+        assert!(e.message.contains("Nothing"));
+        e.clipboard = "y".repeat(MAX_LINE + 1);
+        e.on_key(Key::Ctrl('v'));
+        assert!(e.message.contains("too large") && lines(&e) == vec!["x"]);
+    }
+
+    #[test]
+    fn the_matching_bracket_is_found_across_lines_and_nesting() {
+        let mut e = editor("fn f(a: [u8; (1)]) {\n    x\n}\n");
+        e.on_key(Key::Right);
+        e.on_key(Key::Right);
+        e.on_key(Key::Right);
+        e.on_key(Key::Right);
+        // Cursor is right after "fn f", on the "(" of the parameters.
+        assert_eq!(e.bracket_match(), Some(((0, 4), (0, 17))));
+        // Standing just after a closer finds its opener.
+        e.buf.col = 18;
+        assert_eq!(e.bracket_match(), Some(((0, 17), (0, 4))));
+        // The brace on the first line matches the one on the last.
+        e.buf.col = 19;
+        assert_eq!(e.bracket_match(), Some(((0, 19), (2, 0))));
+        e.buf.row = 2;
+        e.buf.col = 0;
+        assert_eq!(e.bracket_match(), Some(((2, 0), (0, 19))));
+        // No match, and no bracket at all.
+        let mut e = editor("(((\n");
+        assert_eq!(e.bracket_match(), None);
+        e.buf.col = 3;
+        assert_eq!(e.bracket_match(), None);
+        let e = editor("abc\n");
+        assert_eq!(e.bracket_match(), None);
+        // The highlight is drawn.
+        let mut e = editor("(a)\n");
+        let mut g = Grid::new(90, 14);
+        let area = g.area();
+        e.draw(&mut g, area);
+        let (x, y) = (0..90)
+            .flat_map(|x| (0..14).map(move |y| (x, y)))
+            .find(|&(x, y)| g.get(x, y).unwrap().ch == ')' && g.get(x - 1, y).unwrap().ch == 'a')
+            .unwrap();
+        assert_eq!(g.get(x, y).unwrap().bg, theme::SELECT);
+        e.on_key(Key::Down);
+    }
+
+    #[test]
+    fn go_to_line_duplicate_delete_and_comment_toggle() {
+        let mut e = editor("a\nb\nc\nd\n");
+        e.on_key(Key::Ctrl('g'));
+        assert!(drawn(&e, 90, 14).contains("Go to line"));
+        typ(&mut e, "3");
+        e.on_key(Key::Enter);
+        assert_eq!(at(&e), (2, 0));
+        e.on_key(Key::Ctrl('g'));
+        typ(&mut e, "99");
+        e.on_key(Key::Enter);
+        assert_eq!(at(&e), (3, 0), "past the end goes to the last line");
+        e.on_key(Key::Ctrl('g'));
+        e.on_key(Key::Esc);
+        e.on_key(Key::Ctrl('d'));
+        assert_eq!(lines(&e), vec!["a", "b", "c", "d", "d"]);
+        e.on_key(Key::Ctrl('k'));
+        e.on_key(Key::Ctrl('k'));
+        assert_eq!(lines(&e), vec!["a", "b", "c"]);
+        // Comments follow the language: Rust uses //, and a selection comments every line.
+        e.on_key(Key::Ctrl('t'));
+        e.on_key(Key::Up);
+        e.on_key(Key::Ctrl('e'));
+        assert_eq!(lines(&e), vec!["a", "// b", "// c"]);
+        e.on_key(Key::Ctrl('e'));
+        assert_eq!(lines(&e), vec!["a", "b", "c"]);
+        // Indented code keeps its indent; blank lines are left alone.
+        let mut e = editor("    x\n\n    y\n");
+        e.on_key(Key::Ctrl('a'));
+        e.on_key(Key::Ctrl('e'));
+        assert_eq!(lines(&e), vec!["    // x", "", "    // y"]);
+        // Files with no line comment say so.
+        let mut h = EditorScreen::default();
+        h.load("a.html", "<p>").unwrap();
+        h.on_key(Key::Ctrl('e'));
+        assert!(h.message.contains("no line comment"));
+        // The last line cannot be deleted away.
+        let mut one = editor("only\n");
+        one.on_key(Key::Ctrl('k'));
+        assert_eq!(lines(&one), vec![""]);
     }
 }
