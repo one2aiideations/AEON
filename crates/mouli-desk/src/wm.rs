@@ -171,7 +171,7 @@ impl WindowManager {
         }
         let n = self.windows.len() as i32;
         let (want_cols, want_rows) = if tab == Tab::Preview {
-            (100, 32)
+            (96, 24)
         } else {
             (72, 22)
         };

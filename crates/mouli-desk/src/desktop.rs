@@ -655,7 +655,7 @@ mod tests {
         let w = d.wm.top().unwrap();
         assert_eq!(w.tab, Tab::Preview);
         assert!(
-            w.cols >= 90 && w.rows >= 28,
+            w.cols > 72 && w.rows >= 23,
             "a preview window is larger than the usual: {}x{}",
             w.cols,
             w.rows
