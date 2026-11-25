@@ -7,6 +7,7 @@
 //! * [`css`], [`style`]: stylesheets, selectors, media queries, the cascade and inheritance.
 //! * [`layout`], [`display`]: block, inline, flex and table layout, then a list of paint
 //!   operations for the desktop to rasterise (floats, grid and images are not done yet).
+//! * [`image`]: PNG, JPEG (baseline) and GIF decoders.
 //! * [`js`], [`interp`], [`jslib`]: a JavaScript lexer and parser, a tree-walking interpreter
 //!   with hard limits, and the standard library.
 //! * [`scripting`]: `document`, elements, events and timers, so page scripts can change the page.
@@ -29,6 +30,9 @@ pub mod display;
 pub mod dom;
 pub mod gate;
 pub mod html;
+pub mod image;
+#[cfg(test)]
+mod image_fixtures;
 pub mod intents;
 pub mod interp;
 pub mod js;
