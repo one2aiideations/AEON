@@ -1,0 +1,13 @@
+[package]
+name = "mouli-utility"
+version = "0.1.0"
+description = "MOULI-UTILITY: system-related functions in one crate: network, Wi-Fi, Bluetooth, time, hardware, disks, power and terminal prompts"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "term"] }

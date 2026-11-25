@@ -7,13 +7,41 @@ name: MOULI OS image (build + QEMU boot test)
     paths:
       - "os/**"
       - "crates/moulid/**"
-      - "crates/mouli-hw/**"
+      - "crates/mouli-agentic/**"
+      - "crates/mouli-apps/**"
+      - "crates/mouli-code/**"
+      - "crates/mouli-crypto/**"
+      - "crates/mouli-desk/**"
+      - "crates/mouli-device/**"
+      - "crates/mouli-hosted/**"
+      - "crates/mouli-http/**"
+      - "crates/mouli-interface/**"
+      - "crates/mouli-llm/**"
+      - "crates/mouli-pki/**"
+      - "crates/mouli-screen/**"
+      - "crates/mouli-systems/**"
+      - "crates/mouli-tls/**"
+      - "crates/mouli-utility/**"
       - ".github/workflows/os-image.yml"
   pull_request:
     paths:
       - "os/**"
       - "crates/moulid/**"
-      - "crates/mouli-hw/**"
+      - "crates/mouli-agentic/**"
+      - "crates/mouli-apps/**"
+      - "crates/mouli-code/**"
+      - "crates/mouli-crypto/**"
+      - "crates/mouli-desk/**"
+      - "crates/mouli-device/**"
+      - "crates/mouli-hosted/**"
+      - "crates/mouli-http/**"
+      - "crates/mouli-interface/**"
+      - "crates/mouli-llm/**"
+      - "crates/mouli-pki/**"
+      - "crates/mouli-screen/**"
+      - "crates/mouli-systems/**"
+      - "crates/mouli-tls/**"
+      - "crates/mouli-utility/**"
       - ".github/workflows/os-image.yml"
   workflow_dispatch:
 
@@ -80,7 +108,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Unit tests for moulid (host)
-        run: cargo test --locked -p moulid -p mouli-hw
+        run: cargo test --locked -p moulid -p mouli-utility
 
       - name: Tests for the release packaging (PDF writer and release folder script)
         run: python3 -m unittest discover -s os/release -v

@@ -8,7 +8,7 @@ Provenance of everything pulled into this repository from the local `sources/` c
 
 | Source | Went into | Notes |
 |---|---|---|
-| `AEON-main-full` (C core, `aeon-os`) | `mouli-llm::tensor`, `mouli-llm::weights`, `mouli-llm::kernels`, `mouli-systems::identity`, `mouli-agentic::cognition`, `mouli-agentic::runtime`, `mouli-agentic::adapters`, `moulid`, `mouli-hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
+| `AEON-main-full` (C core, `aeon-os`) | `mouli-llm::tensor`, `mouli-llm::weights`, `mouli-llm::kernels`, `mouli-systems::identity`, `mouli-agentic::cognition`, `mouli-agentic::runtime`, `mouli-agentic::adapters`, `moulid`, `mouli-utility::hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
 | Theory toolkit (`TheoryOfIntelligence`, `stem_one_click_v11`) | `mouli-llm::theory` | Robust-S, gap law, calibration, cascade, selection, TIES merge. |
 | 55D research engine (`stem_one_click_v11`) | `mouli-llm::compress` | Model-independent numerics only: entropy, outliers, near-duplicates, quantisation error, pruning threshold, singular values, effective rank, low-rank error, RVQ sizes. |
 | `AgentBox-main` | `mouli-forge` (manifest, registry, candidate mutation, evaluation, capability contracts, fitness, comparison), `mouli-agentic::memory::context` | Pure logic only; see "Left out". |

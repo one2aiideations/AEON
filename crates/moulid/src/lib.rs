@@ -22,41 +22,32 @@
 //! Ported from the retired C `userspace/aeond`.
 #![forbid(unsafe_code)]
 
+// The system-related modules live in `mouli-utility`; they stay reachable here under the same names.
+pub use mouli_utility::{
+    bluetooth, civil_time, clocksync, fslabel, hwprobe, hwreport, known_networks, net,
+    partition_table, procparse, sntp, system, wifi, wifi_saved,
+};
 pub mod args;
 pub mod backoff;
 pub mod banner;
-pub mod bluetooth;
 pub mod catalog;
-pub mod civil_time;
-pub mod clocksync;
 pub mod context;
 pub mod datagraph;
 pub mod download_plan;
 pub mod download_ui;
 pub mod fetch;
-pub mod fslabel;
 pub mod gguf_info;
 pub mod gui;
 pub mod hosted;
 pub mod http;
-pub mod hwprobe;
-pub mod hwreport;
-pub mod known_networks;
 pub mod lineedit;
 pub mod models;
-pub mod net;
-pub mod partition_table;
 pub mod persist;
-pub mod procparse;
-pub mod sntp;
 pub mod storage;
 pub mod sysinfo;
-pub mod system;
 pub mod textwrap;
 pub mod toolloop;
 pub mod ui;
-pub mod wifi;
-pub mod wifi_saved;
 
 use std::path::{Path, PathBuf};
 

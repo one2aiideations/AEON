@@ -14,7 +14,7 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `moulid` | Init (PID 1), console, networking, Wi-Fi, persistence, inference-server supervisor |
-| `mouli-hw` | Hardware probe and run plan |
+| `mouli-utility` | The system-related functions in one crate: network, Wi-Fi and Bluetooth, time (dates, network time), hardware probe and run plan, `/proc` parsers, filesystem labels and partition tables, power off and restart, terminal prompts |
 | `mouli-update` | Signed OS updates, A/B slots, boot counting and rollback |
 | `mouli-sdv` | Experimental software-defined-vehicle development environment (not safety-certified) |
 

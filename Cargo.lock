@@ -2691,10 +2691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-hw"
-version = "0.1.0"
-
-[[package]]
 name = "mouli-interface"
 version = "0.1.0"
 dependencies = [
@@ -2856,6 +2852,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-utility"
+version = "0.1.0"
+dependencies = [
+ "nix",
+]
+
+[[package]]
 name = "mouli-web"
 version = "0.1.0"
 
@@ -2869,11 +2872,11 @@ dependencies = [
  "mouli-device",
  "mouli-hosted",
  "mouli-http",
- "mouli-hw",
  "mouli-interface",
  "mouli-llm",
  "mouli-pki",
  "mouli-screen",
+ "mouli-utility",
  "nix",
  "sha2",
 ]

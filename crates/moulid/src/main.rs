@@ -1,7 +1,7 @@
 //! moulid entry point. See the library docs.
 #![forbid(unsafe_code)]
 
-use mouli_hw::{Hw, Plan};
+use mouli_utility::hw::{Hw, Plan};
 use moulid::args::{Args, DEFAULT_MODEL_DIR};
 use moulid::bluetooth;
 use moulid::clocksync;

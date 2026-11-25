@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-mouli-hw = { path = "../mouli-hw" }
+mouli-utility = { path = "../mouli-utility" }
 mouli-llm = { path = "../mouli-llm" }
 mouli-agentic = { path = "../mouli-agentic" }
 mouli-http = { path = "../mouli-http" }

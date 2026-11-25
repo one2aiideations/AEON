@@ -11,6 +11,7 @@ use crate::ui::{Backend, Turn};
 use mouli_hosted::{chat_stream, keyfile, Error, Provider, Secret};
 use mouli_http::{Client, Url};
 use mouli_interface::wash::{wash, Mode, Vault};
+pub use mouli_utility::prompt::{ask, ask_secret};
 use std::io::{self, BufRead, Write};
 
 /// Provider name used for the key file.
@@ -22,64 +23,6 @@ const REPLY_TOKENS: u32 = 512;
 /// Directory for key files on the data partition.
 fn key_dir(store: &Store) -> std::path::PathBuf {
     store.root().join("keys")
-}
-
-pub(crate) fn ask<R: BufRead, W: Write>(
-    input: &mut R,
-    out: &mut W,
-    prompt: &str,
-) -> io::Result<Option<String>> {
-    write!(out, "{prompt}")?;
-    out.flush()?;
-    let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim().to_string()))
-}
-
-/// Read a line with the terminal's echo turned off, so the key is not shown on screen.
-pub(crate) fn ask_secret<R: BufRead, W: Write>(
-    input: &mut R,
-    out: &mut W,
-    prompt: &str,
-) -> io::Result<Option<String>> {
-    #[cfg(target_os = "linux")]
-    let _guard = EchoOff::new();
-    let r = ask(input, out, prompt);
-    writeln!(out)?;
-    r
-}
-
-/// Turns terminal echo off for stdin until dropped. Silently does nothing when stdin is not a
-/// terminal (tests, pipes).
-#[cfg(target_os = "linux")]
-struct EchoOff(Option<nix::sys::termios::Termios>);
-
-#[cfg(target_os = "linux")]
-impl EchoOff {
-    fn new() -> Self {
-        use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
-        let stdin = io::stdin();
-        let Ok(orig) = tcgetattr(&stdin) else {
-            return Self(None);
-        };
-        let mut quiet = orig.clone();
-        quiet.local_flags.remove(LocalFlags::ECHO);
-        quiet.local_flags.insert(LocalFlags::ECHONL);
-        let _ = tcsetattr(&stdin, SetArg::TCSANOW, &quiet);
-        Self(Some(orig))
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for EchoOff {
-    fn drop(&mut self) {
-        if let Some(orig) = &self.0 {
-            let _ =
-                nix::sys::termios::tcsetattr(io::stdin(), nix::sys::termios::SetArg::TCSANOW, orig);
-        }
-    }
 }
 
 /// What the person must agree to before anything is sent.

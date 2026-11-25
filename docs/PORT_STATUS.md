@@ -21,7 +21,7 @@ public APIs. **Differential tests against the C code (same input through both, o
 | `aeon_ebpf_boundary` (classification), `aeon_kernel_adapter` (hooks) | `mouli-systems::identity::hooks` | classification and hook bookkeeping ported; **attaching real eBPF/netfilter hooks stays kernel-side** |
 | `aeon_cognitive_core`, `aeon_cognitive_engine` | `mouli-agentic::cognition`, `mouli-agentic::kernel` | ported |
 | `aeon_runtime`, `aeon_system_embodiment` (actions, sensors, tools, memory region check) | `mouli-agentic::runtime::{action, sensors, tools}`, `mouli-llm::tensor::arena` | ported |
-| `aeon_detect_cpu_caps` | `mouli-hw` (`parse_cpuinfo`, `probe`, `plan`) | ported (reads `/proc`, not compile-time flags) |
+| `aeon_detect_cpu_caps` | `mouli-utility::hw` (`parse_cpuinfo`, `probe`, `plan`) | ported (reads `/proc`, not compile-time flags) |
 | `aeon_topstar_contract` | `mouli-agentic::adapters::topstar`, and the fuller `mouli-systems::topstar` crate | ported |
 | `userspace/aeond` | `moulid` | ported; HTTP surface not diffed against C |
 | `aeon_kernel_device` (character device and ioctl) | none | **non-Rust by design**: Linux kernel module (track K0/K2) |
