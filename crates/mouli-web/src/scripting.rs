@@ -1075,6 +1075,9 @@ impl Scripting {
         let scripts = dom.inline_scripts();
         let mut interp = Interp::new();
         // Measured: about 3 KB of stack per call level in release builds (21 KB in debug).
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            interp.epoch_ms = d.as_millis() as f64;
+        }
         interp.max_depth = 48;
         let proto = interp.new_obj();
         let host: H = Rc::new(RefCell::new(Host {

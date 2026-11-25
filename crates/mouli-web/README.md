@@ -16,7 +16,7 @@ page tools. The rest of this README is the wider product guide; this section is 
 | Layout: block, inline, flex, grid (tracks, `fr`, `repeat`, `auto-fill`, spans, placement), tables, lists, positioning | Done. Floats, grid areas, `rowspan` are **not** done. |
 | Pictures: PNG, baseline JPEG, GIF (first frame) | Done. Progressive JPEG, WebP, SVG and animation are not. |
 | Browser: address bar, history, links, forms (GET), style sheets, scripts, pictures | Done in the Browser window (Ctrl-B). POST forms, cookies, downloads and tabs are not. |
-| JavaScript: syntax of modern scripts, closures, classes, destructuring, exceptions, timers | Done, with step, depth, object and size limits. `Map`, `Set`, `Promise` and regular expressions exist. No `async`/`await`, generators, `Symbol` or `new Date()` yet. |
+| JavaScript: syntax of modern scripts, closures, classes, destructuring, exceptions, timers | Done, with step, depth, object and size limits. `Map`, `Set`, `Promise`, regular expressions and `Date` (UTC only) exist. No `async`/`await`, generators or `Symbol` yet. |
 | `document`, elements, events (with bubbling), `classList`, `style`, `innerHTML`, selectors | Done. No network, storage or `eval`. |
 | Markdown preview | Done. |
 | Tabs, bookmarks, publishing, MCP discovery | Not started; see the sections below. |

@@ -12,8 +12,8 @@
 //! Known differences from the standard (kept deliberately small): strings are Rust text and
 //! `length` counts characters, not UTF-16 units; arrays have no holes; `let` has no temporal dead
 //! zone; objects that form cycles are never freed (the whole interpreter is dropped with the
-//! page); no `async`, generators, `Symbol` or `Date` objects yet (`Promise`, `Map`, `Set` and
-//! regular expressions exist).
+//! page; no `async`, generators or `Symbol` yet (`Promise`, `Map`, `Set`, regular expressions and
+//! `Date` exist; dates are in UTC, there is no time zone database).
 
 use crate::js::{self, *};
 use std::cell::RefCell;
@@ -153,6 +153,8 @@ pub enum Kind {
     Promise(PromiseData),
     /// A regular expression and its source text.
     Regex(Rc<crate::regex::Regex>, Rc<str>),
+    /// A `Date`: milliseconds since 1970 (UTC), `NaN` when invalid.
+    Date(f64),
 }
 
 /// What a value is when used as a `Map` key (same-value-zero equality).
@@ -297,6 +299,8 @@ pub struct Interp {
     next_timer: u32,
     /// The virtual clock in milliseconds.
     pub clock: f64,
+    /// Milliseconds since 1970 at clock zero (what `Date.now()` starts from); the host sets it.
+    pub epoch_ms: f64,
 }
 
 fn index_key(k: &str) -> Option<usize> {
@@ -435,6 +439,7 @@ impl Interp {
             microtasks: VecDeque::new(),
             next_timer: 1,
             clock: 0.0,
+            epoch_ms: 1_700_000_000_000.0,
         };
         crate::jslib::install(&mut i);
         i
@@ -918,10 +923,22 @@ impl Interp {
     // ------------------------------------------------------------ conversions
 
     pub(crate) fn coerce_primitive(&mut self, v: &Value) -> R<Value> {
+        self.coerce_primitive_hint(v, false)
+    }
+
+    /// Like [`Interp::coerce_primitive`]; with `prefer_text` a `Date` gives its text (what `+`
+    /// and `String(x)` use) instead of its number.
+    pub(crate) fn coerce_primitive_hint(&mut self, v: &Value, prefer_text: bool) -> R<Value> {
         let Value::Obj(o) = v else {
             return Ok(v.clone());
         };
-        for name in ["valueOf", "toString"] {
+        let is_date = prefer_text && matches!(o.borrow().kind, Kind::Date(_));
+        let order = if is_date {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in order {
             let f = self.get(v, name)?;
             if is_callable(&f) {
                 let r = self.call(&f, v.clone(), Vec::new())?;
@@ -942,7 +959,7 @@ impl Interp {
             Value::Num(n) => Rc::from(num_to_string(*n).as_str()),
             Value::Str(s) => s.clone(),
             Value::Obj(_) => {
-                let p = self.coerce_primitive(v)?;
+                let p = self.coerce_primitive_hint(v, true)?;
                 self.coerce_str(&p)?
             }
         })
@@ -1070,6 +1087,9 @@ impl Interp {
                     } else {
                         format!("{name}: {msg}")
                     };
+                }
+                if let Kind::Date(t) = &o.borrow().kind {
+                    return crate::jslib::iso_string(*t).unwrap_or_else(|| "Invalid Date".into());
                 }
                 if let Kind::Regex(re, src) = &o.borrow().kind {
                     return format!("/{src}/{}", crate::jslib::flags_string(&re.flags));
@@ -2589,8 +2609,8 @@ impl Interp {
                 if let (Value::Num(x), Value::Num(y)) = (a, b) {
                     return Ok(Value::Num(x + y));
                 }
-                let x = self.coerce_primitive(a)?;
-                let y = self.coerce_primitive(b)?;
+                let x = self.coerce_primitive_hint(a, true)?;
+                let y = self.coerce_primitive_hint(b, true)?;
                 if matches!(x, Value::Str(_)) || matches!(y, Value::Str(_)) {
                     let (p, q) = (self.coerce_str(&x)?, self.coerce_str(&y)?);
                     if p.len() + q.len() > MAX_STRING {
@@ -3317,6 +3337,85 @@ mod tests {
         assert!(run("/(a+)+b/.test('a'.repeat(40))").contains("took too long"));
         assert_eq!(run("/a/"), "/a/");
         assert_eq!(run("typeof /a/ + (/a/ instanceof RegExp)"), "objecttrue");
+    }
+
+    #[test]
+    fn dates_are_parsed_formatted_and_computed_in_utc() {
+        assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            run("new Date(Date.UTC(2024, 1, 29, 12, 30, 45, 123)).toISOString()"),
+            "2024-02-29T12:30:45.123Z"
+        );
+        assert_eq!(run("new Date('2024-05-06').getTime()"), "1714953600000");
+        assert_eq!(
+            run("new Date('2024-05-06T07:08:09.5Z').toISOString()"),
+            "2024-05-06T07:08:09.500Z"
+        );
+        assert_eq!(
+            run("new Date('2024-05-06T07:08:09+05:30').toISOString()"),
+            "2024-05-06T01:38:09.000Z"
+        );
+        assert_eq!(
+            run("new Date(2024, 0, 31).getMonth() + ',' + new Date(2024, 0, 31).getDate()"),
+            "0,31"
+        );
+        assert_eq!(
+            run("new Date(2023, 11, 31, 23, 59, 59).toISOString()"),
+            "2023-12-31T23:59:59.000Z"
+        );
+        assert_eq!(
+            run("const d = new Date(2024, 0, 31); d.setMonth(1); d.toISOString()"),
+            "2024-03-02T00:00:00.000Z"
+        );
+        assert_eq!(run("const d = new Date(2024, 0, 1); d.setDate(0); d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate()"), "2023-11-31");
+        assert_eq!(
+            run("const d = new Date(0); d.setHours(25, 61); d.toISOString()"),
+            "1970-01-02T02:01:00.000Z"
+        );
+        assert_eq!(run("const d = new Date(2000, 5, 15); [d.getFullYear(), d.getMonth(), d.getDate(), d.getDay(), d.getHours()]"), "[ 2000, 5, 15, 4, 0 ]");
+        assert_eq!(
+            run("new Date(1700000000000).toString()"),
+            "Tue Nov 14 2023 22:13:20 GMT+0000 (UTC)"
+        );
+        assert_eq!(
+            run("new Date(1700000000000).toUTCString()"),
+            "Tue, 14 Nov 2023 22:13:20 GMT"
+        );
+        assert_eq!(run("new Date(1700000000000).toLocaleDateString() + ' ' + new Date(1700000000000).toLocaleTimeString()"), "11/14/2023 10:13:20 PM");
+        assert_eq!(
+            run("new Date(2024, 2, 1) - new Date(2024, 1, 1)"),
+            "2505600000"
+        );
+        assert_eq!(run("new Date(5) < new Date(6)"), "true");
+        assert_eq!(
+            run("'d=' + new Date(0)"),
+            "d=Thu Jan 01 1970 00:00:00 GMT+0000 (UTC)"
+        );
+        assert_eq!(
+            run("JSON.stringify({ d: new Date(0) })"),
+            "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+        );
+        assert_eq!(run("new Date(0)"), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            run("isNaN(new Date('nonsense')) + ' ' + new Date('2024-13-01').getTime()"),
+            "true NaN"
+        );
+        assert_eq!(run("String(new Date(NaN))"), "Invalid Date");
+        assert!(run("new Date(NaN).toISOString()").contains("RangeError"));
+        assert_eq!(run("typeof Date.now() + (Date.now() > 1.6e12) + (new Date() instanceof Date) + typeof Date()"), "numbertruetruestring");
+        assert_eq!(run("Date.parse('1970-01-02')"), "86400000");
+        assert_eq!(run("new Date(new Date(1000)).getTime()"), "1000");
+        assert_eq!(run("new Date(8.64e15 + 1).getTime()"), "NaN");
+        assert_eq!(
+            run("new Date(-1).toISOString()"),
+            "1969-12-31T23:59:59.999Z"
+        );
+        assert_eq!(run("new Date(Date.UTC(-1, 0)).getFullYear()"), "-1");
+        assert!(run("Date.prototype.getTime.call({})").contains("TypeError"));
+        assert_eq!(
+            run("class D extends Date { year() { return this.getFullYear(); } } new D(0).year()"),
+            "1970"
+        );
     }
 
     #[test]

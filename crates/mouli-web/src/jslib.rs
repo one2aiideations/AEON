@@ -1,6 +1,6 @@
 //! The JavaScript standard library installed into every [`Interp`]: `Object`, `Function`,
 //! `Array`, `String`, `Number`, `Boolean`, the error types, `Math`, `JSON`, `console`, timers,
-//! `Date.now` and `performance.now`.
+//! `Map`, `Set`, `Promise`, `RegExp`, `Date` (UTC) and `performance.now`.
 
 use crate::interp::{
     is_callable, make_bound, num_to_string, str_to_num, to_i32, Interp, Kind, MapData, MapKey, Obj,
@@ -460,6 +460,7 @@ pub(crate) fn install(i: &mut Interp) {
     install_array(i);
     install_string(i);
     install_regexp(i);
+    install_date(i);
     install_number(i);
     install_errors(i);
     install_collections(i);
@@ -1661,12 +1662,7 @@ fn install_globals(i: &mut Interp) {
         i.set_global(name, fv);
     }
     let _ = str_to_num;
-    // Date.now and performance.now read the virtual clock.
-    let d = i.new_obj();
-    method(i, &d, "now", |i, _, _| {
-        Ok(Value::Num(1_700_000_000_000.0 + i.clock.floor()))
-    });
-    i.set_global("Date", Value::Obj(d));
+    // performance.now reads the virtual clock.
     let p = i.new_obj();
     method(i, &p, "now", |i, _, _| Ok(Value::Num(i.clock)));
     i.set_global("performance", Value::Obj(p));
@@ -2543,4 +2539,441 @@ fn install_regexp(i: &mut Interp) {
             Ok(Value::str(&out))
         });
     }
+}
+
+// ------------------------------------------------------------------ Date
+
+const MS_DAY: f64 = 86_400_000.0;
+const MAX_TIME: f64 = 8.64e15;
+
+/// Days since 1970-01-01 of a civil date (proleptic Gregorian; Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The civil date of a day number.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Year, month (0-11), day, hours, minutes, seconds, milliseconds, weekday (0 = Sunday).
+fn parts(t: f64) -> [i64; 8] {
+    let ms = t as i64;
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    [
+        y,
+        m - 1,
+        d,
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000,
+        (days + 4).rem_euclid(7),
+    ]
+}
+
+/// A time value from components that may be out of range (month 14, day 0, hour 25 ...).
+fn make_time(y: f64, mo: f64, d: f64, h: f64, mi: f64, s: f64, ms: f64) -> f64 {
+    if ![y, mo, d, h, mi, s, ms].iter().all(|v| v.is_finite()) {
+        return f64::NAN;
+    }
+    let (y, mo) = (y.trunc(), mo.trunc());
+    let ym = y + (mo / 12.0).floor();
+    let mn = mo.rem_euclid(12.0);
+    if ym.abs() > 400_000.0 {
+        return f64::NAN;
+    }
+    let days = days_from_civil(ym as i64, mn as i64 + 1, 1) as f64 + d.trunc() - 1.0;
+    let t = days * MS_DAY
+        + h.trunc() * 3_600_000.0
+        + mi.trunc() * 60_000.0
+        + s.trunc() * 1000.0
+        + ms.trunc();
+    if t.abs() > MAX_TIME {
+        f64::NAN
+    } else {
+        t
+    }
+}
+
+const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `2024-05-06T07:08:09.010Z`, or `None` for an invalid time.
+pub(crate) fn iso_string(t: f64) -> Option<String> {
+    if !t.is_finite() {
+        return None;
+    }
+    let p = parts(t);
+    let year = if (0..=9999).contains(&p[0]) {
+        format!("{:04}", p[0])
+    } else {
+        format!("{}{:06}", if p[0] < 0 { '-' } else { '+' }, p[0].abs())
+    };
+    Some(format!(
+        "{year}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        p[1] + 1,
+        p[2],
+        p[3],
+        p[4],
+        p[5],
+        p[6]
+    ))
+}
+
+fn date_string(t: f64) -> String {
+    if !t.is_finite() {
+        return "Invalid Date".into();
+    }
+    let p = parts(t);
+    format!(
+        "{} {} {:02} {:04} {:02}:{:02}:{:02} GMT+0000 (UTC)",
+        DAYS[p[7] as usize], MONTHS[p[1] as usize], p[2], p[0], p[3], p[4], p[5]
+    )
+}
+
+/// Reads ISO-8601 dates (`2024-05-06`, `2024-05-06T07:08`, `...:09.010Z`, `+02:00`); `NaN` otherwise.
+fn parse_date(s: &str) -> f64 {
+    let b = s.trim().as_bytes();
+    let num = |from: usize, n: usize| -> Option<f64> {
+        let part = b.get(from..from + n)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse::<f64>().ok())?
+    };
+    let Some(y) = num(0, 4) else { return f64::NAN };
+    let (mut mo, mut d, mut h, mut mi, mut sec, mut ms) = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    let mut at = 4;
+    if b.get(at) == Some(&b'-') {
+        let Some(v) = num(at + 1, 2) else {
+            return f64::NAN;
+        };
+        mo = v;
+        at += 3;
+        if b.get(at) == Some(&b'-') {
+            let Some(v) = num(at + 1, 2) else {
+                return f64::NAN;
+            };
+            d = v;
+            at += 3;
+        }
+    }
+    let mut offset = 0.0;
+    if matches!(b.get(at), Some(b'T' | b't' | b' ')) {
+        let (Some(hh), Some(mm)) = (num(at + 1, 2), num(at + 4, 2)) else {
+            return f64::NAN;
+        };
+        h = hh;
+        mi = mm;
+        at += 6;
+        if b.get(at) == Some(&b':') {
+            let Some(v) = num(at + 1, 2) else {
+                return f64::NAN;
+            };
+            sec = v;
+            at += 3;
+            if b.get(at) == Some(&b'.') {
+                let st = at + 1;
+                let mut e = st;
+                while b.get(e).is_some_and(u8::is_ascii_digit) {
+                    e += 1;
+                }
+                if e == st {
+                    return f64::NAN;
+                }
+                let frac = std::str::from_utf8(&b[st..e.min(st + 3)]).unwrap_or("0");
+                ms = frac.parse::<f64>().unwrap_or(0.0) * 10f64.powi(3 - frac.len() as i32);
+                at = e;
+            }
+        }
+        match b.get(at) {
+            Some(b'Z' | b'z') => at += 1,
+            Some(&sign @ (b'+' | b'-')) => {
+                let (Some(oh), Some(om)) = (num(at + 1, 2), num(at + 4, 2)) else {
+                    return f64::NAN;
+                };
+                offset = (oh * 60.0 + om) * 60_000.0 * if sign == b'-' { -1.0 } else { 1.0 };
+                at += 6;
+            }
+            _ => {}
+        }
+    }
+    if at != b.len()
+        || !(1.0..=12.0).contains(&mo)
+        || !(1.0..=31.0).contains(&d)
+        || h > 24.0
+        || mi > 59.0
+        || sec > 59.0
+    {
+        return f64::NAN;
+    }
+    make_time(y, mo - 1.0, d, h, mi, sec, ms) - offset
+}
+
+fn time_of(i: &mut Interp, this: &Value) -> R<f64> {
+    if let Value::Obj(o) = this {
+        if let Kind::Date(t) = &o.borrow().kind {
+            return Ok(*t);
+        }
+    }
+    Err(i.make_error("TypeError", "this is not a Date object"))
+}
+
+fn set_time(i: &mut Interp, this: &Value, t: f64) -> R<Value> {
+    let t = if t.is_finite() && t.abs() <= MAX_TIME {
+        t.trunc()
+    } else {
+        f64::NAN
+    };
+    if let Value::Obj(o) = this {
+        if let Kind::Date(slot) = &mut o.borrow_mut().kind {
+            *slot = t;
+            return Ok(Value::Num(t));
+        }
+    }
+    Err(i.make_error("TypeError", "this is not a Date object"))
+}
+
+fn now_ms(i: &Interp) -> f64 {
+    (i.epoch_ms + i.clock).floor()
+}
+
+fn install_date(i: &mut Interp) {
+    let proto = i.new_obj();
+    let d = ctor(i, "Date", &proto, |i, this, a| {
+        let Value::Obj(o) = this else {
+            // Called without `new`: the current time as text.
+            return Ok(Value::str(&date_string(now_ms(i))));
+        };
+        let t = match a.len() {
+            0 => now_ms(i),
+            1 => match &a[0] {
+                Value::Str(sv) => parse_date(sv),
+                Value::Obj(src) if matches!(src.borrow().kind, Kind::Date(_)) => time_of(i, &a[0])?,
+                v => i.coerce_num(v)?,
+            },
+            _ => {
+                let mut n = [f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+                for (k, slot) in n.iter_mut().enumerate() {
+                    if let Some(v) = a.get(k) {
+                        *slot = i.coerce_num(v)?;
+                    }
+                }
+                if (0.0..=99.0).contains(&n[0]) {
+                    n[0] += 1900.0;
+                }
+                make_time(n[0], n[1], n[2], n[3], n[4], n[5], n[6])
+            }
+        };
+        let t = if t.is_finite() && t.abs() <= MAX_TIME {
+            t.trunc()
+        } else {
+            f64::NAN
+        };
+        {
+            let mut b = o.borrow_mut();
+            b.kind = Kind::Date(t);
+            b.class = "Date";
+        }
+        Ok(this.clone())
+    });
+    method(i, &d, "now", |i, _, _| Ok(Value::Num(now_ms(i))));
+    method(i, &d, "parse", |i, _, a| {
+        let t = i.text(&arg(a, 0))?;
+        Ok(Value::Num(parse_date(&t)))
+    });
+    method(i, &d, "UTC", |i, _, a| {
+        let mut n = [f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        for (k, slot) in n.iter_mut().enumerate() {
+            if let Some(v) = a.get(k) {
+                *slot = i.coerce_num(v)?;
+            }
+        }
+        if (0.0..=99.0).contains(&n[0]) {
+            n[0] += 1900.0;
+        }
+        Ok(Value::Num(make_time(
+            n[0], n[1], n[2], n[3], n[4], n[5], n[6],
+        )))
+    });
+    for name in ["getTime", "valueOf"] {
+        method(i, &proto, name, |i, t, _| Ok(Value::Num(time_of(i, t)?)));
+    }
+    method(i, &proto, "getTimezoneOffset", |i, t, _| {
+        time_of(i, t)?;
+        Ok(Value::Num(0.0))
+    });
+    // Getters (the time zone is UTC, so local and UTC are the same).
+    let getters: [(&str, usize); 8] = [
+        ("FullYear", 0),
+        ("Month", 1),
+        ("Date", 2),
+        ("Hours", 3),
+        ("Minutes", 4),
+        ("Seconds", 5),
+        ("Milliseconds", 6),
+        ("Day", 7),
+    ];
+    for (name, idx) in getters {
+        for prefix in ["get", "getUTC"] {
+            method(i, &proto, &format!("{prefix}{name}"), move |i, t, _| {
+                let tm = time_of(i, t)?;
+                Ok(Value::Num(if tm.is_finite() {
+                    parts(tm)[idx] as f64
+                } else {
+                    f64::NAN
+                }))
+            });
+        }
+    }
+    // Setters: each replaces some components and keeps the rest.
+    let setters: [(&str, usize, usize); 7] = [
+        ("FullYear", 0, 3),
+        ("Month", 1, 2),
+        ("Date", 2, 1),
+        ("Hours", 3, 4),
+        ("Minutes", 4, 3),
+        ("Seconds", 5, 2),
+        ("Milliseconds", 6, 1),
+    ];
+    for (name, first, max_args) in setters {
+        for prefix in ["set", "setUTC"] {
+            method(i, &proto, &format!("{prefix}{name}"), move |i, t, a| {
+                let tm = time_of(i, t)?;
+                let base = if tm.is_finite() {
+                    tm
+                } else if first == 0 {
+                    0.0
+                } else {
+                    return Ok(Value::Num(f64::NAN));
+                };
+                let p = parts(base);
+                let mut c: [f64; 7] = [
+                    p[0] as f64,
+                    p[1] as f64,
+                    p[2] as f64,
+                    p[3] as f64,
+                    p[4] as f64,
+                    p[5] as f64,
+                    p[6] as f64,
+                ];
+                for k in 0..max_args.min(a.len()).max(1) {
+                    c[first + k] = match a.get(k) {
+                        Some(v) => i.coerce_num(v)?,
+                        None => f64::NAN,
+                    };
+                }
+                set_time(i, t, make_time(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+            });
+        }
+    }
+    method(i, &proto, "setTime", |i, t, a| {
+        let v = i.coerce_num(&arg(a, 0))?;
+        set_time(i, t, v)
+    });
+    method(i, &proto, "toISOString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        match iso_string(tm) {
+            Some(s) => Ok(Value::str(&s)),
+            None => Err(i.make_error("RangeError", "Invalid time value")),
+        }
+    });
+    method(i, &proto, "toJSON", |i, t, _| {
+        let tm = time_of(i, t)?;
+        Ok(iso_string(tm).map_or(Value::Null, |s| Value::str(&s)))
+    });
+    method(i, &proto, "toString", |i, t, _| {
+        Ok(Value::str(&date_string(time_of(i, t)?)))
+    });
+    method(i, &proto, "toUTCString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        Ok(Value::str(&format!(
+            "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+            DAYS[p[7] as usize], p[2], MONTHS[p[1] as usize], p[0], p[3], p[4], p[5]
+        )))
+    });
+    method(i, &proto, "toDateString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        Ok(Value::str(&format!(
+            "{} {} {:02} {:04}",
+            DAYS[p[7] as usize], MONTHS[p[1] as usize], p[2], p[0]
+        )))
+    });
+    method(i, &proto, "toTimeString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        Ok(Value::str(&format!(
+            "{:02}:{:02}:{:02} GMT+0000 (UTC)",
+            p[3], p[4], p[5]
+        )))
+    });
+    method(i, &proto, "toLocaleDateString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        Ok(Value::str(&format!("{}/{}/{}", p[1] + 1, p[2], p[0])))
+    });
+    method(i, &proto, "toLocaleTimeString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        let h12 = if p[3] % 12 == 0 { 12 } else { p[3] % 12 };
+        Ok(Value::str(&format!(
+            "{h12}:{:02}:{:02} {}",
+            p[4],
+            p[5],
+            if p[3] < 12 { "AM" } else { "PM" }
+        )))
+    });
+    method(i, &proto, "toLocaleString", |i, t, _| {
+        let tm = time_of(i, t)?;
+        if !tm.is_finite() {
+            return Ok(Value::str("Invalid Date"));
+        }
+        let p = parts(tm);
+        let h12 = if p[3] % 12 == 0 { 12 } else { p[3] % 12 };
+        Ok(Value::str(&format!(
+            "{}/{}/{}, {h12}:{:02}:{:02} {}",
+            p[1] + 1,
+            p[2],
+            p[0],
+            p[4],
+            p[5],
+            if p[3] < 12 { "AM" } else { "PM" }
+        )))
+    });
 }
