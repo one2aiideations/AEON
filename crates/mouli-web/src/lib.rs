@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod css;
+pub mod display;
 pub mod dom;
 pub mod gate;
 pub mod html;

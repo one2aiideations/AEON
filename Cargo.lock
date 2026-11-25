@@ -2778,6 +2778,9 @@ dependencies = [
 [[package]]
 name = "mouli-screen"
 version = "0.1.0"
+dependencies = [
+ "mouli-web",
+]
 
 [[package]]
 name = "mouli-sdv"
