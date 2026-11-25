@@ -20,3 +20,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The model engine is where the time goes, so it is built for speed, not size.
+[profile.release.package.mouli-llm]
+opt-level = 3

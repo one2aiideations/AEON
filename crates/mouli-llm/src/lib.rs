@@ -3585,7 +3585,7 @@ pub mod quant {
     pub fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> Result<f32, QuantError> {
         let mut tmp = vec![0.0f32; x.len()];
         dequantize(ty, row, &mut tmp)?;
-        Ok(tmp.iter().zip(x).map(|(a, b)| a * b).sum())
+        Ok(dot_f32(&tmp, x))
     }
 
     /// Matrix-vector product with a quantised row-major matrix: `out[r] = row_r · x`.
@@ -3610,17 +3610,425 @@ pub mod quant {
                 found: bytes.len(),
             });
         }
+        if !is_supported(ty) {
+            return Err(QuantError::Unsupported(ty));
+        }
+        let work = rows.saturating_mul(cols);
+        let threads = if work >= PARALLEL_MIN_WORK && rows >= 2 * MIN_ROWS_PER_THREAD {
+            thread_count().min(rows / MIN_ROWS_PER_THREAD).max(1)
+        } else {
+            1
+        };
+        if threads <= 1 {
+            return matvec_rows(ty, bytes, row_bytes, cols, x, out);
+        }
+        // Each thread takes a run of whole rows; the result does not depend on how rows are split.
+        let per = rows.div_ceil(threads);
+        let mut result: Result<(), QuantError> = Ok(());
+        std::thread::scope(|s| {
+            let handles: Vec<_> = out
+                .chunks_mut(per)
+                .enumerate()
+                .map(|(i, o)| {
+                    let part = &bytes[i * per * row_bytes..(i * per + o.len()) * row_bytes];
+                    s.spawn(move || matvec_rows(ty, part, row_bytes, cols, x, o))
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(Err(e)) => result = Err(e),
+                    Ok(Ok(())) => {}
+                    Err(_) => result = Err(QuantError::Overflow),
+                }
+            }
+        });
+        result
+    }
+
+    /// Matrix times several vectors: `out[t * rows + r] = row_r · xs[t * cols ..]` for each of `t`
+    /// input vectors. Each weight row is expanded once and reused for every vector, which is what
+    /// makes reading a long prompt much faster than going through it one token at a time.
+    pub fn matmat(
+        ty: GgmlType,
+        bytes: &[u8],
+        rows: usize,
+        cols: usize,
+        xs: &[f32],
+        t: usize,
+        out: &mut [f32],
+    ) -> Result<(), QuantError> {
+        if t == 1 {
+            return matvec(ty, bytes, rows, cols, xs, out);
+        }
+        if xs.len() != cols.checked_mul(t).ok_or(QuantError::Overflow)? || out.len() != rows * t {
+            return Err(QuantError::WrongOutputLength);
+        }
+        let row_bytes = byte_len(ty, cols)?;
+        if bytes.len() != row_bytes.checked_mul(rows).ok_or(QuantError::Overflow)? {
+            return Err(QuantError::WrongByteLength {
+                expected: row_bytes * rows,
+                found: bytes.len(),
+            });
+        }
+        if !is_supported(ty) {
+            return Err(QuantError::Unsupported(ty));
+        }
+        let work = rows.saturating_mul(cols).saturating_mul(t) / 8;
+        let threads = if work >= PARALLEL_MIN_WORK && rows >= 2 * MIN_ROWS_PER_THREAD {
+            thread_count().min(rows / MIN_ROWS_PER_THREAD).max(1)
+        } else {
+            1
+        };
+        let per = rows.div_ceil(threads);
+        let part = |start: usize, end: usize| -> Result<Vec<f32>, QuantError> {
+            let mut tmp = vec![0.0f32; cols];
+            let mut local = vec![0.0f32; (end - start) * t];
+            for r in start..end {
+                dequantize(ty, &bytes[r * row_bytes..(r + 1) * row_bytes], &mut tmp)?;
+                for ti in 0..t {
+                    local[(r - start) * t + ti] = dot_f32(&tmp, &xs[ti * cols..(ti + 1) * cols]);
+                }
+            }
+            Ok(local)
+        };
+        let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
+        if threads <= 1 {
+            pieces.push((0, part(0, rows)?));
+        } else {
+            let mut failure = None;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|i| (i * per, ((i + 1) * per).min(rows)))
+                    .filter(|(a, b)| a < b)
+                    .map(|(a, b)| (a, s.spawn(move || part(a, b))))
+                    .collect();
+                for (a, h) in handles {
+                    match h.join() {
+                        Ok(Ok(v)) => pieces.push((a, v)),
+                        Ok(Err(e)) => failure = Some(e),
+                        Err(_) => failure = Some(QuantError::Overflow),
+                    }
+                }
+            });
+            if let Some(e) = failure {
+                return Err(e);
+            }
+        }
+        for (start, local) in pieces {
+            let n = local.len() / t;
+            for rr in 0..n {
+                for ti in 0..t {
+                    out[ti * rows + start + rr] = local[rr * t + ti];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Work (rows times columns) below which threads are not worth starting.
+    const PARALLEL_MIN_WORK: usize = 1 << 19;
+    /// Fewest rows a thread is given.
+    const MIN_ROWS_PER_THREAD: usize = 32;
+
+    /// How many threads matrix products may use: the machine's, at most 8, or `MOULI_THREADS`.
+    #[must_use]
+    pub fn thread_count() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            let env = std::env::var("MOULI_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+            let hw = std::thread::available_parallelism().map_or(1, usize::from);
+            env.unwrap_or(hw.min(8)).clamp(1, 64)
+        })
+    }
+
+    /// Dot product with eight independent running sums, so the CPU can add in parallel (a single
+    /// running sum must wait for each addition to finish before the next).
+    #[must_use]
+    pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        let mut acc = [0.0f32; 8];
+        let n = a.len().min(b.len());
+        let (a, b) = (&a[..n], &b[..n]);
+        let (ca, ra) = a.as_chunks::<8>();
+        let (cb, rb) = b.as_chunks::<8>();
+        for (x, y) in ca.iter().zip(cb) {
+            for i in 0..8 {
+                acc[i] += x[i] * y[i];
+            }
+        }
+        let mut tail = 0.0f32;
+        for (x, y) in ra.iter().zip(rb) {
+            tail += x * y;
+        }
+        ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+    }
+
+    /// A dot product of one packed row with a vector.
+    type RowDot = fn(&[u8], &[f32]) -> f32;
+
+    fn matvec_rows(
+        ty: GgmlType,
+        bytes: &[u8],
+        row_bytes: usize,
+        cols: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), QuantError> {
+        // The common formats are multiplied straight from their packed form; the rest are
+        // expanded one row at a time.
+        let fused: Option<RowDot> = match ty {
+            GgmlType::Q4_K => Some(fused::q4_k),
+            GgmlType::Q6_K => Some(fused::q6_k),
+            GgmlType::Q8_0 => Some(fused::q8_0),
+            GgmlType::Q4_0 => Some(fused::q4_0),
+            _ => None,
+        };
+        if let Some(f) = fused {
+            for (r, o) in out.iter_mut().enumerate() {
+                *o = f(&bytes[r * row_bytes..(r + 1) * row_bytes], x);
+            }
+            return Ok(());
+        }
         let mut tmp = vec![0.0f32; cols];
         for (r, o) in out.iter_mut().enumerate() {
             dequantize(ty, &bytes[r * row_bytes..(r + 1) * row_bytes], &mut tmp)?;
-            *o = tmp.iter().zip(x).map(|(a, b)| a * b).sum();
+            *o = dot_f32(&tmp, x);
         }
         Ok(())
+    }
+
+    /// Dot products computed straight from the packed weights, without expanding them first.
+    ///
+    /// Each packed value is `scale * q (- offset)`, so a block's dot product is
+    /// `scale * sum(q * x) - offset * sum(x)`: one multiply-add per weight and the scale applied
+    /// once per block. Eight running sums keep the loops vectorisable.
+    mod fused {
+        use super::kquant::scale_min;
+        use crate::quant::float::f16_to_f32;
+
+        fn h(b: &[u8], at: usize) -> f32 {
+            f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]))
+        }
+
+        fn sum8(a: &[f32; 8]) -> f32 {
+            ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]))
+        }
+
+        pub(super) fn q4_k(row: &[u8], x: &[f32]) -> f32 {
+            let mut total = 0.0f32;
+            for (b, xb) in row
+                .as_chunks::<144>()
+                .0
+                .iter()
+                .zip(x.as_chunks::<256>().0.iter())
+            {
+                let (d, dmin) = (h(b, 0), h(b, 2));
+                let scales = &b[4..16];
+                for c in 0..4 {
+                    let (sc1, m1) = scale_min(2 * c, scales);
+                    let (sc2, m2) = scale_min(2 * c + 1, scales);
+                    let (Ok(q), Ok(x1), Ok(x2)) = (
+                        <&[u8; 32]>::try_from(&b[16 + c * 32..48 + c * 32]),
+                        <&[f32; 32]>::try_from(&xb[c * 64..c * 64 + 32]),
+                        <&[f32; 32]>::try_from(&xb[c * 64 + 32..c * 64 + 64]),
+                    ) else {
+                        continue;
+                    };
+                    let (mut q1, mut q2) = ([0.0f32; 8], [0.0f32; 8]);
+                    let (mut s1, mut s2) = ([0.0f32; 8], [0.0f32; 8]);
+                    for i in 0..4 {
+                        for j in 0..8 {
+                            let l = i * 8 + j;
+                            q1[j] += f32::from(q[l] & 0xf) * x1[l];
+                            q2[j] += f32::from(q[l] >> 4) * x2[l];
+                            s1[j] += x1[l];
+                            s2[j] += x2[l];
+                        }
+                    }
+                    total += d * f32::from(sc1) * sum8(&q1) - dmin * f32::from(m1) * sum8(&s1)
+                        + d * f32::from(sc2) * sum8(&q2)
+                        - dmin * f32::from(m2) * sum8(&s2);
+                }
+            }
+            total
+        }
+
+        pub(super) fn q6_k(row: &[u8], x: &[f32]) -> f32 {
+            let mut total = 0.0f32;
+            for (b, xb) in row
+                .as_chunks::<210>()
+                .0
+                .iter()
+                .zip(x.as_chunks::<256>().0.iter())
+            {
+                let d = h(b, 208);
+                for half in 0..2 {
+                    let ql = &b[half * 64..half * 64 + 64];
+                    let qh = &b[128 + half * 32..128 + half * 32 + 32];
+                    let sc = &b[192 + half * 8..192 + half * 8 + 8];
+                    let xs = &xb[half * 128..half * 128 + 128];
+                    for is in 0..2 {
+                        // Two runs of 16 share one set of four scales. Fixed-size views let the
+                        // compiler drop the bounds checks and vectorise the inner loops.
+                        let o = is * 16;
+                        let (Ok(qa), Ok(qb), Ok(qc)) = (
+                            <&[u8; 16]>::try_from(&ql[o..o + 16]),
+                            <&[u8; 16]>::try_from(&ql[o + 32..o + 48]),
+                            <&[u8; 16]>::try_from(&qh[o..o + 16]),
+                        ) else {
+                            continue;
+                        };
+                        let (Ok(x0), Ok(x1), Ok(x2), Ok(x3)) = (
+                            <&[f32; 16]>::try_from(&xs[o..o + 16]),
+                            <&[f32; 16]>::try_from(&xs[o + 32..o + 48]),
+                            <&[f32; 16]>::try_from(&xs[o + 64..o + 80]),
+                            <&[f32; 16]>::try_from(&xs[o + 96..o + 112]),
+                        ) else {
+                            continue;
+                        };
+                        let mut acc = [[0.0f32; 8]; 4];
+                        for i in 0..2 {
+                            for j in 0..8 {
+                                let l = i * 8 + j;
+                                let hb = qc[l];
+                                let q1 = i32::from((qa[l] & 0xf) | ((hb & 3) << 4)) - 32;
+                                let q2 = i32::from((qb[l] & 0xf) | (((hb >> 2) & 3) << 4)) - 32;
+                                let q3 = i32::from((qa[l] >> 4) | (((hb >> 4) & 3) << 4)) - 32;
+                                let q4 = i32::from((qb[l] >> 4) | (((hb >> 6) & 3) << 4)) - 32;
+                                acc[0][j] += q1 as f32 * x0[l];
+                                acc[1][j] += q2 as f32 * x1[l];
+                                acc[2][j] += q3 as f32 * x2[l];
+                                acc[3][j] += q4 as f32 * x3[l];
+                            }
+                        }
+                        for (k, a) in acc.iter().enumerate() {
+                            let s = f32::from(sc[is + 2 * k] as i8);
+                            total += d * s * sum8(a);
+                        }
+                    }
+                }
+            }
+            total
+        }
+
+        pub(super) fn q8_0(row: &[u8], x: &[f32]) -> f32 {
+            let mut total = 0.0f32;
+            for (b, xb) in row
+                .as_chunks::<34>()
+                .0
+                .iter()
+                .zip(x.as_chunks::<32>().0.iter())
+            {
+                let mut acc = [0.0f32; 8];
+                for i in 0..4 {
+                    for (j, a) in acc.iter_mut().enumerate() {
+                        let l = i * 8 + j;
+                        *a += f32::from(b[2 + l] as i8) * xb[l];
+                    }
+                }
+                total += h(b, 0) * sum8(&acc);
+            }
+            total
+        }
+
+        pub(super) fn q4_0(row: &[u8], x: &[f32]) -> f32 {
+            let mut total = 0.0f32;
+            for (b, xb) in row
+                .as_chunks::<18>()
+                .0
+                .iter()
+                .zip(x.as_chunks::<32>().0.iter())
+            {
+                let (mut lo, mut hi) = ([0.0f32; 8], [0.0f32; 8]);
+                for i in 0..2 {
+                    for j in 0..8 {
+                        let l = i * 8 + j;
+                        let q = b[2 + l];
+                        lo[j] += (f32::from(q & 0xf) - 8.0) * xb[l];
+                        hi[j] += (f32::from(q >> 4) - 8.0) * xb[l + 16];
+                    }
+                }
+                total += h(b, 0) * (sum8(&lo) + sum8(&hi));
+            }
+            total
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn fused_dot_products_agree_with_expanding_first() {
+            // Deterministic pseudo-random bytes and inputs.
+            let mut seed = 0x1234_5678_9abc_def1u64;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for (ty, bs, per) in [
+                (GgmlType::Q4_K, 144usize, 256usize),
+                (GgmlType::Q6_K, 210, 256),
+                (GgmlType::Q8_0, 34, 32),
+                (GgmlType::Q4_0, 18, 32),
+            ] {
+                let cols = per * 6;
+                let mut bytes: Vec<u8> = (0..6 * bs).map(|_| (rnd() >> 24) as u8).collect();
+                // Sensible scales: set every block's f16 scale bytes to small normal numbers.
+                for blk in 0..6 {
+                    let at = match ty {
+                        GgmlType::Q6_K => blk * bs + 208,
+                        _ => blk * bs,
+                    };
+                    bytes[at] = 0x00;
+                    bytes[at + 1] = 0x2c; // about 0.0625
+                    if matches!(ty, GgmlType::Q4_K) {
+                        bytes[at + 2] = 0x00;
+                        bytes[at + 3] = 0x28; // about 0.03
+                    }
+                }
+                let x: Vec<f32> = (0..cols)
+                    .map(|_| ((rnd() >> 40) as f32 / 8_388_608.0) - 1.0)
+                    .collect();
+                let mut out = [0.0f32; 1];
+                matvec(ty, &bytes, 1, cols, &x, &mut out).unwrap();
+                let want = dot_row(ty, &bytes, &x).unwrap();
+                let mut tmp = vec![0.0f32; cols];
+                dequantize(ty, &bytes, &mut tmp).unwrap();
+                let reference: f64 = tmp
+                    .iter()
+                    .zip(&x)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                let tol = 1e-3 * reference.abs().max(1.0);
+                assert!(
+                    (f64::from(out[0]) - reference).abs() < tol,
+                    "{ty:?}: fused {} vs {reference}",
+                    out[0]
+                );
+                assert!((f64::from(want) - reference).abs() < tol);
+            }
+        }
+
+        #[test]
+        fn threaded_and_single_threaded_matvec_give_the_same_answer() {
+            let (rows, cols) = (1024usize, 512usize);
+            let bytes: Vec<u8> = (0..rows * (cols / 256) * 144)
+                .map(|i| (i * 31 % 251) as u8)
+                .collect();
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.37).sin()).collect();
+            let mut a = vec![0.0f32; rows];
+            matvec(GgmlType::Q4_K, &bytes, rows, cols, &x, &mut a).unwrap();
+            let mut b = vec![0.0f32; rows];
+            matvec_rows(GgmlType::Q4_K, &bytes, 2 * 144, cols, &x, &mut b).unwrap();
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "rows are independent, so splitting them cannot change a result"
+            );
+        }
 
         #[test]
         fn support_table() {
@@ -11227,6 +11635,25 @@ mod model {
             )?)
         }
 
+        /// `out[t * rows ..] = m * xs[t * cols ..]` for `t` input vectors.
+        pub(crate) fn matmat(
+            &self,
+            m: &Mat,
+            xs: &[f32],
+            t: usize,
+            out: &mut [f32],
+        ) -> Result<(), LlmError> {
+            Ok(crate::quant::matmat(
+                m.ty,
+                &self.bytes()[m.start..m.end],
+                m.rows,
+                m.cols,
+                xs,
+                t,
+                out,
+            )?)
+        }
+
         /// The embedding row of `token`.
         pub(crate) fn embed(&self, token: u32, out: &mut [f32]) -> Result<(), LlmError> {
             let m = &self.token_embd;
@@ -11454,6 +11881,9 @@ mod session {
     use crate::model::Model;
     use crate::sampler::Sampler;
 
+    /// Tokens processed together when a prompt is read.
+    const PREFILL_CHUNK: usize = 32;
+
     /// State of one conversation with a [`Model`]: the KV cache and the next position.
     pub struct Session<'m> {
         model: &'m Model,
@@ -11664,6 +12094,9 @@ mod session {
         }
 
         /// Process several tokens and return the logits after the last one.
+        ///
+        /// Tokens are taken in chunks so that every weight is read once per chunk, not once per
+        /// token; the result is the same as feeding them one at a time (up to rounding).
         pub fn prefill(&mut self, tokens: &[u32]) -> Result<&[f32], LlmError> {
             if tokens.is_empty() {
                 return Err(LlmError::BadConfig("prefill needs at least one token"));
@@ -11671,10 +12104,156 @@ mod session {
             if tokens.len() > self.remaining() {
                 return Err(LlmError::ContextFull);
             }
-            for t in &tokens[..tokens.len() - 1] {
-                self.forward(*t)?;
+            let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_CHUNK).collect();
+            let last = chunks.len() - 1;
+            for (i, ch) in chunks.into_iter().enumerate() {
+                if ch.len() == 1 {
+                    // A lone token takes the ordinary path (and a lone final token needs logits).
+                    self.forward(ch[0])?;
+                } else {
+                    self.forward_chunk(ch, i == last)?;
+                }
             }
-            self.forward(tokens[tokens.len() - 1])
+            Ok(&self.logits)
+        }
+
+        /// Runs `tokens` (at least two) through the network together. Logits are produced only
+        /// when `want_logits` is set.
+        fn forward_chunk(&mut self, tokens: &[u32], want_logits: bool) -> Result<(), LlmError> {
+            let m = self.model;
+            let c = m.config();
+            let t = tokens.len();
+            if t > self.remaining() {
+                return Err(LlmError::ContextFull);
+            }
+            let (e, qd, kd, ff) = (c.n_embd, c.n_head * c.head_dim, c.kv_dim(), c.n_ff);
+            let base_pos = self.pos;
+            let group = c.n_head / c.n_head_kv;
+            let scale = 1.0 / (c.head_dim as f32).sqrt();
+            let mut x = vec![0.0f32; t * e];
+            for (i, tok) in tokens.iter().enumerate() {
+                m.embed(*tok, &mut x[i * e..(i + 1) * e])?;
+            }
+            let mut xn = vec![0.0f32; t * e];
+            let mut q = vec![0.0f32; t * qd];
+            let mut kb = vec![0.0f32; t * kd];
+            let mut vb = vec![0.0f32; t * kd];
+            let mut attn = vec![0.0f32; t * qd];
+            let mut gate = vec![0.0f32; t * ff];
+            let mut up = vec![0.0f32; t * ff];
+            let mut hidden = vec![0.0f32; t * ff];
+            for (l, layer) in m.layers.iter().enumerate() {
+                for i in 0..t {
+                    map_op(ops::rmsnorm(
+                        &x[i * e..(i + 1) * e],
+                        &layer.attn_norm,
+                        c.rms_eps,
+                        &mut xn[i * e..(i + 1) * e],
+                    ))?;
+                }
+                m.matmat(&layer.wq, &xn, t, &mut q)?;
+                m.matmat(&layer.wk, &xn, t, &mut kb)?;
+                m.matmat(&layer.wv, &xn, t, &mut vb)?;
+                for (buf, bias, width) in [
+                    (&mut q, &layer.bq, qd),
+                    (&mut kb, &layer.bk, kd),
+                    (&mut vb, &layer.bv, kd),
+                ] {
+                    if let Some(b) = bias {
+                        for row in buf.chunks_mut(width) {
+                            for (v, b) in row.iter_mut().zip(b) {
+                                *v += b;
+                            }
+                        }
+                    }
+                }
+                for i in 0..t {
+                    let pos = base_pos + i;
+                    rope(
+                        &mut q[i * qd..(i + 1) * qd],
+                        c.n_head,
+                        c.head_dim,
+                        c.rope_dim,
+                        pos,
+                        c.rope_base,
+                        c.rope_style,
+                    );
+                    rope(
+                        &mut kb[i * kd..(i + 1) * kd],
+                        c.n_head_kv,
+                        c.head_dim,
+                        c.rope_dim,
+                        pos,
+                        c.rope_base,
+                        c.rope_style,
+                    );
+                    for h in 0..c.n_head_kv {
+                        let at = self.cache_base(l, h) + pos * c.head_dim;
+                        self.k[at..at + c.head_dim].copy_from_slice(
+                            &kb[i * kd + h * c.head_dim..i * kd + (h + 1) * c.head_dim],
+                        );
+                        self.v[at..at + c.head_dim].copy_from_slice(
+                            &vb[i * kd + h * c.head_dim..i * kd + (h + 1) * c.head_dim],
+                        );
+                    }
+                }
+                for i in 0..t {
+                    let pos = base_pos + i;
+                    for h in 0..c.n_head {
+                        let base = self.cache_base(l, h / group);
+                        let len = (pos + 1) * c.head_dim;
+                        map_op(ops::attention(
+                            &q[i * qd + h * c.head_dim..i * qd + (h + 1) * c.head_dim],
+                            &self.k[base..base + len],
+                            &self.v[base..base + len],
+                            pos + 1,
+                            scale,
+                            &mut self.scores,
+                            &mut attn[i * qd + h * c.head_dim..i * qd + (h + 1) * c.head_dim],
+                        ))?;
+                    }
+                }
+                m.matmat(&layer.wo, &attn, t, &mut xn)?;
+                for (xv, o) in x.iter_mut().zip(&xn) {
+                    *xv += o;
+                }
+                for i in 0..t {
+                    map_op(ops::rmsnorm(
+                        &x[i * e..(i + 1) * e],
+                        &layer.ffn_norm,
+                        c.rms_eps,
+                        &mut xn[i * e..(i + 1) * e],
+                    ))?;
+                }
+                m.matmat(&layer.w_gate, &xn, t, &mut gate)?;
+                m.matmat(&layer.w_up, &xn, t, &mut up)?;
+                for i in 0..t {
+                    map_op(ops::swiglu(
+                        &gate[i * ff..(i + 1) * ff],
+                        &up[i * ff..(i + 1) * ff],
+                        &mut hidden[i * ff..(i + 1) * ff],
+                    ))?;
+                }
+                m.matmat(&layer.w_down, &hidden, t, &mut xn)?;
+                for (xv, o) in x.iter_mut().zip(&xn) {
+                    *xv += o;
+                }
+            }
+            self.pos += t;
+            if want_logits {
+                self.x.copy_from_slice(&x[(t - 1) * e..t * e]);
+                map_op(ops::rmsnorm(
+                    &self.x,
+                    &m.output_norm,
+                    c.rms_eps,
+                    &mut self.xn,
+                ))?;
+                m.matvec(&m.output, &self.xn, &mut self.logits)?;
+                if self.logits.iter().any(|v| !v.is_finite()) {
+                    return Err(LlmError::NonFinite);
+                }
+            }
+            Ok(())
         }
 
         /// Feed `prompt`, then sample up to `max_new` tokens, stopping early on a token in `stop`
