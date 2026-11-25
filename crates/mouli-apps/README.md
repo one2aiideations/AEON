@@ -9,6 +9,7 @@ through one gate: policy, approval where the risk calls for it, and the audit ch
 | Sheet (`mouli-sheet`) | `sheet.list`, `sheet.get`, `sheet.show`, `sheet.set`, `sheet.add`, `sheet.clear` | `sheet.clear` |
 | Studio (`mouli-studio`) | `studio.show`, `studio.heading`, `studio.paragraph`, `studio.clear` | `studio.clear` |
 | CRM (`mouli-crm`) | `crm.lead.list/capture/qualify/convert`, `crm.opp.list/advance`, `crm.approval.decide`, `crm.forecast` | `crm.approval.decide` |
+| Player (`mouli-player`) | `player.status`, `player.queue` (read); `player.add/play/pause/next/prev/stop/seek/volume/mute/speed/shuffle/repeat/autoplay/shorts/rate/jump/remove/clear` | none (all are plain writes; viewers get the two read ones) |
 | Code (`mouli-code`) | `code.status`, `code.files`, `code.read`, `code.edit`, `code.propose`, `code.reject`, `code.apply`, `code.rollback` | `code.apply`, `code.rollback` |
 
 `register(&mut workspace)` creates both and returns shared handles so the screens can draw their

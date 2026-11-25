@@ -128,6 +128,7 @@ impl MenuBar {
                         item("Sheet", "F7", Command::Open(Tab::Sheet)),
                         item("Studio", "F8", Command::Open(Tab::Studio)),
                         item("Code", "F9", Command::Open(Tab::Editor)),
+                        item("Player", "F10", Command::Open(Tab::Player)),
                     ],
                 },
                 Menu {

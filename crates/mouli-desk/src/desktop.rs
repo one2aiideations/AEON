@@ -110,6 +110,10 @@ impl Desktop {
                 label: "Code",
                 tab: Some(Tab::Editor),
             },
+            IconSpot {
+                label: "Player",
+                tab: Some(Tab::Player),
+            },
         ];
         Self {
             width,
@@ -254,7 +258,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=9) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
+            Key::F(n @ 1..=10) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
             _ => None,
         };
         if let Some(cmd) = command {

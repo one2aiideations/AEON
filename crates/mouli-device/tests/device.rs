@@ -938,3 +938,186 @@ fn reading_a_file_in_the_editor_does_not_copy_it_into_the_conversation() {
         .unwrap_or(0);
     assert!(longest < 500, "{longest}");
 }
+
+// ---------------------------------------------------------------- the player
+
+#[derive(Clone, Default)]
+struct PlayLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+impl mouli_player::Backend for PlayLog {
+    fn load(&mut self, s: &mouli_player::Source) -> Result<(), String> {
+        self.0.borrow_mut().push(format!("load {}", s.label()));
+        Ok(())
+    }
+    fn pause(&mut self, p: bool) {
+        self.0.borrow_mut().push(format!("pause {p}"));
+    }
+    fn seek(&mut self, s: u32) {
+        self.0.borrow_mut().push(format!("seek {s}"));
+    }
+    fn set_volume(&mut self, v: u8) {
+        self.0.borrow_mut().push(format!("vol {v}"));
+    }
+    fn set_speed(&mut self, v: u16) {
+        self.0.borrow_mut().push(format!("speed {v}"));
+    }
+    fn stop(&mut self) {
+        self.0.borrow_mut().push("stop".into());
+    }
+}
+
+fn player_device(user: &str, role: &str) -> (Device<Echo>, PlayLog) {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_role(Permissions::new(
+        "viewer",
+        &["player.status", "player.queue"],
+    ));
+    ws.add_model(model());
+    let log = PlayLog::default();
+    let player = mouli_apps::register_player(&mut ws, Box::new(log.clone())).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", user, role).unwrap();
+    d.attach_player(player);
+    (d, log)
+}
+
+fn last_load(log: &PlayLog) -> String {
+    log.0
+        .borrow()
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("load"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn add_link(d: &mut Device<Echo>, url: &str) {
+    d.on_key(Key::Char('o'));
+    type_keys(d, url);
+    d.on_key(Key::Enter);
+}
+
+#[test]
+fn a_pasted_link_joins_the_queue_and_space_starts_it() {
+    let (mut d, log) = player_device("owner", "owner");
+    d.on_key(Key::F(10));
+    assert_eq!(d.shell.active, Tab::Player);
+    add_link(&mut d, "https://www.youtube.com/shorts/dQw4w9WgXcQ");
+    assert_eq!(d.shell.player.view.queue.len(), 1);
+    assert_eq!(d.shell.player.view.queue[0].kind, "short");
+    assert!(
+        d.shell.player.message.contains("Added"),
+        "{}",
+        d.shell.player.message
+    );
+    d.on_key(Key::Char(' '));
+    assert_eq!(last_load(&log), "load YouTube Short dQw4w9WgXcQ");
+    assert_eq!(d.shell.player.view.state, "loading");
+    d.player_event(mouli_player::Event::Loaded(Some(31)));
+    d.player_event(mouli_player::Event::Position(12));
+    let v = &d.shell.player.view;
+    assert_eq!(
+        (v.state.as_str(), v.position, v.duration),
+        ("playing", 12, Some(31))
+    );
+    assert!(v.queue[0].current);
+}
+
+#[test]
+fn shorts_play_one_after_another_from_the_keyboard_with_no_scrolling() {
+    let (mut d, log) = player_device("owner", "owner");
+    d.on_key(Key::F(10));
+    for id in ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"] {
+        add_link(&mut d, &format!("https://www.youtube.com/shorts/{id}"));
+    }
+    d.on_key(Key::Char('f')); // the Shorts feed
+    assert!(d.shell.player.view.shorts && d.shell.player.view.autoplay);
+    d.on_key(Key::Char(' '));
+    for _ in 0..3 {
+        d.player_event(mouli_player::Event::Loaded(None));
+        d.player_event(mouli_player::Event::Ended);
+    }
+    let loads: Vec<String> = log
+        .0
+        .borrow()
+        .iter()
+        .filter(|l| l.starts_with("load"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        loads,
+        [
+            "load YouTube Short aaaaaaaaaaa",
+            "load YouTube Short bbbbbbbbbbb",
+            "load YouTube Short ccccccccccc"
+        ]
+    );
+    assert_eq!(d.shell.player.view.state, "ended");
+}
+
+#[test]
+fn thumbs_down_skips_and_the_keys_change_volume_and_speed_through_the_gate() {
+    let (mut d, log) = player_device("owner", "owner");
+    d.on_key(Key::F(10));
+    add_link(&mut d, "/m/a.mp4");
+    add_link(&mut d, "/m/b.mp4");
+    d.on_key(Key::Char(' '));
+    d.player_event(mouli_player::Event::Loaded(None));
+    d.on_key(Key::Char('d'));
+    assert_eq!(last_load(&log), "load b.mp4", "down skips to the next");
+    d.on_key(Key::Char('-'));
+    d.on_key(Key::Char(']'));
+    assert_eq!(d.shell.player.view.volume, 75);
+    assert_eq!(d.shell.player.view.speed, 125);
+    assert!(
+        d.shell
+            .audit
+            .rows
+            .iter()
+            .any(|r| r.action == "player.add" && r.outcome == "ok"),
+        "calls are audited"
+    );
+    assert!(d.shell.audit.rows.iter().any(|r| r.action == "player.rate"));
+}
+
+#[test]
+fn a_viewer_cannot_control_the_player_and_is_told_why() {
+    let (mut d, log) = player_device("vic", "viewer");
+    d.on_key(Key::F(10));
+    add_link(&mut d, "/m/a.mp4");
+    assert!(d.shell.player.view.queue.is_empty());
+    assert!(
+        !d.shell.player.message.is_empty(),
+        "{}",
+        d.shell.player.message
+    );
+    d.on_key(Key::Char(' '));
+    assert!(log.0.borrow().is_empty(), "nothing was played");
+}
+
+#[test]
+fn a_bad_link_is_refused_with_a_reason_on_the_screen() {
+    let (mut d, log) = player_device("owner", "owner");
+    d.on_key(Key::F(10));
+    add_link(&mut d, "https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ");
+    assert!(d.shell.player.view.queue.is_empty());
+    assert!(
+        d.shell.player.message.contains("not a YouTube"),
+        "{}",
+        d.shell.player.message
+    );
+    assert!(log.0.borrow().is_empty());
+}
+
+#[test]
+fn without_a_player_the_screen_says_so() {
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.on_key(Key::F(10));
+    d.on_key(Key::Char(' '));
+    assert!(
+        d.shell.player.message.contains("not connected"),
+        "{}",
+        d.shell.player.message
+    );
+    d.player_event(mouli_player::Event::Ended); // harmless
+}

@@ -11,6 +11,7 @@ mouli-screen = { path = "../mouli-screen" }
 mouli-interface = { path = "../mouli-interface" }
 mouli-code = { path = "../mouli-code" }
 mouli-apps = { path = "../mouli-apps" }
+mouli-player = { path = "../mouli-player" }
 mouli-studio = { path = "../mouli-studio" }
 
 [dev-dependencies]

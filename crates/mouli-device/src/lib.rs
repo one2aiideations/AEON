@@ -55,6 +55,7 @@ pub struct Device<B: Backend> {
     patch: patch::PatchSlot,
     apps: Option<Apps>,
     store: Option<AppStore>,
+    player: Option<mouli_apps::SharedPlayer>,
 }
 
 /// Where the applications are saved, and what was last written there.
@@ -87,6 +88,7 @@ impl<B: Backend> Device<B> {
             patch: patch::PatchSlot::default(),
             apps: None,
             store: None,
+            player: None,
         };
         d.refresh();
         Ok(d)
@@ -96,6 +98,22 @@ impl<B: Backend> Device<B> {
     /// and Studio screens show their real state.
     pub fn attach_apps(&mut self, apps: Apps) {
         self.apps = Some(apps);
+        self.refresh();
+    }
+
+    /// Connects the player registered in the workspace (see `mouli_apps::register_player`), so the
+    /// Player screen shows its real state and its keys control it through the governed gate.
+    pub fn attach_player(&mut self, player: mouli_apps::SharedPlayer) {
+        self.player = Some(player);
+        self.refresh();
+    }
+
+    /// Passes on what the player's backend reported (the video ended, an error, the position ...).
+    /// The host calls this as events arrive from mpv or from the YouTube page.
+    pub fn player_event(&mut self, event: mouli_player::Event) {
+        if let Some(p) = &self.player {
+            p.borrow_mut().on_event(event);
+        }
         self.refresh();
     }
 
@@ -288,12 +306,17 @@ impl<B: Backend> Device<B> {
             Some("code") => self.shell.review.message = text.to_string(),
             Some("sheet") => self.shell.sheet.message = text.to_string(),
             Some("studio") => self.shell.studio.message = text.to_string(),
+            Some("player") => self.shell.player.message = text.to_string(),
             _ => self.notice(text),
         }
     }
 
     /// Runs a capability a screen asked for, through the same gate as the chat.
     fn call(&mut self, capability: &str, args: Vec<(String, String)>) {
+        if capability.starts_with("player.") && self.player.is_none() {
+            self.app_message(capability, "The player is not connected.");
+            return;
+        }
         if capability.starts_with("code.") && !self.patch.gated {
             self.app_message(capability, "The Code application is not connected.");
             return;
@@ -318,6 +341,12 @@ impl<B: Backend> Device<B> {
     /// Hands what a capability returned to the screen that asked for it.
     fn deliver(&mut self, capability: &str, path: &str, text: &str) {
         match capability {
+            // Controls such as play, pause and seek show their result in the screen itself; only
+            // the actions with something to say (a title was added, an item taken out) get a line.
+            "player.add" | "player.remove" | "player.rate" | "player.clear" | "player.stop" => {
+                self.shell.player.message = text.to_string();
+            }
+            cap if cap.starts_with("player.") => self.shell.player.message.clear(),
             "code.files" => {
                 let files = text.lines().map(str::to_string).collect();
                 self.shell.editor.set_files(files);
@@ -415,7 +444,38 @@ impl<B: Backend> Device<B> {
         self.shell.security.set(score, findings);
         self.save_apps();
         self.refresh_apps();
+        self.refresh_player();
         patch::sync(self);
+    }
+
+    /// Copies the player's state into its screen.
+    fn refresh_player(&mut self) {
+        use mouli_screen::screens::{PlayerRow, PlayerView};
+        let Some(p) = &self.player else { return };
+        let s = p.borrow().snapshot();
+        self.shell.player.set_view(PlayerView {
+            state: s.state.to_string(),
+            failure: s.failure,
+            now: s.now,
+            position: s.position,
+            duration: s.duration,
+            volume: s.volume,
+            muted: s.muted,
+            speed: s.speed,
+            autoplay: s.autoplay,
+            shorts: s.shorts,
+            shuffle: s.shuffle,
+            repeat: s.repeat.to_string(),
+            queue: s
+                .queue
+                .into_iter()
+                .map(|r| PlayerRow {
+                    title: r.title,
+                    kind: r.kind.to_string(),
+                    current: r.current,
+                })
+                .collect(),
+        });
     }
 
     /// Copies the applications' state into their screens.

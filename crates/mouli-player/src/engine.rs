@@ -36,6 +36,27 @@ pub trait Backend {
     fn stop(&mut self);
 }
 
+impl<T: Backend + ?Sized> Backend for Box<T> {
+    fn load(&mut self, source: &Source) -> Result<(), String> {
+        (**self).load(source)
+    }
+    fn pause(&mut self, paused: bool) {
+        (**self).pause(paused);
+    }
+    fn seek(&mut self, secs: u32) {
+        (**self).seek(secs);
+    }
+    fn set_volume(&mut self, percent: u8) {
+        (**self).set_volume(percent);
+    }
+    fn set_speed(&mut self, percent: u16) {
+        (**self).set_speed(percent);
+    }
+    fn stop(&mut self) {
+        (**self).stop();
+    }
+}
+
 /// Where the player stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -82,6 +103,16 @@ pub enum Command {
     ShortsMode(bool),
     /// Mark the current item good, bad or reportable.
     Rate(Feedback),
+    /// Play queue item number `i` (counting from 0 in the order added).
+    Jump(usize),
+    /// Take queue item number `i` out. Taking out what is playing stops it.
+    Remove(usize),
+    /// Empty the queue and stop.
+    Clear,
+    /// Shuffle on or off.
+    Shuffle(bool),
+    /// What happens at the end of the queue.
+    SetRepeat(Repeat),
 }
 
 /// What the backend reports.
@@ -381,6 +412,34 @@ impl<B: Backend> Player<B> {
                     self.autoplay = true;
                 }
             }
+            Command::Jump(i) => {
+                self.errors_in_row = 0;
+                if self.queue.jump(i).is_some() {
+                    self.load_current();
+                }
+            }
+            Command::Remove(i) => {
+                if i < self.queue.len() {
+                    let playing_now = self.queue.current_item_index() == Some(i)
+                        && matches!(self.state, State::Loading | State::Playing | State::Paused);
+                    if playing_now {
+                        self.backend.stop();
+                        self.state = State::Idle;
+                        self.position = 0;
+                        self.duration = None;
+                    }
+                    self.queue.remove(i);
+                }
+            }
+            Command::Clear => {
+                self.queue.clear();
+                self.backend.stop();
+                self.state = State::Idle;
+                self.position = 0;
+                self.duration = None;
+            }
+            Command::Shuffle(on) => self.queue.set_shuffle(on),
+            Command::SetRepeat(r) => self.queue.set_repeat(r),
             Command::Rate(f) => {
                 if let Some(item) = self.queue.current().cloned() {
                     if matches!(self.state, State::Loading | State::Playing | State::Paused) {
@@ -855,5 +914,99 @@ mod tests {
         p.command(Command::Play);
         assert_eq!(*p.state(), State::Playing);
         assert_eq!(p.backend().loaded.len(), 2, "resuming does not reload");
+    }
+}
+
+#[cfg(test)]
+mod more_commands {
+    use super::*;
+    use crate::queue::Item;
+
+    #[derive(Default)]
+    struct Fake {
+        loaded: Vec<String>,
+        stops: u32,
+    }
+    impl Backend for Fake {
+        fn load(&mut self, s: &Source) -> Result<(), String> {
+            self.loaded.push(s.label());
+            Ok(())
+        }
+        fn pause(&mut self, _: bool) {}
+        fn seek(&mut self, _: u32) {}
+        fn set_volume(&mut self, _: u8) {}
+        fn set_speed(&mut self, _: u16) {}
+        fn stop(&mut self) {
+            self.stops += 1;
+        }
+    }
+
+    fn player(n: usize) -> Player<Fake> {
+        let mut p = Player::new(Fake::default());
+        for i in 0..n {
+            p.queue_mut()
+                .push(Item::new(Source::File(format!("/m/{i}.mp4"))));
+        }
+        p
+    }
+
+    #[test]
+    fn jump_plays_the_chosen_item_and_ignores_a_bad_number() {
+        let mut p = player(4);
+        p.command(Command::Jump(2));
+        assert_eq!(p.backend().loaded, vec!["2.mp4"]);
+        assert_eq!(*p.state(), State::Loading);
+        p.command(Command::Jump(99));
+        assert_eq!(p.backend().loaded.len(), 1, "no such item: nothing happens");
+        p.on_event(Event::Loaded(None));
+        p.on_event(Event::Ended);
+        assert_eq!(
+            p.backend().loaded.last().unwrap(),
+            "3.mp4",
+            "play goes on from there"
+        );
+    }
+
+    #[test]
+    fn removing_what_plays_stops_it_and_removing_another_keeps_playing() {
+        let mut p = player(4);
+        p.command(Command::Play);
+        p.on_event(Event::Loaded(None));
+        p.command(Command::Remove(3));
+        assert_eq!(*p.state(), State::Playing);
+        assert_eq!(p.queue().len(), 3);
+        p.command(Command::Remove(0));
+        assert_eq!(*p.state(), State::Idle, "the playing item was taken out");
+        assert_eq!(p.backend().stops, 1);
+        assert_eq!(p.queue().len(), 2);
+        p.command(Command::Remove(50));
+        assert_eq!(p.queue().len(), 2, "no such item");
+    }
+
+    #[test]
+    fn clear_empties_and_stops_and_shuffle_and_repeat_pass_through() {
+        let mut p = player(3);
+        p.command(Command::Shuffle(true));
+        p.command(Command::SetRepeat(Repeat::All));
+        assert!(p.queue().shuffle());
+        assert_eq!(p.queue().repeat(), Repeat::All);
+        p.command(Command::Play);
+        p.on_event(Event::Loaded(None));
+        p.command(Command::Clear);
+        assert!(p.queue().is_empty());
+        assert_eq!(*p.state(), State::Idle);
+        assert!(p.now_playing().is_none());
+        p.command(Command::Play);
+        assert_eq!(*p.state(), State::Idle, "nothing to play");
+    }
+
+    #[test]
+    fn a_boxed_backend_works_as_a_backend() {
+        let b: Box<dyn Backend> = Box::new(Fake::default());
+        let mut p = Player::new(b);
+        p.queue_mut()
+            .push(Item::new(Source::File("/m/a.mp4".into())));
+        p.command(Command::Play);
+        assert_eq!(*p.state(), State::Loading);
     }
 }

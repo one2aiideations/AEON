@@ -4,8 +4,8 @@ use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
 use crate::screens::{
-    Approvals, Audit, Chat, EditorScreen, ModelPicker, Review, SecurityScreen, SheetScreen,
-    StudioScreen,
+    Approvals, Audit, Chat, EditorScreen, ModelPicker, PlayerScreen, Review, SecurityScreen,
+    SheetScreen, StudioScreen,
 };
 
 /// The whole interface.
@@ -29,6 +29,8 @@ pub struct Shell {
     pub studio: StudioScreen,
     /// The code editor.
     pub editor: EditorScreen,
+    /// The video and YouTube player.
+    pub player: PlayerScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -47,6 +49,7 @@ impl Default for Shell {
             sheet: SheetScreen::default(),
             studio: StudioScreen::default(),
             editor: EditorScreen::default(),
+            player: PlayerScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -71,6 +74,7 @@ impl Shell {
             Tab::Sheet => &self.sheet,
             Tab::Studio => &self.studio,
             Tab::Editor => &self.editor,
+            Tab::Player => &self.player,
         }
     }
 
@@ -86,6 +90,7 @@ impl Shell {
             Tab::Sheet => &mut self.sheet,
             Tab::Studio => &mut self.studio,
             Tab::Editor => &mut self.editor,
+            Tab::Player => &mut self.player,
         }
     }
 

@@ -29,9 +29,8 @@ script, run in Node against a fake YouTube player and fake network.
 
 **Not verified:** the page in a real browser against real YouTube (nothing here has run a browser),
 including whether YouTube accepts a player embedded on `http://127.0.0.1` (it may answer error 153
-or 150/101 for some videos). **Not built yet:** the browser engine in the boot image (for example
-WPE WebKit with `cog`) and the mpv and sound packages, the video and sound output, and the player
-screen. Until then nothing can be shown or heard.
+or 150/101 for some videos). **Done on the device side:** the Player screen (F10 and a desktop icon) and the `player.*` capabilities in `mouli-apps` (add, play, pause, next, prev, seek, volume, mute, speed, shuffle, repeat, autoplay, Shorts feed, thumbs up/down/report, jump, remove, clear), all through the governed gate; the host feeds backend events in with `Device::player_event`. **Not built yet:** the browser engine in the boot image (for example
+WPE WebKit with `cog`) and the mpv and sound packages, and the video and sound output. Until then nothing can be shown or heard. Nothing starts the bridge, mpv or the browser yet (that is the host's job once they are in the image).
 
 ## Tests
 

@@ -239,3 +239,23 @@ pub const CODE: Icon = [
     "................",
     "................",
 ];
+
+/// Player: a screen with a play triangle and a progress bar.
+pub const PLAYER: Icon = [
+    "................",
+    ".kkkkkkkkkkkkkk.",
+    ".kddddddddddddk.",
+    ".kddddddddddddk.",
+    ".kddkkddddddddk.",
+    ".kddkrkddddddyk.",
+    ".kddkrrkdddddyk.",
+    ".kddkrkddddddyk.",
+    ".kddkkddddddddk.",
+    ".kddddddddddddk.",
+    ".kdbbbbbbbbbddk.",
+    ".kdbbbbbbbbbddk.",
+    ".kddddddddddddk.",
+    ".kkkkkkkkkkkkkk.",
+    "................",
+    "................",
+];

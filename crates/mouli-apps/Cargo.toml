@@ -10,6 +10,7 @@ description = "MOULI-APPS: adapters that turn the application crates (Sheet, Stu
 mouli-code = { path = "../mouli-code" }
 mouli-crm = { path = "../mouli-crm" }
 mouli-interface = { path = "../mouli-interface" }
+mouli-player = { path = "../mouli-player" }
 mouli-sheet = { path = "../mouli-sheet" }
 mouli-studio = { path = "../mouli-studio" }
 

@@ -8,6 +8,7 @@
 
 mod code;
 mod crm;
+mod player;
 mod sheet;
 mod store;
 mod studio;
@@ -18,6 +19,7 @@ use std::rc::Rc;
 
 pub use code::{ChangedFile, CodeApp, CodeState, PatchError, SharedCode, Stage, View, NOT_ALLOWED};
 pub use crm::{Clock, CrmApp, SharedCrm};
+pub use player::{PlayerApp, SharedPlayer};
 pub use sheet::{range_text, SharedBook, SheetApp};
 pub use store::{parse_workbook, workbook_text};
 pub use studio::{SharedDoc, StudioApp};
@@ -65,4 +67,17 @@ pub fn register_code(ws: &mut Workspace) -> Result<SharedCode> {
     let state = CodeState::shared();
     ws.register_app(Box::new(CodeApp::new(state.clone())))?;
     Ok(state)
+}
+
+/// Creates the player application over `backend` and registers it with `ws`.
+///
+/// # Errors
+/// The registry's error when a capability name is taken.
+pub fn register_player(
+    ws: &mut Workspace,
+    backend: Box<dyn mouli_player::Backend>,
+) -> Result<SharedPlayer> {
+    let player = PlayerApp::new_player(backend);
+    ws.register_app(Box::new(PlayerApp::new(player.clone())))?;
+    Ok(player)
 }
