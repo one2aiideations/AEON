@@ -48,6 +48,7 @@ pub mod partition_table;
 pub mod persist;
 pub mod procparse;
 pub mod sntp;
+pub mod sysinfo;
 pub mod system;
 pub mod textwrap;
 pub mod ui;

@@ -119,7 +119,7 @@ fn draw_window(c: &mut Canvas, w: &Window, active: bool, shell: &Shell) {
 }
 
 fn draw_alert(c: &mut Canvas, d: &Desktop, alert: &Alert) {
-    let (r, ok) = d.alert_rects(alert);
+    let (r, buttons) = d.alert_layout(alert);
     shadow(c, r);
     fill(c, r, SURFACE_HIGH);
     outline(c, r, OUTLINE_ACTIVE);
@@ -137,7 +137,9 @@ fn draw_alert(c: &mut Canvas, d: &Desktop, alert: &Alert) {
         };
         text(c, face, r.x + 28, r.y + 24 + i as i32 * 22, line, colour);
     }
-    button(c, ok, "OK");
+    for (rect, b) in buttons.iter().zip(&alert.buttons) {
+        button(c, *rect, b.label);
+    }
 }
 
 fn draw_icons(c: &mut Canvas, d: &Desktop) {
@@ -190,7 +192,9 @@ impl Desktop {
         for win in &self.wm.windows {
             draw_window(&mut c, win, Some(win.id) == front, shell);
         }
-        self.menu.draw_bar(&mut c, &self.status);
+        let right = crate::status::left_edge(self.width, &self.system);
+        self.menu.draw_bar(&mut c, &self.status, right);
+        crate::status::draw(&mut c, &self.system, self.pointer);
         self.menu.draw_dropdown(&mut c, self.wm.top().is_some());
         if let Some(alert) = &self.alert {
             draw_alert(&mut c, self, alert);

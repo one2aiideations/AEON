@@ -50,6 +50,8 @@ pub enum End {
     SwitchModel,
     /// Power off.
     Quit,
+    /// Restart.
+    Reboot,
     /// Input closed.
     Eof,
 }

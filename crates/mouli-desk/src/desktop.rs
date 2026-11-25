@@ -16,11 +16,33 @@ pub const DOUBLE_CLICK_MS: u64 = 500;
 /// Spacing of the desktop icons.
 pub const ICON_CELL: i32 = 76;
 
-/// A dialog box with a message and an OK button.
+/// What pressing a dialog button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertResult {
+    /// Just close the dialog.
+    Close,
+    /// Power the machine off.
+    PowerOff,
+    /// Restart the machine.
+    Reboot,
+}
+
+/// A button of a dialog box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlertButton {
+    /// The label.
+    pub label: &'static str,
+    /// What it does.
+    pub result: AlertResult,
+}
+
+/// A dialog box with a message and one or more buttons (OK for a plain message).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
     /// The lines of text.
     pub lines: Vec<String>,
+    /// The buttons, left to right; the last is the default and is what Enter and Escape choose.
+    pub buttons: Vec<AlertButton>,
 }
 
 /// One icon on the desktop.
@@ -53,8 +75,10 @@ pub struct Desktop {
     pub menu: MenuBar,
     /// Where the pointer is.
     pub pointer: (i32, i32),
-    /// Text at the right end of the menu bar (the user, the time).
+    /// Text in the menu bar, left of the system area.
     pub status: String,
+    /// What the system area of the menu bar shows (network, Bluetooth, battery, clock).
+    pub system: crate::status::SystemStatus,
     /// The icons, top to bottom along the right edge.
     pub icons: Vec<IconSpot>,
     /// The selected icon.
@@ -106,6 +130,7 @@ impl Desktop {
             menu: MenuBar::standard(width),
             pointer: (width / 2, height / 2),
             status: String::new(),
+            system: crate::status::SystemStatus::default(),
             icons,
             selected_icon: None,
             alert: None,
@@ -138,26 +163,104 @@ impl Desktop {
         shell.active = tab;
     }
 
-    /// The dialog's frame and its OK button.
+    /// The dialog's frame and its last button (OK for a plain message).
     pub fn alert_rects(&self, alert: &Alert) -> (crate::geom::Rect, crate::geom::Rect) {
+        let (frame, buttons) = self.alert_layout(alert);
+        let last = buttons
+            .last()
+            .copied()
+            .unwrap_or_else(|| crate::geom::Rect::new(frame.x, frame.y, 0, 0));
+        (frame, last)
+    }
+
+    /// The dialog's frame and the rectangle of each button, left to right.
+    pub fn alert_layout(&self, alert: &Alert) -> (crate::geom::Rect, Vec<crate::geom::Rect>) {
         use crate::geom::Rect;
         use mouli_screen::typeface::ui_medium;
+        const BUTTON_W: i32 = 104;
+        const GAP: i32 = 12;
         let longest = alert
             .lines
             .iter()
             .map(|l| crate::paint::text_width(ui_medium(), l))
             .max()
             .unwrap_or(0);
-        let w = (longest + 56).clamp(340, (self.width - 20).max(340));
+        let n = alert.buttons.len().max(1) as i32;
+        let buttons_w = n * BUTTON_W + (n - 1) * GAP;
+        let w = (longest + 56)
+            .max(buttons_w + 40)
+            .clamp(340, (self.width - 20).max(340));
         let h = 24 + alert.lines.len() as i32 * 22 + 16 + 36 + 20;
         let d = Rect::new((self.width - w) / 2, (self.height - h) / 3, w, h);
-        let ok = Rect::new(d.right() - 20 - 88, d.bottom() - 20 - 36, 88, 36);
-        (d, ok)
+        let mut x = d.right() - 20 - buttons_w;
+        let rects = (0..n)
+            .map(|_| {
+                let r = Rect::new(x, d.bottom() - 20 - 36, BUTTON_W, 36);
+                x += BUTTON_W + GAP;
+                r
+            })
+            .collect();
+        (d, rects)
     }
 
     fn show_alert(&mut self, lines: &[&str]) {
         self.alert = Some(Alert {
             lines: lines.iter().map(|s| (*s).to_string()).collect(),
+            buttons: vec![AlertButton {
+                label: "OK",
+                result: AlertResult::Close,
+            }],
+        });
+    }
+
+    fn show_info(&mut self, lines: Vec<String>) {
+        self.alert = Some(Alert {
+            lines,
+            buttons: vec![AlertButton {
+                label: "OK",
+                result: AlertResult::Close,
+            }],
+        });
+    }
+
+    /// Asks what to do about power: shut down, restart or cancel.
+    pub fn show_power_dialog(&mut self) {
+        self.alert = Some(Alert {
+            lines: vec![
+                "Power".into(),
+                String::new(),
+                "What do you want to do?".into(),
+            ],
+            buttons: vec![
+                AlertButton {
+                    label: "Shut Down",
+                    result: AlertResult::PowerOff,
+                },
+                AlertButton {
+                    label: "Restart",
+                    result: AlertResult::Reboot,
+                },
+                AlertButton {
+                    label: "Cancel",
+                    result: AlertResult::Close,
+                },
+            ],
+        });
+    }
+
+    fn show_restart_dialog(&mut self) {
+        self.alert = Some(Alert {
+            lines: vec!["Restart MOULI OS?".into()],
+            buttons: vec![
+                AlertButton {
+                    label: "Restart",
+                    result: AlertResult::Reboot,
+                },
+                AlertButton {
+                    label: "Cancel",
+                    result: AlertResult::Close,
+                },
+            ],
         });
     }
 
@@ -177,7 +280,7 @@ impl Desktop {
             }
             Command::Help => {
                 self.show_alert(&[
-                    "F1 to F8   open a window",
+                    "F1 to F10  open a window",
                     "Ctrl-N     new conversation",
                     "Ctrl-W     close the window",
                     "Ctrl-Q     shut down",
@@ -197,6 +300,10 @@ impl Desktop {
                 Action::None
             }
             Command::Quit => Action::Quit,
+            Command::Restart => {
+                self.show_restart_dialog();
+                Action::None
+            }
             Command::Open(tab) => {
                 self.open(shell, tab);
                 Action::Show(tab)
@@ -226,6 +333,8 @@ impl Desktop {
     /// window's screen.
     pub fn on_key(&mut self, shell: &mut Shell, key: Key) -> Action {
         if self.alert.is_some() {
+            // Enter, Escape and Space choose the default button, which is the last one (OK or
+            // Cancel), so a stray key never powers the machine off.
             if matches!(key, Key::Enter | Key::Esc | Key::Char(' ')) {
                 self.alert = None;
             }
@@ -294,9 +403,18 @@ impl Desktop {
     fn press_left(&mut self, shell: &mut Shell, now_ms: u64) -> Action {
         let (px, py) = self.pointer;
         if let Some(alert) = &self.alert {
-            let (_, ok) = self.alert_rects(alert);
-            if ok.contains(px, py) {
+            let (_, rects) = self.alert_layout(alert);
+            let pressed = rects
+                .iter()
+                .position(|r| r.contains(px, py))
+                .and_then(|i| alert.buttons.get(i).copied());
+            if let Some(b) = pressed {
                 self.alert = None;
+                return match b.result {
+                    AlertResult::Close => Action::None,
+                    AlertResult::PowerOff => Action::Quit,
+                    AlertResult::Reboot => Action::Reboot,
+                };
             }
             return Action::None;
         }
@@ -314,6 +432,15 @@ impl Desktop {
             };
         }
         if py < MENU_H {
+            if let Some(item) = crate::status::item_at(self.width, &self.system, px, py) {
+                if item == crate::status::StatusItem::Power {
+                    self.show_power_dialog();
+                } else {
+                    let lines = crate::status::info_lines(item, &self.system);
+                    self.show_info(lines);
+                }
+                return Action::None;
+            }
             if let Some(i) = self.menu.title_at(px, py) {
                 self.menu.open = Some(i);
                 self.menu.hover = None;
@@ -903,5 +1030,191 @@ mod tests {
             d.wm.cascade();
             d.render(&s);
         }
+    }
+
+    fn with_system(d: &mut Desktop) {
+        use crate::status::{Battery, Bluetooth, NetKind, Network, SystemStatus};
+        d.system = SystemStatus {
+            time: "17:42".into(),
+            date: "Tue 25 Nov".into(),
+            zone: "UTC".into(),
+            network: Network {
+                kind: NetKind::Wifi,
+                name: "HomeNet".into(),
+                bars: 4,
+            },
+            bluetooth: Bluetooth::On,
+            battery: Some(Battery {
+                percent: 55,
+                charging: true,
+            }),
+        };
+    }
+
+    fn status_centre(d: &Desktop, item: crate::status::StatusItem) -> (i32, i32) {
+        let r = crate::status::layout(d.width, &d.system)
+            .into_iter()
+            .find(|(i, _)| *i == item)
+            .unwrap()
+            .1;
+        (r.x + r.w / 2, 8)
+    }
+
+    #[test]
+    fn the_power_button_asks_and_each_button_does_its_own_thing() {
+        use crate::status::StatusItem;
+        for (button, want) in [
+            (0usize, Action::Quit),
+            (1, Action::Reboot),
+            (2, Action::None),
+        ] {
+            let (mut d, mut s) = setup();
+            with_system(&mut d);
+            let (x, y) = status_centre(&d, StatusItem::Power);
+            assert_eq!(
+                click(&mut d, &mut s, x, y, 0),
+                Action::None,
+                "the click only asks"
+            );
+            let alert = d.alert.clone().expect("a power dialog");
+            assert_eq!(alert.buttons.len(), 3);
+            assert_eq!(alert.buttons[0].label, "Shut Down");
+            let (_, rects) = d.alert_layout(&alert);
+            let r = rects[button];
+            assert_eq!(
+                click(&mut d, &mut s, r.x + 5, r.y + 5, 10),
+                want,
+                "button {button}"
+            );
+            assert!(d.alert.is_none());
+        }
+    }
+
+    #[test]
+    fn keys_in_the_power_dialog_never_power_off() {
+        use crate::status::StatusItem;
+        for key in [Key::Enter, Key::Esc, Key::Char(' ')] {
+            let (mut d, mut s) = setup();
+            with_system(&mut d);
+            let (x, y) = status_centre(&d, StatusItem::Power);
+            click(&mut d, &mut s, x, y, 0);
+            assert_eq!(d.on_key(&mut s, key), Action::None);
+            assert!(d.alert.is_none(), "{key:?} cancels");
+        }
+        // Other keys do nothing while the dialog is open.
+        let (mut d, mut s) = setup();
+        with_system(&mut d);
+        let (x, y) = status_centre(&d, StatusItem::Power);
+        click(&mut d, &mut s, x, y, 0);
+        assert_eq!(d.on_key(&mut s, Key::Ctrl('q')), Action::None);
+        assert!(d.alert.is_some());
+    }
+
+    #[test]
+    fn a_click_beside_the_buttons_keeps_the_power_dialog_open() {
+        use crate::status::StatusItem;
+        let (mut d, mut s) = setup();
+        with_system(&mut d);
+        let (x, y) = status_centre(&d, StatusItem::Power);
+        click(&mut d, &mut s, x, y, 0);
+        click(&mut d, &mut s, 5, 400, 10);
+        assert!(d.alert.is_some());
+    }
+
+    #[test]
+    fn the_other_status_items_show_what_they_mean() {
+        use crate::status::StatusItem;
+        for (item, word) in [
+            (StatusItem::Network, "HomeNet"),
+            (StatusItem::Bluetooth, "Bluetooth"),
+            (StatusItem::Battery, "55%"),
+            (StatusItem::Clock, "17:42"),
+        ] {
+            let (mut d, mut s) = setup();
+            with_system(&mut d);
+            let (x, y) = status_centre(&d, item);
+            assert_eq!(click(&mut d, &mut s, x, y, 0), Action::None);
+            let alert = d.alert.clone().expect("an information dialog");
+            assert!(
+                alert.lines.join(" ").contains(word),
+                "{item:?}: {:?}",
+                alert.lines
+            );
+            assert_eq!(alert.buttons.len(), 1);
+            let (_, ok) = d.alert_rects(&alert);
+            click(&mut d, &mut s, ok.x + 5, ok.y + 5, 10);
+            assert!(d.alert.is_none());
+        }
+    }
+
+    #[test]
+    fn file_restart_asks_before_restarting() {
+        let (mut d, mut s) = setup();
+        let file = d.menu.title_rects()[1];
+        click(&mut d, &mut s, file.x + 5, 8, 0);
+        let items: Vec<&str> = d.menu.menus[1].items.iter().map(|i| i.label).collect();
+        let k = items
+            .iter()
+            .position(|l| *l == "Restart")
+            .expect("Restart in File");
+        let item = d.menu.item_rects(1)[k];
+        assert_eq!(
+            click(&mut d, &mut s, item.x + 10, item.y + 5, 10),
+            Action::None
+        );
+        let alert = d.alert.clone().expect("a restart dialog");
+        assert_eq!(alert.buttons.len(), 2);
+        let (_, rects) = d.alert_layout(&alert);
+        assert_eq!(
+            click(&mut d, &mut s, rects[0].x + 5, rects[0].y + 5, 20),
+            Action::Reboot
+        );
+    }
+
+    #[test]
+    fn the_status_text_stops_before_the_system_area() {
+        let (mut d, _s) = setup();
+        with_system(&mut d);
+        let shell = Shell::new();
+        d.status =
+            "MOULI OS  |  12 waiting for approval (F3)  |  and a very long extra note".into();
+        let with_text = d.render(&shell);
+        d.status = String::new();
+        let without = d.render(&shell);
+        let left = crate::status::left_edge(d.width, &d.system);
+        for y in 0..crate::menu::MENU_H {
+            for x in left..d.width {
+                assert_eq!(
+                    with_text.get(x as usize, y as usize),
+                    without.get(x as usize, y as usize),
+                    "the text reached the system area at ({x},{y})"
+                );
+            }
+        }
+        // And the text itself was drawn somewhere to the left.
+        let differs = (0..left).any(|x| {
+            (0..crate::menu::MENU_H).any(|y| {
+                with_text.get(x as usize, y as usize) != without.get(x as usize, y as usize)
+            })
+        });
+        assert!(differs, "the status text is visible");
+    }
+
+    #[test]
+    fn dialogs_with_three_buttons_fit_on_a_small_screen() {
+        let mut d = Desktop::new(640, 480);
+        d.show_power_dialog();
+        let alert = d.alert.clone().unwrap();
+        let (frame, rects) = d.alert_layout(&alert);
+        for r in &rects {
+            assert!(
+                r.x >= frame.x && r.right() <= frame.right(),
+                "{r:?} in {frame:?}"
+            );
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].right() <= w[1].x);
+        }
+        assert!(frame.x >= 0 && frame.right() <= 640);
     }
 }

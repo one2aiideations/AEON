@@ -9,9 +9,12 @@
 //! device) [`start`] returns an error and `moulid` keeps the text chat. A pointing device that
 //! reports absolute positions (some touchpads and touchscreens) is not used; a USB or PS/2 mouse is.
 
+use crate::sysinfo::{self, Collector, SysEnv};
 use crate::ui::{trim_history, Backend, End, Turn};
+use crate::wifi::Runner;
 use mouli_desk::desktop::Desktop;
 use mouli_desk::input::{EvdevDecoder, MouseEvent, TouchpadDecoder};
+use mouli_desk::status::SystemStatus;
 use mouli_device::{Backend as DeviceBackend, Device, Outcome};
 use mouli_interface::routing::{ModelEntry, Route};
 use mouli_interface::{Permissions, Policy, Workspace};
@@ -24,7 +27,9 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The framebuffer device.
@@ -310,6 +315,8 @@ impl KeyDecoder {
 pub enum Ev {
     /// An input device appeared after the desktop started (the message names it).
     NewInput(String),
+    /// The system area of the menu bar has new content (clock, network, Bluetooth, battery).
+    Status(Box<SystemStatus>),
     /// The mouse did something.
     Mouse(MouseEvent),
     /// A key was pressed.
@@ -531,6 +538,62 @@ pub fn watch_inputs(
     });
 }
 
+/// Starts a thread that gathers the system status every `tick` and sends it on `tx` whenever it
+/// changed. `offset_min` is the UTC offset in minutes, shared with the desktop so that
+/// `/time.zone` takes effect at once. The thread stops when the receiver is gone.
+pub fn spawn_status<R: Runner + Send + 'static>(
+    mut runner: R,
+    env: SysEnv,
+    tx: Sender<Ev>,
+    offset_min: Arc<AtomicI32>,
+    tick: Duration,
+) {
+    std::thread::spawn(move || {
+        let mut collector = Collector::new(env);
+        let mut last: Option<SystemStatus> = None;
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+            let s = collector.status(&mut runner, now, offset_min.load(Ordering::Relaxed));
+            if last.as_ref() != Some(&s) {
+                if tx.send(Ev::Status(Box::new(s.clone()))).is_err() {
+                    return;
+                }
+                last = Some(s);
+            }
+            std::thread::sleep(tick);
+        }
+    });
+}
+
+/// Handles `/time.zone`: shows or sets the UTC offset used by the clock. Returns the notice to show.
+fn time_zone_command(
+    arg: &str,
+    offset: &AtomicI32,
+    store: Option<&crate::persist::Store>,
+) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return format!(
+            "The clock shows {}. To change it, type /time.zone +05:30 (or -8, or UTC).",
+            sysinfo::zone_label(offset.load(Ordering::Relaxed))
+        );
+    }
+    let Some(minutes) = sysinfo::parse_offset(arg) else {
+        return "That is not a time zone. Examples: /time.zone +05:30, /time.zone -8, /time.zone UTC (from -12:00 to +14:00).".into();
+    };
+    offset.store(minutes, Ordering::Relaxed);
+    let saved = match store {
+        Some(s) => match s.set(sysinfo::OFFSET_KEY, &minutes.to_string()) {
+            Ok(()) => " It is kept for the next start.",
+            Err(_) => " (It could not be saved.)",
+        },
+        None => " (No MOULI-DATA disk, so it is forgotten at power-off.)",
+    };
+    format!("Time zone set to {}.{saved}", sysinfo::zone_label(minutes))
+}
+
 // ------------------------------------------------------------------ console
 
 /// Keeps typed characters from being echoed onto the framebuffer console while the desktop is
@@ -671,6 +734,8 @@ pub struct Session<D: Display> {
     device: Device<NoRoute>,
     saving: bool,
     inputs: InputSummary,
+    offset: Arc<AtomicI32>,
+    settings: Option<crate::persist::Store>,
 }
 
 impl<D: Display> Session<D> {
@@ -683,6 +748,8 @@ impl<D: Display> Session<D> {
             device,
             saving: false,
             inputs: InputSummary::default(),
+            offset: Arc::new(AtomicI32::new(0)),
+            settings: None,
         }
     }
 
@@ -713,9 +780,26 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
         return Err("no keyboard, mouse or touchpad found in /dev/input".into());
     }
     watch_inputs(INPUT_DIR.into(), INPUT_SYS.into(), width, tx.clone(), seen);
-    let mut s = Session::new(display, tx, rx, device);
+    let mut s = Session::new(display, tx.clone(), rx, device);
     s.saving = data_dir.is_some();
     s.inputs = inputs;
+    s.settings = data_dir.and_then(|d| crate::persist::Store::open(d).ok());
+    if let Some(m) = s
+        .settings
+        .as_ref()
+        .and_then(|st| st.settings().get(sysinfo::OFFSET_KEY).cloned())
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|m| (sysinfo::MIN_OFFSET..=sysinfo::MAX_OFFSET).contains(m))
+    {
+        s.offset.store(m, Ordering::Relaxed);
+    }
+    spawn_status(
+        crate::wifi::System,
+        SysEnv::real(),
+        tx,
+        s.offset.clone(),
+        Duration::from_secs(1),
+    );
     Ok(s)
 }
 
@@ -809,6 +893,8 @@ where
         mut device,
         saving,
         inputs,
+        offset,
+        settings,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -886,10 +972,20 @@ where
                     device.shell.chat.push(Role::Notice, &text);
                     Action::None
                 }
+                Ev::Status(s) => {
+                    desktop.system = *s;
+                    Action::None
+                }
             };
             match action {
                 Action::None => {}
                 Action::Show(tab) => desktop.open(&mut device.shell, tab),
+                Action::Send(text) if text.trim_start().starts_with("/time.zone") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/time.zone".len()..].to_string();
+                    let note = time_zone_command(&arg, &offset, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
                 Action::Send(text) if text.trim_start().starts_with('/') => {
                     // A command for an application: carried out through the governed workspace
                     // (policy, approvals, audit), not sent to the model.
@@ -921,6 +1017,7 @@ where
                 }
                 other => match device.run(other) {
                     Outcome::Quit => return Ok(End::Quit),
+                    Outcome::Reboot => return Ok(End::Reboot),
                     Outcome::Handled => {}
                     Outcome::Host(_) => device.shell.chat.push(
                         Role::Notice,
@@ -1576,5 +1673,235 @@ mod tests {
         assert_eq!(status_text("MOULI OS", 0), "MOULI OS");
         assert!(status_text("MOULI OS", 1).contains("1 waiting for approval (F3)"));
         assert!(status_text("MOULI OS", 3).contains("3 waiting for approval (F3)"));
+    }
+
+    struct NoRun;
+    impl Runner for NoRun {
+        fn run(&mut self, _: &str, _: &[&str]) -> Option<String> {
+            None
+        }
+        fn pause(&mut self, _: Duration) {}
+    }
+
+    fn next_status(rx: &Receiver<Ev>) -> Box<SystemStatus> {
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a status arrives")
+            {
+                Ev::Status(s) => return s,
+                _ => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn the_status_thread_reports_the_clock_and_follows_a_new_zone() {
+        let root = tmp("statusthread");
+        let env = SysEnv {
+            sys_net: root.join("net"),
+            sys_bt: root.join("bt"),
+            power: root.join("power"),
+            dbus_socket: root.join("none"),
+        };
+        let (tx, rx) = channel();
+        let offset = Arc::new(AtomicI32::new(0));
+        spawn_status(NoRun, env, tx, offset.clone(), Duration::from_millis(10));
+        let first = next_status(&rx);
+        assert_eq!(first.zone, "UTC");
+        assert_eq!(first.time.len(), 5, "HH:MM: {}", first.time);
+        offset.store(330, Ordering::Relaxed);
+        let mut zone = String::new();
+        for _ in 0..200 {
+            zone = next_status(&rx).zone;
+            if zone == "UTC+05:30" {
+                break;
+            }
+        }
+        assert_eq!(zone, "UTC+05:30");
+        // Unchanged status is not sent again and the thread ends when the receiver is gone.
+        drop(rx);
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_time_zone_command_validates_shows_and_saves() {
+        let offset = AtomicI32::new(0);
+        let dir = tmp("tz");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::persist::Store::open(&dir).unwrap();
+        assert!(time_zone_command("", &offset, Some(&store)).contains("shows UTC"));
+        let ok = time_zone_command(" +05:30 ", &offset, Some(&store));
+        assert!(ok.contains("UTC+05:30") && ok.contains("kept"), "{ok}");
+        assert_eq!(offset.load(Ordering::Relaxed), 330);
+        assert_eq!(
+            store
+                .settings()
+                .get(sysinfo::OFFSET_KEY)
+                .map(String::as_str),
+            Some("330")
+        );
+        assert!(time_zone_command("", &offset, Some(&store)).contains("UTC+05:30"));
+        for bad in ["+99", "x", "+5:99", "1e9", "UTC+25"] {
+            let msg = time_zone_command(bad, &offset, Some(&store));
+            assert!(msg.contains("not a time zone"), "{bad}: {msg}");
+            assert_eq!(offset.load(Ordering::Relaxed), 330, "{bad} changes nothing");
+        }
+        let no_disk = time_zone_command("-8", &offset, None);
+        assert!(no_disk.contains("forgotten at power-off"), "{no_disk}");
+        assert_eq!(offset.load(Ordering::Relaxed), -480);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typing_time_zone_in_the_chat_sets_the_zone_and_keeps_it_on_the_data_disk() {
+        let dir = tmp("tzchat");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.settings = crate::persist::Store::open(&dir).ok();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("/time.zone +05:30\n") {
+            tx.send(e).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let end = run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        assert_eq!(end, End::Quit);
+        let saved = crate::persist::Store::open(&dir).unwrap().settings();
+        assert_eq!(
+            saved.get(sysinfo::OFFSET_KEY).map(String::as_str),
+            Some("330")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the model was not asked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn click_at(tx: &Sender<Ev>, from: &mut (i32, i32), to: (i32, i32)) {
+        use mouli_desk::input::Button;
+        tx.send(Ev::Mouse(MouseEvent::Move {
+            dx: to.0 - from.0,
+            dy: to.1 - from.1,
+        }))
+        .unwrap();
+        tx.send(Ev::Mouse(MouseEvent::Down(Button::Left))).unwrap();
+        tx.send(Ev::Mouse(MouseEvent::Up(Button::Left))).unwrap();
+        *from = to;
+    }
+
+    #[test]
+    fn the_power_button_shuts_down_or_restarts_through_the_event_loop() {
+        use mouli_desk::desktop::Desktop;
+        use mouli_desk::status::{layout, StatusItem};
+        for (button, want) in [(0usize, End::Quit), (1, End::Reboot)] {
+            let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (tx, rx) = channel();
+            let session = Session::new(Shots(shots), tx.clone(), rx, build_device(None).unwrap());
+            // The same desktop the loop builds (the test display is 800 by 600) tells where to click.
+            let mut d = Desktop::new(800, 600);
+            let power = layout(800, &d.system)
+                .into_iter()
+                .find(|(i, _)| *i == StatusItem::Power)
+                .unwrap()
+                .1;
+            d.show_power_dialog();
+            let (_, rects) = d.alert_layout(&d.alert.clone().unwrap());
+            let mut at = (400, 300);
+            click_at(&tx, &mut at, (power.x + power.w / 2, 8));
+            click_at(&tx, &mut at, (rects[button].x + 10, rects[button].y + 10));
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let end = run(
+                session,
+                Counting(calls),
+                "sys",
+                1000,
+                &ModelsInfo::only("t"),
+            )
+            .unwrap();
+            assert_eq!(end, want, "button {button}");
+        }
+    }
+
+    #[test]
+    fn a_status_event_reaches_the_menu_bar() {
+        use mouli_desk::status::{Bluetooth, NetKind, Network};
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Shots(shots.clone()),
+            tx.clone(),
+            rx,
+            build_device(None).unwrap(),
+        );
+        // Quit after the status event has been drawn.
+        let s = SystemStatus {
+            time: "08:15".into(),
+            date: "Thu 26 Nov".into(),
+            zone: "UTC".into(),
+            network: Network {
+                kind: NetKind::Wifi,
+                name: "N".into(),
+                bars: 4,
+            },
+            bluetooth: Bluetooth::On,
+            battery: None,
+        };
+        tx.send(Ev::Status(Box::new(s))).unwrap();
+        let t2 = tx.clone();
+        let seen = shots.clone();
+        let quitter = std::thread::spawn(move || {
+            // Quit once the picture with the new status has been drawn (start, then the status).
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls),
+            "sys",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        // The first picture (before the status) and the last (after it) differ in the system area.
+        let pics = shots.lock().unwrap();
+        assert!(
+            pics.len() >= 2,
+            "drawn at start and after the batch: {}",
+            pics.len()
+        );
+        let (first, last) = (&pics[0], &pics[pics.len() - 1]);
+        let left = mouli_desk::status::left_edge(
+            800,
+            &SystemStatus {
+                time: "08:15".into(),
+                date: "Thu 26 Nov".into(),
+                zone: "UTC".into(),
+                network: Network {
+                    kind: NetKind::Wifi,
+                    name: "N".into(),
+                    bars: 4,
+                },
+                bluetooth: Bluetooth::On,
+                battery: None,
+            },
+        );
+        let differs = (left..800).any(|x| {
+            (0..mouli_desk::menu::MENU_H)
+                .any(|y| first.get(x as usize, y as usize) != last.get(x as usize, y as usize))
+        });
+        assert!(differs, "the bar changed");
     }
 }

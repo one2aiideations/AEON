@@ -38,6 +38,8 @@ pub enum Outcome {
     Handled,
     /// Power off.
     Quit,
+    /// Restart.
+    Reboot,
     /// A request only the host can carry out (loading a model, Wi-Fi, hardware report...).
     Host(Action),
 }
@@ -217,6 +219,7 @@ impl<B: Backend> Device<B> {
         match action {
             Action::None | Action::Show(_) => Outcome::Handled,
             Action::Quit => Outcome::Quit,
+            Action::Reboot => Outcome::Reboot,
             Action::Send(text) => {
                 self.send(&text);
                 Outcome::Handled

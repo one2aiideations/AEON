@@ -101,6 +101,22 @@ pub fn power_off() -> String {
     "power off is Linux-only".into()
 }
 
+/// Flush filesystems and restart. Only returns on failure.
+#[cfg(target_os = "linux")]
+pub fn reboot() -> String {
+    nix::unistd::sync();
+    match nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT) {
+        Ok(never) => match never {},
+        Err(e) => format!("restart failed: {e}"),
+    }
+}
+
+/// Development-mode stand-in.
+#[cfg(not(target_os = "linux"))]
+pub fn reboot() -> String {
+    "restart is Linux-only".into()
+}
+
 /// Kernel command line, or empty when unavailable.
 #[must_use]
 pub fn kernel_cmdline() -> String {

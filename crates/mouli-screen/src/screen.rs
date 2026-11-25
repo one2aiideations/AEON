@@ -12,6 +12,8 @@ pub enum Action {
     None,
     /// Power off.
     Quit,
+    /// Restart the machine.
+    Reboot,
     /// Show another screen.
     Show(Tab),
     /// Send this text to the model (or run it as a command).

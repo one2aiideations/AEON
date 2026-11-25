@@ -108,6 +108,21 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Unmounts the data disk and restarts the machine (when running as PID 1).
+fn restart(pid1: bool) -> ExitCode {
+    if pid1 {
+        if let Some(root) = DATA_ROOT.get() {
+            persist::unmount(root);
+        }
+        say("MOULI: restarting");
+        say(&system::reboot());
+        loop {
+            sleep(Duration::from_secs(3600));
+        }
+    }
+    ExitCode::from(0)
+}
+
 fn finish(pid1: bool, code: u8) -> ExitCode {
     if pid1 {
         if let Some(root) = DATA_ROOT.get() {
@@ -343,6 +358,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 );
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}
+                    Ok(End::Reboot) => return restart(pid1),
                     Ok(End::Quit | End::SwitchModel) => return finish(pid1, 0),
                     Ok(End::Eof) | Err(_) => {
                         if !pid1 {
@@ -425,6 +441,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 stop(&mut child);
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}
+                    Ok(End::Reboot) => return restart(pid1),
                     Ok(End::Quit | End::SwitchModel) => return finish(pid1, 0),
                     Ok(End::Eof) | Err(_) => {
                         if !pid1 {
