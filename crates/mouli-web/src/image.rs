@@ -1,11 +1,11 @@
 //! Picture decoders, written from scratch: PNG (all colour types, bit depths and interlacing),
-//! baseline JPEG, and the first frame of a GIF. Output is a [`Bitmap`] of `0xAARRGGBB` pixels.
+//! JPEG (baseline and progressive), and the first frame of a GIF. Output is a [`Bitmap`] of `0xAARRGGBB` pixels.
 //!
 //! Everything is bounded: pictures larger than [`MAX_PIXELS`] or [`MAX_SIDE`] are refused before
 //! any memory is reserved for them, decompression stops at the size the header promised, and a
 //! damaged file gives an error, never a panic.
 //!
-//! Not supported (an error that says so): progressive JPEG, arithmetic-coded JPEG, CMYK JPEG,
+//! Not supported (an error that says so): arithmetic-coded JPEG, lossless JPEG, CMYK JPEG,
 //! 16-bit-per-sample output precision (reduced to 8 bits), GIF animation (first frame only),
 //! WebP and SVG.
 
@@ -907,11 +907,18 @@ fn decode_jpeg(d: &[u8]) -> Res<Bitmap> {
     let mut comps: Vec<Comp> = Vec::new();
     let (mut w, mut h) = (0usize, 0usize);
     let mut restart = 0usize;
+    // Progressive pictures keep every coefficient until all scans are in.
+    let mut progressive = false;
+    let mut coefs: Vec<Vec<i16>> = Vec::new();
+    let mut scans = 0usize;
     loop {
         // Find the next marker.
         while d.get(pos) != Some(&0xFF) {
             pos += 1;
             if pos >= d.len() {
+                if progressive && scans > 0 {
+                    return Ok(jpeg_finish_progressive(&comps, &coefs, &qt, w, h));
+                }
                 return Err("the file ends too soon");
             }
         }
@@ -921,6 +928,9 @@ fn decode_jpeg(d: &[u8]) -> Res<Bitmap> {
         let m = *d.get(pos).ok_or("the file ends too soon")?;
         pos += 1;
         if m == 0xD9 {
+            if progressive && scans > 0 {
+                return Ok(jpeg_finish_progressive(&comps, &coefs, &qt, w, h));
+            }
             return Err("the picture has no image data");
         }
         if m == 0x01 || (0xD0..=0xD8).contains(&m) {
@@ -968,7 +978,8 @@ fn decode_jpeg(d: &[u8]) -> Res<Bitmap> {
                     s = &s[17 + total..];
                 }
             }
-            0xC0 | 0xC1 => {
+            0xC0..=0xC2 => {
+                progressive = m == 0xC2;
                 if seg.len() < 6 || seg[0] != 8 {
                     return Err("only 8-bit JPEG pictures are supported");
                 }
@@ -998,8 +1009,16 @@ fn decode_jpeg(d: &[u8]) -> Res<Bitmap> {
                 {
                     return Err("the picture data is damaged");
                 }
+                if progressive {
+                    let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
+                    let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
+                    let (mx, my) = (w.div_ceil(8 * hmax), h.div_ceil(8 * vmax));
+                    coefs = comps
+                        .iter()
+                        .map(|c| vec![0i16; mx * c.h * my * c.v * 64])
+                        .collect();
+                }
             }
-            0xC2 => return Err("progressive JPEG pictures are not supported yet"),
             0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
                 return Err("this kind of JPEG is not supported")
             }
@@ -1013,24 +1032,290 @@ fn decode_jpeg(d: &[u8]) -> Res<Bitmap> {
                     return Err("the picture data is damaged");
                 }
                 let n = usize::from(*seg.first().ok_or("the picture data is damaged")?);
-                if n != comps.len() || seg.len() < 1 + n * 2 {
+                if n == 0 || n > comps.len() || seg.len() < 4 + n * 2 {
                     return Err("this JPEG scan layout is not supported");
                 }
+                let mut used = Vec::new();
                 for i in 0..n {
                     let (cid, t) = (seg[1 + i * 2], seg[2 + i * 2]);
-                    let c = comps
-                        .iter_mut()
-                        .find(|c| c.id == cid)
+                    let ci = comps
+                        .iter()
+                        .position(|c| c.id == cid)
                         .ok_or("the picture data is damaged")?;
-                    c.dc = usize::from(t >> 4) & 3;
-                    c.ac = usize::from(t & 15) & 3;
+                    comps[ci].dc = usize::from(t >> 4) & 3;
+                    comps[ci].ac = usize::from(t & 15) & 3;
+                    used.push(ci);
                 }
-                return jpeg_scan(d, pos + len, &comps, &qt, &dc_tabs, &ac_tabs, w, h, restart);
+                if !progressive {
+                    if n != comps.len() {
+                        return Err("this JPEG scan layout is not supported");
+                    }
+                    return jpeg_scan(d, pos + len, &comps, &qt, &dc_tabs, &ac_tabs, w, h, restart);
+                }
+                let (ss, se) = (usize::from(seg[1 + n * 2]), usize::from(seg[2 + n * 2]));
+                let (ah, al) = (
+                    u32::from(seg[3 + n * 2] >> 4),
+                    u32::from(seg[3 + n * 2] & 15),
+                );
+                let scan = ProgScan {
+                    comps: used,
+                    ss,
+                    se,
+                    ah,
+                    al,
+                };
+                let end = jpeg_progressive_scan(
+                    d,
+                    pos + len,
+                    &comps,
+                    &mut coefs,
+                    &dc_tabs,
+                    &ac_tabs,
+                    w,
+                    h,
+                    restart,
+                    &scan,
+                )?;
+                scans += 1;
+                if scans > 200 {
+                    return Err("the picture has too many scans");
+                }
+                // Move to the next real marker (skipping stuffed bytes and restart markers).
+                pos = end;
+                while pos + 1 < d.len()
+                    && !(d[pos] == 0xFF && d[pos + 1] != 0 && !(0xD0..=0xD7).contains(&d[pos + 1]))
+                {
+                    pos += 1;
+                }
+                continue;
             }
             _ => {}
         }
         pos += len;
     }
+}
+
+/// What one progressive scan covers.
+struct ProgScan {
+    comps: Vec<usize>,
+    ss: usize,
+    se: usize,
+    ah: u32,
+    al: u32,
+}
+
+/// Decodes one scan of a progressive picture into the coefficient arrays. Returns where reading
+/// stopped.
+#[allow(clippy::too_many_arguments)]
+fn jpeg_progressive_scan(
+    d: &[u8],
+    start: usize,
+    comps: &[Comp],
+    coefs: &mut [Vec<i16>],
+    dc_tabs: &[Option<JHuff>; 4],
+    ac_tabs: &[Option<JHuff>; 4],
+    w: usize,
+    h: usize,
+    restart: usize,
+    scan: &ProgScan,
+) -> Res<usize> {
+    let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
+    let (mcus_x, mcus_y) = (w.div_ceil(8 * hmax), h.div_ceil(8 * vmax));
+    let (ss, se, ah, al) = (scan.ss, scan.se, scan.ah, scan.al);
+    if ss > se || se > 63 || (ss == 0 && se != 0 && ah == 0 && scan.comps.len() > 1) || al > 13 {
+        return Err("the picture data is damaged");
+    }
+    let dc_scan = ss == 0;
+    if !dc_scan && scan.comps.len() != 1 {
+        return Err("the picture data is damaged");
+    }
+    let single = scan.comps.len() == 1;
+    let mut br = JBits {
+        d,
+        pos: start,
+        bits: 0,
+        cnt: 0,
+        marker: false,
+    };
+    let mut pred = vec![0i32; comps.len()];
+    let mut eobrun = 0u32;
+    let mut count = 0usize;
+    // The block grid a lone component is scanned over, and the padded grid its coefficients use.
+    let own = |c: &Comp| -> (usize, usize) {
+        let cw = (w * c.h).div_ceil(hmax);
+        let ch = (h * c.v).div_ceil(vmax);
+        (cw.div_ceil(8), ch.div_ceil(8))
+    };
+    let (units_x, units_y) = if single {
+        own(&comps[scan.comps[0]])
+    } else {
+        (mcus_x, mcus_y)
+    };
+    for uy in 0..units_y {
+        for ux in 0..units_x {
+            if restart > 0 && count > 0 && count.is_multiple_of(restart) {
+                br.restart();
+                pred.iter_mut().for_each(|p| *p = 0);
+                eobrun = 0;
+            }
+            count += 1;
+            for &ci in &scan.comps {
+                let c = &comps[ci];
+                let (nh, nv) = if single { (1, 1) } else { (c.h, c.v) };
+                let bw_pad = mcus_x * c.h;
+                for by in 0..nv {
+                    for bx in 0..nh {
+                        let (brow, bcol) = if single {
+                            (uy, ux)
+                        } else {
+                            (uy * c.v + by, ux * c.h + bx)
+                        };
+                        let base = (brow * bw_pad + bcol) * 64;
+                        let Some(blk) = coefs[ci].get_mut(base..base + 64) else {
+                            return Err("the picture data is damaged");
+                        };
+                        if dc_scan {
+                            if ah == 0 {
+                                let t = br.decode(
+                                    dc_tabs[c.dc]
+                                        .as_ref()
+                                        .ok_or("the picture is missing a table")?,
+                                )?;
+                                if t > 16 {
+                                    return Err("the picture data is damaged");
+                                }
+                                pred[ci] += br.extend(u32::from(t));
+                                blk[0] = (pred[ci] << al) as i16;
+                            } else if br.bit() == 1 {
+                                blk[0] |= (1i32 << al) as i16;
+                            }
+                            continue;
+                        }
+                        let act = ac_tabs[c.ac]
+                            .as_ref()
+                            .ok_or("the picture is missing a table")?;
+                        if ah == 0 {
+                            if eobrun > 0 {
+                                eobrun -= 1;
+                                continue;
+                            }
+                            let mut k = ss;
+                            while k <= se {
+                                let rs = br.decode(act)?;
+                                let (r, s) = (usize::from(rs >> 4), u32::from(rs & 15));
+                                if s == 0 {
+                                    if r < 15 {
+                                        eobrun = (1u32 << r) - 1;
+                                        if r > 0 {
+                                            eobrun += br.receive(r as u32) as u32;
+                                        }
+                                        break;
+                                    }
+                                    k += 16;
+                                } else {
+                                    k += r;
+                                    if k > 63 {
+                                        break;
+                                    }
+                                    blk[ZIGZAG[k]] = (br.extend(s) << al) as i16;
+                                    k += 1;
+                                }
+                            }
+                        } else {
+                            // Refinement: one more bit for coefficients already non-zero, and new
+                            // coefficients of magnitude one.
+                            let p1 = (1i32 << al) as i16;
+                            let m1 = (-1i32 << al) as i16;
+                            let mut k = ss;
+                            if eobrun == 0 {
+                                while k <= se {
+                                    let rs = br.decode(act)?;
+                                    let (mut r, s) = (i32::from(rs >> 4), u32::from(rs & 15));
+                                    let mut val = 0i16;
+                                    if s != 0 {
+                                        val = if br.bit() == 1 { p1 } else { m1 };
+                                    } else if r != 15 {
+                                        eobrun = 1u32 << r;
+                                        if r > 0 {
+                                            eobrun += br.receive(r as u32) as u32;
+                                        }
+                                        break;
+                                    }
+                                    while k <= se {
+                                        let slot = &mut blk[ZIGZAG[k]];
+                                        if *slot != 0 {
+                                            if br.bit() == 1 && (*slot & p1) == 0 {
+                                                *slot += if *slot >= 0 { p1 } else { m1 };
+                                            }
+                                        } else {
+                                            r -= 1;
+                                            if r < 0 {
+                                                break;
+                                            }
+                                        }
+                                        k += 1;
+                                    }
+                                    if val != 0 && k <= 63 {
+                                        blk[ZIGZAG[k]] = val;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                            if eobrun > 0 {
+                                while k <= se {
+                                    let slot = &mut blk[ZIGZAG[k]];
+                                    if *slot != 0 && br.bit() == 1 && (*slot & p1) == 0 {
+                                        *slot += if *slot >= 0 { p1 } else { m1 };
+                                    }
+                                    k += 1;
+                                }
+                                eobrun -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(br.pos)
+}
+
+/// Turns the coefficients of a finished progressive picture into pixels.
+fn jpeg_finish_progressive(
+    comps: &[Comp],
+    coefs: &[Vec<i16>],
+    qt: &[[i32; 64]; 4],
+    w: usize,
+    h: usize,
+) -> Bitmap {
+    let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
+    let (mcus_x, mcus_y) = (w.div_ceil(8 * hmax), h.div_ceil(8 * vmax));
+    let mut planes: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (ci, c) in comps.iter().enumerate() {
+        let bw = mcus_x * c.h;
+        let bh = mcus_y * c.v;
+        let stride = bw * 8;
+        let mut plane = vec![0u8; stride * bh * 8];
+        for brow in 0..bh {
+            for bcol in 0..bw {
+                let base = (brow * bw + bcol) * 64;
+                let mut block = [0i32; 64];
+                for (i, v) in block.iter_mut().enumerate() {
+                    *v = i32::from(coefs[ci][base + i]) * qt[c.tq][i];
+                }
+                let mut out = [0u8; 64];
+                idct(&block, &mut out);
+                for y in 0..8 {
+                    let row = (brow * 8 + y) * stride + bcol * 8;
+                    plane[row..row + 8].copy_from_slice(&out[y * 8..y * 8 + 8]);
+                }
+            }
+        }
+        planes.push((stride, plane));
+    }
+    jpeg_to_bitmap(comps, &planes, w, h, hmax, vmax)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1122,6 +1407,18 @@ fn jpeg_scan(
             }
         }
     }
+    Ok(jpeg_to_bitmap(comps, &planes, w, h, hmax, vmax))
+}
+
+/// Colour conversion and upsampling of finished component planes.
+fn jpeg_to_bitmap(
+    comps: &[Comp],
+    planes: &[(usize, Vec<u8>)],
+    w: usize,
+    h: usize,
+    hmax: usize,
+    vmax: usize,
+) -> Bitmap {
     let mut px = vec![0u32; w * h];
     for y in 0..h {
         for x in 0..w {
@@ -1145,7 +1442,7 @@ fn jpeg_scan(
             px[y * w + x] = 0xFF00_0000 | cl(r) << 16 | cl(g) << 8 | cl(b);
         }
     }
-    Ok(Bitmap { w, h, px })
+    Bitmap { w, h, px }
 }
 
 #[cfg(test)]
@@ -1252,9 +1549,31 @@ mod tests {
             fx::JPG_RST_REF,
             6,
         );
-        assert_eq!(
-            decode(&unhex(fx::JPG_PROG)).unwrap_err(),
-            "progressive JPEG pictures are not supported yet"
+        // Progressive pictures (several refining scans) match the other decoder too, including
+        // subsampled colour and a grey one.
+        same(
+            &decode(&unhex(fx::JPG_PROG)).unwrap(),
+            fx::JPG_PROG_SIZE,
+            fx::JPG_PROG_REF,
+            40,
+        );
+        same(
+            &decode(&unhex(fx::JPG_PROG444)).unwrap(),
+            fx::JPG_PROG444_SIZE,
+            fx::JPG_PROG444_REF,
+            6,
+        );
+        same(
+            &decode(&unhex(fx::JPG_PROG420)).unwrap(),
+            fx::JPG_PROG420_SIZE,
+            fx::JPG_PROG420_REF,
+            40,
+        );
+        same(
+            &decode(&unhex(fx::JPG_PROG_GRAY)).unwrap(),
+            fx::JPG_PROG_GRAY_SIZE,
+            fx::JPG_PROG_GRAY_REF,
+            4,
         );
     }
 
@@ -1318,7 +1637,15 @@ mod tests {
 
     #[test]
     fn damaged_and_hostile_files_give_errors_not_panics() {
-        for name in [fx::PNG_RGB, fx::PNG_PAL, fx::JPG_RGB, fx::JPG_420, fx::GIF] {
+        for name in [
+            fx::PNG_RGB,
+            fx::PNG_PAL,
+            fx::JPG_RGB,
+            fx::JPG_420,
+            fx::GIF,
+            fx::JPG_PROG,
+            fx::JPG_PROG420,
+        ] {
             let good = unhex(name);
             for cut in (0..good.len()).step_by(7) {
                 let _ = decode(&good[..cut]);

@@ -8,7 +8,7 @@
 //! * [`layout`], [`display`]: block, inline, flex and table layout, then a list of paint
 //!   operations for the desktop to rasterise (floats, grid and images are not done yet).
 //! * [`regex`]: the regular-expression matcher behind JavaScript's `RegExp`.
-//! * [`image`]: PNG, JPEG (baseline) and GIF decoders.
+//! * [`image`]: PNG, JPEG (baseline and progressive) and GIF decoders.
 //! * [`js`], [`interp`], [`jslib`]: a JavaScript lexer and parser, a tree-walking interpreter
 //!   with hard limits, and the standard library.
 //! * [`scripting`]: `document`, elements, events and timers, so page scripts can change the page.
