@@ -18,7 +18,7 @@ use mouli_interface::{Permissions, Policy, Workspace};
 use mouli_screen::key::Key;
 use mouli_screen::raster::Canvas;
 use mouli_screen::screen::{Action, Tab};
-use mouli_screen::screens::Role;
+use mouli_screen::screens::{ModelRow, Role};
 use mouli_screen::shell::Shell;
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -639,6 +639,14 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     let apps = mouli_apps::register(&mut ws).map_err(|e| fail(&e))?;
     let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
     let player = mouli_apps::register_player(&mut ws, Box::new(NoVideo)).map_err(|e| fail(&e))?;
+    // The CRM has no window yet, but its commands (`/crm.lead.list`, `/crm.forecast`, ...) work
+    // through the chat. Its data is kept in memory only.
+    let clock: mouli_apps::Clock = Box::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    });
+    let _crm = mouli_apps::register_crm(&mut ws, TENANT, clock).map_err(|e| fail(&e))?;
     let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
     device.attach_apps(apps);
     device.attach_code(code);
@@ -711,6 +719,53 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     Ok(s)
 }
 
+/// The models the Models window shows, and which one is loaded.
+#[derive(Debug, Clone, Default)]
+pub struct ModelsInfo {
+    /// Every model found on the machine.
+    pub rows: Vec<ModelRow>,
+    /// Memory a model may use, in MB.
+    pub budget_mb: u64,
+    /// The planned context length.
+    pub ctx: u32,
+    /// The name of the model that is loaded.
+    pub loaded: String,
+}
+
+impl ModelsInfo {
+    /// A list with only the loaded model (when the others are not known).
+    #[must_use]
+    pub fn only(name: &str) -> Self {
+        Self {
+            rows: vec![ModelRow {
+                name: name.into(),
+                size_mb: 0,
+                arch: None,
+                needs_mb: 0,
+                fits: true,
+            }],
+            budget_mb: 0,
+            ctx: 0,
+            loaded: name.into(),
+        }
+    }
+}
+
+/// Fills the Models window and the chat title from `info`.
+fn show_models(shell: &mut Shell, info: &ModelsInfo) {
+    shell.models.rows = info.rows.clone();
+    shell.models.budget_mb = info.budget_mb;
+    shell.models.ctx = info.ctx;
+    if let Some(i) = info.rows.iter().position(|r| r.name == info.loaded) {
+        shell.models.cursor.selected = i;
+    }
+    shell.models.message = format!(
+        "Loaded: {}. To switch, restart and pick another.",
+        info.loaded
+    );
+    shell.chat.model = info.loaded.clone();
+}
+
 fn fresh(system_prompt: &str) -> Vec<Turn> {
     vec![Turn {
         role: "system",
@@ -731,7 +786,7 @@ pub fn run<B, D>(
     backend: B,
     system_prompt: &str,
     max_tokens: usize,
-    model_name: &str,
+    models: &ModelsInfo,
 ) -> io::Result<End>
 where
     B: Backend + Send + 'static,
@@ -756,7 +811,7 @@ where
     } else {
         "MOULI OS - nothing is saved (no MOULI-DATA disk)".into()
     };
-    device.shell.chat.model = model_name.into();
+    show_models(&mut device.shell, models);
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
         device.shell.chat.push(
@@ -765,6 +820,22 @@ where
         );
     }
     device.shell.chat.push(Role::Notice, &inputs.line());
+    let commands: Vec<String> = device
+        .workspace()
+        .help()
+        .iter()
+        .map(|(name, _)| format!("/{name}"))
+        .take(14)
+        .collect();
+    if !commands.is_empty() {
+        device.shell.chat.push(
+            Role::Notice,
+            &format!(
+                "Commands you can type here (the apps run them through the governed gate): {} ...",
+                commands.join(", ")
+            ),
+        );
+    }
     let mut history = fresh(system_prompt);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
@@ -808,6 +879,11 @@ where
             match action {
                 Action::None => {}
                 Action::Show(tab) => desktop.open(&mut device.shell, tab),
+                Action::Send(text) if text.trim_start().starts_with('/') => {
+                    // A command for an application: carried out through the governed workspace
+                    // (policy, approvals, audit), not sent to the model.
+                    device.run(Action::Send(text));
+                }
                 Action::Send(text) => {
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
@@ -1156,7 +1232,7 @@ mod tests {
             }
             t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
         });
-        let end = run(session, Echo, "be nice", 10_000, "tiny").unwrap();
+        let end = run(session, Echo, "be nice", 10_000, &ModelsInfo::only("tiny")).unwrap();
         quitter.join().unwrap();
         assert_eq!(end, End::Quit);
         let n = shots.lock().unwrap().len();
@@ -1224,7 +1300,7 @@ mod tests {
             tx.send(e).unwrap();
         }
         tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
-        let end = run(session, Echo, "sys", 1000, "tiny").unwrap();
+        let end = run(session, Echo, "sys", 1000, &ModelsInfo::only("tiny")).unwrap();
         assert_eq!(end, End::Quit);
         let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
         assert!(saved.contains("424242"), "saved sheet: {saved}");
@@ -1337,5 +1413,149 @@ mod tests {
         let again = scan_inputs(&dev, &sys, 1280, &tx, &mut seen);
         assert_eq!(again, InputSummary::default(), "not opened twice");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Backend for Counting {
+        fn reply(&mut self, _: &[Turn]) -> Result<String, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("model answer".into())
+        }
+    }
+
+    #[test]
+    fn the_models_window_lists_the_models_and_says_which_is_loaded() {
+        let mut shell = Shell::new();
+        let info = ModelsInfo {
+            rows: vec![
+                ModelRow {
+                    name: "small".into(),
+                    size_mb: 800,
+                    arch: Some("llama".into()),
+                    needs_mb: 1000,
+                    fits: true,
+                },
+                ModelRow {
+                    name: "big".into(),
+                    size_mb: 4000,
+                    arch: None,
+                    needs_mb: 5000,
+                    fits: false,
+                },
+            ],
+            budget_mb: 3000,
+            ctx: 2048,
+            loaded: "big".into(),
+        };
+        show_models(&mut shell, &info);
+        assert_eq!(shell.models.rows.len(), 2);
+        assert_eq!(
+            shell.models.selected().unwrap().name,
+            "big",
+            "the loaded model is selected"
+        );
+        assert_eq!((shell.models.budget_mb, shell.models.ctx), (3000, 2048));
+        assert!(shell.models.message.contains("Loaded: big"));
+        assert_eq!(shell.chat.model, "big");
+        // With only a name known, there is still one row.
+        show_models(&mut shell, &ModelsInfo::only("x"));
+        assert_eq!(shell.models.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_slash_command_in_the_chat_runs_the_application_and_never_reaches_the_model() {
+        let dir = tmp("slash");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots), tx.clone(), rx, device);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("/sheet.set cell=A1 value=7777\n") {
+            tx.send(e).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let end = run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        assert_eq!(end, End::Quit);
+        let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
+        assert!(
+            saved.contains("7777"),
+            "the command edited the sheet: {saved}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the model was not asked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_text_still_goes_to_the_model() {
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Shots(shots.clone()),
+            tx.clone(),
+            rx,
+            build_device(None).unwrap(),
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("hello there\n") {
+            tx.send(e).unwrap();
+        }
+        let t2 = tx.clone();
+        let seen = shots.clone();
+        let quitter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_crm_is_registered_and_answers_its_commands() {
+        let mut d = build_device(None).unwrap();
+        let names: Vec<String> = d
+            .workspace()
+            .help()
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        for want in [
+            "crm.lead.list",
+            "crm.forecast",
+            "sheet.set",
+            "studio.paragraph",
+        ] {
+            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        }
+        d.run(Action::Send("/crm.lead.list".into()));
+        let last = d.shell.chat.messages.last().unwrap();
+        assert_eq!(last.role, Role::Tool, "{}", last.text);
+        d.run(Action::Send("/crm.no.such.thing".into()));
+        assert_eq!(
+            d.shell.chat.messages.last().unwrap().role,
+            Role::Notice,
+            "an unknown command is explained, not sent to the model"
+        );
     }
 }

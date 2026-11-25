@@ -396,7 +396,24 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     }
                 };
                 let end = match session {
-                    Some(s) => gui::run(s, backend, SYSTEM_PROMPT, max_tokens, &m.name),
+                    Some(s) => {
+                        let info = gui::ModelsInfo {
+                            rows: models
+                                .iter()
+                                .map(|f| mouli_screen::screens::ModelRow {
+                                    name: f.name.clone(),
+                                    size_mb: f.size_mb(),
+                                    arch: f.arch.clone(),
+                                    needs_mb: f.needs_mb(plan.ctx),
+                                    fits: f.fits(plan.model_budget_mb, plan.ctx),
+                                })
+                                .collect(),
+                            budget_mb: plan.model_budget_mb,
+                            ctx: plan.ctx,
+                            loaded: m.name.clone(),
+                        };
+                        gui::run(s, backend, SYSTEM_PROMPT, max_tokens, &info)
+                    }
                     None => chat_loop(
                         &mut backend,
                         &mut input,
