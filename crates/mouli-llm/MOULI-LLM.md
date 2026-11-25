@@ -19,6 +19,8 @@ claiming that a dense 70B model is interactive on a laptop (it is not; section 4
 The former crates `mouli-gguf`, `mouli-quant`, `mouli-tokenizer`, `mouli-tensor`, `mouli-model` and `mouli-engine` were merged into this crate
 (history kept) as the modules `gguf`, `quant`, `tokenizer`, `tensor`, `weights` and `kernels`. All 144 unit tests and the integration tests moved with them
 and pass; `moulid` and `mouli-runtime` now depend on `mouli-llm`.
+The crate is now **one source file**, `src/lib.rs` (about 8,300 lines), with the modules as inline `mod name { ... }` blocks; public paths are unchanged
+(`mouli_llm::gguf::...`). Integration tests (`tests/`) and the fuzz target (`fuzz/`) stay as separate files because they are separate build targets.
 
 | Piece | Where | State |
 |---|---|---|
