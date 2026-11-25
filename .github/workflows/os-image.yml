@@ -22,6 +22,7 @@ name: MOULI OS image (build + QEMU boot test)
       - "crates/mouli-systems/**"
       - "crates/mouli-tls/**"
       - "crates/mouli-utility/**"
+      - "crates/mouli-web/**"
       - ".github/workflows/os-image.yml"
   pull_request:
     paths:
@@ -42,6 +43,7 @@ name: MOULI OS image (build + QEMU boot test)
       - "crates/mouli-systems/**"
       - "crates/mouli-tls/**"
       - "crates/mouli-utility/**"
+      - "crates/mouli-web/**"
       - ".github/workflows/os-image.yml"
   workflow_dispatch:
 
