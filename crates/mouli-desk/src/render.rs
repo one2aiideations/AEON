@@ -6,7 +6,7 @@ use crate::desktop::{Alert, Desktop};
 use crate::geom::Rect;
 use crate::paint::*;
 use crate::theme::*;
-use crate::wm::{Window, STATUS_H, TITLE_H};
+use crate::wm::{Window, CELL_H, STATUS_H, TITLE_H};
 use mouli_screen::grid::Grid;
 use mouli_screen::raster::{render_text, Canvas};
 use mouli_screen::screen::Tab;
@@ -86,6 +86,16 @@ fn draw_window(c: &mut Canvas, w: &Window, active: bool, shell: &Shell) {
         shell
             .preview
             .draw_pixels(c, (k.x, k.y, k.w, k.h), (shell.editor.path(), &text));
+    } else if w.tab == Tab::Browser {
+        // An address bar of characters over a picture of the page.
+        fill(c, k, 0xFFFF_FFFF);
+        let mut bar = Grid::new(w.cols as usize, 1);
+        shell.browser.draw_bar(&mut bar);
+        let bar_rect = Rect::new(k.x, k.y, k.w, CELL_H);
+        blit(c, &render_text(&bar), k.x, k.y, bar_rect);
+        shell
+            .browser
+            .draw_pixels(c, (k.x, k.y + CELL_H, k.w, k.h - CELL_H));
     } else {
         let mut grid = Grid::new(w.cols as usize, w.rows as usize);
         let area = grid.area();
@@ -169,6 +179,7 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Player) => &PLAYER,
             Some(Tab::Storage) => &DISK,
             Some(Tab::Preview) => &CODE,
+            Some(Tab::Browser) => &BROWSER,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;

@@ -104,6 +104,8 @@ pub struct PreviewScreen {
     state: RefCell<State>,
     /// A message for the person (for example where a link points).
     pub message: String,
+    /// The address of the last link clicked that leads to another page (taken by the browser).
+    pub last_link: Option<String>,
 }
 
 impl PreviewScreen {
@@ -254,6 +256,7 @@ impl PreviewScreen {
             }
         }
         self.message = format!("Link: {}", href.chars().take(120).collect::<String>());
+        self.last_link = Some(href);
     }
 
     /// The current scroll offset in pixels.

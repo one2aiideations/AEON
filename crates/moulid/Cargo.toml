@@ -11,6 +11,7 @@ mouli-utility = { path = "../mouli-utility" }
 mouli-llm = { path = "../mouli-llm" }
 mouli-agentic = { path = "../mouli-agentic" }
 mouli-http = { path = "../mouli-http" }
+mouli-web = { path = "../mouli-web" }
 mouli-hosted = { path = "../mouli-hosted" }
 mouli-interface = { path = "../mouli-interface" }
 sha2 = "0.10"

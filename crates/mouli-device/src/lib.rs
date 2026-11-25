@@ -278,6 +278,7 @@ impl<B: Backend> Device<B> {
             other @ (Action::ChooseModel(_)
             | Action::RescanModels
             | Action::RescanStorage
+            | Action::Navigate(_)
             | Action::DeleteStorage(_)
             | Action::Wifi
             | Action::Hosted

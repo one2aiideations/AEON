@@ -330,6 +330,200 @@ pub fn inline_resources(
     dom.inner_html(0)
 }
 
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// A short page that explains a failure (shown in the window).
+#[must_use]
+pub fn error_page(url: &str, message: &str) -> String {
+    format!(
+        "<body style=\"margin:0;background:#fafafa\"><div style=\"padding:32px;font-size:14px;color:#212121\"><h2 style=\"margin:0 0 12px 0\">This page cannot be shown</h2><p style=\"margin:0 0 8px 0\">{}</p><p style=\"margin:0;color:#757575;font-size:12px\">{}</p></div></body>",
+        escape(message),
+        escape(url)
+    )
+}
+
+/// What submitting a form sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormSubmit {
+    /// `get` or `post` (lowercase).
+    pub method: String,
+    /// The `action` attribute (may be empty or relative).
+    pub action: String,
+    /// The fields as `name=value&...`, percent-encoded.
+    pub query: String,
+}
+
+/// Percent-encodes text for a query string (spaces become `+`).
+#[must_use]
+pub fn encode_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn input_type(dom: &Dom, n: usize) -> Option<String> {
+    (dom.tag(n)? == "input").then(|| dom.attr(n, "type").unwrap_or("text").to_ascii_lowercase())
+}
+
+/// Whether the node is a field that takes typed text.
+#[must_use]
+pub fn is_text_field(dom: &Dom, node: usize) -> bool {
+    if dom.attr(node, "disabled").is_some() || dom.attr(node, "readonly").is_some() {
+        return false;
+    }
+    match dom.tag(node) {
+        Some("textarea") => true,
+        Some("input") => !matches!(
+            input_type(dom, node).as_deref(),
+            Some(
+                "submit"
+                    | "reset"
+                    | "button"
+                    | "image"
+                    | "checkbox"
+                    | "radio"
+                    | "hidden"
+                    | "file"
+                    | "range"
+                    | "color"
+            )
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the node is a checkbox or a radio button.
+#[must_use]
+pub fn is_toggle(dom: &Dom, node: usize) -> bool {
+    matches!(input_type(dom, node).as_deref(), Some("checkbox" | "radio"))
+        && dom.attr(node, "disabled").is_none()
+}
+
+/// Whether activating the node sends its form (a submit button).
+#[must_use]
+pub fn is_submit(dom: &Dom, node: usize) -> bool {
+    if dom.attr(node, "disabled").is_some() {
+        return false;
+    }
+    match dom.tag(node) {
+        Some("button") => dom
+            .attr(node, "type")
+            .is_none_or(|t| t.eq_ignore_ascii_case("submit")),
+        Some("input") => matches!(input_type(dom, node).as_deref(), Some("submit" | "image")),
+        _ => false,
+    }
+}
+
+/// The form that holds a node.
+#[must_use]
+pub fn form_of(dom: &Dom, node: usize) -> Option<usize> {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if dom.tag(n) == Some("form") {
+            return Some(n);
+        }
+        cur = dom.parent(n);
+    }
+    None
+}
+
+/// Collects what a form would send. `submitter` is the button that was used (its name and value
+/// are sent too).
+#[must_use]
+pub fn submit_form(dom: &Dom, form: usize, submitter: Option<usize>) -> FormSubmit {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for n in dom.descendants(form) {
+        let Some(name) = dom.attr(n, "name").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if dom.attr(n, "disabled").is_some() {
+            continue;
+        }
+        match dom.tag(n) {
+            Some("input") => match input_type(dom, n).as_deref() {
+                Some("checkbox" | "radio") => {
+                    if dom.attr(n, "checked").is_some() {
+                        pairs.push((
+                            name.to_string(),
+                            dom.attr(n, "value").unwrap_or("on").to_string(),
+                        ));
+                    }
+                }
+                Some("submit" | "image" | "button" | "reset" | "file") => {
+                    if submitter == Some(n) {
+                        pairs.push((
+                            name.to_string(),
+                            dom.attr(n, "value").unwrap_or("").to_string(),
+                        ));
+                    }
+                }
+                _ => pairs.push((
+                    name.to_string(),
+                    dom.attr(n, "value").unwrap_or("").to_string(),
+                )),
+            },
+            Some("textarea") => pairs.push((name.to_string(), dom.text_content(n))),
+            Some("select") => {
+                let opts: Vec<usize> = dom
+                    .descendants(n)
+                    .into_iter()
+                    .filter(|&o| dom.tag(o) == Some("option"))
+                    .collect();
+                let chosen = opts
+                    .iter()
+                    .find(|&&o| dom.attr(o, "selected").is_some())
+                    .or(opts.first());
+                if let Some(&o) = chosen {
+                    let v = dom
+                        .attr(o, "value")
+                        .map_or_else(|| dom.text_content(o).trim().to_string(), str::to_string);
+                    pairs.push((name.to_string(), v));
+                }
+            }
+            Some("button") if submitter == Some(n) => pairs.push((
+                name.to_string(),
+                dom.attr(n, "value").unwrap_or("").to_string(),
+            )),
+            _ => {}
+        }
+    }
+    FormSubmit {
+        method: dom
+            .attr(form, "method")
+            .unwrap_or("get")
+            .to_ascii_lowercase(),
+        action: dom.attr(form, "action").unwrap_or("").to_string(),
+        query: pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", encode_component(k), encode_component(v)))
+            .collect::<Vec<_>>()
+            .join("&"),
+    }
+}
+
+/// The link a GET form sends to: its action joined with the query (the query replaces any in the
+/// action). `None` for other methods.
+#[must_use]
+pub fn form_link(f: &FormSubmit) -> Option<String> {
+    if f.method != "get" {
+        return None;
+    }
+    let base = f.action.split(['?', '#']).next().unwrap_or("");
+    Some(format!("{base}?{}", f.query))
+}
+
 /// Turns the bytes of a response into text: UTF-8, or Latin-1 when the content type says so.
 #[must_use]
 pub fn decode_body(bytes: &[u8], content_type: &str) -> String {
@@ -612,5 +806,60 @@ mod tests {
             Some("/x")
         );
         assert_eq!(link_target(&d, d.by_id("i").unwrap()), None);
+    }
+
+    #[test]
+    fn forms_collect_their_fields_and_become_get_links() {
+        let d = Dom::parse("<form id=f action='/search?old=1#x' method=GET><input name=q value='a b&c'><input type=hidden name=h value=1><input type=checkbox name=c checked><input type=checkbox name=off><input type=radio name=r value=x checked><input type=radio name=r value=y><select name=s><option value=1>One</option><option selected>Two</option></select><textarea name=t>line</textarea><input name=skip disabled value=z><input value=noname><input type=submit name=go value=Go id=b1><button name=other value=2 id=b2>x</button></form>");
+        let f = d.by_id("f").unwrap();
+        let s = submit_form(&d, f, d.by_id("b1"));
+        assert_eq!(s.query, "q=a+b%26c&h=1&c=on&r=x&s=Two&t=line&go=Go");
+        assert_eq!(
+            form_link(&s).as_deref(),
+            Some("/search?q=a+b%26c&h=1&c=on&r=x&s=Two&t=line&go=Go")
+        );
+        assert_eq!(
+            submit_form(&d, f, None).query,
+            "q=a+b%26c&h=1&c=on&r=x&s=Two&t=line"
+        );
+        let post = FormSubmit {
+            method: "post".into(),
+            action: String::new(),
+            query: String::new(),
+        };
+        assert!(form_link(&post).is_none());
+        assert_eq!(
+            form_link(&FormSubmit {
+                method: "get".into(),
+                action: String::new(),
+                query: "q=1".into()
+            })
+            .as_deref(),
+            Some("?q=1")
+        );
+        assert_eq!(encode_component("é €/~"), "%C3%A9+%E2%82%AC%2F%7E");
+        // Classification.
+        let d = Dom::parse("<form><input id=t><input id=p type=password><input id=c type=checkbox><input id=s type=submit><button id=b>b</button><button id=n type=button>n</button><input id=h type=hidden><input id=ro readonly><textarea id=ta></textarea><div id=x></div></form>");
+        let id = |n: &str| d.by_id(n).unwrap();
+        assert!(
+            is_text_field(&d, id("t")) && is_text_field(&d, id("p")) && is_text_field(&d, id("ta"))
+        );
+        assert!(
+            !is_text_field(&d, id("c"))
+                && !is_text_field(&d, id("s"))
+                && !is_text_field(&d, id("h"))
+                && !is_text_field(&d, id("ro"))
+                && !is_text_field(&d, id("x"))
+        );
+        assert!(is_toggle(&d, id("c")) && !is_toggle(&d, id("t")));
+        assert!(
+            is_submit(&d, id("s"))
+                && is_submit(&d, id("b"))
+                && !is_submit(&d, id("n"))
+                && !is_submit(&d, id("t"))
+        );
+        assert_eq!(form_of(&d, id("t")), d.find_all("form").first().copied());
+        let lone = Dom::parse("<input id=q>");
+        assert!(form_of(&lone, lone.by_id("q").unwrap()).is_none());
     }
 }

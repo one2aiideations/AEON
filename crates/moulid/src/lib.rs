@@ -30,6 +30,7 @@ pub use mouli_utility::{
 pub mod args;
 pub mod backoff;
 pub mod banner;
+pub mod browse;
 pub mod catalog;
 pub mod context;
 pub mod datagraph;

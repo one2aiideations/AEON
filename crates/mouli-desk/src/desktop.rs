@@ -114,6 +114,10 @@ impl Desktop {
                 label: "Code",
                 tab: Some(Tab::Editor),
             },
+            IconSpot {
+                label: "Browser",
+                tab: Some(Tab::Browser),
+            },
         ];
         Self {
             width,
@@ -343,6 +347,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
+            Key::Ctrl('b') => Some(Command::Open(Tab::Browser)),
             Key::F(n @ 1..=12) => Tab::ALL
                 .get(usize::from(n) - 1)
                 .filter(|t| !MOVED_OUT.contains(t))
@@ -472,6 +477,20 @@ impl Desktop {
                     // Links in the preview are followed by position, in pixels.
                     let k = w.content();
                     shell.preview.click((px - k.x) as f32, (py - k.y) as f32);
+                }
+                if let Some(w) = self.wm.get(id).filter(|w| w.tab == Tab::Browser) {
+                    // The first row is the address bar; below it is the page, in pixels.
+                    let k = w.content();
+                    let bar = crate::wm::CELL_H;
+                    return if py - k.y < bar {
+                        shell
+                            .browser
+                            .click_bar(((px - k.x) / crate::wm::CELL_W).max(0) as usize)
+                    } else {
+                        shell
+                            .browser
+                            .click((px - k.x) as f32, (py - k.y - bar) as f32)
+                    };
                 }
             }
             Some(Hit::Frame(id)) => self.focus(shell, id),
@@ -683,6 +702,55 @@ mod tests {
     }
 
     #[test]
+    fn the_browser_opens_with_ctrl_b_and_follows_links_through_the_host() {
+        let (mut d, mut s) = setup();
+        assert_eq!(d.on_key(&mut s, Key::Ctrl('b')), Action::Show(Tab::Browser));
+        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Browser));
+        assert!(
+            d.icons.iter().any(|i| i.tab == Some(Tab::Browser)),
+            "the browser has a desktop icon"
+        );
+        assert!(d
+            .menu
+            .menus
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .any(|i| i.label == "Browser" && i.shortcut == "^B"));
+        let k = d.wm.top().unwrap().content();
+        // A click on the address field starts editing; typing and Enter ask the host to load it.
+        click(&mut d, &mut s, k.x + 12 * crate::wm::CELL_W, k.y + 4, 0);
+        assert!(s.browser.editing());
+        for c in "example.com/start".chars() {
+            d.on_key(&mut s, Key::Char(c));
+        }
+        let a = d.on_key(&mut s, Key::Enter);
+        assert_eq!(a, Action::Navigate("https://example.com/start".into()));
+        // The host answers with a page that has a link and a red background.
+        s.browser.loaded(
+            "https://example.com/start",
+            "https://example.com/start",
+            "<body style=\"margin:0;background:#ff0000\"><p style=\"margin:0;font-size:20px\"><a href=\"/next\">go</a></p></body>".into(),
+        );
+        let c = d.render(&s);
+        assert_eq!(
+            c.get((k.x + k.w - 5) as usize, (k.y + k.h - 5) as usize),
+            Some(0x00FF_0000),
+            "the page is drawn under the address bar"
+        );
+        // Clicking the link asks the host for the joined address.
+        let a = click(&mut d, &mut s, k.x + 6, k.y + crate::wm::CELL_H + 8, 10);
+        assert_eq!(a, Action::Navigate("https://example.com/next".into()));
+        // The back button in the bar goes to the first page.
+        s.browser.loaded(
+            "https://example.com/next",
+            "https://example.com/next",
+            "<p>2</p>".into(),
+        );
+        let a = click(&mut d, &mut s, k.x + crate::wm::CELL_W, k.y + 4, 20);
+        assert_eq!(a, Action::Navigate("https://example.com/start".into()));
+    }
+
+    #[test]
     fn a_click_on_a_link_in_the_preview_is_reported_and_other_windows_are_unaffected() {
         let (mut d, mut s) = setup();
         s.editor
@@ -852,7 +920,7 @@ mod tests {
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[9]; // Admin > Security
+        let item = d.menu.item_rects(3)[10]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);

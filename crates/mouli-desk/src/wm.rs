@@ -170,7 +170,7 @@ impl WindowManager {
             return id;
         }
         let n = self.windows.len() as i32;
-        let (want_cols, want_rows) = if tab == Tab::Preview {
+        let (want_cols, want_rows) = if tab == Tab::Preview || tab == Tab::Browser {
             (96, 24)
         } else {
             (72, 22)

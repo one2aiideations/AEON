@@ -325,6 +325,13 @@ pub enum Ev {
     Key(Key),
     /// The model finished answering (or failed).
     Reply(Result<String, String>),
+    /// The browser finished loading an address (or failed).
+    Page {
+        /// The address that was asked for.
+        requested: String,
+        /// The page, or why it could not be loaded.
+        result: Result<crate::browse::Loaded, String>,
+    },
 }
 
 /// What an input device can be used for, from the kernel's capability words.
@@ -949,6 +956,7 @@ where
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
     let reply_tx = tx.clone();
+    let reply_tx_pages = tx.clone();
     std::thread::spawn(move || {
         let mut backend = backend;
         while let Ok(turns) = req_rx.recv() {
@@ -963,12 +971,14 @@ where
     display.present(&desktop.render(&device.shell))?;
     loop {
         let mut batch = Vec::new();
-        if device.shell.preview.wants_ticks() {
+        if device.shell.preview.wants_ticks() || device.shell.browser.view.wants_ticks() {
             // A page with timers: wake up often enough to run them.
             match rx.recv_timeout(Duration::from_millis(40)) {
                 Ok(first) => batch.push(first),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if device.shell.preview.tick() {
+                    let a = device.shell.preview.tick();
+                    let b = device.shell.browser.view.tick();
+                    if a || b {
                         display.present(&desktop.render(&device.shell))?;
                     }
                     continue;
@@ -1041,6 +1051,16 @@ where
                     desktop.system = *s;
                     Action::None
                 }
+                Ev::Page { requested, result } => {
+                    match result {
+                        Ok(l) => device.shell.browser.loaded(&requested, &l.url, l.html),
+                        Err(m) => {
+                            let page = crate::browse::error_page(&requested, &m);
+                            device.shell.browser.failed(&requested, &m, page);
+                        }
+                    }
+                    Action::None
+                }
             };
             match action {
                 Action::None => {}
@@ -1049,6 +1069,19 @@ where
                     if tab == Tab::Storage {
                         refresh_storage(&mut device.shell, data_root.as_deref());
                     }
+                }
+                Action::Navigate(url) => {
+                    let tx = reply_tx_pages.clone();
+                    std::thread::spawn(move || {
+                        let result = match crate::fetch::HttpFetcher::system() {
+                            Ok(f) => crate::browse::load(&f, &url),
+                            Err(e) => Err(e),
+                        };
+                        let _ = tx.send(Ev::Page {
+                            requested: url,
+                            result,
+                        });
+                    });
                 }
                 Action::RescanStorage => {
                     refresh_storage(&mut device.shell, data_root.as_deref());

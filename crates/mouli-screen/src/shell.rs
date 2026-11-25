@@ -4,8 +4,8 @@ use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
 use crate::screens::{
-    Approvals, Audit, Chat, EditorScreen, ModelPicker, PlayerScreen, PreviewScreen, Review,
-    SecurityScreen, SheetScreen, StorageScreen, StudioScreen,
+    Approvals, Audit, BrowserScreen, Chat, EditorScreen, ModelPicker, PlayerScreen, PreviewScreen,
+    Review, SecurityScreen, SheetScreen, StorageScreen, StudioScreen,
 };
 
 /// The whole interface.
@@ -35,6 +35,8 @@ pub struct Shell {
     pub storage: StorageScreen,
     /// The rendered preview of the open file.
     pub preview: PreviewScreen,
+    /// The web browser.
+    pub browser: BrowserScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -56,6 +58,7 @@ impl Default for Shell {
             player: PlayerScreen::default(),
             storage: StorageScreen::default(),
             preview: PreviewScreen::default(),
+            browser: BrowserScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -83,6 +86,7 @@ impl Shell {
             Tab::Player => &self.player,
             Tab::Storage => &self.storage,
             Tab::Preview => &self.preview,
+            Tab::Browser => &self.browser,
         }
     }
 
@@ -101,6 +105,7 @@ impl Shell {
             Tab::Player => &mut self.player,
             Tab::Storage => &mut self.storage,
             Tab::Preview => &mut self.preview,
+            Tab::Browser => &mut self.browser,
         }
     }
 
@@ -143,16 +148,15 @@ impl Shell {
         // just their function key, so every screen stays reachable.
         let full_width: usize = 8 + Tab::ALL
             .iter()
-            .enumerate()
-            .map(|(i, t)| format!(" F{} {} ", i + 1, t.label()).chars().count())
+            .map(|t| format!(" {} {} ", t.key_name(), t.label()).chars().count())
             .sum::<usize>();
         let compact = full_width + 1 > area.w;
-        for (i, tab) in Tab::ALL.iter().enumerate() {
-            let on = *tab == self.active;
+        for tab in Tab::ALL {
+            let on = tab == self.active;
             let label = if compact && !on {
-                format!(" F{} ", i + 1)
+                format!(" {} ", tab.key_name())
             } else {
-                format!(" F{} {} ", i + 1, tab.label())
+                format!(" {} {} ", tab.key_name(), tab.label())
             };
             let (fg, bg) = if on {
                 (theme::BG, theme::ACCENT)

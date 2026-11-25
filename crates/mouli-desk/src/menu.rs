@@ -127,6 +127,7 @@ impl MenuBar {
                         item("Code", "F9", Command::Open(Tab::Editor)),
                         item("Storage", "F11", Command::Open(Tab::Storage)),
                         item("Preview", "F12", Command::Open(Tab::Preview)),
+                        item("Browser", "^B", Command::Open(Tab::Browser)),
                         SEP,
                         item("Admin", "", Command::Nothing),
                         item("Approvals", "F3", Command::Open(Tab::Approvals)),

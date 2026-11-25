@@ -28,6 +28,8 @@ pub enum Action {
     RescanStorage,
     /// Remove the stored model at this index in the Storage list (the host decides if it may).
     DeleteStorage(usize),
+    /// Open this web address in the browser (the host fetches it and reports back).
+    Navigate(String),
     /// Open Wi-Fi setup.
     Wifi,
     /// Use a hosted model online.
@@ -87,11 +89,13 @@ pub enum Tab {
     Storage,
     /// A rendered preview of the file open in the code editor.
     Preview,
+    /// The web browser.
+    Browser,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 12] = [
+    pub const ALL: [Tab; 13] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -104,6 +108,7 @@ impl Tab {
         Tab::Player,
         Tab::Storage,
         Tab::Preview,
+        Tab::Browser,
     ];
 
     /// The name shown in the tab bar.
@@ -121,12 +126,24 @@ impl Tab {
             Tab::Player => "Player",
             Tab::Storage => "Storage",
             Tab::Preview => "Preview",
+            Tab::Browser => "Browser",
         }
     }
 
-    /// The function key that opens it (F1 to F12).
+    /// The key that opens it: F1 to F12 for the first twelve, Ctrl-B for the browser.
     pub const fn key(self) -> Key {
-        Key::F(self as u8 + 1)
+        match self {
+            Tab::Browser => Key::Ctrl('b'),
+            t => Key::F(t as u8 + 1),
+        }
+    }
+
+    /// The key as shown to people (`F3`, `^B`).
+    pub fn key_name(self) -> String {
+        match self {
+            Tab::Browser => "^B".into(),
+            t => format!("F{}", t as u8 + 1),
+        }
     }
 }
 
@@ -205,7 +222,10 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 12);
+        assert_eq!(Tab::ALL.len(), 13);
+        assert_eq!(Tab::Browser.key(), Key::Ctrl('b'));
+        assert_eq!(Tab::Browser.key_name(), "^B");
+        assert_eq!(Tab::Chat.key_name(), "F1");
         assert_eq!(Tab::Storage.key(), Key::F(11));
         assert_eq!(Tab::Preview.key(), Key::F(12));
         assert_eq!(Tab::Editor.key(), Key::F(9));
@@ -224,7 +244,8 @@ mod tests {
                 "Code",
                 "Player",
                 "Storage",
-                "Preview"
+                "Preview",
+                "Browser"
             ]
         );
     }

@@ -2,6 +2,7 @@
 
 pub mod approvals;
 pub mod audit;
+pub mod browser;
 pub mod chat;
 pub mod editor;
 pub mod models;
@@ -15,6 +16,7 @@ pub mod studio;
 
 pub use approvals::{ApprovalRow, Approvals};
 pub use audit::{Audit, AuditRow, Chain, Filter};
+pub use browser::BrowserScreen;
 pub use chat::{Chat, Message, Role};
 pub use editor::EditorScreen;
 pub use models::{ModelPicker, ModelRow};
