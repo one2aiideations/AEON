@@ -3,6 +3,7 @@
 //! * [`source`]: what can be played and how to read an address safely.
 //! * [`queue`]: the play queue with shuffle, repeat and history.
 //! * [`engine`]: the player state machine, including hands-free Shorts autoplay.
+//! * [`bridge`]: the local server that runs YouTube's own player page and passes commands and events.
 //! * [`mpv`]: the control protocol of the `mpv` media engine, for local files and direct URLs.
 //!
 //! YouTube items are never fetched or decoded here. They are only ever played by YouTube's own
@@ -13,6 +14,7 @@
 //! OS image. Everything in this crate is testable without a display.
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod engine;
 pub mod mpv;
 pub mod queue;
