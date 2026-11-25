@@ -9,6 +9,8 @@
 //! * [`jobs`]: scheduled agent jobs.
 //! * [`runtime`]: the sensors, cognition, model, action, telemetry loop.
 //! * [`adapters`]: views of sibling systems' messages.
+//! * [`graph`]: the AI data graph: conversations, messages, models, files, tool calls and approvals
+//!   as typed nodes and timed edges, saved as an append-only log.
 //!
 //! Merged from nine crates; behaviour and tests are unchanged.
 
@@ -25438,6 +25440,712 @@ pub mod agentmem {
                     Err(ReportCodecError::InvalidReport)
                 );
             }
+        }
+    }
+}
+
+pub mod graph {
+    //! The AI data graph: what the OS knows and what happened, as typed nodes and timed edges.
+    //!
+    //! Conversations, messages, models, files, tool calls and approvals are **nodes**; "said",
+    //! "replied to", "called", "touched", "held for", "decided" are **edges** with a time. Every
+    //! change is also written as one line of an append-only log ([`Graph::drain_log`]) that the
+    //! host saves (on MOULI-DATA) and replays at the next start ([`Graph::replay`]), so the history
+    //! survives power-off and can be audited line by line.
+    //!
+    //! The graph is plain data with no clock and no I/O: callers pass the time, and the host
+    //! stores the log. Everything is bounded, labels are validated, and the log format escapes every
+    //! byte that could forge a record, so text from a model or a file can never alter the graph's
+    //! structure.
+    //!
+    //! This is the vocabulary used by the desktop:
+    //!
+    //! | node kind | key |
+    //! |---|---|
+    //! | `person`, `agent` | the principal (`owner`, `agent:chat`) |
+    //! | `model` | the model name |
+    //! | `conversation` | a conversation id |
+    //! | `message` | `<conversation>/<number>` |
+    //! | `file` | the project path |
+    //! | `toolcall` | `<conversation>/<number>` |
+    //! | `approval` | the approval id |
+    #![forbid(unsafe_code)]
+
+    use std::collections::{BTreeMap, HashMap};
+    use std::fmt;
+
+    /// Longest node key, in bytes.
+    pub const MAX_KEY: usize = 512;
+    /// Longest property value kept, in characters (longer values are cut).
+    pub const MAX_VALUE: usize = 2000;
+    /// Most properties on one node or edge.
+    pub const MAX_PROPS: usize = 16;
+    /// Longest label (node kind, edge kind, property name).
+    pub const MAX_LABEL: usize = 32;
+    /// Most nodes.
+    pub const MAX_NODES: usize = 1 << 21;
+    /// Most edges.
+    pub const MAX_EDGES: usize = 1 << 22;
+    /// Longest log line accepted by [`Graph::replay`], in bytes.
+    pub const MAX_LINE: usize = 64 * 1024;
+
+    /// A node's number (1, 2, 3, ... in creation order).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct NodeId(pub u64);
+
+    /// Something the graph knows about.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Node {
+        /// The node's number.
+        pub id: NodeId,
+        /// What it is (`message`, `file`, ...).
+        pub kind: String,
+        /// Its name within its kind; unique per kind.
+        pub key: String,
+        /// When it was first recorded (seconds since the Unix epoch).
+        pub created: u64,
+        /// Facts about it; the latest value of each name.
+        pub props: BTreeMap<String, String>,
+    }
+
+    /// A timed relationship between two nodes.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Edge {
+        /// Where it starts.
+        pub from: NodeId,
+        /// Where it ends.
+        pub to: NodeId,
+        /// What it means (`said`, `called`, ...).
+        pub kind: String,
+        /// When it happened.
+        pub time: u64,
+        /// Facts about it (for example `verdict=approved`).
+        pub props: BTreeMap<String, String>,
+    }
+
+    /// Why a graph operation or a replay failed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GraphError {
+        /// A label or key is empty, too long or has forbidden characters (the text says which).
+        BadName(&'static str),
+        /// A node number does not exist.
+        UnknownNode(u64),
+        /// A limit was reached (the text says which).
+        Full(&'static str),
+        /// A log line is malformed (1-based line number).
+        BadLine(usize),
+    }
+
+    impl fmt::Display for GraphError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::BadName(w) => write!(f, "invalid {w}"),
+                Self::UnknownNode(n) => write!(f, "no node {n}"),
+                Self::Full(w) => write!(f, "graph limit reached: {w}"),
+                Self::BadLine(n) => write!(f, "graph log line {n} is malformed"),
+            }
+        }
+    }
+
+    impl std::error::Error for GraphError {}
+
+    fn valid_label(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= MAX_LABEL
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    fn valid_key(s: &str) -> bool {
+        !s.is_empty() && s.len() <= MAX_KEY && !s.chars().any(char::is_control)
+    }
+
+    /// Percent-encodes every byte except ASCII letters, digits and `-_./:@`, so an encoded value
+    /// never contains a space, a line break, `=` or `%` other than as an escape.
+    fn esc(s: &str) -> String {
+        let mut o = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || b"-_./:@".contains(&b) {
+                o.push(char::from(b));
+            } else {
+                o.push_str(&format!("%{b:02X}"));
+            }
+        }
+        o
+    }
+
+    fn unesc(s: &str) -> Option<String> {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                let h = s.get(i + 1..i + 3)?;
+                if !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                out.push(u8::from_str_radix(h, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    fn cut(s: &str) -> String {
+        s.chars().take(MAX_VALUE).collect()
+    }
+
+    /// The graph.
+    #[derive(Debug, Clone)]
+    pub struct Graph {
+        nodes: Vec<Node>,
+        by_key: HashMap<(String, String), NodeId>,
+        edges: Vec<Edge>,
+        out: HashMap<NodeId, Vec<usize>>,
+        inn: HashMap<NodeId, Vec<usize>>,
+        pending: Vec<String>,
+        max_nodes: usize,
+        max_edges: usize,
+    }
+
+    impl Default for Graph {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Graph {
+        /// An empty graph with the standard limits.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::with_limits(MAX_NODES, MAX_EDGES)
+        }
+
+        /// An empty graph with smaller limits (used by tests).
+        #[must_use]
+        pub fn with_limits(max_nodes: usize, max_edges: usize) -> Self {
+            Self {
+                nodes: Vec::new(),
+                by_key: HashMap::new(),
+                edges: Vec::new(),
+                out: HashMap::new(),
+                inn: HashMap::new(),
+                pending: Vec::new(),
+                max_nodes,
+                max_edges,
+            }
+        }
+
+        /// Number of nodes.
+        #[must_use]
+        pub fn node_count(&self) -> usize {
+            self.nodes.len()
+        }
+
+        /// Number of edges.
+        #[must_use]
+        pub fn edge_count(&self) -> usize {
+            self.edges.len()
+        }
+
+        /// The node of `kind` named `key`, created at `now` if it does not exist yet.
+        ///
+        /// # Errors
+        /// [`GraphError::BadName`] for an invalid kind or key; [`GraphError::Full`] at the limit.
+        pub fn node(&mut self, kind: &str, key: &str, now: u64) -> Result<NodeId, GraphError> {
+            if !valid_label(kind) {
+                return Err(GraphError::BadName("node kind"));
+            }
+            if !valid_key(key) {
+                return Err(GraphError::BadName("node key"));
+            }
+            if let Some(&id) = self.by_key.get(&(kind.to_string(), key.to_string())) {
+                return Ok(id);
+            }
+            if self.nodes.len() >= self.max_nodes {
+                return Err(GraphError::Full("nodes"));
+            }
+            let id = NodeId(self.nodes.len() as u64 + 1);
+            self.pending
+                .push(format!("N {} {now} {kind} {}", id.0, esc(key)));
+            self.by_key.insert((kind.to_string(), key.to_string()), id);
+            self.nodes.push(Node {
+                id,
+                kind: kind.into(),
+                key: key.into(),
+                created: now,
+                props: BTreeMap::new(),
+            });
+            Ok(id)
+        }
+
+        /// Sets a fact about a node (the latest value of a name wins; long values are cut).
+        ///
+        /// # Errors
+        /// [`GraphError::UnknownNode`], [`GraphError::BadName`] for a bad property name or too many
+        /// properties.
+        pub fn set(&mut self, id: NodeId, name: &str, value: &str) -> Result<(), GraphError> {
+            if !valid_label(name) {
+                return Err(GraphError::BadName("property name"));
+            }
+            let v = cut(value);
+            let n = self
+                .nodes
+                .get_mut(Self::index(id)?)
+                .ok_or(GraphError::UnknownNode(id.0))?;
+            if !n.props.contains_key(name) && n.props.len() >= MAX_PROPS {
+                return Err(GraphError::BadName("property count"));
+            }
+            self.pending.push(format!("P {} {name} {}", id.0, esc(&v)));
+            n.props.insert(name.into(), v);
+            Ok(())
+        }
+
+        fn index(id: NodeId) -> Result<usize, GraphError> {
+            usize::try_from(id.0)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .ok_or(GraphError::UnknownNode(id.0))
+        }
+
+        /// Records that `from` has relation `kind` to `to` at `time`, with optional facts.
+        ///
+        /// # Errors
+        /// [`GraphError::UnknownNode`], [`GraphError::BadName`], [`GraphError::Full`].
+        pub fn link(
+            &mut self,
+            from: NodeId,
+            to: NodeId,
+            kind: &str,
+            time: u64,
+            props: &[(&str, &str)],
+        ) -> Result<(), GraphError> {
+            if !valid_label(kind) {
+                return Err(GraphError::BadName("edge kind"));
+            }
+            if props.len() > MAX_PROPS || props.iter().any(|(k, _)| !valid_label(k)) {
+                return Err(GraphError::BadName("edge property"));
+            }
+            for id in [from, to] {
+                if self.nodes.get(Self::index(id)?).is_none() {
+                    return Err(GraphError::UnknownNode(id.0));
+                }
+            }
+            if self.edges.len() >= self.max_edges {
+                return Err(GraphError::Full("edges"));
+            }
+            let map: BTreeMap<String, String> = props
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), cut(v)))
+                .collect();
+            let mut line = format!("E {} {} {time} {kind}", from.0, to.0);
+            for (k, v) in &map {
+                line.push_str(&format!(" {k}={}", esc(v)));
+            }
+            self.pending.push(line);
+            let i = self.edges.len();
+            self.out.entry(from).or_default().push(i);
+            self.inn.entry(to).or_default().push(i);
+            self.edges.push(Edge {
+                from,
+                to,
+                kind: kind.into(),
+                time,
+                props: map,
+            });
+            Ok(())
+        }
+
+        /// The node with this number.
+        #[must_use]
+        pub fn get(&self, id: NodeId) -> Option<&Node> {
+            self.nodes.get(Self::index(id).ok()?)
+        }
+
+        /// The node of `kind` named `key`, if there is one.
+        #[must_use]
+        pub fn find(&self, kind: &str, key: &str) -> Option<&Node> {
+            self.by_key
+                .get(&(kind.to_string(), key.to_string()))
+                .and_then(|&id| self.get(id))
+        }
+
+        /// Edges leaving `id`, oldest first, optionally only of one kind.
+        #[must_use]
+        pub fn out_edges(&self, id: NodeId, kind: Option<&str>) -> Vec<&Edge> {
+            self.pick(self.out.get(&id), kind)
+        }
+
+        /// Edges arriving at `id`, oldest first, optionally only of one kind.
+        #[must_use]
+        pub fn in_edges(&self, id: NodeId, kind: Option<&str>) -> Vec<&Edge> {
+            self.pick(self.inn.get(&id), kind)
+        }
+
+        fn pick(&self, ix: Option<&Vec<usize>>, kind: Option<&str>) -> Vec<&Edge> {
+            ix.map(|v| {
+                v.iter()
+                    .map(|&i| &self.edges[i])
+                    .filter(|e| kind.is_none_or(|k| e.kind == k))
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+
+        /// All nodes of a kind, newest first.
+        #[must_use]
+        pub fn nodes_of(&self, kind: &str) -> Vec<&Node> {
+            self.nodes.iter().rev().filter(|n| n.kind == kind).collect()
+        }
+
+        /// The last `n` edges, newest first.
+        #[must_use]
+        pub fn recent(&self, n: usize) -> Vec<&Edge> {
+            self.edges.iter().rev().take(n).collect()
+        }
+
+        /// Every edge touching `id` in either direction, oldest first by time: the history of one
+        /// thing.
+        #[must_use]
+        pub fn history(&self, id: NodeId) -> Vec<&Edge> {
+            let mut v: Vec<&Edge> = self
+                .out_edges(id, None)
+                .into_iter()
+                .chain(self.in_edges(id, None))
+                .collect();
+            v.sort_by_key(|e| e.time);
+            v.dedup_by(|a, b| std::ptr::eq(*a, *b));
+            v
+        }
+
+        /// What led to `id`: follows edges *backwards* (who points here, who points at them, ...)
+        /// breadth first up to `depth` steps, never visiting a node twice. Each result is the cause
+        /// and the edge kind through which it led on. Starts nearest first.
+        #[must_use]
+        pub fn causes(&self, id: NodeId, depth: usize) -> Vec<(NodeId, String)> {
+            let mut seen = std::collections::HashSet::from([id]);
+            let mut frontier = vec![id];
+            let mut out = Vec::new();
+            for _ in 0..depth {
+                let mut next = Vec::new();
+                for n in frontier {
+                    for e in self.in_edges(n, None) {
+                        if seen.insert(e.from) {
+                            out.push((e.from, e.kind.clone()));
+                            next.push(e.from);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+            out
+        }
+
+        /// The log lines for everything recorded since the last call (nodes, facts, edges in order).
+        /// The host appends them to its file.
+        pub fn drain_log(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.pending)
+        }
+
+        /// Rebuilds a graph from a saved log. Nothing is pending afterwards.
+        ///
+        /// # Errors
+        /// [`GraphError::BadLine`] with the 1-based number of the first bad line: a record that is
+        /// malformed, out of order (node numbers must count up from 1), or refers to a node that is
+        /// not there. Blank lines are skipped.
+        pub fn replay(text: &str) -> Result<Self, GraphError> {
+            let mut g = Self::new();
+            for (i, line) in text.lines().enumerate() {
+                let n = i + 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.len() > MAX_LINE {
+                    return Err(GraphError::BadLine(n));
+                }
+                let bad = |_| GraphError::BadLine(n);
+                let parts: Vec<&str> = line.split(' ').collect();
+                match parts.as_slice() {
+                    ["N", id, created, kind, key] => {
+                        let id: u64 = id.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let created: u64 = created.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let key = unesc(key).ok_or(GraphError::BadLine(n))?;
+                        if id != g.nodes.len() as u64 + 1 || g.find(kind, &key).is_some() {
+                            return Err(GraphError::BadLine(n));
+                        }
+                        g.node(kind, &key, created).map_err(bad)?;
+                    }
+                    ["P", id, name, value] => {
+                        let id: u64 = id.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let value = unesc(value).ok_or(GraphError::BadLine(n))?;
+                        g.set(NodeId(id), name, &value).map_err(bad)?;
+                    }
+                    ["E", from, to, time, kind, rest @ ..] => {
+                        let from: u64 = from.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let to: u64 = to.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let time: u64 = time.parse().map_err(|_| GraphError::BadLine(n))?;
+                        let mut props = Vec::new();
+                        for kv in rest {
+                            let (k, v) = kv.split_once('=').ok_or(GraphError::BadLine(n))?;
+                            props.push((k.to_string(), unesc(v).ok_or(GraphError::BadLine(n))?));
+                        }
+                        let refs: Vec<(&str, &str)> = props
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        g.link(NodeId(from), NodeId(to), kind, time, &refs)
+                            .map_err(bad)?;
+                    }
+                    _ => return Err(GraphError::BadLine(n)),
+                }
+            }
+            g.pending.clear();
+            Ok(g)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn small() -> (Graph, NodeId, NodeId, NodeId) {
+            let mut g = Graph::new();
+            let m = g.node("message", "c1/1", 10).unwrap();
+            let t = g.node("toolcall", "c1/1", 11).unwrap();
+            let f = g.node("file", "src/main.rs", 11).unwrap();
+            g.link(m, t, "called", 11, &[]).unwrap();
+            g.link(t, f, "touched", 11, &[("how", "read")]).unwrap();
+            (g, m, t, f)
+        }
+
+        #[test]
+        fn nodes_are_created_once_and_found_by_kind_and_key() {
+            let mut g = Graph::new();
+            let a = g.node("file", "a.rs", 5).unwrap();
+            assert_eq!(
+                g.node("file", "a.rs", 99).unwrap(),
+                a,
+                "same node, original time"
+            );
+            assert_eq!(g.get(a).unwrap().created, 5);
+            let other = g.node("message", "a.rs", 6).unwrap();
+            assert_ne!(a, other, "keys are per kind");
+            assert_eq!(g.find("file", "a.rs").unwrap().id, a);
+            assert!(g.find("file", "b.rs").is_none());
+            assert_eq!((g.node_count(), g.edge_count()), (2, 0));
+            assert_eq!(a, NodeId(1));
+        }
+
+        #[test]
+        fn names_are_validated() {
+            let mut g = Graph::new();
+            for kind in ["", "Upper", "has space", "x-y", &"k".repeat(MAX_LABEL + 1)] {
+                assert!(
+                    matches!(g.node(kind, "k", 0), Err(GraphError::BadName(_))),
+                    "{kind:?}"
+                );
+            }
+            for key in [
+                "",
+                "line\nbreak",
+                "tab\there",
+                "\u{1b}[2J",
+                &"k".repeat(MAX_KEY + 1),
+            ] {
+                assert!(
+                    matches!(g.node("file", key, 0), Err(GraphError::BadName(_))),
+                    "{key:?}"
+                );
+            }
+            assert!(g.node("file", &"k".repeat(MAX_KEY), 0).is_ok());
+            assert!(
+                g.node("file", "naïve/文件.rs", 0).is_ok(),
+                "any printable text"
+            );
+            let n = g.node("file", "x", 0).unwrap();
+            assert!(g.set(n, "Bad Name", "v").is_err());
+            assert!(g.link(n, n, "Bad Kind", 0, &[]).is_err());
+            assert!(g.link(n, n, "ok", 0, &[("Bad", "v")]).is_err());
+            assert!(g.link(n, NodeId(99), "ok", 0, &[]).is_err());
+            assert!(
+                g.link(NodeId(0), n, "ok", 0, &[]).is_err(),
+                "numbers start at 1"
+            );
+        }
+
+        #[test]
+        fn facts_are_bounded_and_the_latest_wins() {
+            let mut g = Graph::new();
+            let n = g.node("message", "m", 0).unwrap();
+            g.set(n, "text", "first").unwrap();
+            g.set(n, "text", "second").unwrap();
+            assert_eq!(g.get(n).unwrap().props["text"], "second");
+            g.set(n, "long", &"é".repeat(MAX_VALUE + 50)).unwrap();
+            assert_eq!(g.get(n).unwrap().props["long"].chars().count(), MAX_VALUE);
+            for i in 0..MAX_PROPS {
+                let _ = g.set(n, &format!("p{i}"), "v");
+            }
+            assert!(g.set(n, "one_too_many", "v").is_err());
+            assert!(g.set(n, "text", "still can update").is_ok());
+            assert!(g.set(NodeId(77), "x", "v").is_err());
+        }
+
+        #[test]
+        fn edges_are_found_in_both_directions_and_by_kind() {
+            let (g, m, t, f) = small();
+            assert_eq!(g.out_edges(m, None).len(), 1);
+            assert_eq!(g.out_edges(m, Some("called"))[0].to, t);
+            assert!(g.out_edges(m, Some("touched")).is_empty());
+            assert_eq!(g.in_edges(f, Some("touched"))[0].props["how"], "read");
+            assert_eq!(g.recent(1)[0].kind, "touched", "newest first");
+            assert_eq!(g.recent(10).len(), 2);
+            assert_eq!(g.nodes_of("file").len(), 1);
+            assert_eq!(
+                g.history(t).len(),
+                2,
+                "the call has one edge in and one out"
+            );
+        }
+
+        #[test]
+        fn causes_follow_edges_backwards_without_looping() {
+            let (mut g, m, t, f) = small();
+            let c = g.node("conversation", "c1", 9).unwrap();
+            g.link(c, m, "said", 10, &[]).unwrap();
+            // A cycle must not make it loop.
+            g.link(f, c, "mentioned_in", 12, &[]).unwrap();
+            let why = g.causes(f, 10);
+            let ids: Vec<NodeId> = why.iter().map(|w| w.0).collect();
+            assert_eq!(
+                ids,
+                vec![t, m, c],
+                "file <- call <- message <- conversation: {why:?}"
+            );
+            assert_eq!(why[0].1, "touched");
+            assert_eq!(g.causes(f, 1).len(), 1, "depth limits the walk");
+            assert!(g.causes(c, 0).is_empty());
+            assert_eq!(g.causes(NodeId(1000), 5), vec![]);
+        }
+
+        #[test]
+        fn limits_stop_growth() {
+            let mut g = Graph::with_limits(2, 1);
+            let a = g.node("file", "a", 0).unwrap();
+            let b = g.node("file", "b", 0).unwrap();
+            assert_eq!(g.node("file", "c", 0), Err(GraphError::Full("nodes")));
+            assert_eq!(
+                g.node("file", "a", 0),
+                Ok(a),
+                "an existing node is still found"
+            );
+            g.link(a, b, "x", 0, &[]).unwrap();
+            assert_eq!(g.link(a, b, "x", 0, &[]), Err(GraphError::Full("edges")));
+        }
+
+        #[test]
+        fn the_log_round_trips_hostile_text() {
+            let mut g = Graph::new();
+            let nasty = "line1\nE 1 1 0 forged\r\n%41 = ; \"q\" \u{0} \u{1b}[31m 日本語 😀";
+            let m = g.node("message", "c/1", 100).unwrap();
+            g.set(m, "text", nasty).unwrap();
+            g.set(m, "empty", "").unwrap();
+            let t = g.node("toolcall", "c/1", 101).unwrap();
+            g.link(m, t, "called", 102, &[("cmd", nasty), ("n", "1")])
+                .unwrap();
+            let f = g.node("file", "dir with space/a=b%.rs", 103).unwrap();
+            g.link(t, f, "touched", 104, &[]).unwrap();
+            let log = g.drain_log().join("\n");
+            assert_eq!(
+                log.lines().count(),
+                7,
+                "one line per record, nothing forged: {log}"
+            );
+            let back = Graph::replay(&log).unwrap();
+            assert_eq!((back.node_count(), back.edge_count()), (3, 2));
+            assert_eq!(back.get(m).unwrap().props["text"], nasty);
+            assert_eq!(back.get(m).unwrap().props["empty"], "");
+            assert_eq!(back.find("file", "dir with space/a=b%.rs").unwrap().id, f);
+            assert_eq!(back.out_edges(m, Some("called"))[0].props["cmd"], nasty);
+            assert_eq!(back.out_edges(m, None)[0].time, 102);
+            let mut back = back;
+            assert!(back.drain_log().is_empty(), "replay leaves nothing pending");
+        }
+
+        #[test]
+        fn the_log_is_incremental() {
+            let mut g = Graph::new();
+            let a = g.node("file", "a", 1).unwrap();
+            assert_eq!(g.drain_log().len(), 1);
+            assert!(g.drain_log().is_empty());
+            let b = g.node("file", "b", 2).unwrap();
+            g.link(a, b, "x", 3, &[]).unwrap();
+            let more = g.drain_log();
+            assert_eq!(more.len(), 2);
+            // Appending the second batch to the first file rebuilds the whole graph.
+            let all = format!("N 1 1 file a\n{}", more.join("\n"));
+            assert_eq!(Graph::replay(&all).unwrap().edge_count(), 1);
+        }
+
+        #[test]
+        fn damaged_logs_are_refused_with_the_line_number() {
+            let good = "N 1 5 file a\nN 2 5 file b\nE 1 2 6 x";
+            assert!(Graph::replay(good).is_ok());
+            assert!(Graph::replay("").unwrap().node_count() == 0);
+            assert!(
+                Graph::replay("\n\nN 1 5 file a\n\n").is_ok(),
+                "blank lines are skipped"
+            );
+            for (bad, line) in [
+                ("garbage", 1),
+                ("N 2 5 file a", 1),                    // numbers must start at 1
+                ("N 1 5 file a\nN 3 5 file b", 2),      // and count up
+                ("N 1 5 file a\nN 2 5 file a", 2),      // duplicate key
+                ("N 1 x file a", 1),                    // bad time
+                ("N 1 5 File a", 1),                    // bad kind
+                ("N 1 5 file %ZZ", 1),                  // bad escape
+                ("N 1 5 file %FF", 1),                  // not UTF-8
+                ("N 1 5 file a\nE 1 9 6 x", 2),         // unknown node
+                ("N 1 5 file a\nE 1 1 6 x novalue", 2), // property without =
+                ("N 1 5 file a\nP 9 text v", 2),        // fact on unknown node
+                ("N 1 5 file a\nE 1 1 6", 2),           // missing kind
+                ("N 1 5 file a extra", 1),              // extra field
+                ("N 1 5 file a\nQ 1", 2),               // unknown record
+            ] {
+                assert_eq!(
+                    Graph::replay(bad).unwrap_err(),
+                    GraphError::BadLine(line),
+                    "{bad:?}"
+                );
+            }
+            let long = format!("N 1 5 file {}", "a".repeat(MAX_LINE));
+            assert_eq!(Graph::replay(&long).unwrap_err(), GraphError::BadLine(1));
+        }
+
+        #[test]
+        fn escaping_is_reversible_and_never_leaves_separators() {
+            for s in [
+                "",
+                "a b",
+                "a\nb",
+                "a=b",
+                "%",
+                "%%41",
+                "日本",
+                "😀",
+                "\u{0}\u{7f}",
+            ] {
+                let e = esc(s);
+                assert!(!e.contains([' ', '\n', '\r', '=']), "{e:?}");
+                assert_eq!(unesc(&e).unwrap(), s);
+            }
+            assert_eq!(unesc("%4"), None);
+            assert_eq!(unesc("%"), None);
         }
     }
 }

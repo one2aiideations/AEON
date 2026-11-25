@@ -60,7 +60,7 @@ runs `moulid`'s own console.
 
 | Crate | Purpose |
 |---|---|
-| `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) and sibling-system adapters |
+| `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) sibling-system adapters and the AI data graph (`graph`: conversations, messages, models, files, tool calls and approvals as typed, timed nodes and edges, saved as an append-only log) |
 | `mouli-forge`, `mouli-topstar`, `mouli-neuro` | Versioned agent manifests, TOPSTAR domain model, spiking runtime |
 | `mouli-lab` | Aetheron research harness with gradient checks (no real-data results yet) |
 

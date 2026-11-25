@@ -30,6 +30,7 @@ pub mod catalog;
 pub mod civil_time;
 pub mod clocksync;
 pub mod context;
+pub mod datagraph;
 pub mod download_plan;
 pub mod download_ui;
 pub mod fetch;

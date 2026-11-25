@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 mouli-hw = { path = "../mouli-hw" }
 mouli-llm = { path = "../mouli-llm" }
+mouli-agentic = { path = "../mouli-agentic" }
 mouli-http = { path = "../mouli-http" }
 mouli-hosted = { path = "../mouli-hosted" }
 mouli-interface = { path = "../mouli-interface" }

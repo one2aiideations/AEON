@@ -9,6 +9,7 @@
 //! device) [`start`] returns an error and `moulid` keeps the text chat. A pointing device that
 //! reports absolute positions (some touchpads and touchscreens) is not used; a USB or PS/2 mouse is.
 
+use crate::datagraph::Recorder;
 use crate::sysinfo::{self, Collector, SysEnv};
 use crate::toolloop;
 use crate::ui::{trim_history, Backend, End, Turn};
@@ -710,6 +711,14 @@ pub struct Session<D: Display> {
     inputs: InputSummary,
     offset: Arc<AtomicI32>,
     settings: Option<crate::persist::Store>,
+    graph: Recorder,
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before it).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl<D: Display> Session<D> {
@@ -724,6 +733,7 @@ impl<D: Display> Session<D> {
             inputs: InputSummary::default(),
             offset: Arc::new(AtomicI32::new(0)),
             settings: None,
+            graph: Recorder::in_memory(unix_now()),
         }
     }
 
@@ -758,6 +768,9 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     s.saving = data_dir.is_some();
     s.inputs = inputs;
     s.settings = data_dir.and_then(|d| crate::persist::Store::open(d).ok());
+    if let Some(d) = data_dir {
+        s.graph = Recorder::open(d, unix_now());
+    }
     if let Some(m) = s
         .settings
         .as_ref()
@@ -869,6 +882,7 @@ where
         inputs,
         offset,
         settings,
+        mut graph,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -922,6 +936,10 @@ where
         }
     };
     let mut steps = 0usize;
+    if let Some(w) = graph.warning.take() {
+        device.shell.chat.push(Role::Notice, &w);
+    }
+    let model_name = models.loaded.clone();
     let mut history = fresh(&system_text);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
@@ -956,6 +974,7 @@ where
                 Ev::Reply(r) => {
                     let answer = on_reply(&mut device.shell, &mut history, r);
                     if let Some(text) = answer {
+                        graph.assistant_message(&text, &model_name, unix_now());
                         let known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
                         if let Some(command) = toolloop::parse_tool_call(&text, &known) {
                             if steps >= toolloop::MAX_STEPS {
@@ -965,7 +984,21 @@ where
                                 );
                             } else {
                                 steps += 1;
+                                let held_before: Vec<String> = device
+                                    .shell
+                                    .approvals
+                                    .rows
+                                    .iter()
+                                    .map(|r| r.id.clone())
+                                    .collect();
                                 let output = device.run_agent(&command);
+                                let now = unix_now();
+                                graph.tool_call(mouli_device::AGENT_USER, &command, &output, now);
+                                for row in &device.shell.approvals.rows {
+                                    if !held_before.contains(&row.id) {
+                                        graph.approval_held(&row.id, &row.capability, now);
+                                    }
+                                }
                                 history.push(Turn {
                                     role: "user",
                                     content: toolloop::result_turn(&command, &output),
@@ -998,14 +1031,37 @@ where
                     let note = time_zone_command(&arg, &offset, settings.as_ref());
                     device.shell.chat.push(Role::Notice, &note);
                 }
+                Action::Send(text) if text.trim_start().starts_with("/graph") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/graph".len()..].trim().to_string();
+                    let note = if let Some(path) = arg.strip_prefix(".file") {
+                        graph.describe_file(path.trim())
+                    } else if arg == ".forget" {
+                        graph.forget(unix_now())
+                    } else if arg.is_empty() {
+                        graph.describe_recent()
+                    } else {
+                        "Use /graph (recent activity), /graph.file PATH (history of a file) or /graph.forget (erase the record).".to_string()
+                    };
+                    device.shell.chat.push(Role::Notice, &note);
+                }
                 Action::Send(text) if text.trim_start().starts_with('/') => {
                     // A command for an application: carried out through the governed workspace
                     // (policy, approvals, audit), not sent to the model.
-                    device.run(Action::Send(text));
+                    let before = device.shell.chat.messages.len();
+                    device.run(Action::Send(text.clone()));
+                    let output = device.shell.chat.messages[before..]
+                        .iter()
+                        .filter(|m| m.role != Role::User)
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    graph.tool_call("owner", &text, &output, unix_now());
                 }
                 Action::Send(text) => {
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
+                        graph.user_message(&text, unix_now());
                         steps = 0;
                         history.push(Turn {
                             role: "user",
@@ -1027,9 +1083,22 @@ where
                         device.run(Action::NewConversation);
                         history = fresh(&system_text);
                         steps = 0;
+                        graph.new_conversation(unix_now());
                     }
                 }
-                other => match device.run(other) {
+                other => {
+                    let decision = if let Action::Decide { id, approve } = &other {
+                        Some((id.clone(), *approve))
+                    } else {
+                        None
+                    };
+                    let outcome = device.run(other);
+                    if let Some((id, approve)) = decision {
+                        if !device.shell.approvals.rows.iter().any(|r| r.id == id) {
+                            graph.approval_decided(&id, approve, "owner", unix_now());
+                        }
+                    }
+                    match outcome {
                     Outcome::Quit => return Ok(End::Quit),
                     Outcome::Reboot => return Ok(End::Reboot),
                     Outcome::Handled => {}
@@ -1037,7 +1106,8 @@ where
                         Role::Notice,
                         "That is not available in the desktop yet; restart with mouli.text=1 for the text menu.",
                     ),
-                },
+                    }
+                }
             }
         }
         desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
@@ -2013,5 +2083,151 @@ mod tests {
     fn a_plain_answer_makes_no_tool_call() {
         let (calls, _) = run_script(vec!["Just text."], "hi\n", 1);
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn the_desktop_records_the_conversation_the_tool_call_and_the_approval_in_the_graph() {
+        let dir = tmp("graphe2e");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1000);
+        for e in keys_for("please look at the project\n") {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies: vec!["TOOL: /code.files", "There are no files."],
+            seen: seen.clone(),
+        };
+        run(session, backend, "base", 100_000, &ModelsInfo::only("tiny")).unwrap();
+        quitter.join().unwrap();
+        let back = Recorder::open(&dir, 2000);
+        assert!(back.warning.is_none(), "{:?}", back.warning);
+        let g = back.graph();
+        let texts: Vec<String> = g
+            .nodes_of("message")
+            .iter()
+            .map(|n| format!("{}:{}", n.props["role"], n.props["text"]))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "user:please look at the project"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "assistant:TOOL: /code.files"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "assistant:There are no files."),
+            "{texts:?}"
+        );
+        let call = &g.nodes_of("toolcall")[0];
+        assert_eq!(call.props["tool"], "code.files");
+        let by = g.out_edges(call.id, Some("run_by"))[0].to;
+        assert_eq!(g.get(by).unwrap().key, "agent:chat");
+        assert!(g.find("model", "tiny").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_graph_commands_show_and_erase_the_record() {
+        let dir = tmp("graphcmd");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1);
+        for line in [
+            "/code.files\n",
+            "/graph\n",
+            "/graph.file nothing.rs\n",
+            "/graph.forget\n",
+            "/graph.what\n",
+        ] {
+            for e in keys_for(line) {
+                tx.send(e).unwrap();
+            }
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls.clone()),
+            "s",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "none of these reach the model"
+        );
+        assert!(
+            !dir.join(crate::datagraph::LOG_NAME).exists(),
+            "forgotten at the end"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_agent_change_is_recorded_as_a_held_approval_linked_to_its_file() {
+        let dir = tmp("graphapproval");
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        std::fs::write(dir.join("projects/a.txt"), "old\n").unwrap();
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1000);
+        for e in keys_for("change a.txt\n") {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < 3 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies: vec![
+                "TOOL: /code.edit path=a.txt text=new",
+                "TOOL: /code.apply",
+                "It is waiting for your approval.",
+            ],
+            seen: seen.clone(),
+        };
+        run(session, backend, "base", 100_000, &ModelsInfo::only("tiny")).unwrap();
+        quitter.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("projects/a.txt")).unwrap(),
+            "old\n",
+            "nothing written without approval"
+        );
+        let back = Recorder::open(&dir, 2000);
+        let g = back.graph();
+        let apr = &g.nodes_of("approval")[0];
+        assert_eq!(apr.props["capability"], "code.apply");
+        assert_eq!(apr.props["status"], "waiting");
+        let call = g.in_edges(apr.id, Some("held_for"))[0].from;
+        assert_eq!(g.get(call).unwrap().props["tool"], "code.apply");
+        let file = g.find("file", "a.txt").unwrap();
+        assert_eq!(g.in_edges(file.id, Some("touched"))[0].props["how"], "edit");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

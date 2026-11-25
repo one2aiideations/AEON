@@ -2918,6 +2918,7 @@ version = "0.1.0"
 name = "moulid"
 version = "0.1.0"
 dependencies = [
+ "mouli-agentic",
  "mouli-apps",
  "mouli-desk",
  "mouli-device",
