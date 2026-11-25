@@ -3,8 +3,10 @@
 //! `Date.now` and `performance.now`.
 
 use crate::interp::{
-    is_callable, make_bound, num_to_string, str_to_num, to_i32, Interp, Kind, Obj, Prop, Value, R,
+    is_callable, make_bound, num_to_string, str_to_num, to_i32, Interp, Kind, MapData, MapKey, Obj,
+    PromiseData, Prop, Value, R,
 };
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -458,6 +460,8 @@ pub(crate) fn install(i: &mut Interp) {
     install_string(i);
     install_number(i);
     install_errors(i);
+    install_collections(i);
+    install_promise(i);
     install_math_json(i);
     install_globals(i);
 }
@@ -1664,4 +1668,409 @@ fn install_globals(i: &mut Interp) {
     let p = i.new_obj();
     method(i, &p, "now", |i, _, _| Ok(Value::Num(i.clock)));
     i.set_global("performance", Value::Obj(p));
+}
+
+fn with_map<T>(i: &mut Interp, this: &Value, f: impl FnOnce(&mut MapData) -> T) -> R<T> {
+    if let Value::Obj(o) = this {
+        if let Kind::Map(m) = &mut o.borrow_mut().kind {
+            return Ok(f(m));
+        }
+    }
+    Err(i.make_error(
+        "TypeError",
+        "the method was called on a value that is not a Map or Set",
+    ))
+}
+
+fn map_put(i: &mut Interp, this: &Value, k: Value, v: Value) -> R<()> {
+    let k = if matches!(k, Value::Num(n) if n == 0.0) {
+        Value::Num(0.0)
+    } else {
+        k
+    };
+    let full = with_map(i, this, |m| {
+        let key = MapKey::of(&k);
+        if let Some(&at) = m.index.get(&key) {
+            if let Some(e) = m.entries[at].as_mut() {
+                e.1 = v;
+            }
+            false
+        } else if m.live >= 1_000_000 {
+            true
+        } else {
+            m.index.insert(key, m.entries.len());
+            m.entries.push(Some((k, v)));
+            m.live += 1;
+            false
+        }
+    })?;
+    if full {
+        return Err(i.make_error("RangeError", "the collection is too large"));
+    }
+    Ok(())
+}
+
+fn map_remove(m: &mut MapData, k: &Value) -> bool {
+    let Some(at) = m.index.remove(&MapKey::of(k)) else {
+        return false;
+    };
+    m.entries[at] = None;
+    m.live -= 1;
+    if m.entries.len() > 2 * m.live + 16 {
+        let kept: Vec<(Value, Value)> = m.entries.drain(..).flatten().collect();
+        m.index.clear();
+        for (n, (k, v)) in kept.into_iter().enumerate() {
+            m.index.insert(MapKey::of(&k), n);
+            m.entries.push(Some((k, v)));
+        }
+    }
+    true
+}
+
+fn install_collections(i: &mut Interp) {
+    for (name, is_set) in [("Map", false), ("Set", true)] {
+        let proto = i.new_obj();
+        let label: &'static str = name;
+        let _ = ctor(i, name, &proto, move |i, this, a| {
+            let Value::Obj(o) = this else {
+                return Err(
+                    i.make_error("TypeError", &format!("Constructor {label} requires 'new'"))
+                );
+            };
+            {
+                let mut b = o.borrow_mut();
+                b.kind = Kind::Map(MapData::default());
+                b.class = label;
+            }
+            if !matches!(arg(a, 0), Value::Undefined | Value::Null) {
+                for item in i.iter_values(&arg(a, 0))? {
+                    if is_set {
+                        map_put(i, this, item, Value::Undefined)?;
+                    } else {
+                        let pair = array_items(i, &item)?;
+                        map_put(i, this, arg(&pair, 0), arg(&pair, 1))?;
+                    }
+                }
+            }
+            Ok(this.clone())
+        });
+        let g = {
+            let f = i.native("size", |i, t, _| {
+                Ok(Value::Num(with_map(i, t, |m| m.live)? as f64))
+            });
+            Prop {
+                value: Value::Undefined,
+                get: Some(f),
+                set: None,
+                enumerable: false,
+            }
+        };
+        i.define(&proto, "size", g);
+        method(i, &proto, "has", |i, t, a| {
+            Ok(Value::Bool(with_map(i, t, |m| {
+                m.index.contains_key(&MapKey::of(&arg(a, 0)))
+            })?))
+        });
+        method(i, &proto, "delete", |i, t, a| {
+            Ok(Value::Bool(with_map(i, t, |m| map_remove(m, &arg(a, 0)))?))
+        });
+        method(i, &proto, "clear", |i, t, _| {
+            with_map(i, t, |m| *m = MapData::default())?;
+            Ok(Value::Undefined)
+        });
+        if is_set {
+            method(i, &proto, "add", |i, t, a| {
+                map_put(i, t, arg(a, 0), Value::Undefined)?;
+                Ok(t.clone())
+            });
+        } else {
+            method(i, &proto, "set", |i, t, a| {
+                map_put(i, t, arg(a, 0), arg(a, 1))?;
+                Ok(t.clone())
+            });
+            method(i, &proto, "get", |i, t, a| {
+                Ok(with_map(i, t, |m| {
+                    m.index
+                        .get(&MapKey::of(&arg(a, 0)))
+                        .and_then(|&at| m.entries[at].as_ref().map(|e| e.1.clone()))
+                })?
+                .unwrap_or(Value::Undefined))
+            });
+        }
+        for (mname, which) in [("keys", 0), ("values", 1), ("entries", 2)] {
+            method(i, &proto, mname, move |i, t, _| {
+                let items: Vec<(Value, Value)> =
+                    with_map(i, t, |m| m.entries.iter().flatten().cloned().collect())?;
+                let out = items
+                    .into_iter()
+                    .map(|(k, v)| match (which, is_set) {
+                        (0, _) | (1, true) => k,
+                        (1, false) => v,
+                        (_, true) => i.new_array(vec![k.clone(), k]),
+                        _ => i.new_array(vec![k, v]),
+                    })
+                    .collect();
+                Ok(i.new_array(out))
+            });
+        }
+        method(i, &proto, "forEach", move |i, t, a| {
+            let f = arg(a, 0);
+            if !is_callable(&f) {
+                return Err(i.make_error("TypeError", "the callback is not a function"));
+            }
+            let items: Vec<(Value, Value)> =
+                with_map(i, t, |m| m.entries.iter().flatten().cloned().collect())?;
+            for (k, v) in items {
+                let first = if is_set { k.clone() } else { v };
+                i.call_value(&f, arg(a, 1), vec![first, k, t.clone()])?;
+            }
+            Ok(Value::Undefined)
+        });
+    }
+}
+
+// ------------------------------------------------------------------ promises
+
+fn new_promise(i: &mut Interp) -> Obj {
+    let p = i.protos.promise.clone();
+    i.alloc(Some(p), Kind::Promise(PromiseData::default()), "Promise")
+}
+
+fn settle(i: &mut Interp, p: &Obj, state: u8, value: Value) {
+    let reactions = {
+        let mut b = p.borrow_mut();
+        let Kind::Promise(d) = &mut b.kind else {
+            return;
+        };
+        if d.state != 0 {
+            return;
+        }
+        d.state = state;
+        d.value = Some(value.clone());
+        std::mem::take(&mut d.reactions)
+    };
+    for (on_f, on_r, q) in reactions {
+        queue_reaction(i, state, value.clone(), on_f, on_r, q);
+    }
+}
+
+fn queue_reaction(i: &mut Interp, state: u8, value: Value, on_f: Value, on_r: Value, q: Obj) {
+    i.microtasks.push_back(Box::new(move |i: &mut Interp| {
+        let handler = if state == 1 { on_f } else { on_r };
+        if is_callable(&handler) {
+            match i.call_value(&handler, Value::Undefined, vec![value]) {
+                Ok(v) => resolve(i, &q, v),
+                Err(e) => settle(i, &q, 2, e),
+            }
+        } else if state == 1 {
+            resolve(i, &q, value);
+        } else {
+            settle(i, &q, 2, value);
+        }
+    }));
+}
+
+fn resolvers(i: &mut Interp, p: &Obj) -> (Value, Value) {
+    let done = Rc::new(Cell::new(false));
+    let (p1, d1) = (p.clone(), done.clone());
+    let res = i.native("resolve", move |i, _, a| {
+        if !d1.replace(true) {
+            resolve(i, &p1, arg(a, 0));
+        }
+        Ok(Value::Undefined)
+    });
+    let (p2, d2) = (p.clone(), done);
+    let rej = i.native("reject", move |i, _, a| {
+        if !d2.replace(true) {
+            settle(i, &p2, 2, arg(a, 0));
+        }
+        Ok(Value::Undefined)
+    });
+    (res, rej)
+}
+
+fn resolve(i: &mut Interp, p: &Obj, x: Value) {
+    if let Value::Obj(xo) = &x {
+        if Rc::ptr_eq(xo, p) {
+            let e = i.make_error("TypeError", "a promise cannot be resolved with itself");
+            settle(i, p, 2, e);
+            return;
+        }
+        match i.get_prop(&x, "then") {
+            Err(e) => settle(i, p, 2, e),
+            Ok(then) if is_callable(&then) => {
+                let p = p.clone();
+                i.microtasks.push_back(Box::new(move |i: &mut Interp| {
+                    let (res, rej) = resolvers(i, &p);
+                    if let Err(e) = i.call_value(&then, x, vec![res, rej.clone()]) {
+                        let _ = i.call_value(&rej, Value::Undefined, vec![e]);
+                    }
+                }));
+            }
+            Ok(_) => settle(i, p, 1, x),
+        }
+    } else {
+        settle(i, p, 1, x);
+    }
+}
+
+fn promise_then(i: &mut Interp, this: &Value, on_f: Value, on_r: Value) -> R<Value> {
+    let Value::Obj(p) = this else {
+        return Err(i.make_error("TypeError", "then called on a value that is not a promise"));
+    };
+    let q = new_promise(i);
+    let now = {
+        let mut b = p.borrow_mut();
+        let Kind::Promise(d) = &mut b.kind else {
+            drop(b);
+            return Err(i.make_error("TypeError", "then called on a value that is not a promise"));
+        };
+        if d.state == 0 {
+            d.reactions.push((on_f.clone(), on_r.clone(), q.clone()));
+            None
+        } else {
+            Some((d.state, d.value.clone().unwrap_or(Value::Undefined)))
+        }
+    };
+    if let Some((state, v)) = now {
+        queue_reaction(i, state, v, on_f, on_r, q.clone());
+    }
+    Ok(Value::Obj(q))
+}
+
+fn promise_from(i: &mut Interp, x: Value) -> Obj {
+    if let Value::Obj(o) = &x {
+        if matches!(o.borrow().kind, Kind::Promise(_)) {
+            return o.clone();
+        }
+    }
+    let p = new_promise(i);
+    resolve(i, &p, x);
+    p
+}
+
+fn install_promise(i: &mut Interp) {
+    let proto = i.protos.promise.clone();
+    let po = ctor(i, "Promise", &proto, |i, this, a| {
+        let exec = arg(a, 0);
+        let Value::Obj(o) = this else {
+            return Err(i.make_error("TypeError", "Promise constructor requires 'new'"));
+        };
+        if !is_callable(&exec) {
+            return Err(i.make_error("TypeError", "the Promise executor is not a function"));
+        }
+        {
+            let mut b = o.borrow_mut();
+            b.kind = Kind::Promise(PromiseData::default());
+            b.class = "Promise";
+        }
+        let (res, rej) = resolvers(i, o);
+        if let Err(e) = i.call_value(&exec, Value::Undefined, vec![res, rej.clone()]) {
+            i.call_value(&rej, Value::Undefined, vec![e])?;
+        }
+        Ok(this.clone())
+    });
+    method(i, &proto, "then", |i, t, a| {
+        promise_then(i, t, arg(a, 0), arg(a, 1))
+    });
+    method(i, &proto, "catch", |i, t, a| {
+        promise_then(i, t, Value::Undefined, arg(a, 0))
+    });
+    method(i, &proto, "finally", |i, t, a| {
+        let f = arg(a, 0);
+        let f2 = f.clone();
+        let on_f = i.native("finally", move |i, _, a| {
+            if is_callable(&f) {
+                i.call_value(&f, Value::Undefined, Vec::new())?;
+            }
+            Ok(arg(a, 0))
+        });
+        let on_r = i.native("finally", move |i, _, a| {
+            if is_callable(&f2) {
+                i.call_value(&f2, Value::Undefined, Vec::new())?;
+            }
+            Err(arg(a, 0))
+        });
+        promise_then(i, t, on_f, on_r)
+    });
+    method(i, &po, "resolve", |i, _, a| {
+        Ok(Value::Obj(promise_from(i, arg(a, 0))))
+    });
+    method(i, &po, "reject", |i, _, a| {
+        let p = new_promise(i);
+        settle(i, &p, 2, arg(a, 0));
+        Ok(Value::Obj(p))
+    });
+    for (name, mode) in [("all", 0u8), ("allSettled", 1), ("race", 2)] {
+        method(i, &po, name, move |i, _, a| {
+            let items = i.iter_values(&arg(a, 0))?;
+            let out = new_promise(i);
+            let results = Rc::new(RefCell::new(vec![Value::Undefined; items.len()]));
+            let left = Rc::new(Cell::new(items.len()));
+            if items.is_empty() && mode != 2 {
+                let arr = i.new_array(Vec::new());
+                resolve(i, &out, arr);
+            }
+            for (k, item) in items.into_iter().enumerate() {
+                let p = Value::Obj(promise_from(i, item));
+                let (r1, l1, o1) = (results.clone(), left.clone(), out.clone());
+                let on_f = i.native("onFulfilled", move |i, _, a| {
+                    let v = if mode == 1 {
+                        let o = i.new_obj();
+                        i.put(&o, "status", Value::str("fulfilled"));
+                        i.put(&o, "value", arg(a, 0));
+                        Value::Obj(o)
+                    } else {
+                        arg(a, 0)
+                    };
+                    if mode == 2 {
+                        resolve(i, &o1, v);
+                    } else {
+                        r1.borrow_mut()[k] = v;
+                        l1.set(l1.get() - 1);
+                        if l1.get() == 0 {
+                            let all = r1.borrow().clone();
+                            let arr = i.new_array(all);
+                            resolve(i, &o1, arr);
+                        }
+                    }
+                    Ok(Value::Undefined)
+                });
+                let (r2, l2, o2) = (results.clone(), left.clone(), out.clone());
+                let on_r = i.native("onRejected", move |i, _, a| {
+                    if mode == 1 {
+                        let o = i.new_obj();
+                        i.put(&o, "status", Value::str("rejected"));
+                        i.put(&o, "reason", arg(a, 0));
+                        r2.borrow_mut()[k] = Value::Obj(o);
+                        l2.set(l2.get() - 1);
+                        if l2.get() == 0 {
+                            let all = r2.borrow().clone();
+                            let arr = i.new_array(all);
+                            resolve(i, &o2, arr);
+                        }
+                    } else {
+                        settle(i, &o2, 2, arg(a, 0));
+                    }
+                    Ok(Value::Undefined)
+                });
+                promise_then(i, &p, on_f, on_r)?;
+            }
+            Ok(Value::Obj(out))
+        });
+    }
+    let qm = i.native("queueMicrotask", |i, _, a| {
+        let f = arg(a, 0);
+        if !is_callable(&f) {
+            return Err(i.make_error("TypeError", "the callback is not a function"));
+        }
+        i.microtasks.push_back(Box::new(move |i: &mut Interp| {
+            if let Err(e) = i.call_value(&f, Value::Undefined, Vec::new()) {
+                let m = i.error_text(&e);
+                i.console.push(m);
+            }
+        }));
+        Ok(Value::Undefined)
+    });
+    i.set_global("queueMicrotask", qm);
 }

@@ -17,8 +17,11 @@
 
 use crate::js::{self, *};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+
+/// A queued promise callback.
+pub(crate) type Microtask = Box<dyn FnOnce(&mut Interp)>;
 
 /// A thrown value (an `Err` in the interpreter's results).
 pub type R<T> = Result<T, Value>;
@@ -144,6 +147,59 @@ pub enum Kind {
     Native(NativeFn, Rc<str>),
     /// `f.bind(this, ...args)`
     Bound(Value, Value, Vec<Value>),
+    /// A `Map` or a `Set` (a set keeps `undefined` as every value).
+    Map(MapData),
+    /// A `Promise`.
+    Promise(PromiseData),
+}
+
+/// What a value is when used as a `Map` key (same-value-zero equality).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum MapKey {
+    /// `undefined`
+    Undef,
+    /// `null`
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// A number (bit pattern, with `NaN` and `-0` normalised).
+    Num(u64),
+    /// A string.
+    Str(Rc<str>),
+    /// An object, by identity.
+    Obj(usize),
+}
+
+impl MapKey {
+    pub(crate) fn of(v: &Value) -> MapKey {
+        match v {
+            Value::Undefined => MapKey::Undef,
+            Value::Null => MapKey::Null,
+            Value::Bool(b) => MapKey::Bool(*b),
+            Value::Num(n) if n.is_nan() => MapKey::Num(f64::NAN.to_bits()),
+            Value::Num(n) if *n == 0.0 => MapKey::Num(0),
+            Value::Num(n) => MapKey::Num(n.to_bits()),
+            Value::Str(t) => MapKey::Str(t.clone()),
+            Value::Obj(o) => MapKey::Obj(Rc::as_ptr(o) as *const () as usize),
+        }
+    }
+}
+
+/// The contents of a `Map` or `Set`: hashed lookup, insertion order kept.
+#[derive(Default)]
+pub struct MapData {
+    pub(crate) index: HashMap<MapKey, usize>,
+    pub(crate) entries: Vec<Option<(Value, Value)>>,
+    pub(crate) live: usize,
+}
+
+/// A promise.
+#[derive(Default)]
+pub struct PromiseData {
+    /// 0 pending, 1 fulfilled, 2 rejected.
+    pub(crate) state: u8,
+    pub(crate) value: Option<Value>,
+    pub(crate) reactions: Vec<(Value, Value, Obj)>,
 }
 
 /// An object.
@@ -188,6 +244,7 @@ pub struct Protos {
     pub(crate) string: Obj,
     pub(crate) number: Obj,
     pub(crate) boolean: Obj,
+    pub(crate) promise: Obj,
     pub(crate) errors: HashMap<&'static str, Obj>,
 }
 
@@ -232,6 +289,7 @@ pub struct Interp {
     /// Lines written by `console.log` and friends (the newest are kept).
     pub console: Vec<String>,
     timers: Vec<Timer>,
+    pub(crate) microtasks: VecDeque<Microtask>,
     next_timer: u32,
     /// The virtual clock in milliseconds.
     pub clock: f64,
@@ -330,6 +388,7 @@ impl Interp {
         let string = mk(Some(object.clone()));
         let number = mk(Some(object.clone()));
         let boolean = mk(Some(object.clone()));
+        let promise = mk(Some(object.clone()));
         let error = mk(Some(object.clone()));
         let mut errors = HashMap::new();
         errors.insert("Error", error);
@@ -353,6 +412,7 @@ impl Interp {
                 string,
                 number,
                 boolean,
+                promise,
                 errors,
             },
             steps: 0,
@@ -365,6 +425,7 @@ impl Interp {
             short: false,
             console: Vec::new(),
             timers: Vec::new(),
+            microtasks: VecDeque::new(),
             next_timer: 1,
             clock: 0.0,
         };
@@ -406,6 +467,7 @@ impl Interp {
                 return Err(self.describe_error(&e));
             }
         }
+        self.run_microtasks();
         Ok(last)
     }
 
@@ -542,7 +604,7 @@ impl Interp {
 
     // ------------------------------------------------------------ allocation and properties
 
-    fn alloc(&mut self, proto: Option<Obj>, kind: Kind, class: &'static str) -> Obj {
+    pub(crate) fn alloc(&mut self, proto: Option<Obj>, kind: Kind, class: &'static str) -> Obj {
         self.objects += 1;
         if self.objects > self.object_limit && self.fatal.is_none() {
             self.fatal = Some("too many objects".into());
@@ -969,6 +1031,68 @@ impl Interp {
                         name.to_string()
                     } else {
                         format!("{name}: {msg}")
+                    };
+                }
+                let special = {
+                    let b = o.borrow();
+                    match &b.kind {
+                        Kind::Map(m) => Some((
+                            b.class == "Set",
+                            m.entries.iter().flatten().cloned().collect::<Vec<_>>(),
+                            m.live,
+                        )),
+                        Kind::Promise(p) => {
+                            let t = match (p.state, &p.value) {
+                                (1, Some(v)) => Some(v.clone()),
+                                (2, Some(v)) => Some(v.clone()),
+                                _ => None,
+                            };
+                            drop(b);
+                            let st = o.borrow();
+                            let Kind::Promise(p) = &st.kind else {
+                                return String::new();
+                            };
+                            let label = match p.state {
+                                0 => "<pending>".to_string(),
+                                1 => String::new(),
+                                _ => "<rejected> ".to_string(),
+                            };
+                            drop(st);
+                            let inner = t
+                                .map(|v| self.inspect_in(&v, depth + 1, seen, false))
+                                .unwrap_or_default();
+                            return format!("Promise {{ {label}{inner} }}");
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((is_set, items, live)) = special {
+                    if depth > 2 {
+                        return if is_set {
+                            "[Set]".into()
+                        } else {
+                            "[Map]".into()
+                        };
+                    }
+                    seen.push(o.clone());
+                    let parts: Vec<String> = items
+                        .iter()
+                        .take(100)
+                        .map(|(k, v)| {
+                            let ks = self.inspect_in(k, depth + 1, seen, false);
+                            if is_set {
+                                ks
+                            } else {
+                                format!("{ks} => {}", self.inspect_in(v, depth + 1, seen, false))
+                            }
+                        })
+                        .collect();
+                    seen.pop();
+                    let name = if is_set { "Set" } else { "Map" };
+                    return if parts.is_empty() {
+                        format!("{name}({live}) {{}}")
+                    } else {
+                        format!("{name}({live}) {{ {} }}", parts.join(", "))
                     };
                 }
                 if depth > 2 {
@@ -1414,11 +1538,31 @@ impl Interp {
         Ok(false)
     }
 
-    fn iter_values(&mut self, v: &Value) -> R<Vec<Value>> {
+    pub(crate) fn iter_values(&mut self, v: &Value) -> R<Vec<Value>> {
         match v {
             Value::Obj(o) => {
-                if let Kind::Array(a) = &o.borrow().kind {
-                    return Ok(a.clone());
+                {
+                    let b = o.borrow();
+                    match &b.kind {
+                        Kind::Array(a) => return Ok(a.clone()),
+                        Kind::Map(m) => {
+                            let is_set = b.class == "Set";
+                            let items: Vec<(Value, Value)> =
+                                m.entries.iter().flatten().cloned().collect();
+                            drop(b);
+                            return Ok(items
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    if is_set {
+                                        k
+                                    } else {
+                                        self.new_array(vec![k, v])
+                                    }
+                                })
+                                .collect());
+                        }
+                        _ => {}
+                    }
                 }
                 self.throw("TypeError", "the value is not iterable")
             }
@@ -2510,6 +2654,19 @@ impl Interp {
         self.timers.retain(|t| t.id != id);
     }
 
+    /// Runs the queued promise callbacks (and anything they queue), up to a bound.
+    pub fn run_microtasks(&mut self) {
+        let mut n = 0;
+        while let Some(t) = self.microtasks.pop_front() {
+            t(self);
+            n += 1;
+            if n > 100_000 {
+                self.microtasks.clear();
+                break;
+            }
+        }
+    }
+
     /// How many timers are waiting.
     #[must_use]
     pub fn pending_timers(&self) -> usize {
@@ -2547,6 +2704,7 @@ impl Interp {
                 self.log_line(m);
                 self.fatal = None;
             }
+            self.run_microtasks();
             ran += 1;
         }
         self.clock = until;
@@ -2996,6 +3154,72 @@ mod tests {
         i.run("setTimeout(() => { throw new Error('late') }, 1); setTimeout(() => console.log('still runs'), 2);").unwrap();
         i.advance(10.0);
         assert_eq!(i.console, vec!["Uncaught Error: late", "still runs"]);
+    }
+
+    #[test]
+    fn maps_and_sets_keep_order_and_use_same_value_zero() {
+        assert_eq!(run("const m = new Map([['a', 1], ['b', 2]]); m.set('a', 9).set(NaN, 'n').set(0, 'z'); [m.size, m.get('a'), m.get(NaN), m.get(-0), m.has('b'), m.has('q'), m.delete('b'), m.size]"), "[ 4, 9, 'n', 'z', true, false, true, 3 ]");
+        assert_eq!(run("const o = {}; const m = new Map(); m.set(o, 1); m.set({}, 2); [m.get(o), m.size, [...m.keys()].length]"), "[ 1, 2, 2 ]");
+        assert_eq!(run("[...new Set([3, 1, 3, 2, 1])]"), "[ 3, 1, 2 ]");
+        assert_eq!(
+            run("const s = new Set('hello'); [s.size, s.has('l'), [...s].join('')]"),
+            "[ 4, true, 'helo' ]"
+        );
+        assert_eq!(run("const r = []; new Map([[1, 'a'], [2, 'b']]).forEach((v, k) => r.push(k + v)); for (const [k, v] of new Map([[3, 'c']])) r.push(k + v); r"), "[ '1a', '2b', '3c' ]");
+        assert_eq!(
+            run("new Map([['k', [1, 2]]])"),
+            "Map(1) { 'k' => [ 1, 2 ] }"
+        );
+        assert_eq!(run("new Set([1, 'x'])"), "Set(2) { 1, 'x' }");
+        assert_eq!(run("const m = new Map(); for (let i = 0; i < 50000; i++) m.set('k' + i, i); for (let i = 0; i < 49990; i++) m.delete('k' + i); [m.size, m.get('k49995'), [...m.values()].length]"), "[ 10, 49995, 10 ]");
+        assert!(run("Map()").contains("requires 'new'"));
+        assert!(run("Map.prototype.get.call({}, 1)").contains("not a Map or Set"));
+        assert_eq!(run("class Counter extends Map { inc(k) { this.set(k, (this.get(k) || 0) + 1); return this } } const c = new Counter(); c.inc('a').inc('a'); c.get('a')"), "2");
+    }
+
+    #[test]
+    fn promises_run_their_callbacks_in_order_after_the_script() {
+        let out = console("
+            const log = (...a) => console.log(...a);
+            log('start');
+            setTimeout(() => log('timeout'), 0);
+            Promise.resolve(1).then(v => { log('then', v); return v + 1; }).then(v => log('then2', v));
+            queueMicrotask(() => log('micro'));
+            new Promise((res, rej) => rej(new Error('no'))).catch(e => log('caught', e.message)).finally(() => log('finally'));
+            log('end');
+        ");
+        assert_eq!(
+            out,
+            vec![
+                "start",
+                "end",
+                "then 1",
+                "micro",
+                "caught no",
+                "then2 2",
+                "finally"
+            ]
+        );
+        let out = console("
+            Promise.all([1, Promise.resolve(2), new Promise(r => setTimeout(() => r(3), 10))]).then(v => console.log('all', v));
+            Promise.race([new Promise(r => setTimeout(() => r('slow'), 50)), new Promise(r => setTimeout(() => r('fast'), 5))]).then(v => console.log('race', v));
+            Promise.allSettled([Promise.reject('x'), 5]).then(v => console.log(JSON.stringify(v)));
+            Promise.resolve({ then(res) { res('thenable'); } }).then(v => console.log(v));
+        ");
+        assert_eq!(out, vec!["[{\"status\":\"rejected\",\"reason\":\"x\"},{\"status\":\"fulfilled\",\"value\":5}]", "thenable"]);
+        let mut i = Interp::new();
+        i.run("Promise.all([1, new Promise(r => setTimeout(() => r(3), 10))]).then(v => console.log('all', v)); Promise.race([new Promise(r => setTimeout(() => r('slow'), 50)), new Promise(r => setTimeout(() => r('fast'), 5))]).then(v => console.log('race', v));").unwrap();
+        i.advance(100.0);
+        assert_eq!(i.console, vec!["race fast", "all [ 1, 3 ]"]);
+        assert_eq!(run("Promise.resolve(5)"), "Promise { 5 }");
+        assert_eq!(run("new Promise(() => {})"), "Promise { <pending> }");
+        assert!(run("Promise(() => {})").contains("requires 'new'"));
+        // A promise that resolves with itself is rejected, and a chain cannot starve the interpreter.
+        assert_eq!(console("const p = new Promise(r => setTimeout(() => r(p))); p.catch(e => console.log(e instanceof TypeError)); setTimeout(() => {}, 5)").len(), 0);
+        let mut i = Interp::new();
+        i.run("function loop() { Promise.resolve().then(loop) } loop();")
+            .unwrap();
+        assert_eq!(i.pending_timers(), 0);
     }
 
     #[test]

@@ -489,6 +489,7 @@ fn fire(i: &mut Interp, h: &H, target: usize, kind: &str, ev: &Value) -> R<bool>
             break;
         }
     }
+    i.run_microtasks();
     Ok(!i.get_prop(ev, "defaultPrevented")?.truthy())
 }
 
