@@ -2,6 +2,7 @@
 # Build the MOULI x86_64 image with Buildroot.
 #   os/build.sh [BUILDROOT_DIR] [OUTPUT_DIR]
 # Env: MOULI_MODEL=/path/model.gguf to bake a model into the image.
+#      MOULI_JOBS=N limits parallel compile jobs (default: all cores; llama.cpp needs about 1.5 GB per job).
 # moulid (the Rust init, crates/moulid) is built here as a static musl binary and installed by the
 # Buildroot post-build script; Buildroot itself only builds the kernel, libc and llama.cpp.
 set -eu
@@ -24,5 +25,5 @@ make -C "$BR" O="$OUT" olddefconfig
 for opt in BR2_PACKAGE_MOULI_LLAMA_CPP BR2_TARGET_ROOTFS_CPIO BR2_INIT_NONE BR2_LINUX_KERNEL_USE_DEFCONFIG BR2_PACKAGE_CA_CERTIFICATES; do
     grep -q "^$opt=y" "$OUT/.config" || { echo "config check failed: $opt"; exit 1; }
 done
-make -C "$BR" O="$OUT" -j"$(nproc)"
+make -C "$BR" O="$OUT" -j"${MOULI_JOBS:-$(nproc)}"
 ls -la "$OUT/images"

@@ -32,5 +32,6 @@ To check a release, from the release folder: `sha256sum -c 03-Verification/SHA25
 CI builds the folder from the release ISO and uploads it as the `MOULI-OS-Release-v<version>`
 artifact. The version is `MOULI_RELEASE_VERSION` in `.github/workflows/os-image.yml`.
 
-Before a release is distributed, the author must confirm section 1 of `LICENSE.txt`: no licence
-for MOULI's own code has been chosen yet (the workspace says `LicenseRef-MOULI-undecided`).
+Licence: MOULI's own code is free for distribution (section 1 of `LICENSE.txt`). That says nothing
+about modifying or selling it. If a standard licence such as MIT or Apache-2.0 is wanted, replace
+section 1 and the workspace `license` field (`LicenseRef-MOULI-undecided` in `Cargo.toml`).

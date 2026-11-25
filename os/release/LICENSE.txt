@@ -6,10 +6,8 @@ Copyright (c) 2026 Chandra Mouli Krishna Moorthy (cmklive@gmail.com)
 1. MOULI components
 -------------------
 The MOULI start-up program (moulid), the build scripts and the other components written for
-@PRODUCT_NAME@ are copyright of the author named above. A licence for them has not yet been
-published. Until the author publishes one, all rights are reserved and no permission is granted
-beyond running the image as supplied. THE AUTHOR MUST CONFIRM OR REPLACE THIS SECTION BEFORE THE
-RELEASE IS DISTRIBUTED.
+@PRODUCT_NAME@ are copyright of the author named above and are free for distribution: anyone may
+copy and pass on @PRODUCT_NAME@ free of charge. Copyright stays with the author.
 
 2. Other software in the image
 ------------------------------
