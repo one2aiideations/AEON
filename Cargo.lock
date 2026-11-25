@@ -2559,17 +2559,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-adapters"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-agentmem"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-agents"
+name = "mouli-agentic"
 version = "0.1.0"
 dependencies = [
+ "mouli-llm",
  "sha2",
 ]
 
@@ -2628,10 +2621,6 @@ name = "mouli-code"
 version = "0.1.0"
 
 [[package]]
-name = "mouli-cognition"
-version = "0.1.0"
-
-[[package]]
 name = "mouli-comms"
 version = "0.1.0"
 dependencies = [
@@ -2640,14 +2629,6 @@ dependencies = [
  "sha2",
  "x25519-dalek",
 ]
-
-[[package]]
-name = "mouli-compress"
-version = "0.1.0"
-
-[[package]]
-name = "mouli-core"
-version = "0.1.0"
 
 [[package]]
 name = "mouli-crm"
@@ -2791,13 +2772,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mouli-memory"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
 name = "mouli-mesh"
 version = "0.1.0"
 dependencies = [
@@ -2817,10 +2791,6 @@ dependencies = [
  "sha2",
  "uuid",
 ]
-
-[[package]]
-name = "mouli-orchestra"
-version = "0.1.0"
 
 [[package]]
 name = "mouli-pki"
@@ -2851,14 +2821,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "mouli-runtime"
-version = "0.1.0"
-dependencies = [
- "mouli-cognition",
- "mouli-llm",
 ]
 
 [[package]]
@@ -2919,10 +2881,6 @@ dependencies = [
  "serde_json",
  "sysinfo",
 ]
-
-[[package]]
-name = "mouli-theory"
-version = "0.1.0"
 
 [[package]]
 name = "mouli-tls"

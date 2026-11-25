@@ -124,10 +124,7 @@ impl MenuBar {
                     items: vec![
                         item("Chat", "F1", Command::Open(Tab::Chat)),
                         item("Models", "F2", Command::Open(Tab::Models)),
-                        item("Sheet", "F7", Command::Open(Tab::Sheet)),
-                        item("Studio", "F8", Command::Open(Tab::Studio)),
                         item("Code", "F9", Command::Open(Tab::Editor)),
-                        item("Player", "F10", Command::Open(Tab::Player)),
                         SEP,
                         item("Admin", "", Command::Nothing),
                         item("Approvals", "F3", Command::Open(Tab::Approvals)),

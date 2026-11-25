@@ -7473,6 +7473,3393 @@ pub mod weights {
     }
 }
 
+pub mod theory {
+    //! MOULI theory layer, from "Towards a Mathematical Theory of Intelligence".
+    //!
+    //! MOULI uses these measures to choose, route and merge models by how they
+    //! behave under shift, not by a single familiar benchmark number.
+    //!
+    //! * [`robust`]: closure conditions, robust score S (worst case), shortcut
+    //!   reliance and the gap law that predicts accuracy under shift.
+    //! * [`calibration`]: ECE, Brier score and the self-knowledge loss.
+    //! * [`cascade`]: cheapest-first two-model cascades and their Pareto frontier.
+    //! * [`select`]: leaderboard ranking and robust choice of a merge weight.
+    //! * [`merge`]: task-vector screening and TIES / linear merging.
+    //!
+    //! Rule kept from the research engine: nothing is reported as measured
+    //! unless it was measured; these functions only transform measurements.
+    #![forbid(unsafe_code)]
+
+    /// Options per multiple-choice item used throughout (A-D).
+    pub const K: usize = 4;
+
+    pub mod calibration {
+        //! Self-knowledge: how well a model's confidence matches its correctness.
+
+        /// Calibration metrics over scored items.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Calibration {
+            /// Items scored.
+            pub items: usize,
+            /// Fraction correct.
+            pub accuracy: f64,
+            /// Mean confidence.
+            pub mean_confidence: f64,
+            /// Expected calibration error over equal-width bins.
+            pub ece: f64,
+            /// Brier score `E[(P - V)^2]`.
+            pub brier: f64,
+        }
+
+        impl Calibration {
+            /// Exact expected cost of acting on this confidence: `E[(P - V)^2] / 2`.
+            #[must_use]
+            pub fn self_knowledge_loss(&self) -> f64 {
+                self.brier / 2.0
+            }
+        }
+
+        /// Compute calibration from `(confidence, correct)` pairs using `bins` bins.
+        ///
+        /// Bin `b` holds confidences in `(b/bins, (b+1)/bins]`; a confidence of 0
+        /// goes to the first bin. Returns `None` for no items or zero bins.
+        #[must_use]
+        pub fn calibration(records: &[(f64, bool)], bins: usize) -> Option<Calibration> {
+            if records.is_empty() || bins == 0 {
+                return None;
+            }
+            let n = records.len() as f64;
+            let mut sum_p = vec![0.0f64; bins];
+            let mut sum_v = vec![0.0f64; bins];
+            let mut count = vec![0usize; bins];
+            for &(p, v) in records {
+                let p = p.clamp(0.0, 1.0);
+                let b = ((p * bins as f64).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(bins - 1);
+                sum_p[b] += p;
+                sum_v[b] += f64::from(u8::from(v));
+                count[b] += 1;
+            }
+            let ece = (0..bins)
+                .filter(|&b| count[b] > 0)
+                .map(|b| {
+                    let c = count[b] as f64;
+                    c / n * (sum_p[b] / c - sum_v[b] / c).abs()
+                })
+                .sum();
+            let brier = records
+                .iter()
+                .map(|&(p, v)| (p - f64::from(u8::from(v))).powi(2))
+                .sum::<f64>()
+                / n;
+            Some(Calibration {
+                items: records.len(),
+                accuracy: records.iter().filter(|r| r.1).count() as f64 / n,
+                mean_confidence: records.iter().map(|r| r.0).sum::<f64>() / n,
+                ece,
+                brier,
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn perfect_and_overconfident() {
+                let perfect = [(1.0, true), (0.0, false)];
+                let c = calibration(&perfect, 10).unwrap();
+                assert!(c.ece.abs() < 1e-12 && c.brier.abs() < 1e-12);
+
+                let over = [(0.9, false), (0.9, true)];
+                let c = calibration(&over, 10).unwrap();
+                assert!((c.ece - 0.4).abs() < 1e-12);
+                assert!((c.brier - (0.81 + 0.01) / 2.0).abs() < 1e-12);
+                assert!((c.self_knowledge_loss() - c.brier / 2.0).abs() < 1e-12);
+                assert!(calibration(&[], 10).is_none());
+            }
+        }
+    }
+
+    pub mod cascade {
+        //! Cheapest-first model cascades.
+        //!
+        //! A two-model cascade answers with the small model when its confidence is
+        //! at least a threshold, otherwise it also runs the large model. Every plan
+        //! is evaluated on items scored by all candidates.
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// One scored item.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Scored {
+            /// Answer was correct.
+            pub correct: bool,
+            /// Model confidence in its answer.
+            pub confidence: f64,
+        }
+
+        /// A model and its per-item results.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Candidate {
+            /// Name.
+            pub name: String,
+            /// Cost per item (for example parameters invoked).
+            pub cost: f64,
+            /// Results keyed by item id.
+            pub records: BTreeMap<u64, Scored>,
+        }
+
+        /// A routing plan and its measured trade-off.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Plan {
+            /// Models in order.
+            pub models: Vec<String>,
+            /// Confidence threshold on the first model (cascades only).
+            pub threshold: Option<f64>,
+            /// Accuracy on shared items.
+            pub accuracy: f64,
+            /// Mean cost per item.
+            pub avg_cost: f64,
+        }
+
+        /// Cascade planning result.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct CascadeReport {
+            /// Shared items used.
+            pub common_items: usize,
+            /// Most accurate single model.
+            pub best_single: Plan,
+            /// Cheapest plan within `tolerance` of the best single model's accuracy.
+            pub recommended: Plan,
+            /// Plans not dominated on (cost, accuracy), cheapest first.
+            pub frontier: Vec<Plan>,
+        }
+
+        impl CascadeReport {
+            /// Fraction of compute saved by the recommendation vs. the best single model.
+            #[must_use]
+            pub fn saving(&self) -> f64 {
+                if self.best_single.avg_cost > 0.0 {
+                    1.0 - self.recommended.avg_cost / self.best_single.avg_cost
+                } else {
+                    0.0
+                }
+            }
+        }
+
+        /// Plan cascades over `candidates`, sweeping `grid` thresholds per pair.
+        ///
+        /// Returns `None` with fewer than two candidates or fewer than `min_common`
+        /// shared items.
+        #[must_use]
+        pub fn plan(
+            candidates: &[Candidate],
+            grid: usize,
+            tolerance: f64,
+            min_common: usize,
+        ) -> Option<CascadeReport> {
+            if candidates.len() < 2 || grid < 2 {
+                return None;
+            }
+            let mut common: BTreeSet<u64> = candidates[0].records.keys().copied().collect();
+            for c in &candidates[1..] {
+                common.retain(|k| c.records.contains_key(k));
+            }
+            if common.len() < min_common.max(1) {
+                return None;
+            }
+            let items: Vec<u64> = common.into_iter().collect();
+            let n = items.len() as f64;
+            let acc_of =
+                |c: &Candidate| items.iter().filter(|i| c.records[i].correct).count() as f64 / n;
+
+            let singles: Vec<Plan> = candidates
+                .iter()
+                .map(|c| Plan {
+                    models: vec![c.name.clone()],
+                    threshold: None,
+                    accuracy: acc_of(c),
+                    avg_cost: c.cost,
+                })
+                .collect();
+            let mut plans = singles.clone();
+
+            let mut by_cost: Vec<&Candidate> = candidates.iter().collect();
+            by_cost.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+            for (i, small) in by_cost.iter().enumerate() {
+                let mut confs: Vec<f64> =
+                    items.iter().map(|j| small.records[j].confidence).collect();
+                confs.sort_by(f64::total_cmp);
+                for large in &by_cost[i + 1..] {
+                    for g in 0..grid {
+                        let tau = if g + 1 == grid {
+                            f64::INFINITY
+                        } else {
+                            confs[g * (confs.len() - 1) / (grid - 1)]
+                        };
+                        let (mut ok, mut cost) = (0.0f64, 0.0f64);
+                        for j in &items {
+                            let rs = small.records[j];
+                            cost += small.cost;
+                            if rs.confidence >= tau {
+                                ok += f64::from(u8::from(rs.correct));
+                            } else {
+                                ok += f64::from(u8::from(large.records[j].correct));
+                                cost += large.cost;
+                            }
+                        }
+                        plans.push(Plan {
+                            models: vec![small.name.clone(), large.name.clone()],
+                            threshold: tau.is_finite().then_some(tau),
+                            accuracy: ok / n,
+                            avg_cost: cost / n,
+                        });
+                    }
+                }
+            }
+
+            let mut sorted = plans.clone();
+            sorted.sort_by(|a, b| {
+                a.avg_cost
+                    .total_cmp(&b.avg_cost)
+                    .then(b.accuracy.total_cmp(&a.accuracy))
+            });
+            let mut frontier: Vec<Plan> = Vec::new();
+            for p in sorted {
+                if frontier
+                    .last()
+                    .is_none_or(|last| p.accuracy > last.accuracy + 1e-12)
+                {
+                    frontier.push(p);
+                }
+            }
+            let best_single = singles
+                .iter()
+                .max_by(|a, b| a.accuracy.total_cmp(&b.accuracy))?
+                .clone();
+            let recommended = plans
+                .iter()
+                .filter(|p| p.accuracy >= best_single.accuracy - tolerance)
+                .min_by(|a, b| a.avg_cost.total_cmp(&b.avg_cost))?
+                .clone();
+            Some(CascadeReport {
+                common_items: items.len(),
+                best_single,
+                recommended,
+                frontier,
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn cand(name: &str, cost: f64, rows: &[(bool, f64)]) -> Candidate {
+                Candidate {
+                    name: name.into(),
+                    cost,
+                    records: rows
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(correct, confidence))| {
+                            (
+                                i as u64,
+                                Scored {
+                                    correct,
+                                    confidence,
+                                },
+                            )
+                        })
+                        .collect(),
+                }
+            }
+
+            #[test]
+            fn cascade_saves_compute() {
+                // Small model is right exactly when confident; large model is always right.
+                let small_rows: Vec<(bool, f64)> = (0..20)
+                    .map(|i| (i < 15, if i < 15 { 0.9 } else { 0.3 }))
+                    .collect();
+                let large_rows: Vec<(bool, f64)> = (0..20).map(|_| (true, 0.95)).collect();
+                let r = plan(
+                    &[
+                        cand("small", 1.0, &small_rows),
+                        cand("large", 10.0, &large_rows),
+                    ],
+                    21,
+                    0.0,
+                    20,
+                )
+                .unwrap();
+                assert_eq!(r.best_single.models, vec!["large".to_string()]);
+                assert!((r.recommended.accuracy - 1.0).abs() < 1e-12);
+                assert_eq!(r.recommended.models.len(), 2);
+                assert!(r.saving() > 0.5);
+                assert!(r.frontier.windows(2).all(|w| w[1].accuracy > w[0].accuracy));
+            }
+
+            #[test]
+            fn needs_overlap() {
+                let a = cand("a", 1.0, &[(true, 0.5)]);
+                let b = cand("b", 2.0, &[(true, 0.5)]);
+                assert!(plan(&[a.clone(), b], 5, 0.01, 20).is_none());
+                assert!(plan(&[a], 5, 0.01, 1).is_none());
+            }
+        }
+    }
+
+    pub mod merge {
+        //! Task-vector screening and model merging (TIES and linear).
+        //!
+        //! A task vector is `finetuned - base` for one tensor. TIES merging trims
+        //! small entries per model, elects the majority sign per entry, and averages
+        //! only the entries that agree with it.
+
+        /// Magnitude threshold keeping the top `density` fraction of `tau`.
+        ///
+        /// `density >= 1` keeps everything (threshold 0).
+        #[must_use]
+        pub fn ties_threshold(tau: &[f32], density: f32) -> f32 {
+            if tau.is_empty() || density >= 1.0 {
+                return 0.0;
+            }
+            let mut mags: Vec<f32> = tau.iter().map(|x| x.abs()).collect();
+            let drop = ((mags.len() as f32 * (1.0 - density.max(0.0))) as usize).max(1);
+            if drop >= mags.len() {
+                return mags.iter().copied().fold(0.0, f32::max);
+            }
+            let (_, kth, _) = mags.select_nth_unstable_by(drop - 1, f32::total_cmp);
+            *kth
+        }
+
+        /// TIES-combine task vectors `taus` (equal length) with per-model thresholds.
+        #[must_use]
+        pub fn ties_combine(taus: &[&[f32]], thresholds: &[f32]) -> Vec<f32> {
+            let Some(first) = taus.first() else {
+                return Vec::new();
+            };
+            let n = first.len();
+            (0..n)
+                .map(|i| {
+                    let vals: Vec<f32> = taus
+                        .iter()
+                        .zip(thresholds)
+                        .map(|(t, &h)| {
+                            let v = t.get(i).copied().unwrap_or(0.0);
+                            if v.abs() >= h {
+                                v
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    let sign = vals.iter().sum::<f32>().signum();
+                    let (sum, cnt) = vals
+                        .iter()
+                        .filter(|&&v| v != 0.0 && v.signum() == sign)
+                        .fold((0.0f32, 0u32), |(s, c), &v| (s + v, c + 1));
+                    if cnt == 0 {
+                        0.0
+                    } else {
+                        sum / cnt as f32
+                    }
+                })
+                .collect()
+        }
+
+        /// Merge method.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Method {
+            /// TIES with the given density.
+            Ties {
+                /// Fraction of entries kept per model.
+                density: f32,
+            },
+            /// Weighted sum of task vectors.
+            Linear {
+                /// One weight per model.
+                weights: Vec<f32>,
+            },
+        }
+
+        /// Merge one tensor: `base + lambda * combine(finetuned - base)`.
+        ///
+        /// Returns `None` when shapes differ or the weight count is wrong; callers
+        /// then keep the base tensor unchanged.
+        #[must_use]
+        pub fn merge_tensor(
+            base: &[f32],
+            finetuned: &[&[f32]],
+            method: &Method,
+            lambda: f32,
+        ) -> Option<Vec<f32>> {
+            if finetuned.is_empty() || finetuned.iter().any(|f| f.len() != base.len()) {
+                return None;
+            }
+            let taus: Vec<Vec<f32>> = finetuned
+                .iter()
+                .map(|f| f.iter().zip(base).map(|(a, b)| a - b).collect())
+                .collect();
+            let refs: Vec<&[f32]> = taus.iter().map(Vec::as_slice).collect();
+            let tau = match method {
+                Method::Ties { density } => {
+                    let thr: Vec<f32> = refs.iter().map(|t| ties_threshold(t, *density)).collect();
+                    ties_combine(&refs, &thr)
+                }
+                Method::Linear { weights } => {
+                    if weights.len() != refs.len() {
+                        return None;
+                    }
+                    (0..base.len())
+                        .map(|i| refs.iter().zip(weights).map(|(t, w)| w * t[i]).sum())
+                        .collect()
+                }
+            };
+            Some(base.iter().zip(tau).map(|(b, t)| b + lambda * t).collect())
+        }
+
+        /// Screening verdict for one candidate.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub enum Screen {
+            /// Keep.
+            Keep,
+            /// Task vector is ~zero.
+            IdenticalToBase,
+            /// Task vector too large relative to the base.
+            Diverged(f64),
+            /// Near-duplicate of an earlier kept candidate (its index).
+            Duplicate(usize),
+        }
+
+        /// Screen candidates given accumulated statistics over all tensors:
+        /// `gram[i][j] = <tau_i, tau_j>` and `base_sq = |base|^2`.
+        ///
+        /// Candidates are visited in the given order (put preferred ones first).
+        #[must_use]
+        pub fn screen(gram: &[Vec<f64>], base_sq: f64, max_rel: f64, dup_cos: f64) -> Vec<Screen> {
+            let n = gram.len();
+            let norms: Vec<f64> = (0..n).map(|i| gram[i][i].max(0.0).sqrt()).collect();
+            let bnorm = base_sq.max(0.0).sqrt();
+            let mut kept: Vec<usize> = Vec::new();
+            (0..n)
+                .map(|i| {
+                    let rel = if bnorm > 0.0 { norms[i] / bnorm } else { 0.0 };
+                    if rel < 1e-5 {
+                        return Screen::IdenticalToBase;
+                    }
+                    if rel > max_rel {
+                        return Screen::Diverged(rel);
+                    }
+                    if let Some(&j) = kept
+                        .iter()
+                        .find(|&&j| gram[i][j] / (norms[i] * norms[j] + 1e-12) > dup_cos)
+                    {
+                        return Screen::Duplicate(j);
+                    }
+                    kept.push(i);
+                    Screen::Keep
+                })
+                .collect()
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn threshold_keeps_top_fraction() {
+                let t = [0.1, -0.4, 0.3, -0.2];
+                assert!((ties_threshold(&t, 0.5) - 0.2).abs() < 1e-6);
+                assert_eq!(ties_threshold(&t, 1.0), 0.0);
+            }
+
+            #[test]
+            fn ties_resolves_sign_conflicts() {
+                let a = [1.0f32, 1.0, -0.1];
+                let b = [3.0f32, -2.0, -0.1];
+                let c = [-1.0f32, -2.0, 0.0];
+                let out = ties_combine(&[&a, &b, &c], &[0.0, 0.0, 0.0]);
+                assert!((out[0] - 2.0).abs() < 1e-6); // + wins: mean of 1, 3
+                assert!((out[1] + 2.0).abs() < 1e-6); // - wins: mean of -2, -2
+                assert!((out[2] + 0.1).abs() < 1e-6);
+            }
+
+            #[test]
+            fn merge_linear_and_ties() {
+                let base = [1.0f32, 1.0];
+                let f1 = [2.0f32, 1.0];
+                let f2 = [1.0f32, 3.0];
+                let lin = merge_tensor(
+                    &base,
+                    &[&f1, &f2],
+                    &Method::Linear {
+                        weights: vec![0.5, 0.5],
+                    },
+                    1.0,
+                )
+                .unwrap();
+                assert_eq!(lin, vec![1.5, 2.0]);
+                let ties =
+                    merge_tensor(&base, &[&f1, &f2], &Method::Ties { density: 1.0 }, 1.0).unwrap();
+                assert_eq!(ties, vec![2.0, 3.0]);
+                assert!(
+                    merge_tensor(&base, &[&[1.0f32][..]], &Method::Ties { density: 1.0 }, 1.0)
+                        .is_none()
+                );
+            }
+
+            #[test]
+            fn screening() {
+                // tau0 = (1,0), tau1 = (1,0) duplicate, tau2 = (0,0), tau3 = (10,0) diverged
+                let gram = vec![
+                    vec![1.0, 1.0, 0.0, 10.0],
+                    vec![1.0, 1.0, 0.0, 10.0],
+                    vec![0.0, 0.0, 0.0, 0.0],
+                    vec![10.0, 10.0, 0.0, 100.0],
+                ];
+                let v = screen(&gram, 25.0, 1.0, 0.99);
+                assert_eq!(v[0], Screen::Keep);
+                assert_eq!(v[1], Screen::Duplicate(0));
+                assert_eq!(v[2], Screen::IdenticalToBase);
+                assert!(matches!(v[3], Screen::Diverged(r) if (r - 2.0).abs() < 1e-9));
+            }
+        }
+    }
+
+    pub mod robust {
+        //! Robust score, shortcut reliance and the gap law.
+        //!
+        //! A closure test runs the same model under controlled hidden conditions:
+        //! a clean reference, and shortcuts (answer position, planted hint) that
+        //! point to the right answer with probability `p`. The robust score S is the
+        //! worst accuracy over the closure conditions.
+
+        use crate::theory::K;
+        use std::collections::BTreeMap;
+
+        /// Shortcut validity on familiar data.
+        pub const FAMILIAR: f64 = 0.95;
+
+        /// Kind of planted shortcut.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum Shortcut {
+            /// Correct answer tends to sit at a fixed position.
+            Position,
+            /// A hint names an answer.
+            Hint,
+        }
+
+        /// One test condition: no shortcut, or a shortcut that is right with probability `p` (in percent).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum Condition {
+            /// No shortcut.
+            Clean,
+            /// Shortcut right with `percent`% probability.
+            Cue(Shortcut, u8),
+        }
+
+        impl Condition {
+            /// Probability that the cue points to the correct answer.
+            #[must_use]
+            pub fn p(self) -> Option<f64> {
+                match self {
+                    Self::Clean => None,
+                    Self::Cue(_, pct) => Some(f64::from(pct) / 100.0),
+                }
+            }
+        }
+
+        /// Conditions whose worst case defines S.
+        pub const CLOSURE: [Condition; 5] = [
+            Condition::Clean,
+            Condition::Cue(Shortcut::Position, 95),
+            Condition::Cue(Shortcut::Position, 0),
+            Condition::Cue(Shortcut::Hint, 95),
+            Condition::Cue(Shortcut::Hint, 0),
+        ];
+
+        /// Held-out shift conditions (not used for S).
+        pub const HELDOUT: [Condition; 2] = [
+            Condition::Cue(Shortcut::Position, 25),
+            Condition::Cue(Shortcut::Hint, 25),
+        ];
+
+        /// Cue informativeness: `(p - 1/K) / (1 - 1/K)`; 1 = always right, 0 = chance.
+        #[must_use]
+        pub fn q_of(p: f64) -> f64 {
+            let k = K as f64;
+            (p - 1.0 / k) / (1.0 - 1.0 / k)
+        }
+
+        /// Interventional reliance on a shortcut, measured on familiar items:
+        /// how much more often the model follows the cue when it is present than in
+        /// the counterfactual prompt without it, rescaled to [0, 1].
+        #[must_use]
+        pub fn reliance(follow: usize, follow_counterfactual: usize, n: usize) -> f64 {
+            if n == 0 {
+                return 0.0;
+            }
+            let k = K as f64;
+            (follow as f64 - follow_counterfactual as f64) / n as f64 / (1.0 - 1.0 / k)
+        }
+
+        /// Gap law: predicted accuracy when the cue validity shifts from familiar to `p_new`.
+        ///
+        /// `predicted = acc_familiar + reliance * (q(p_new) - q(FAMILIAR)) * (1 - 1/K)`.
+        #[must_use]
+        pub fn gap_law(acc_familiar: f64, reliance: f64, p_new: f64) -> f64 {
+            let k = K as f64;
+            acc_familiar + reliance * (q_of(p_new) - q_of(FAMILIAR)) * (1.0 - 1.0 / k)
+        }
+
+        /// Gap-law check for one condition.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct GapCheck {
+            /// Gap-law prediction.
+            pub predicted: f64,
+            /// Measured accuracy.
+            pub actual: f64,
+        }
+
+        impl GapCheck {
+            /// `|predicted - actual|`.
+            #[must_use]
+            pub fn abs_error(&self) -> f64 {
+                (self.predicted - self.actual).abs()
+            }
+        }
+
+        /// Summary of a closure test.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Summary {
+            /// Worst closure accuracy (robust score S).
+            pub robust_s: Option<f64>,
+            /// Mean closure accuracy.
+            pub closure_mean: Option<f64>,
+            /// Mean held-out accuracy.
+            pub heldout_mean: Option<f64>,
+            /// Mean accuracy on the two familiar (95%) conditions.
+            pub familiar_mean: Option<f64>,
+            /// Gap-law predictions vs. measurements for the shifted conditions.
+            pub gap: BTreeMap<Condition, GapCheck>,
+        }
+
+        fn mean(xs: &[f64]) -> Option<f64> {
+            (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64)
+        }
+
+        /// Summarise per-condition accuracy and measured reliance.
+        #[must_use]
+        pub fn summarise(acc: &BTreeMap<Condition, f64>, rel: &BTreeMap<Shortcut, f64>) -> Summary {
+            let pick = |cs: &[Condition]| -> Vec<f64> {
+                cs.iter().filter_map(|c| acc.get(c).copied()).collect()
+            };
+            let closure = pick(&CLOSURE);
+            let held = pick(&HELDOUT);
+            let familiar = pick(&[
+                Condition::Cue(Shortcut::Position, 95),
+                Condition::Cue(Shortcut::Hint, 95),
+            ]);
+            let mut gap = BTreeMap::new();
+            for (&s, &r) in rel {
+                let Some(&fam) = acc.get(&Condition::Cue(s, 95)) else {
+                    continue;
+                };
+                for pct in [25u8, 0] {
+                    let c = Condition::Cue(s, pct);
+                    if let Some(&actual) = acc.get(&c) {
+                        gap.insert(
+                            c,
+                            GapCheck {
+                                predicted: gap_law(fam, r, f64::from(pct) / 100.0),
+                                actual,
+                            },
+                        );
+                    }
+                }
+            }
+            Summary {
+                robust_s: closure.iter().copied().reduce(f64::min),
+                closure_mean: mean(&closure),
+                heldout_mean: mean(&held),
+                familiar_mean: mean(&familiar),
+                gap,
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn q_and_gap_law() {
+                assert!((q_of(1.0) - 1.0).abs() < 1e-12);
+                assert!(q_of(0.25).abs() < 1e-12);
+                // No reliance: accuracy does not move under shift.
+                assert!((gap_law(0.8, 0.0, 0.0) - 0.8).abs() < 1e-12);
+                // Full reliance, cue flips from 95% right to never right.
+                let drop = gap_law(0.95, 1.0, 0.0);
+                assert!((drop - (0.95 + (q_of(0.0) - q_of(0.95)) * 0.75)).abs() < 1e-12);
+                assert!(drop.abs() < 1e-9);
+            }
+
+            #[test]
+            fn reliance_scale() {
+                assert!((reliance(100, 25, 100) - 1.0).abs() < 1e-12);
+                assert_eq!(reliance(5, 5, 10), 0.0);
+                assert_eq!(reliance(1, 0, 0), 0.0);
+            }
+
+            #[test]
+            fn summary_takes_worst_case() {
+                let mut acc = BTreeMap::new();
+                acc.insert(Condition::Clean, 0.7);
+                acc.insert(Condition::Cue(Shortcut::Position, 95), 0.9);
+                acc.insert(Condition::Cue(Shortcut::Position, 0), 0.4);
+                acc.insert(Condition::Cue(Shortcut::Position, 25), 0.6);
+                acc.insert(Condition::Cue(Shortcut::Hint, 95), 0.8);
+                acc.insert(Condition::Cue(Shortcut::Hint, 0), 0.6);
+                let mut rel = BTreeMap::new();
+                rel.insert(Shortcut::Position, 0.5);
+                let s = summarise(&acc, &rel);
+                assert_eq!(s.robust_s, Some(0.4));
+                assert!((s.familiar_mean.unwrap() - 0.85).abs() < 1e-12);
+                assert_eq!(s.heldout_mean, Some(0.6));
+                assert_eq!(s.gap.len(), 2);
+                let g = s.gap[&Condition::Cue(Shortcut::Position, 0)];
+                assert!((g.predicted - gap_law(0.9, 0.5, 0.0)).abs() < 1e-12);
+                assert!((g.abs_error() - (g.predicted - 0.4).abs()).abs() < 1e-12);
+            }
+        }
+    }
+
+    pub mod select {
+        //! Model selection by robust score.
+
+        /// One evaluated model.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Entry {
+            /// Name.
+            pub name: String,
+            /// Parameter count, if known.
+            pub parameters: Option<u64>,
+            /// Robust score S.
+            pub robust_s: f64,
+        }
+
+        /// Rank by S (highest first) and recommend: the cheapest model with
+        /// `S >= threshold`, or the highest S when no threshold is given.
+        #[must_use]
+        pub fn leaderboard(
+            mut rows: Vec<Entry>,
+            threshold: Option<f64>,
+        ) -> (Vec<Entry>, Option<Entry>) {
+            rows.sort_by(|a, b| b.robust_s.total_cmp(&a.robust_s));
+            let rec = match threshold {
+                Some(t) => rows
+                    .iter()
+                    .filter(|r| r.robust_s >= t)
+                    .filter_map(|r| r.parameters.map(|p| (p, r)))
+                    .min_by_key(|(p, _)| *p)
+                    .map(|(_, r)| r.clone()),
+                None => rows.first().cloned(),
+            };
+            (rows, rec)
+        }
+
+        /// Pick the merge weight `t` with the highest S; ties go to the `t` closest to 0.5.
+        #[must_use]
+        pub fn choose_merge_weight(trials: &[(f64, f64)]) -> Option<f64> {
+            trials
+                .iter()
+                .filter(|(t, s)| t.is_finite() && s.is_finite())
+                .max_by(|a, b| {
+                    a.1.total_cmp(&b.1)
+                        .then((b.0 - 0.5).abs().total_cmp(&(a.0 - 0.5).abs()))
+                })
+                .map(|&(t, _)| t)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn e(name: &str, p: u64, s: f64) -> Entry {
+                Entry {
+                    name: name.into(),
+                    parameters: Some(p),
+                    robust_s: s,
+                }
+            }
+
+            #[test]
+            fn cheapest_above_threshold() {
+                let rows = vec![e("big", 70, 0.8), e("mid", 8, 0.62), e("tiny", 1, 0.4)];
+                let (ranked, rec) = leaderboard(rows.clone(), Some(0.6));
+                assert_eq!(ranked[0].name, "big");
+                assert_eq!(rec.unwrap().name, "mid");
+                assert_eq!(leaderboard(rows.clone(), None).1.unwrap().name, "big");
+                assert!(leaderboard(rows, Some(0.9)).1.is_none());
+            }
+
+            #[test]
+            fn merge_weight_ties_prefer_half() {
+                assert_eq!(
+                    choose_merge_weight(&[(0.2, 0.7), (0.5, 0.7), (0.9, 0.6)]),
+                    Some(0.5)
+                );
+                assert_eq!(choose_merge_weight(&[(0.3, 0.1), (0.8, 0.9)]), Some(0.8));
+                assert_eq!(choose_merge_weight(&[]), None);
+            }
+        }
+    }
+}
+
+pub mod compress {
+    //! Weight analysis for compression planning.
+    //!
+    //! Model-independent numerics normalised from the 55D research engine. Each function
+    //! takes plain `f32` slices, so it works on tensors read by `mouli-llm::gguf` or produced
+    //! anywhere else. These functions *measure*: none changes a model, and a plan (for
+    //! example a pruning threshold) is not evidence that the planned model still works.
+    //!
+    //! Differences from the Python original, all deliberate:
+    //!
+    //! * Row sampling in [`stats::near_duplicate_fraction`] is evenly strided, not random,
+    //!   so results are reproducible without an RNG.
+    //! * Singular values come from a Jacobi eigen-solver on the Gram matrix, so large
+    //!   matrices are cropped to `max_dim` (default [`lowrank::DEFAULT_MAX_DIM`]) before
+    //!   analysis; the original cropped to 2048 using LAPACK.
+
+    use std::fmt;
+
+    /// Invalid input to an analysis function.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AnalysisError {
+        /// `data.len()` is not `rows * cols`, or a dimension is zero.
+        BadShape,
+        /// A parameter is out of range (the text says which).
+        BadParameter(&'static str),
+        /// The input contains NaN or infinity.
+        NonFinite,
+    }
+
+    impl fmt::Display for AnalysisError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                AnalysisError::BadShape => f.write_str("data length does not match the shape"),
+                AnalysisError::BadParameter(p) => write!(f, "invalid parameter: {p}"),
+                AnalysisError::NonFinite => f.write_str("input contains NaN or infinity"),
+            }
+        }
+    }
+
+    impl std::error::Error for AnalysisError {}
+
+    /// A row-major matrix view.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Matrix<'a> {
+        /// Row-major elements.
+        pub data: &'a [f32],
+        /// Row count (at least 1).
+        pub rows: usize,
+        /// Column count (at least 1).
+        pub cols: usize,
+    }
+
+    impl<'a> Matrix<'a> {
+        /// Validate and wrap a row-major buffer.
+        pub fn new(data: &'a [f32], rows: usize, cols: usize) -> Result<Self, AnalysisError> {
+            if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(data.len()) {
+                return Err(AnalysisError::BadShape);
+            }
+            if data.iter().any(|x| !x.is_finite()) {
+                return Err(AnalysisError::NonFinite);
+            }
+            Ok(Matrix { data, rows, cols })
+        }
+
+        /// One row.
+        pub fn row(&self, r: usize) -> &'a [f32] {
+            &self.data[r * self.cols..(r + 1) * self.cols]
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn matrix_validates_shape_and_values() {
+            assert!(Matrix::new(&[1.0, 2.0, 3.0, 4.0], 2, 2).is_ok());
+            assert_eq!(
+                Matrix::new(&[1.0; 3], 2, 2).unwrap_err(),
+                AnalysisError::BadShape
+            );
+            assert_eq!(Matrix::new(&[], 0, 2).unwrap_err(), AnalysisError::BadShape);
+            assert_eq!(
+                Matrix::new(&[1.0, f32::NAN], 1, 2).unwrap_err(),
+                AnalysisError::NonFinite
+            );
+            assert_eq!(
+                Matrix::new(&[1.0, f32::INFINITY], 1, 2).unwrap_err(),
+                AnalysisError::NonFinite
+            );
+            let m = Matrix::new(&[1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
+            assert_eq!(m.row(1), &[3.0, 4.0]);
+        }
+    }
+
+    pub mod lowrank {
+        //! Singular values, effective rank and low-rank approximation error.
+        //!
+        //! Singular values are computed as the square roots of the eigenvalues of the smaller
+        //! Gram matrix (`AᵀA` or `AAᵀ`) with a cyclic Jacobi solver in `f64`. That is accurate
+        //! enough for analysis (small singular values lose relative precision) and needs no
+        //! linear-algebra dependency.
+
+        use crate::compress::{AnalysisError, Matrix};
+
+        /// Largest matrix side analysed by default; bigger inputs are cropped to the top-left block.
+        pub const DEFAULT_MAX_DIM: usize = 256;
+
+        const MAX_SWEEPS: usize = 64;
+
+        /// Eigenvalues of a symmetric `n x n` matrix (row-major, destroyed), unordered.
+        fn jacobi_eigenvalues(a: &mut [f64], n: usize) -> Vec<f64> {
+            for _ in 0..MAX_SWEEPS {
+                let mut off = 0.0f64;
+                let mut diag = 0.0f64;
+                for i in 0..n {
+                    diag += a[i * n + i] * a[i * n + i];
+                    for j in i + 1..n {
+                        off += a[i * n + j] * a[i * n + j];
+                    }
+                }
+                if off <= 1e-24 * (diag + off).max(f64::MIN_POSITIVE) {
+                    break;
+                }
+                for p in 0..n {
+                    for q in p + 1..n {
+                        let apq = a[p * n + q];
+                        if apq.abs() < 1e-300 {
+                            continue;
+                        }
+                        let theta = (a[q * n + q] - a[p * n + p]) / (2.0 * apq);
+                        let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                        let t = if theta == 0.0 { 1.0 } else { t };
+                        let c = 1.0 / (t * t + 1.0).sqrt();
+                        let s = t * c;
+                        for k in 0..n {
+                            let (akp, akq) = (a[k * n + p], a[k * n + q]);
+                            a[k * n + p] = c * akp - s * akq;
+                            a[k * n + q] = s * akp + c * akq;
+                        }
+                        for k in 0..n {
+                            let (apk, aqk) = (a[p * n + k], a[q * n + k]);
+                            a[p * n + k] = c * apk - s * aqk;
+                            a[q * n + k] = s * apk + c * aqk;
+                        }
+                    }
+                }
+            }
+            (0..n).map(|i| a[i * n + i]).collect()
+        }
+
+        /// Squared singular values in descending order, from the top-left
+        /// `min(rows, max_dim) x min(cols, max_dim)` block of `m`.
+        pub fn singular_values_squared(
+            m: Matrix<'_>,
+            max_dim: usize,
+        ) -> Result<Vec<f64>, AnalysisError> {
+            if max_dim == 0 {
+                return Err(AnalysisError::BadParameter("max_dim must be at least 1"));
+            }
+            let (r, c) = (m.rows.min(max_dim), m.cols.min(max_dim));
+            let at = |i: usize, j: usize| f64::from(m.data[i * m.cols + j]);
+            // Gram matrix of the smaller side.
+            let n = r.min(c);
+            let mut g = vec![0.0f64; n * n];
+            if c <= r {
+                for i in 0..r {
+                    for p in 0..c {
+                        let aip = at(i, p);
+                        if aip != 0.0 {
+                            for q in p..c {
+                                g[p * n + q] += aip * at(i, q);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for p in 0..r {
+                    for q in p..r {
+                        let mut s = 0.0;
+                        for j in 0..c {
+                            s += at(p, j) * at(q, j);
+                        }
+                        g[p * n + q] = s;
+                    }
+                }
+            }
+            for p in 0..n {
+                for q in 0..p {
+                    g[p * n + q] = g[q * n + p];
+                }
+            }
+            let mut ev = jacobi_eigenvalues(&mut g, n);
+            for e in &mut ev {
+                if *e < 0.0 {
+                    *e = 0.0; // rounding noise
+                }
+            }
+            ev.sort_by(|a, b| b.total_cmp(a));
+            Ok(ev)
+        }
+
+        /// Smallest rank whose singular values capture at least `energy_threshold` of the total
+        /// squared energy (the original's `searchsorted(...) + 1`). `0` for an all-zero matrix.
+        /// `energy_threshold` must be in `(0, 1]`.
+        pub fn effective_rank(
+            m: Matrix<'_>,
+            energy_threshold: f64,
+            max_dim: usize,
+        ) -> Result<usize, AnalysisError> {
+            if !(energy_threshold > 0.0 && energy_threshold <= 1.0) {
+                return Err(AnalysisError::BadParameter(
+                    "energy_threshold must be in (0, 1]",
+                ));
+            }
+            let power = singular_values_squared(m, max_dim)?;
+            let total: f64 = power.iter().sum();
+            if total <= 0.0 {
+                return Ok(0);
+            }
+            let mut cum = 0.0;
+            for (i, p) in power.iter().enumerate() {
+                cum += p;
+                if cum / total >= energy_threshold - 1e-12 {
+                    return Ok(i + 1);
+                }
+            }
+            Ok(power.len())
+        }
+
+        /// Rank used for a given parameter ratio: `max(1, floor(min(rows, cols) * ratio))`.
+        /// `ratio` must be in `(0, 1]`.
+        pub fn rank_for_ratio(
+            rows: usize,
+            cols: usize,
+            ratio: f64,
+        ) -> Result<usize, AnalysisError> {
+            if !(ratio > 0.0 && ratio <= 1.0) {
+                return Err(AnalysisError::BadParameter("ratio must be in (0, 1]"));
+            }
+            Ok(((rows.min(cols) as f64 * ratio) as usize).max(1))
+        }
+
+        /// Relative Frobenius error of the best rank-`rank` approximation:
+        /// `‖A - A_k‖_F / (‖A‖_F + 1e-12)`. By the Eckart–Young theorem this equals
+        /// `sqrt(Σ_{i>k} σᵢ²)` over the full norm, so no reconstruction is needed.
+        /// Computed on the same cropped block as [`singular_values_squared`].
+        pub fn low_rank_relative_error(
+            m: Matrix<'_>,
+            rank: usize,
+            max_dim: usize,
+        ) -> Result<f64, AnalysisError> {
+            if rank == 0 {
+                return Err(AnalysisError::BadParameter("rank must be at least 1"));
+            }
+            let power = singular_values_squared(m, max_dim)?;
+            let total: f64 = power.iter().sum();
+            let tail: f64 = power.iter().skip(rank).sum();
+            Ok(tail.sqrt() / (total.sqrt() + 1e-12))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn mat(data: &[f32], r: usize, c: usize) -> Matrix<'_> {
+                Matrix::new(data, r, c).unwrap()
+            }
+
+            #[test]
+            fn diagonal_matrix_singular_values() {
+                let d = [3.0f32, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 1.0];
+                let s = singular_values_squared(mat(&d, 3, 3), 256).unwrap();
+                for (got, want) in s.iter().zip([16.0, 9.0, 1.0]) {
+                    assert!((got - want).abs() < 1e-9, "{s:?}");
+                }
+            }
+
+            #[test]
+            fn tall_and_wide_agree() {
+                let a: Vec<f32> = (0..24).map(|i| ((i * 5) % 11) as f32 - 4.0).collect();
+                let tall = singular_values_squared(mat(&a, 6, 4), 256).unwrap();
+                // transpose
+                let mut t = vec![0.0f32; 24];
+                for i in 0..6 {
+                    for j in 0..4 {
+                        t[j * 6 + i] = a[i * 4 + j];
+                    }
+                }
+                let wide = singular_values_squared(mat(&t, 4, 6), 256).unwrap();
+                assert_eq!(tall.len(), 4);
+                for (x, y) in tall.iter().zip(&wide) {
+                    assert!((x - y).abs() < 1e-6 * x.max(1.0), "{tall:?} vs {wide:?}");
+                }
+            }
+
+            #[test]
+            fn energy_equals_squared_frobenius_norm() {
+                let a: Vec<f32> = (0..30).map(|i| (i as f32).sin() * 3.0).collect();
+                let s = singular_values_squared(mat(&a, 5, 6), 256).unwrap();
+                let frob: f64 = a.iter().map(|v| f64::from(*v).powi(2)).sum();
+                assert!((s.iter().sum::<f64>() - frob).abs() < 1e-6 * frob);
+            }
+
+            #[test]
+            fn rank_one_matrix_has_effective_rank_one() {
+                // outer product u v^T
+                let u = [1.0f32, 2.0, 3.0, 4.0];
+                let v = [2.0f32, -1.0, 0.5];
+                let mut a = Vec::new();
+                for x in u {
+                    for y in v {
+                        a.push(x * y);
+                    }
+                }
+                assert_eq!(effective_rank(mat(&a, 4, 3), 0.99, 256).unwrap(), 1);
+                let s = singular_values_squared(mat(&a, 4, 3), 256).unwrap();
+                assert!(s[1] < 1e-9 * s[0]);
+            }
+
+            #[test]
+            fn identity_needs_every_dimension_for_full_energy() {
+                let mut i = vec![0.0f32; 16];
+                for k in 0..4 {
+                    i[k * 4 + k] = 1.0;
+                }
+                assert_eq!(effective_rank(mat(&i, 4, 4), 1.0, 256).unwrap(), 4);
+                assert_eq!(effective_rank(mat(&i, 4, 4), 0.5, 256).unwrap(), 2);
+                assert_eq!(effective_rank(mat(&i, 4, 4), 0.99, 256).unwrap(), 4);
+            }
+
+            #[test]
+            fn zero_matrix_has_rank_zero() {
+                assert_eq!(effective_rank(mat(&[0.0; 6], 2, 3), 0.99, 256).unwrap(), 0);
+            }
+
+            #[test]
+            fn low_rank_error_is_exact_for_a_diagonal() {
+                let d = [3.0f32, 0.0, 0.0, 4.0];
+                // keep the largest (4): tail is 3 over sqrt(25) = 5
+                let e = low_rank_relative_error(mat(&d, 2, 2), 1, 256).unwrap();
+                assert!((e - 0.6).abs() < 1e-9, "{e}");
+                assert!(low_rank_relative_error(mat(&d, 2, 2), 2, 256).unwrap() < 1e-9);
+                assert!(low_rank_relative_error(mat(&d, 2, 2), 5, 256).unwrap() < 1e-9);
+            }
+
+            #[test]
+            fn error_decreases_with_rank() {
+                let a: Vec<f32> = (0..64).map(|i| ((i * 13) % 17) as f32 - 8.0).collect();
+                let m = mat(&a, 8, 8);
+                let mut last = f64::MAX;
+                for r in 1..=8 {
+                    let e = low_rank_relative_error(m, r, 256).unwrap();
+                    assert!(e <= last + 1e-12);
+                    last = e;
+                }
+                assert!(last < 1e-6);
+            }
+
+            #[test]
+            fn cropping_to_max_dim() {
+                let a: Vec<f32> = (0..100).map(|i| (i % 9) as f32).collect();
+                let cropped = singular_values_squared(mat(&a, 10, 10), 3).unwrap();
+                assert_eq!(cropped.len(), 3);
+                assert!(singular_values_squared(mat(&a, 10, 10), 0).is_err());
+            }
+
+            #[test]
+            fn rank_for_ratio_rules() {
+                assert_eq!(rank_for_ratio(10, 20, 0.5).unwrap(), 5);
+                assert_eq!(rank_for_ratio(10, 20, 0.01).unwrap(), 1);
+                assert_eq!(rank_for_ratio(10, 20, 1.0).unwrap(), 10);
+                assert!(rank_for_ratio(10, 20, 0.0).is_err());
+                assert!(rank_for_ratio(10, 20, 1.5).is_err());
+            }
+
+            #[test]
+            fn parameter_validation() {
+                let m = mat(&[1.0, 0.0, 0.0, 1.0], 2, 2);
+                assert!(effective_rank(m, 0.0, 8).is_err());
+                assert!(effective_rank(m, 1.5, 8).is_err());
+                assert!(low_rank_relative_error(m, 0, 8).is_err());
+            }
+        }
+    }
+
+    pub mod prune {
+        //! Magnitude pruning plans.
+
+        use crate::compress::AnalysisError;
+
+        /// The global magnitude threshold that would prune the smallest `ratio` of all weights:
+        /// the `k`-th smallest absolute value with `k = clamp(floor(ratio * n), 1, n)`.
+        ///
+        /// This is a *plan*. Weights with `|w| <= threshold` are the pruning candidates; whether
+        /// the pruned model still works is a separate experiment. `ratio` must be in `[0, 1]`.
+        /// `None` when there are no weights.
+        pub fn global_magnitude_threshold(
+            tensors: &[&[f32]],
+            ratio: f64,
+        ) -> Result<Option<f32>, AnalysisError> {
+            if !(0.0..=1.0).contains(&ratio) || ratio.is_nan() {
+                return Err(AnalysisError::BadParameter("ratio must be in [0, 1]"));
+            }
+            let mut all: Vec<f32> = Vec::with_capacity(tensors.iter().map(|t| t.len()).sum());
+            for t in tensors {
+                for v in *t {
+                    if !v.is_finite() {
+                        return Err(AnalysisError::NonFinite);
+                    }
+                    all.push(v.abs());
+                }
+            }
+            if all.is_empty() {
+                return Ok(None);
+            }
+            let n = all.len();
+            let k = ((ratio * n as f64) as usize).clamp(1, n);
+            let (_, kth, _) = all.select_nth_unstable_by(k - 1, |a, b| a.total_cmp(b));
+            Ok(Some(*kth))
+        }
+
+        /// Fraction of weights with `|w| <= threshold` (the share a plan would prune).
+        pub fn pruned_fraction(tensors: &[&[f32]], threshold: f32) -> f64 {
+            let total: usize = tensors.iter().map(|t| t.len()).sum();
+            if total == 0 {
+                return 0.0;
+            }
+            let pruned: usize = tensors
+                .iter()
+                .map(|t| t.iter().filter(|v| v.abs() <= threshold).count())
+                .sum();
+            pruned as f64 / total as f64
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn threshold_is_the_kth_smallest_magnitude() {
+                let a = [1.0f32, -2.0, 3.0];
+                let b = [-4.0f32, 5.0, 0.5, 6.0, -7.0, 8.0, 9.0];
+                let t = [&a[..], &b[..]];
+                // sorted magnitudes: 0.5 1 2 3 4 5 6 7 8 9 ; 10 weights
+                assert_eq!(global_magnitude_threshold(&t, 0.5).unwrap(), Some(4.0));
+                assert_eq!(global_magnitude_threshold(&t, 1.0).unwrap(), Some(9.0));
+                assert_eq!(global_magnitude_threshold(&t, 0.0).unwrap(), Some(0.5)); // k clamps to 1
+                assert_eq!(global_magnitude_threshold(&t, 0.05).unwrap(), Some(0.5));
+            }
+
+            #[test]
+            fn pruned_fraction_matches_the_plan() {
+                let w: Vec<f32> = (1..=100).map(|i| i as f32).collect();
+                let t = [&w[..]];
+                let th = global_magnitude_threshold(&t, 0.3).unwrap().unwrap();
+                assert_eq!(th, 30.0);
+                assert!((pruned_fraction(&t, th) - 0.3).abs() < 1e-12);
+                assert_eq!(pruned_fraction(&[], 1.0), 0.0);
+            }
+
+            #[test]
+            fn empty_and_invalid() {
+                assert_eq!(global_magnitude_threshold(&[], 0.5).unwrap(), None);
+                assert_eq!(global_magnitude_threshold(&[&[]], 0.5).unwrap(), None);
+                assert!(global_magnitude_threshold(&[&[1.0]], -0.1).is_err());
+                assert!(global_magnitude_threshold(&[&[1.0]], 1.1).is_err());
+                assert!(global_magnitude_threshold(&[&[1.0]], f64::NAN).is_err());
+                assert_eq!(
+                    global_magnitude_threshold(&[&[f32::NAN]], 0.5).unwrap_err(),
+                    AnalysisError::NonFinite
+                );
+            }
+
+            #[test]
+            fn ties_are_handled() {
+                let w = [2.0f32; 10];
+                assert_eq!(
+                    global_magnitude_threshold(&[&w[..]], 0.5).unwrap(),
+                    Some(2.0)
+                );
+                assert_eq!(pruned_fraction(&[&w[..]], 2.0), 1.0);
+            }
+        }
+    }
+
+    pub mod quant {
+        //! Quantisation error.
+
+        use crate::compress::AnalysisError;
+
+        /// Relative L2 error of symmetric per-tensor integer quantisation at `bits` bits:
+        /// `‖dequant(quant(x)) - x‖ / (‖x‖ + 1e-12)`, with `qmax = 2^(bits-1) - 1` and
+        /// `scale = max|x| / qmax` (floored at 1e-12).
+        ///
+        /// This measures representational error only; it never alters the weights.
+        /// `bits` must be 2..=16. Empty input gives `0.0`.
+        pub fn symmetric_quantization_error(x: &[f32], bits: u32) -> Result<f64, AnalysisError> {
+            if !(2..=16).contains(&bits) {
+                return Err(AnalysisError::BadParameter("bits must be 2..=16"));
+            }
+            if x.iter().any(|v| !v.is_finite()) {
+                return Err(AnalysisError::NonFinite);
+            }
+            let qmax = f64::from((1u32 << (bits - 1)) - 1);
+            let max_abs = x.iter().map(|v| f64::from(v.abs())).fold(0.0, f64::max);
+            let scale = (max_abs / qmax.max(1.0)).max(1e-12);
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for v in x {
+                let v = f64::from(*v);
+                let q = (v / scale).round().clamp(-qmax, qmax);
+                err += (q * scale - v).powi(2);
+                norm += v * v;
+            }
+            Ok(err.sqrt() / (norm.sqrt() + 1e-12))
+        }
+
+        /// Mean and maximum of [`symmetric_quantization_error`] over several tensors, with the
+        /// number measured. Empty tensors are skipped. `None` mean/max when nothing was measured.
+        pub fn quantization_summary(
+            tensors: &[&[f32]],
+            bits: u32,
+        ) -> Result<(Option<f64>, Option<f64>, usize), AnalysisError> {
+            let mut errs = Vec::new();
+            for t in tensors.iter().filter(|t| !t.is_empty()) {
+                errs.push(symmetric_quantization_error(t, bits)?);
+            }
+            if errs.is_empty() {
+                return Ok((None, None, 0));
+            }
+            let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+            let max = errs.iter().copied().fold(f64::MIN, f64::max);
+            Ok((Some(mean), Some(max), errs.len()))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn exactly_representable_values_have_zero_error() {
+                // 8-bit: qmax 127, values k * (127/127) are exact when max_abs = 127
+                let x: Vec<f32> = (-127..=127).map(|v| v as f32).collect();
+                assert!(symmetric_quantization_error(&x, 8).unwrap() < 1e-9);
+            }
+
+            #[test]
+            fn more_bits_means_less_error() {
+                let x: Vec<f32> = (0..500)
+                    .map(|i| ((i * 37) % 200) as f32 / 10.0 - 10.0)
+                    .collect();
+                let e4 = symmetric_quantization_error(&x, 4).unwrap();
+                let e8 = symmetric_quantization_error(&x, 8).unwrap();
+                let e16 = symmetric_quantization_error(&x, 16).unwrap();
+                assert!(e4 > e8 && e8 > e16, "{e4} {e8} {e16}");
+                assert!(e16 < 1e-4);
+            }
+
+            #[test]
+            fn two_bit_is_ternary() {
+                // bits=2 -> qmax 1: values snap to {-s, 0, s}, s = max|x|
+                let e = symmetric_quantization_error(&[1.0, -1.0, 0.4, -0.4], 2).unwrap();
+                // errors 0, 0, 0.4, 0.4 over norm sqrt(2.32)
+                let expected = (0.32f64).sqrt() / (2.32f64).sqrt();
+                assert!((e - expected).abs() < 1e-6, "{e} vs {expected}");
+            }
+
+            #[test]
+            fn zeros_and_empty() {
+                assert_eq!(symmetric_quantization_error(&[0.0; 8], 8).unwrap(), 0.0);
+                assert_eq!(symmetric_quantization_error(&[], 8).unwrap(), 0.0);
+            }
+
+            #[test]
+            fn rejects_bad_parameters() {
+                assert!(symmetric_quantization_error(&[1.0], 1).is_err());
+                assert!(symmetric_quantization_error(&[1.0], 17).is_err());
+                assert_eq!(
+                    symmetric_quantization_error(&[f32::NAN], 8).unwrap_err(),
+                    AnalysisError::NonFinite
+                );
+            }
+
+            #[test]
+            fn summary_skips_empty_tensors() {
+                let a: Vec<f32> = (0..64).map(|i| i as f32).collect();
+                let b: Vec<f32> = (0..64).map(|i| (i * i % 13) as f32).collect();
+                let (mean, max, n) = quantization_summary(&[&a, &[], &b], 4).unwrap();
+                assert_eq!(n, 2);
+                let (ea, eb) = (
+                    symmetric_quantization_error(&a, 4).unwrap(),
+                    symmetric_quantization_error(&b, 4).unwrap(),
+                );
+                assert!((mean.unwrap() - (ea + eb) / 2.0).abs() < 1e-12);
+                assert!((max.unwrap() - ea.max(eb)).abs() < 1e-12);
+                assert_eq!(quantization_summary(&[], 4).unwrap(), (None, None, 0));
+            }
+        }
+    }
+
+    pub mod rvq {
+        //! Residual vector quantisation storage accounting.
+        //!
+        //! The codebook fitting of the original (k-means stages) is not ported; only the size
+        //! arithmetic, which is what compression planning needs to compare against other schemes.
+
+        /// Bytes of a residual-VQ encoding: per stage, `K` codewords of `dimension` f32 values
+        /// plus one label per vector. Labels take 1, 2 or 4 bytes depending on `K`.
+        /// Returns `None` on arithmetic overflow.
+        pub fn storage_bytes(vectors: u64, dimension: u64, k: u64, stages: u64) -> Option<u64> {
+            let label_bytes: u64 = if k <= 256 {
+                1
+            } else if k <= 65_536 {
+                2
+            } else {
+                4
+            };
+            let codebook = k.checked_mul(dimension)?.checked_mul(4)?;
+            let labels = vectors.checked_mul(label_bytes)?;
+            stages.checked_mul(codebook.checked_add(labels)?)
+        }
+
+        /// Compression ratio against dense f32 storage of `vectors * dimension` values
+        /// (`> 1` means smaller). `None` on overflow or when the encoding would be empty.
+        pub fn compression_ratio(vectors: u64, dimension: u64, k: u64, stages: u64) -> Option<f64> {
+            let dense = vectors.checked_mul(dimension)?.checked_mul(4)?;
+            let enc = storage_bytes(vectors, dimension, k, stages)?;
+            if enc == 0 {
+                return None;
+            }
+            Some(dense as f64 / enc as f64)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn label_width_follows_codebook_size() {
+                // 1 stage, 10 vectors, dim 4
+                assert_eq!(storage_bytes(10, 4, 256, 1), Some(256 * 4 * 4 + 10));
+                assert_eq!(storage_bytes(10, 4, 257, 1), Some(257 * 4 * 4 + 20));
+                assert_eq!(storage_bytes(10, 4, 65_536, 1), Some(65_536 * 4 * 4 + 20));
+                assert_eq!(storage_bytes(10, 4, 65_537, 1), Some(65_537 * 4 * 4 + 40));
+            }
+
+            #[test]
+            fn stages_multiply() {
+                let one = storage_bytes(100, 8, 16, 1).unwrap();
+                assert_eq!(storage_bytes(100, 8, 16, 3), Some(3 * one));
+                assert_eq!(storage_bytes(100, 8, 16, 0), Some(0));
+            }
+
+            #[test]
+            fn overflow_is_none() {
+                assert_eq!(storage_bytes(u64::MAX, 8, 16, 1), None);
+                assert_eq!(storage_bytes(1, u64::MAX, 16, 1), None);
+                assert_eq!(storage_bytes(1, 8, 16, u64::MAX), None);
+            }
+
+            #[test]
+            fn ratio_against_dense() {
+                // 1_000_000 vectors of dim 8, K=256, 1 stage: dense 32 MB vs ~1 MB + 8 KB... check shape of result
+                let r = compression_ratio(1_000_000, 8, 256, 1).unwrap();
+                assert!(r > 30.0 && r < 32.0, "{r}");
+                assert_eq!(compression_ratio(10, 8, 16, 0), None);
+            }
+        }
+    }
+
+    pub mod stats {
+        //! Distribution statistics of weights.
+
+        use crate::compress::{AnalysisError, Matrix};
+
+        /// Mean and sample standard deviation (n - 1). `None` for fewer than two values.
+        pub fn mean_std(x: &[f32]) -> Option<(f64, f64)> {
+            if x.len() < 2 {
+                return None;
+            }
+            let n = x.len() as f64;
+            let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n;
+            let var = x
+                .iter()
+                .map(|v| (f64::from(*v) - mean).powi(2))
+                .sum::<f64>()
+                / (n - 1.0);
+            Some((mean, var.sqrt()))
+        }
+
+        /// Shannon entropy in bits of an equal-width histogram over `[min, max]`.
+        ///
+        /// `None` for empty input; `0.0` when all values are (nearly) equal. The last bin
+        /// includes the maximum. `bins` must be at least 1.
+        pub fn entropy_bits(x: &[f32], bins: usize) -> Result<Option<f64>, AnalysisError> {
+            if bins == 0 {
+                return Err(AnalysisError::BadParameter("bins must be at least 1"));
+            }
+            if x.is_empty() {
+                return Ok(None);
+            }
+            if x.iter().any(|v| !v.is_finite()) {
+                return Err(AnalysisError::NonFinite);
+            }
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for v in x {
+                lo = lo.min(f64::from(*v));
+                hi = hi.max(f64::from(*v));
+            }
+            // numpy.allclose(min, max) with its default tolerances.
+            if (lo - hi).abs() <= 1e-8 + 1e-5 * hi.abs() {
+                return Ok(Some(0.0));
+            }
+            let width = (hi - lo) / bins as f64;
+            let mut counts = vec![0u64; bins];
+            for v in x {
+                let idx = (((f64::from(*v) - lo) / width) as usize).min(bins - 1);
+                counts[idx] += 1;
+            }
+            let total = x.len() as f64;
+            let h = counts
+                .iter()
+                .filter(|c| **c > 0)
+                .map(|c| {
+                    let p = *c as f64 / total;
+                    -p * p.log2()
+                })
+                .sum();
+            Ok(Some(h))
+        }
+
+        /// Fraction of values with `|x| > |mean| + sigma * std`. `None` when the std is zero or
+        /// there are fewer than two values.
+        pub fn outlier_fraction(x: &[f32], sigma: f64) -> Option<f64> {
+            let (mean, std) = mean_std(x)?;
+            if std <= 0.0 {
+                return None;
+            }
+            let limit = mean.abs() + sigma * std;
+            let n = x.iter().filter(|v| f64::from(v.abs()) > limit).count();
+            Some(n as f64 / x.len() as f64)
+        }
+
+        /// Fraction of adjacent (after ordering) unit-normalised rows whose cosine similarity
+        /// is at least `threshold`, over at most `sample_count` evenly strided rows.
+        ///
+        /// This is the original's approximation: sorting by the first coordinate and comparing
+        /// neighbours avoids an N² comparison. Zero rows are ignored. `None` with fewer than
+        /// two usable rows.
+        pub fn near_duplicate_fraction(
+            m: Matrix<'_>,
+            threshold: f64,
+            sample_count: usize,
+        ) -> Option<f64> {
+            if m.rows < 2 || sample_count == 0 {
+                return None;
+            }
+            let count = sample_count.min(m.rows);
+            let mut rows: Vec<Vec<f64>> = Vec::with_capacity(count);
+            for i in 0..count {
+                let r = m.row(i * m.rows / count);
+                let norm = r.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+                if norm > 1e-12 {
+                    rows.push(r.iter().map(|v| f64::from(*v) / norm).collect());
+                }
+            }
+            if rows.len() < 2 {
+                return None;
+            }
+            rows.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let hits = rows
+                .windows(2)
+                .filter(|w| w[0].iter().zip(&w[1]).map(|(a, b)| a * b).sum::<f64>() >= threshold)
+                .count();
+            Some(hits as f64 / (rows.len() - 1) as f64)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn mean_std_is_sample_std() {
+                let (m, s) = mean_std(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+                assert!((m - 2.5).abs() < 1e-12);
+                assert!((s - (5.0f64 / 3.0).sqrt()).abs() < 1e-12);
+                assert!(mean_std(&[1.0]).is_none());
+                assert!(mean_std(&[]).is_none());
+            }
+
+            #[test]
+            fn entropy_of_uniform_and_degenerate() {
+                // 4 bins, one value each at the bin centres -> exactly 2 bits.
+                let h = entropy_bits(&[0.0, 1.0, 2.0, 3.0], 4).unwrap().unwrap();
+                assert!((h - 2.0).abs() < 1e-12);
+                assert_eq!(entropy_bits(&[5.0, 5.0, 5.0], 16).unwrap(), Some(0.0));
+                assert_eq!(entropy_bits(&[], 16).unwrap(), None);
+                // everything in one bin except the max: two occupied bins
+                let h = entropy_bits(&[0.0, 0.0, 0.0, 1.0], 2).unwrap().unwrap();
+                assert!((h - 0.811_278_124_459_132_9).abs() < 1e-9);
+            }
+
+            #[test]
+            fn entropy_rejects_bad_input() {
+                assert!(entropy_bits(&[1.0], 0).is_err());
+                assert_eq!(
+                    entropy_bits(&[1.0, f32::NAN], 4).unwrap_err(),
+                    AnalysisError::NonFinite
+                );
+            }
+
+            #[test]
+            fn entropy_never_exceeds_log2_bins() {
+                let x: Vec<f32> = (0..1000).map(|i| ((i * 7919) % 1000) as f32).collect();
+                let h = entropy_bits(&x, 128).unwrap().unwrap();
+                assert!(h > 6.5 && h <= 7.0 + 1e-9, "{h}");
+            }
+
+            #[test]
+            fn outliers_use_abs_mean_plus_sigma_std() {
+                let mut x = vec![0.0f32; 99];
+                x.push(100.0);
+                // mean 1, std ~10; limit = 1 + 3*10.05 ~ 31 -> only the 100 exceeds
+                let f = outlier_fraction(&x, 3.0).unwrap();
+                assert!((f - 0.01).abs() < 1e-12);
+                assert_eq!(outlier_fraction(&[2.0, 2.0, 2.0], 3.0), None);
+                assert_eq!(outlier_fraction(&[1.0], 3.0), None);
+            }
+
+            #[test]
+            fn near_duplicates_detects_repeated_rows() {
+                let data = [1.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+                let m = Matrix::new(&data, 4, 2).unwrap();
+                // sorted by first coord: (0,1),(0,1),(1,0),(1,0): pairs 1 and 3 are duplicates, 2 is not
+                let f = near_duplicate_fraction(m, 0.995, 4096).unwrap();
+                assert!((f - 2.0 / 3.0).abs() < 1e-12);
+            }
+
+            #[test]
+            fn near_duplicates_edge_cases() {
+                let one = Matrix::new(&[1.0, 2.0], 1, 2).unwrap();
+                assert_eq!(near_duplicate_fraction(one, 0.99, 10), None);
+                let zeros = Matrix::new(&[0.0; 6], 3, 2).unwrap();
+                assert_eq!(near_duplicate_fraction(zeros, 0.99, 10), None);
+                let m = Matrix::new(&[1.0, 0.0, 0.0, 1.0], 2, 2).unwrap();
+                assert_eq!(near_duplicate_fraction(m, 0.99, 0), None);
+                assert_eq!(near_duplicate_fraction(m, 0.99, 10), Some(0.0));
+            }
+
+            #[test]
+            fn sampling_is_deterministic_and_strided() {
+                let data: Vec<f32> = (0..200).map(|i| (i % 7) as f32 + 1.0).collect();
+                let m = Matrix::new(&data, 100, 2).unwrap();
+                assert_eq!(
+                    near_duplicate_fraction(m, 0.99, 10),
+                    near_duplicate_fraction(m, 0.99, 10)
+                );
+            }
+        }
+    }
+}
+
+pub mod sparse {
+    //! Selective loading: decide how much of a big model has to be resident.
+    //!
+    //! Ported from `sparse_runtime.py` and the planning parts of `theory_forge.py` in the research
+    //! toolkit. Only the *decisions* are here, as plain functions over numbers, so they run on any
+    //! model and are tested without one. Measuring (running the model on calibration prompts and
+    //! scoring it with [`crate::theory`]) is done by the caller and fed in.
+    //!
+    //! * **Mixture of experts.** [`RoutingProfile`] counts how much routing mass each expert got on
+    //!   domain prompts; [`hot_set`] keeps the most used experts up to a coverage target (never fewer
+    //!   than `top_k` per layer); [`HotSet::apply`] restricts an
+    //!   [`ExpertStore`](crate::weights::experts::ExpertStore) to it, so cold experts are never read.
+    //! * **Dense models.** [`NeuronProfile`] and [`slice_mlp`] keep the most active feed-forward
+    //!   neurons and cut the weight matrices down, which gives a smaller real model.
+    //! * **Acceptance.** [`smallest_within_tolerance`] takes the smallest variant whose robust score
+    //!   stays within a tolerance of the full model's.
+    //! * **Budgets and hardware.** [`plan_tiers`] splits memory into fast tier, RAM cache and disk;
+    //!   [`plan_hardware`] and [`device_for`] choose device, precision and run sizes.
+    //!
+    //! Nothing here claims a smaller model is as good: that is only established by scoring it.
+    #![forbid(unsafe_code)]
+
+    use crate::weights::experts::ExpertKey;
+    use crate::weights::experts::ExpertStore;
+    use crate::weights::source::ModelSource;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt;
+
+    /// Largest number of layers, experts, neurons or manifest lines accepted.
+    pub const MAX_ITEMS: usize = 1 << 20;
+
+    /// Invalid input to a planning function.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SparseError {
+        /// A shape or length does not match (the text says which).
+        Shape(&'static str),
+        /// A parameter is outside its range (the text says which).
+        Parameter(&'static str),
+        /// A manifest is malformed (line number, 1-based).
+        Manifest(usize),
+        /// The expert store refused the hot set.
+        Store(String),
+    }
+
+    impl fmt::Display for SparseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Shape(s) => write!(f, "shape mismatch: {s}"),
+                Self::Parameter(s) => write!(f, "invalid parameter: {s}"),
+                Self::Manifest(n) => write!(f, "manifest line {n} is malformed"),
+                Self::Store(s) => write!(f, "expert store refused the hot set: {s}"),
+            }
+        }
+    }
+
+    impl std::error::Error for SparseError {}
+
+    // ------------------------------------------------------------------ expert tensor names
+
+    /// What an expert tensor holds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum ExpertRole {
+        /// The gate projection (`w1`, `gate_proj`).
+        Gate,
+        /// The up projection (`w3`, `up_proj`).
+        Up,
+        /// The down projection (`w2`, `down_proj`).
+        Down,
+        /// Gate and up stacked in one tensor (`gate_up_proj`).
+        GateUp,
+    }
+
+    /// A tensor that belongs to a routed expert, found from its name.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ExpertTensor {
+        /// Layer index.
+        pub layer: usize,
+        /// Which expert, or `None` when the tensor holds every expert of the layer (fused).
+        pub expert: Option<usize>,
+        /// What the tensor is.
+        pub role: ExpertRole,
+    }
+
+    fn number(s: &str) -> Option<usize> {
+        if s.is_empty() || s.len() > 7 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+
+    /// Recognises routed-expert tensors by name, in the checkpoint styles the research toolkit
+    /// handled (`...layers.N.<block>.experts.E.<w1|w2|w3|gate_proj|up_proj|down_proj>.weight`, and
+    /// fused `...layers.N.<block>.experts.<gate_up_proj|down_proj>`) and in GGUF style
+    /// (`blk.N.ffn_<gate|up|down>_exps.weight`, which hold all experts of a layer).
+    /// Anything else, including router, shared-expert and attention tensors, gives `None`.
+    #[must_use]
+    pub fn classify_expert_tensor(name: &str) -> Option<ExpertTensor> {
+        if let Some(rest) = name.strip_prefix("blk.") {
+            let (layer, tail) = rest.split_once('.')?;
+            let role = match tail {
+                "ffn_gate_exps.weight" => ExpertRole::Gate,
+                "ffn_up_exps.weight" => ExpertRole::Up,
+                "ffn_down_exps.weight" => ExpertRole::Down,
+                _ => return None,
+            };
+            return Some(ExpertTensor {
+                layer: number(layer)?,
+                expert: None,
+                role,
+            });
+        }
+        let parts: Vec<&str> = name.split('.').collect();
+        let l = parts.iter().position(|p| *p == "layers")?;
+        let layer = number(parts.get(l + 1)?)?;
+        // After the layer index comes the block name (one or more parts), then `experts`.
+        let e = parts.iter().skip(l + 2).position(|p| *p == "experts")? + l + 2;
+        if e == l + 2 {
+            return None; // the block name is required
+        }
+        let after = &parts[e + 1..];
+        match after {
+            ["gate_up_proj"] => Some(ExpertTensor {
+                layer,
+                expert: None,
+                role: ExpertRole::GateUp,
+            }),
+            ["down_proj"] => Some(ExpertTensor {
+                layer,
+                expert: None,
+                role: ExpertRole::Down,
+            }),
+            [idx, role, "weight"] => {
+                let role = match *role {
+                    "w1" | "gate_proj" => ExpertRole::Gate,
+                    "w3" | "up_proj" => ExpertRole::Up,
+                    "w2" | "down_proj" => ExpertRole::Down,
+                    _ => return None,
+                };
+                Some(ExpertTensor {
+                    layer,
+                    expert: Some(number(idx)?),
+                    role,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    // ------------------------------------------------------------------ mixture of experts
+
+    /// How much routing mass each expert received, per layer, on the calibration prompts.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct RoutingProfile {
+        mass: BTreeMap<usize, BTreeMap<usize, f64>>,
+    }
+
+    impl RoutingProfile {
+        /// An empty profile.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Adds the experts chosen for one token: `(expert, weight)` pairs, as returned by
+        /// [`crate::weights::experts::route`]. Non-finite or negative weights are ignored.
+        pub fn record(&mut self, layer: usize, chosen: &[(usize, f32)]) {
+            let layer_mass = self.mass.entry(layer).or_default();
+            for &(e, w) in chosen {
+                if w.is_finite() && w >= 0.0 {
+                    *layer_mass.entry(e).or_insert(0.0) += f64::from(w);
+                }
+            }
+        }
+
+        /// Mass of one expert (0 when never chosen).
+        #[must_use]
+        pub fn mass(&self, layer: usize, expert: usize) -> f64 {
+            self.mass
+                .get(&layer)
+                .and_then(|m| m.get(&expert))
+                .copied()
+                .unwrap_or(0.0)
+        }
+
+        /// Layers that were seen.
+        #[must_use]
+        pub fn layers(&self) -> Vec<usize> {
+            self.mass.keys().copied().collect()
+        }
+
+        /// The experts of `layer`, most used first (ties: lower expert number first).
+        #[must_use]
+        pub fn ranked(&self, layer: usize) -> Vec<(usize, f64)> {
+            let mut v: Vec<(usize, f64)> = self
+                .mass
+                .get(&layer)
+                .map(|m| m.iter().map(|(&e, &w)| (e, w)).collect())
+                .unwrap_or_default();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            v
+        }
+    }
+
+    /// The experts kept per layer.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct HotSet {
+        /// Kept experts, by layer.
+        pub layers: BTreeMap<usize, BTreeSet<usize>>,
+    }
+
+    impl HotSet {
+        /// Total number of experts kept.
+        #[must_use]
+        pub fn experts_kept(&self) -> usize {
+            self.layers.values().map(BTreeSet::len).sum()
+        }
+
+        /// Restricts `store` so that only these experts can be routed to, and (when `pin`) loads
+        /// them into the fast tier as far as it has room. Returns how many were pinned.
+        ///
+        /// # Errors
+        /// [`SparseError::Store`] if a layer or expert number is outside the store.
+        pub fn apply<S: ModelSource, L: Fn(ExpertKey) -> Option<u64>>(
+            &self,
+            store: &mut ExpertStore<S, L>,
+            pin: bool,
+        ) -> Result<usize, SparseError> {
+            let mut pinned = 0;
+            for (&layer, experts) in &self.layers {
+                let list: Vec<u32> = experts
+                    .iter()
+                    .map(|&e| u32::try_from(e).map_err(|_| SparseError::Parameter("expert number")))
+                    .collect::<Result<_, _>>()?;
+                let layer32 =
+                    u32::try_from(layer).map_err(|_| SparseError::Parameter("layer number"))?;
+                store
+                    .allow_only(layer32, &list)
+                    .map_err(|e| SparseError::Store(e.to_string()))?;
+                if pin {
+                    for &expert in &list {
+                        if store
+                            .pin(ExpertKey {
+                                layer: layer32,
+                                expert,
+                            })
+                            .is_ok()
+                        {
+                            pinned += 1;
+                        }
+                    }
+                }
+            }
+            Ok(pinned)
+        }
+    }
+
+    /// The hot set that covers at least `coverage` (0 to 1) of each layer's routing mass.
+    ///
+    /// Experts are taken most used first, stopping once the coverage is reached *and* at least
+    /// `top_k` are kept; a layer is topped up to `top_k` with the lowest-numbered unused experts so
+    /// the router always has enough to choose from. A layer with no recorded mass keeps `top_k`
+    /// experts (the lowest-numbered). `layers` names the layers to plan.
+    ///
+    /// # Errors
+    /// [`SparseError::Parameter`] for a coverage outside 0..=1, `top_k` of zero or above
+    /// `experts_per_layer`, or too many layers.
+    pub fn hot_set(
+        profile: &RoutingProfile,
+        layers: &[usize],
+        experts_per_layer: usize,
+        top_k: usize,
+        coverage: f64,
+    ) -> Result<HotSet, SparseError> {
+        if !(0.0..=1.0).contains(&coverage) || coverage.is_nan() {
+            return Err(SparseError::Parameter("coverage must be between 0 and 1"));
+        }
+        if top_k == 0
+            || top_k > experts_per_layer
+            || experts_per_layer > MAX_ITEMS
+            || layers.len() > MAX_ITEMS
+        {
+            return Err(SparseError::Parameter("top_k and experts_per_layer"));
+        }
+        let mut out = HotSet::default();
+        for &layer in layers {
+            let ranked = profile.ranked(layer);
+            let total: f64 = ranked.iter().map(|r| r.1).sum();
+            let total = if total > 0.0 { total } else { 1.0 };
+            let mut keep: Vec<usize> = Vec::new();
+            let mut acc = 0.0;
+            for (e, w) in ranked {
+                if e >= experts_per_layer {
+                    continue;
+                }
+                if acc / total >= coverage && keep.len() >= top_k {
+                    break;
+                }
+                keep.push(e);
+                acc += w;
+            }
+            for e in 0..experts_per_layer {
+                if keep.len() >= top_k {
+                    break;
+                }
+                if !keep.contains(&e) {
+                    keep.push(e);
+                }
+            }
+            out.layers.insert(layer, keep.into_iter().collect());
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------ memory tiers
+
+    /// How memory is divided between the always-resident part of a model (the skeleton:
+    /// attention, norms, embeddings, routers, shared experts) and the expert tiers.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct TierPlan {
+        /// The skeleton fits on the accelerator (otherwise it stays in RAM).
+        pub skeleton_on_gpu: bool,
+        /// Bytes available to the fast expert tier (accelerator memory, or 0 with no accelerator).
+        pub fast_bytes: f64,
+        /// Bytes available to the RAM expert cache.
+        pub ram_bytes: f64,
+    }
+
+    /// Splits memory the way the research toolkit did: the skeleton goes to the accelerator when
+    /// `1.3 x` its size fits in `fast_frac` of the free accelerator memory, the fast tier gets the
+    /// rest of that share, and the RAM cache gets `ram_frac` of free RAM minus the skeleton when it
+    /// lives there. Everything that does not fit stays on disk.
+    ///
+    /// # Errors
+    /// [`SparseError::Parameter`] for a fraction outside 0..=1 or a negative or non-finite size.
+    pub fn plan_tiers(
+        skeleton_bytes: f64,
+        gpu_free: f64,
+        ram_free: f64,
+        fast_frac: f64,
+        ram_frac: f64,
+    ) -> Result<TierPlan, SparseError> {
+        let ok = |v: f64| v.is_finite() && v >= 0.0;
+        if ![skeleton_bytes, gpu_free, ram_free].iter().all(|&v| ok(v)) {
+            return Err(SparseError::Parameter(
+                "sizes must be finite and not negative",
+            ));
+        }
+        if !(0.0..=1.0).contains(&fast_frac) || !(0.0..=1.0).contains(&ram_frac) {
+            return Err(SparseError::Parameter("fractions must be between 0 and 1"));
+        }
+        let on_gpu = gpu_free > 0.0 && skeleton_bytes * 1.3 < gpu_free * fast_frac;
+        let fast = if gpu_free > 0.0 {
+            (gpu_free * fast_frac - if on_gpu { skeleton_bytes * 1.3 } else { 0.0 }).max(0.0)
+        } else {
+            0.0
+        };
+        let ram = (ram_free * ram_frac - if on_gpu { 0.0 } else { skeleton_bytes }).max(0.0);
+        Ok(TierPlan {
+            skeleton_on_gpu: on_gpu,
+            fast_bytes: fast,
+            ram_bytes: ram,
+        })
+    }
+
+    // ------------------------------------------------------------------ dense models
+
+    /// Accumulates how strongly each feed-forward neuron fires on the calibration prompts.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct NeuronProfile {
+        sums: Vec<f32>,
+    }
+
+    impl NeuronProfile {
+        /// A profile for `neurons` neurons (the intermediate size).
+        ///
+        /// # Errors
+        /// [`SparseError::Parameter`] for zero or an unreasonable count.
+        pub fn new(neurons: usize) -> Result<Self, SparseError> {
+            if neurons == 0 || neurons > MAX_ITEMS {
+                return Err(SparseError::Parameter("neuron count"));
+            }
+            Ok(Self {
+                sums: vec![0.0; neurons],
+            })
+        }
+
+        /// Adds one token's activations (the input of the down projection): `|a|` per neuron.
+        ///
+        /// # Errors
+        /// [`SparseError::Shape`] if the length differs from the neuron count.
+        pub fn record(&mut self, activations: &[f32]) -> Result<(), SparseError> {
+            if activations.len() != self.sums.len() {
+                return Err(SparseError::Shape("activation length"));
+            }
+            for (s, a) in self.sums.iter_mut().zip(activations) {
+                if a.is_finite() {
+                    *s += a.abs();
+                }
+            }
+            Ok(())
+        }
+
+        /// Importance = accumulated activation x the norm of that neuron's down-projection column.
+        ///
+        /// # Errors
+        /// [`SparseError::Shape`] if `down_col_norms` has the wrong length.
+        pub fn importance(&self, down_col_norms: &[f32]) -> Result<Vec<f32>, SparseError> {
+            if down_col_norms.len() != self.sums.len() {
+                return Err(SparseError::Shape("down column norms"));
+            }
+            Ok(self
+                .sums
+                .iter()
+                .zip(down_col_norms)
+                .map(|(a, n)| a * n)
+                .collect())
+        }
+    }
+
+    /// Norm of each column of a row-major `rows x cols` matrix (for the down projection, whose
+    /// columns are the neurons).
+    ///
+    /// # Errors
+    /// [`SparseError::Shape`] if `data.len() != rows * cols` or a dimension is zero.
+    pub fn column_norms(data: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, SparseError> {
+        if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(data.len()) {
+            return Err(SparseError::Shape("matrix"));
+        }
+        let mut sq = vec![0.0f64; cols];
+        for row in data.chunks_exact(cols) {
+            for (s, &v) in sq.iter_mut().zip(row) {
+                *s += f64::from(v) * f64::from(v);
+            }
+        }
+        // Narrowing back to the model's precision is the intent here.
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(sq.into_iter().map(|s| s.sqrt() as f32).collect())
+    }
+
+    /// How many neurons to keep out of `total` at `fraction`: rounded to a multiple of 64 (at
+    /// least 64) for wide layers, plain rounding (at least 1) for narrow ones; never above `total`.
+    ///
+    /// # Errors
+    /// [`SparseError::Parameter`] for a fraction outside (0, 1] or `total` of zero.
+    pub fn keep_count(total: usize, fraction: f64) -> Result<usize, SparseError> {
+        if total == 0 || total > MAX_ITEMS || !(fraction > 0.0 && fraction <= 1.0) {
+            return Err(SparseError::Parameter("fraction or neuron count"));
+        }
+        // Counts are far below 2^52, so the float arithmetic is exact enough for rounding.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let k = if total >= 128 {
+            (((total as f64 * fraction / 64.0).round() as usize) * 64).max(64)
+        } else {
+            ((total as f64 * fraction).round() as usize).max(1)
+        };
+        Ok(k.min(total))
+    }
+
+    /// The `k` most important neurons, as sorted indices (ties: lower index kept first).
+    ///
+    /// # Errors
+    /// [`SparseError::Parameter`] if `k` is zero or above the number of neurons.
+    pub fn top_neurons(importance: &[f32], k: usize) -> Result<Vec<usize>, SparseError> {
+        if k == 0 || k > importance.len() {
+            return Err(SparseError::Parameter("k"));
+        }
+        let mut idx: Vec<usize> = (0..importance.len()).collect();
+        idx.sort_by(|&a, &b| importance[b].total_cmp(&importance[a]).then(a.cmp(&b)));
+        idx.truncate(k);
+        idx.sort_unstable();
+        Ok(idx)
+    }
+
+    /// Rows `keep` of a row-major `rows x cols` matrix, in order (`index_select` on dimension 0;
+    /// for the gate and up projections, whose rows are neurons).
+    ///
+    /// # Errors
+    /// [`SparseError::Shape`] for a bad shape or an index out of range.
+    pub fn select_rows(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        keep: &[usize],
+    ) -> Result<Vec<f32>, SparseError> {
+        if rows == 0
+            || cols == 0
+            || rows.checked_mul(cols) != Some(data.len())
+            || keep.iter().any(|&r| r >= rows)
+        {
+            return Err(SparseError::Shape("select_rows"));
+        }
+        let mut out = Vec::with_capacity(keep.len() * cols);
+        for &r in keep {
+            out.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+        }
+        Ok(out)
+    }
+
+    /// Columns `keep` of a row-major `rows x cols` matrix (`index_select` on dimension 1; for the
+    /// down projection, whose columns are neurons). The result is `rows x keep.len()`.
+    ///
+    /// # Errors
+    /// [`SparseError::Shape`] for a bad shape or an index out of range.
+    pub fn select_cols(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        keep: &[usize],
+    ) -> Result<Vec<f32>, SparseError> {
+        if rows == 0
+            || cols == 0
+            || rows.checked_mul(cols) != Some(data.len())
+            || keep.iter().any(|&c| c >= cols)
+        {
+            return Err(SparseError::Shape("select_cols"));
+        }
+        let mut out = Vec::with_capacity(rows * keep.len());
+        for row in data.chunks_exact(cols) {
+            out.extend(keep.iter().map(|&c| row[c]));
+        }
+        Ok(out)
+    }
+
+    /// One feed-forward block cut down to the kept neurons.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SlicedMlp {
+        /// Gate projection, `keep.len() x hidden`.
+        pub gate: Vec<f32>,
+        /// Up projection, `keep.len() x hidden`.
+        pub up: Vec<f32>,
+        /// Down projection, `hidden x keep.len()`.
+        pub down: Vec<f32>,
+    }
+
+    /// Cuts a SwiGLU block to the neurons in `keep`: rows of `gate` and `up` (each
+    /// `neurons x hidden`), columns of `down` (`hidden x neurons`).
+    ///
+    /// # Errors
+    /// [`SparseError::Shape`] if the three matrices do not agree.
+    pub fn slice_mlp(
+        gate: &[f32],
+        up: &[f32],
+        down: &[f32],
+        neurons: usize,
+        hidden: usize,
+        keep: &[usize],
+    ) -> Result<SlicedMlp, SparseError> {
+        Ok(SlicedMlp {
+            gate: select_rows(gate, neurons, hidden, keep)?,
+            up: select_rows(up, neurons, hidden, keep)?,
+            down: select_cols(down, hidden, neurons, keep)?,
+        })
+    }
+
+    // ------------------------------------------------------------------ acceptance
+
+    /// The robust score measured for one variant.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Scored {
+        /// The knob that produced it: coverage for experts, the kept fraction for neurons. A
+        /// smaller value means a smaller model.
+        pub setting: f64,
+        /// Robust score S of the variant (see [`crate::theory::robust`]).
+        pub robust_s: f64,
+    }
+
+    /// The smallest variant whose robust score is at least `full_s - tolerance`. Variants are tried
+    /// from the smallest setting up, and the first that passes wins; `None` means none passed, so
+    /// keep the full model.
+    ///
+    /// # Errors
+    /// [`SparseError::Parameter`] for a negative or non-finite tolerance or a non-finite score.
+    pub fn smallest_within_tolerance(
+        full_s: f64,
+        tolerance: f64,
+        variants: &[Scored],
+    ) -> Result<Option<Scored>, SparseError> {
+        if !tolerance.is_finite() || tolerance < 0.0 || !full_s.is_finite() {
+            return Err(SparseError::Parameter("tolerance or full score"));
+        }
+        if variants
+            .iter()
+            .any(|v| !v.setting.is_finite() || !v.robust_s.is_finite())
+        {
+            return Err(SparseError::Parameter("variant score"));
+        }
+        let mut sorted = variants.to_vec();
+        sorted.sort_by(|a, b| a.setting.total_cmp(&b.setting));
+        Ok(sorted
+            .into_iter()
+            .find(|v| v.robust_s >= full_s - tolerance))
+    }
+
+    // ------------------------------------------------------------------ choice scoring
+
+    /// Probability of each answer letter after a multiple-choice prompt, from the model's logits:
+    /// log-softmax over the vocabulary, log-sum-exp over the token ids that spell each letter
+    /// (with and without a leading space), then softmax over the letters.
+    ///
+    /// # Errors
+    /// [`SparseError::Shape`] for empty logits, a token id outside the vocabulary or a letter with
+    /// no token ids.
+    pub fn letter_probs(
+        logits: &[f32],
+        letter_ids: &[Vec<usize>],
+    ) -> Result<Vec<f64>, SparseError> {
+        if logits.is_empty()
+            || letter_ids.is_empty()
+            || letter_ids
+                .iter()
+                .any(|ids| ids.is_empty() || ids.iter().any(|&i| i >= logits.len()))
+        {
+            return Err(SparseError::Shape("logits or letter ids"));
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if !max.is_finite() {
+            return Err(SparseError::Shape("logits are not finite"));
+        }
+        let lse: f64 = logits
+            .iter()
+            .map(|&l| f64::from(l - max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(max);
+        let per_letter: Vec<f64> = letter_ids
+            .iter()
+            .map(|ids| {
+                let m = ids
+                    .iter()
+                    .map(|&i| f64::from(logits[i]))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                m + ids
+                    .iter()
+                    .map(|&i| (f64::from(logits[i]) - m).exp())
+                    .sum::<f64>()
+                    .ln()
+                    - lse
+            })
+            .collect();
+        let m = per_letter.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = per_letter.iter().map(|v| (v - m).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        Ok(exps.into_iter().map(|e| e / sum).collect())
+    }
+
+    /// A calibration prompt: the question, the lettered choices, then `Answer:`.
+    #[must_use]
+    pub fn calibration_prompt(question: &str, choices: &[&str]) -> String {
+        let mut s = question.trim().to_string();
+        s.push('\n');
+        for (letter, c) in ('A'..='Z').zip(choices) {
+            s.push_str(&format!("{letter}. {c}\n"));
+        }
+        s.push_str("Answer:");
+        s
+    }
+
+    // ------------------------------------------------------------------ the manifest
+
+    /// What kind of model was sliced.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Chosen {
+        /// A mixture of experts: the coverage reached and the experts kept.
+        Experts {
+            /// Routing-mass coverage of the chosen hot set.
+            coverage: f64,
+            /// The experts to keep.
+            hot: HotSet,
+        },
+        /// A dense model: the fraction of neurons kept and the sliced checkpoint's name.
+        Neurons {
+            /// Fraction of feed-forward neurons kept.
+            fraction: f64,
+            /// File or folder name of the sliced checkpoint (no path separators or line breaks).
+            checkpoint: String,
+        },
+    }
+
+    /// The result of a selective-loading run, to be read back at load time (`hot_set.json` in the
+    /// research toolkit; a line-based text format here).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Manifest {
+        /// Model name (no line breaks).
+        pub model: String,
+        /// The tolerance on the robust score that was used.
+        pub tolerance: f64,
+        /// What was chosen; `None` means no variant passed, so use the full model.
+        pub chosen: Option<Chosen>,
+    }
+
+    const MAGIC: &str = "mouli-sparse-manifest 1";
+
+    impl Manifest {
+        /// The text form: a magic line, then `key value` lines.
+        ///
+        /// # Errors
+        /// [`SparseError::Parameter`] if the model or checkpoint name has a line break, or a
+        /// checkpoint name has a path separator.
+        pub fn to_text(&self) -> Result<String, SparseError> {
+            let plain = |s: &str| !s.is_empty() && !s.contains(['\n', '\r']);
+            if !plain(&self.model) {
+                return Err(SparseError::Parameter("model name"));
+            }
+            let mut t = format!(
+                "{MAGIC}\nmodel {}\ntolerance {:?}\n",
+                self.model, self.tolerance
+            );
+            match &self.chosen {
+                None => t.push_str("chosen none\n"),
+                Some(Chosen::Experts { coverage, hot }) => {
+                    t.push_str(&format!("chosen experts\ncoverage {coverage:?}\n"));
+                    for (layer, set) in &hot.layers {
+                        t.push_str(&format!("layer {layer}"));
+                        for e in set {
+                            t.push_str(&format!(" {e}"));
+                        }
+                        t.push('\n');
+                    }
+                }
+                Some(Chosen::Neurons {
+                    fraction,
+                    checkpoint,
+                }) => {
+                    if !plain(checkpoint) || checkpoint.contains(['/', '\\']) {
+                        return Err(SparseError::Parameter("checkpoint name"));
+                    }
+                    t.push_str(&format!(
+                        "chosen neurons\nfraction {fraction:?}\ncheckpoint {checkpoint}\n"
+                    ));
+                }
+            }
+            Ok(t)
+        }
+
+        /// Reads the text form strictly: unknown keys, repeated keys, missing keys, bad numbers and
+        /// oversized input are all errors, reported with the line number.
+        ///
+        /// # Errors
+        /// [`SparseError::Manifest`] with the 1-based line of the first problem.
+        pub fn from_text(text: &str) -> Result<Self, SparseError> {
+            let mut lines = text.lines().enumerate().map(|(i, l)| (i + 1, l));
+            if lines.next().map(|(_, l)| l) != Some(MAGIC) {
+                return Err(SparseError::Manifest(1));
+            }
+            let mut model = None;
+            let mut tolerance = None;
+            let mut kind: Option<&str> = None;
+            let mut coverage = None;
+            let mut fraction = None;
+            let mut checkpoint = None;
+            let mut hot = HotSet::default();
+            let num = |s: &str, n: usize| {
+                s.parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or(SparseError::Manifest(n))
+            };
+            for (n, line) in lines {
+                if n > MAX_ITEMS {
+                    return Err(SparseError::Manifest(n));
+                }
+                let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
+                match key {
+                    "model" if model.is_none() && !rest.is_empty() => {
+                        model = Some(rest.to_string())
+                    }
+                    "tolerance" if tolerance.is_none() => tolerance = Some(num(rest, n)?),
+                    "chosen"
+                        if kind.is_none() && matches!(rest, "none" | "experts" | "neurons") =>
+                    {
+                        kind = Some(rest)
+                    }
+                    "coverage" if coverage.is_none() => coverage = Some(num(rest, n)?),
+                    "fraction" if fraction.is_none() => fraction = Some(num(rest, n)?),
+                    "checkpoint" if checkpoint.is_none() && !rest.is_empty() => {
+                        checkpoint = Some(rest.to_string())
+                    }
+                    "layer" => {
+                        let mut it = rest.split(' ');
+                        let layer = it.next().and_then(number).ok_or(SparseError::Manifest(n))?;
+                        let mut set = BTreeSet::new();
+                        for e in it {
+                            set.insert(number(e).ok_or(SparseError::Manifest(n))?);
+                        }
+                        if hot.layers.insert(layer, set).is_some() {
+                            return Err(SparseError::Manifest(n));
+                        }
+                    }
+                    _ => return Err(SparseError::Manifest(n)),
+                }
+            }
+            let end = text.lines().count();
+            let (model, tolerance) = (
+                model.ok_or(SparseError::Manifest(end))?,
+                tolerance.ok_or(SparseError::Manifest(end))?,
+            );
+            let chosen = match kind.ok_or(SparseError::Manifest(end))? {
+                "none" => None,
+                "experts" => Some(Chosen::Experts {
+                    coverage: coverage.ok_or(SparseError::Manifest(end))?,
+                    hot,
+                }),
+                _ => {
+                    let checkpoint = checkpoint.ok_or(SparseError::Manifest(end))?;
+                    if checkpoint.contains(['/', '\\']) {
+                        return Err(SparseError::Manifest(end));
+                    }
+                    Some(Chosen::Neurons {
+                        fraction: fraction.ok_or(SparseError::Manifest(end))?,
+                        checkpoint,
+                    })
+                }
+            };
+            Ok(Self {
+                model,
+                tolerance,
+                chosen,
+            })
+        }
+    }
+
+    /// A row of the report: a variant and what was measured for it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ReportRow {
+        /// For example `hot set 90% routing mass`.
+        pub variant: String,
+        /// Size needed in GB.
+        pub gigabytes: f64,
+        /// Robust score S.
+        pub robust_s: f64,
+        /// Clean accuracy.
+        pub clean: f64,
+        /// Generation speed, tokens per second.
+        pub tokens_per_s: f64,
+    }
+
+    /// The Markdown report: a table, then the chosen variant and the rule.
+    #[must_use]
+    pub fn report_markdown(
+        model: &str,
+        kind: &str,
+        tolerance: f64,
+        rows: &[ReportRow],
+        chosen: Option<&str>,
+    ) -> String {
+        let mut md = format!("# Sparse runtime report: {model}\n\nType: {kind} | tolerance on robust S: {tolerance}\n\n");
+        md.push_str("| variant | GB needed | S | clean | tokens/s |\n|---|---|---|---|---|\n");
+        for r in rows {
+            md.push_str(&format!(
+                "| {} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+                r.variant, r.gigabytes, r.robust_s, r.clean, r.tokens_per_s
+            ));
+        }
+        md.push_str(&format!(
+            "\n**Chosen:** {}\n\nRule: the smallest variant whose robust score S stays within the tolerance of the full model.\n",
+            chosen.unwrap_or("none within tolerance - keep the full model")
+        ));
+        md
+    }
+
+    // ------------------------------------------------------------------ hardware plan
+
+    /// Where the model runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Device {
+        /// The processor.
+        Cpu,
+        /// An NVIDIA GPU.
+        Cuda,
+        /// An Apple GPU.
+        Mps,
+    }
+
+    /// What the machine offers.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Machine {
+        /// Logical processors.
+        pub cpu_threads: usize,
+        /// Free RAM in GB, if known.
+        pub ram_free_gb: Option<f64>,
+        /// Free memory of the best NVIDIA GPU in GB, if there is one.
+        pub gpu_free_gb: Option<f64>,
+        /// Whether that GPU supports bfloat16.
+        pub gpu_bf16: bool,
+        /// Whether an Apple GPU is available.
+        pub mps: bool,
+    }
+
+    /// The run plan chosen from a [`Machine`].
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct HardwarePlan {
+        /// The device.
+        pub device: Device,
+        /// `bfloat16`, `float16` or `float32`.
+        pub dtype: &'static str,
+        /// Processor threads to use (all but one).
+        pub threads: usize,
+        /// Memory available to the model in GB.
+        pub memory_budget_gb: f64,
+        /// Items per theory test.
+        pub theory_n: usize,
+        /// Items per code test.
+        pub code_n: usize,
+        /// Longest context to test.
+        pub max_context: usize,
+    }
+
+    /// Chooses device, precision and run sizes: an NVIDIA GPU with at least 3 GB free, else an
+    /// Apple GPU, else the CPU (unless `force` names a device the machine has).
+    #[must_use]
+    pub fn plan_hardware(m: &Machine, force: Option<Device>) -> HardwarePlan {
+        let gpu = m.gpu_free_gb.filter(|g| g.is_finite() && *g >= 0.0);
+        let auto = match gpu {
+            Some(g) if g >= 3.0 => Device::Cuda,
+            _ if m.mps => Device::Mps,
+            _ => Device::Cpu,
+        };
+        let mut device = force.unwrap_or(auto);
+        if device == Device::Cuda && gpu.is_none() {
+            device = Device::Cpu;
+        }
+        let (dtype, mem) = if device == Device::Cuda {
+            (
+                if m.gpu_bf16 { "bfloat16" } else { "float16" },
+                gpu.unwrap_or(0.0),
+            )
+        } else {
+            (
+                "float32",
+                m.ram_free_gb
+                    .filter(|r| r.is_finite() && *r > 0.0)
+                    .unwrap_or(8.0),
+            )
+        };
+        let fast = device != Device::Cpu;
+        HardwarePlan {
+            device,
+            dtype,
+            threads: m.cpu_threads.saturating_sub(1).max(1),
+            memory_budget_gb: (mem * 10.0).round() / 10.0,
+            theory_n: if fast { 60 } else { 20 },
+            code_n: if fast { 40 } else { 20 },
+            max_context: if fast && mem >= 12.0 {
+                8192
+            } else if mem >= 12.0 {
+                4096
+            } else {
+                2048
+            },
+        }
+    }
+
+    /// Per-model device choice: the GPU only if the weights fit with 40% headroom, else the CPU
+    /// (or the Apple GPU). The second value is a warning when the CPU would need more RAM than is
+    /// free for the model in float32 (twice its size on disk plus 30%).
+    #[must_use]
+    pub fn device_for(
+        model_gb: f64,
+        plan: &HardwarePlan,
+        ram_free_gb: Option<f64>,
+    ) -> (Device, Option<String>) {
+        if plan.device == Device::Cuda && model_gb * 1.4 <= plan.memory_budget_gb {
+            return (Device::Cuda, None);
+        }
+        let ram = ram_free_gb
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(8.0);
+        let warning = (model_gb * 2.0 * 1.3 > ram).then(|| {
+            format!(
+                "about {:.1} GB of RAM needed in float32, {ram} GB free: may be very slow or fail",
+                model_gb * 2.6
+            )
+        });
+        (
+            if plan.device == Device::Mps {
+                Device::Mps
+            } else {
+                Device::Cpu
+            },
+            warning,
+        )
+    }
+
+    /// The merge recipes tried by a grid search over `models` same-architecture models: the equal
+    /// average, then one recipe per model that weights it 0.6 and the others share 0.4. Empty for
+    /// fewer than two models (nothing to merge).
+    #[must_use]
+    pub fn merge_grid(models: usize) -> Vec<Vec<f64>> {
+        if !(2..=64).contains(&models) {
+            return Vec::new();
+        }
+        let others = 0.4 / (models as f64 - 1.0);
+        let mut v = vec![vec![1.0; models]];
+        for j in 0..models {
+            v.push(
+                (0..models)
+                    .map(|i| if i == j { 0.6 } else { others })
+                    .collect(),
+            );
+        }
+        v
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn profile(layer0: &[(usize, f32)]) -> RoutingProfile {
+            let mut p = RoutingProfile::new();
+            for &(e, w) in layer0 {
+                p.record(0, &[(e, w)]);
+            }
+            p
+        }
+
+        #[test]
+        fn names_of_expert_tensors_are_recognised_in_both_checkpoint_styles() {
+            let t = |n: &str| classify_expert_tensor(n);
+            assert_eq!(
+                t("model.layers.3.block_sparse_moe.experts.5.w1.weight"),
+                Some(ExpertTensor {
+                    layer: 3,
+                    expert: Some(5),
+                    role: ExpertRole::Gate
+                })
+            );
+            assert_eq!(
+                t("model.layers.0.mlp.experts.12.up_proj.weight")
+                    .unwrap()
+                    .role,
+                ExpertRole::Up
+            );
+            assert_eq!(
+                t("model.layers.0.mlp.experts.12.w2.weight").unwrap().role,
+                ExpertRole::Down
+            );
+            assert_eq!(
+                t("model.layers.7.mlp.experts.gate_up_proj"),
+                Some(ExpertTensor {
+                    layer: 7,
+                    expert: None,
+                    role: ExpertRole::GateUp
+                })
+            );
+            assert_eq!(
+                t("model.layers.7.mlp.experts.down_proj").unwrap().expert,
+                None
+            );
+            assert_eq!(
+                t("blk.4.ffn_down_exps.weight"),
+                Some(ExpertTensor {
+                    layer: 4,
+                    expert: None,
+                    role: ExpertRole::Down
+                })
+            );
+            for not in [
+                "model.layers.3.mlp.gate.weight",
+                "model.layers.3.mlp.shared_expert.up_proj.weight",
+                "model.layers.3.self_attn.q_proj.weight",
+                "model.embed_tokens.weight",
+                "blk.4.ffn_gate_inp.weight",
+                "blk.x.ffn_down_exps.weight",
+                "model.layers.3.experts.5.w1.weight", // no block name
+                "model.layers.3.mlp.experts.5.w9.weight",
+                "model.layers.3.mlp.experts.5.w1.bias",
+                "model.layers.99999999.mlp.experts.5.w1.weight",
+                "",
+            ] {
+                assert_eq!(t(not), None, "{not}");
+            }
+        }
+
+        #[test]
+        fn the_hot_set_covers_the_requested_share_and_never_drops_below_top_k() {
+            // Masses 50, 30, 15, 5 (total 100).
+            let p = profile(&[(2, 50.0), (0, 30.0), (3, 15.0), (1, 5.0)]);
+            let keep = |c: f64, k: usize| {
+                hot_set(&p, &[0], 4, k, c).unwrap().layers[&0]
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(keep(0.5, 1), vec![2]);
+            assert_eq!(keep(0.8, 1), vec![0, 2]);
+            assert_eq!(keep(0.95, 1), vec![0, 2, 3]);
+            assert_eq!(keep(1.0, 1), vec![0, 1, 2, 3]);
+            assert_eq!(keep(0.0, 1), vec![2], "at least one even for zero coverage");
+            assert_eq!(keep(0.0, 2), vec![0, 2], "top_k is a floor");
+            // Smaller coverage never keeps more.
+            let sizes: Vec<usize> = [0.1, 0.5, 0.8, 0.9, 0.99, 1.0]
+                .iter()
+                .map(|&c| keep(c, 2).len())
+                .collect();
+            assert!(sizes.windows(2).all(|w| w[0] <= w[1]), "{sizes:?}");
+        }
+
+        #[test]
+        fn layers_without_data_and_ties_are_handled() {
+            let p = profile(&[(3, 1.0)]);
+            let h = hot_set(&p, &[0, 1], 8, 2, 0.9).unwrap();
+            // Layer 0 has expert 3 only and tops up with the lowest numbers; layer 1 has no data.
+            assert_eq!(h.layers[&0].iter().copied().collect::<Vec<_>>(), vec![0, 3]);
+            assert_eq!(h.layers[&1].iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+            assert_eq!(h.experts_kept(), 4);
+            // Ties are broken by the lower expert number.
+            let tie = profile(&[(5, 1.0), (1, 1.0), (3, 1.0)]);
+            assert_eq!(
+                hot_set(&tie, &[0], 8, 1, 0.3).unwrap().layers[&0]
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![1]
+            );
+            // Experts outside the layer's range are ignored.
+            let wild = profile(&[(99, 100.0), (1, 1.0)]);
+            assert_eq!(
+                hot_set(&wild, &[0], 4, 1, 0.5).unwrap().layers[&0]
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![1]
+            );
+        }
+
+        #[test]
+        fn bad_hot_set_arguments_are_refused() {
+            let p = RoutingProfile::new();
+            for (c, k, e) in [
+                (1.5, 1, 4),
+                (-0.1, 1, 4),
+                (f64::NAN, 1, 4),
+                (0.5, 0, 4),
+                (0.5, 5, 4),
+                (0.5, 1, MAX_ITEMS + 1),
+            ] {
+                assert!(hot_set(&p, &[0], e, k, c).is_err(), "{c} {k} {e}");
+            }
+        }
+
+        #[test]
+        fn recording_ignores_bad_weights_and_accumulates() {
+            let mut p = RoutingProfile::new();
+            p.record(
+                1,
+                &[
+                    (2, 0.5),
+                    (3, f32::NAN),
+                    (4, -1.0),
+                    (2, 0.25),
+                    (5, f32::INFINITY),
+                ],
+            );
+            assert!((p.mass(1, 2) - 0.75).abs() < 1e-9);
+            assert_eq!(p.mass(1, 3), 0.0);
+            assert_eq!(p.mass(1, 5), 0.0);
+            assert_eq!(p.layers(), vec![1]);
+            assert_eq!(p.ranked(1), vec![(2, 0.75)]);
+            assert!(p.ranked(9).is_empty());
+        }
+
+        #[test]
+        fn a_hot_set_restricts_the_expert_store() {
+            use crate::weights::experts::{ExpertConfig, Tier};
+            let cfg = ExpertConfig {
+                layers: 2,
+                experts_per_layer: 4,
+                expert_bytes: 8,
+                fast_slots: 4,
+                ram_slots: 2,
+            };
+            let src = vec![7u8; 8 * 8];
+            let mut store = ExpertStore::new(cfg, src, |k: ExpertKey| {
+                Some(u64::from(k.layer * 4 + k.expert) * 8)
+            })
+            .unwrap();
+            let h = HotSet {
+                layers: [
+                    (0usize, BTreeSet::from([1usize, 2])),
+                    (1, BTreeSet::from([0usize])),
+                ]
+                .into(),
+            };
+            let pinned = h.apply(&mut store, true).unwrap();
+            assert_eq!(pinned, 3);
+            assert!(store.is_allowed(ExpertKey {
+                layer: 0,
+                expert: 1
+            }));
+            assert!(!store.is_allowed(ExpertKey {
+                layer: 0,
+                expert: 0
+            }));
+            assert!(!store.is_allowed(ExpertKey {
+                layer: 1,
+                expert: 3
+            }));
+            assert_eq!(
+                store
+                    .get(ExpertKey {
+                        layer: 0,
+                        expert: 2
+                    })
+                    .unwrap()
+                    .1,
+                Tier::Fast
+            );
+            assert!(
+                store
+                    .get(ExpertKey {
+                        layer: 0,
+                        expert: 3
+                    })
+                    .is_err(),
+                "cold experts are never read"
+            );
+            // A hot set outside the store is refused.
+            let bad = HotSet {
+                layers: [(5usize, BTreeSet::from([0usize]))].into(),
+            };
+            assert!(matches!(
+                bad.apply(&mut store, false),
+                Err(SparseError::Store(_))
+            ));
+            let bad = HotSet {
+                layers: [(0usize, BTreeSet::from([9usize]))].into(),
+            };
+            assert!(matches!(
+                bad.apply(&mut store, false),
+                Err(SparseError::Store(_))
+            ));
+        }
+
+        #[test]
+        fn memory_tiers_follow_the_research_toolkit_formulas() {
+            let gb = 1u64 << 30;
+            let g = |x: f64| x * gb as f64;
+            // CPU only: no fast tier, RAM = 60% of free minus the skeleton.
+            let p = plan_tiers(g(4.0), 0.0, g(16.0), 0.8, 0.6).unwrap();
+            assert!(!p.skeleton_on_gpu);
+            assert_eq!(p.fast_bytes, 0.0);
+            assert!((p.ram_bytes - g(16.0 * 0.6 - 4.0)).abs() < 1.0);
+            // A roomy GPU takes the skeleton (x1.3) out of its 80% share; RAM keeps its 60%.
+            let p = plan_tiers(g(4.0), g(24.0), g(16.0), 0.8, 0.6).unwrap();
+            assert!(p.skeleton_on_gpu);
+            assert!((p.fast_bytes - g(24.0 * 0.8 - 5.2)).abs() < 1.0);
+            assert!((p.ram_bytes - g(9.6)).abs() < 1.0);
+            // A small GPU cannot hold the skeleton, so it all goes to experts and RAM pays for it.
+            let p = plan_tiers(g(10.0), g(8.0), g(16.0), 0.8, 0.6).unwrap();
+            assert!(!p.skeleton_on_gpu);
+            assert!((p.fast_bytes - g(6.4)).abs() < 1.0);
+            assert_eq!(
+                plan_tiers(g(20.0), 0.0, g(16.0), 0.8, 0.6)
+                    .unwrap()
+                    .ram_bytes,
+                0.0,
+                "never negative"
+            );
+            for bad in [
+                (-1.0, 0.0, 1.0, 0.5, 0.5),
+                (f64::NAN, 0.0, 1.0, 0.5, 0.5),
+                (1.0, 0.0, 1.0, 1.5, 0.5),
+                (1.0, 0.0, 1.0, 0.5, -0.1),
+            ] {
+                assert!(plan_tiers(bad.0, bad.1, bad.2, bad.3, bad.4).is_err());
+            }
+        }
+
+        #[test]
+        fn neuron_importance_multiplies_activation_by_the_down_column_norm() {
+            let mut np = NeuronProfile::new(3).unwrap();
+            np.record(&[1.0, -2.0, 0.5]).unwrap();
+            np.record(&[1.0, 2.0, f32::NAN]).unwrap();
+            assert!(np.record(&[1.0]).is_err());
+            let imp = np.importance(&[1.0, 0.5, 4.0]).unwrap();
+            assert_eq!(imp, vec![2.0, 2.0, 2.0]);
+            assert!(np.importance(&[1.0]).is_err());
+            assert!(NeuronProfile::new(0).is_err());
+            // down is 2 x 3: columns (3,4), (0,0), (6,8) have norms 5, 0, 10.
+            let n = column_norms(&[3.0, 0.0, 6.0, 4.0, 0.0, 8.0], 2, 3).unwrap();
+            assert_eq!(n, vec![5.0, 0.0, 10.0]);
+            assert!(column_norms(&[1.0; 5], 2, 3).is_err());
+            assert!(column_norms(&[], 0, 3).is_err());
+        }
+
+        #[test]
+        fn the_kept_neuron_count_is_rounded_like_the_original() {
+            assert_eq!(keep_count(11008, 0.5).unwrap(), 5504, "multiple of 64");
+            assert_eq!(keep_count(11008, 0.65).unwrap(), 7168);
+            assert_eq!(keep_count(11008, 0.001).unwrap(), 64, "at least 64");
+            assert_eq!(keep_count(11008, 1.0).unwrap(), 11008);
+            assert_eq!(
+                keep_count(100, 0.5).unwrap(),
+                50,
+                "narrow layers round plainly"
+            );
+            assert_eq!(keep_count(100, 0.001).unwrap(), 1);
+            assert_eq!(
+                keep_count(130, 1.0).unwrap(),
+                128,
+                "a multiple of 64 below the width"
+            );
+            for (t, f) in [
+                (0, 0.5),
+                (10, 0.0),
+                (10, 1.5),
+                (10, f64::NAN),
+                (MAX_ITEMS + 1, 0.5),
+            ] {
+                assert!(keep_count(t, f).is_err(), "{t} {f}");
+            }
+        }
+
+        #[test]
+        fn the_most_important_neurons_are_kept_in_order() {
+            let imp = [0.1, 0.9, 0.5, 0.9, 0.0];
+            assert_eq!(top_neurons(&imp, 2).unwrap(), vec![1, 3]);
+            assert_eq!(top_neurons(&imp, 3).unwrap(), vec![1, 2, 3]);
+            assert_eq!(top_neurons(&imp, 5).unwrap(), vec![0, 1, 2, 3, 4]);
+            assert_eq!(
+                top_neurons(&[1.0, 1.0, 1.0], 2).unwrap(),
+                vec![0, 1],
+                "ties keep the lower index"
+            );
+            assert!(top_neurons(&imp, 0).is_err());
+            assert!(top_neurons(&imp, 6).is_err());
+        }
+
+        #[test]
+        fn slicing_keeps_the_same_function_for_the_kept_neurons() {
+            // hidden = 2, neurons = 3.
+            let gate = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let up = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+            let down = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 x 3
+            let s = slice_mlp(&gate, &up, &down, 3, 2, &[0, 2]).unwrap();
+            assert_eq!(s.gate, vec![1.0, 2.0, 5.0, 6.0]);
+            assert_eq!(s.up, vec![7.0, 8.0, 11.0, 12.0]);
+            assert_eq!(s.down, vec![1.0, 3.0, 4.0, 6.0]);
+            // Keeping every neuron changes nothing.
+            let all = slice_mlp(&gate, &up, &down, 3, 2, &[0, 1, 2]).unwrap();
+            assert_eq!(
+                (all.gate.as_slice(), all.up.as_slice(), all.down.as_slice()),
+                (&gate[..], &up[..], &down[..])
+            );
+            // The output of the block for the kept neurons is identical before and after slicing.
+            let x = [0.5f32, -1.0];
+            let silu = |v: f32| v / (1.0 + (-v).exp());
+            let run = |g: &[f32], u: &[f32], d: &[f32], n: usize| -> Vec<f32> {
+                let h: Vec<f32> = (0..n)
+                    .map(|i| {
+                        silu(g[i * 2] * x[0] + g[i * 2 + 1] * x[1])
+                            * (u[i * 2] * x[0] + u[i * 2 + 1] * x[1])
+                    })
+                    .collect();
+                (0..2)
+                    .map(|r| (0..n).map(|i| d[r * n + i] * h[i]).sum())
+                    .collect()
+            };
+            let full = run(&gate, &up, &down, 3);
+            let cut = run(&s.gate, &s.up, &s.down, 2);
+            let drop1: Vec<f32> = {
+                // Full block with neuron 1 removed by zeroing its down column.
+                let mut d = down;
+                d[1] = 0.0;
+                d[4] = 0.0;
+                run(&gate, &up, &d, 3)
+            };
+            assert_eq!(cut, drop1, "slicing equals removing the neuron");
+            assert_ne!(cut, full);
+            assert!(select_rows(&gate, 3, 2, &[3]).is_err());
+            assert!(select_cols(&down, 2, 3, &[3]).is_err());
+            assert!(select_rows(&gate, 2, 2, &[0]).is_err(), "shape mismatch");
+            assert!(slice_mlp(&gate, &up, &down, 3, 3, &[0]).is_err());
+        }
+
+        #[test]
+        fn the_smallest_variant_within_tolerance_wins() {
+            let v = [
+                Scored {
+                    setting: 0.95,
+                    robust_s: 0.69,
+                },
+                Scored {
+                    setting: 0.8,
+                    robust_s: 0.60,
+                },
+                Scored {
+                    setting: 0.99,
+                    robust_s: 0.70,
+                },
+                Scored {
+                    setting: 0.9,
+                    robust_s: 0.68,
+                },
+            ];
+            // Full model 0.70, tolerance 0.02: 0.80 fails (0.60), 0.90 passes (0.68 >= 0.68).
+            let got = smallest_within_tolerance(0.70, 0.02, &v).unwrap().unwrap();
+            assert_eq!(got.setting, 0.9);
+            assert!(
+                smallest_within_tolerance(0.70, 0.0, &v[..2])
+                    .unwrap()
+                    .is_none(),
+                "none passes: keep the full model"
+            );
+            assert!(smallest_within_tolerance(0.70, 0.02, &[])
+                .unwrap()
+                .is_none());
+            assert!(smallest_within_tolerance(0.7, -0.1, &v).is_err());
+            assert!(smallest_within_tolerance(f64::NAN, 0.1, &v).is_err());
+            assert!(smallest_within_tolerance(
+                0.7,
+                0.1,
+                &[Scored {
+                    setting: 0.5,
+                    robust_s: f64::NAN
+                }]
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn answer_letters_are_scored_from_logits() {
+            // Vocabulary of 6; letters A..D use tokens {0}, {1,2}, {3}, {4}.
+            let ids = vec![vec![0], vec![1, 2], vec![3], vec![4]];
+            let flat = letter_probs(&[0.0; 6], &ids).unwrap();
+            // Letter B has two token ids, so it carries twice the mass of the others.
+            assert!(
+                (flat[1] - 0.4).abs() < 1e-9 && (flat[0] - 0.2).abs() < 1e-9,
+                "{flat:?}"
+            );
+            assert!((flat.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            let strong = letter_probs(&[0.0, 0.0, 0.0, 10.0, 0.0, 99.0], &ids).unwrap();
+            assert!(
+                strong[2] > 0.99,
+                "token 5 is not a letter and does not count: {strong:?}"
+            );
+            assert!(letter_probs(&[], &ids).is_err());
+            assert!(
+                letter_probs(&[0.0; 3], &ids).is_err(),
+                "id outside the vocabulary"
+            );
+            assert!(letter_probs(&[0.0; 6], &[vec![]]).is_err());
+            assert!(letter_probs(&[f32::NAN; 6], &ids).is_err());
+            // Large logits do not overflow.
+            assert!(letter_probs(&[1e4, 0.0, 0.0, 0.0, 0.0, 0.0], &ids).unwrap()[0] > 0.99);
+        }
+
+        #[test]
+        fn calibration_prompts_are_lettered() {
+            assert_eq!(
+                calibration_prompt("  2+2? ", &["3", "4"]),
+                "2+2?\nA. 3\nB. 4\nAnswer:"
+            );
+        }
+
+        #[test]
+        fn manifests_round_trip_and_reject_damage() {
+            let hot = HotSet {
+                layers: [
+                    (0usize, BTreeSet::from([1usize, 5])),
+                    (3, BTreeSet::from([0usize, 2, 7])),
+                ]
+                .into(),
+            };
+            let m = Manifest {
+                model: "Mixtral 8x7B".into(),
+                tolerance: 0.02,
+                chosen: Some(Chosen::Experts { coverage: 0.9, hot }),
+            };
+            let text = m.to_text().unwrap();
+            assert_eq!(Manifest::from_text(&text).unwrap(), m);
+            let d = Manifest {
+                model: "q".into(),
+                tolerance: 0.05,
+                chosen: Some(Chosen::Neurons {
+                    fraction: 0.65,
+                    checkpoint: "q_sparse65".into(),
+                }),
+            };
+            assert_eq!(Manifest::from_text(&d.to_text().unwrap()).unwrap(), d);
+            let n = Manifest {
+                model: "q".into(),
+                tolerance: 0.0,
+                chosen: None,
+            };
+            assert_eq!(Manifest::from_text(&n.to_text().unwrap()).unwrap(), n);
+            // Names that could forge lines or paths are not written.
+            for model in ["", "a\nchosen none"] {
+                assert!(Manifest {
+                    model: model.into(),
+                    ..n.clone()
+                }
+                .to_text()
+                .is_err());
+            }
+            for cp in ["../x", "a\\b", "a\nb", ""] {
+                let bad = Manifest {
+                    chosen: Some(Chosen::Neurons {
+                        fraction: 0.5,
+                        checkpoint: cp.into(),
+                    }),
+                    ..n.clone()
+                };
+                assert!(bad.to_text().is_err(), "{cp:?}");
+            }
+            // Damaged input is refused with a line number.
+            for bad in [
+                "",
+                "wrong header\n",
+                &format!("{MAGIC}\nmodel a\ntolerance x\nchosen none\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\n"),
+                &format!("{MAGIC}\nmodel a\nmodel b\ntolerance 0.1\nchosen none\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen maybe\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen experts\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen experts\ncoverage 0.9\nlayer 0 1\nlayer 0 2\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen experts\ncoverage 0.9\nlayer q\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen neurons\nfraction 0.5\ncheckpoint ../evil\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance NaN\nchosen none\n"),
+                &format!("{MAGIC}\nmodel a\ntolerance 0.1\nchosen none\nsurprise 1\n"),
+            ] {
+                assert!(matches!(Manifest::from_text(bad), Err(SparseError::Manifest(_))), "{bad:?}");
+            }
+            assert_eq!(
+                Manifest::from_text(&format!("{MAGIC}\nmodel a\ntolerance x\n")),
+                Err(SparseError::Manifest(3))
+            );
+        }
+
+        #[test]
+        fn the_report_lists_every_variant_and_the_choice() {
+            let rows = [
+                ReportRow {
+                    variant: "full".into(),
+                    gigabytes: 24.0,
+                    robust_s: 0.7,
+                    clean: 0.8,
+                    tokens_per_s: 1.5,
+                },
+                ReportRow {
+                    variant: "hot set 90% routing mass".into(),
+                    gigabytes: 9.5,
+                    robust_s: 0.69,
+                    clean: 0.79,
+                    tokens_per_s: 3.0,
+                },
+            ];
+            let md = report_markdown("Mixtral", "moe", 0.02, &rows, Some("coverage 0.9"));
+            assert!(md.contains("# Sparse runtime report: Mixtral"));
+            assert!(md.contains("| hot set 90% routing mass | 9.500 | 0.690 | 0.790 | 3.000 |"));
+            assert!(md.contains("**Chosen:** coverage 0.9"));
+            assert!(report_markdown("m", "dense", 0.02, &[], None).contains("keep the full model"));
+        }
+
+        fn machine() -> Machine {
+            Machine {
+                cpu_threads: 8,
+                ram_free_gb: Some(11.84),
+                gpu_free_gb: None,
+                gpu_bf16: false,
+                mps: false,
+            }
+        }
+
+        #[test]
+        fn the_hardware_plan_follows_the_research_rules() {
+            let cpu = plan_hardware(&machine(), None);
+            assert_eq!(
+                (cpu.device, cpu.dtype, cpu.threads, cpu.theory_n, cpu.code_n),
+                (Device::Cpu, "float32", 7, 20, 20)
+            );
+            assert_eq!(cpu.memory_budget_gb, 11.8);
+            assert_eq!(cpu.max_context, 2048);
+            let big = plan_hardware(
+                &Machine {
+                    ram_free_gb: Some(32.0),
+                    ..machine()
+                },
+                None,
+            );
+            assert_eq!(big.max_context, 4096);
+            let gpu = Machine {
+                gpu_free_gb: Some(24.0),
+                gpu_bf16: true,
+                ..machine()
+            };
+            let p = plan_hardware(&gpu, None);
+            assert_eq!(
+                (p.device, p.dtype, p.theory_n, p.max_context),
+                (Device::Cuda, "bfloat16", 60, 8192)
+            );
+            assert_eq!(
+                plan_hardware(
+                    &Machine {
+                        gpu_bf16: false,
+                        ..gpu.clone()
+                    },
+                    None
+                )
+                .dtype,
+                "float16"
+            );
+            // A GPU with under 3 GB is not worth it.
+            assert_eq!(
+                plan_hardware(
+                    &Machine {
+                        gpu_free_gb: Some(2.0),
+                        ..machine()
+                    },
+                    None
+                )
+                .device,
+                Device::Cpu
+            );
+            assert_eq!(
+                plan_hardware(
+                    &Machine {
+                        mps: true,
+                        ..machine()
+                    },
+                    None
+                )
+                .device,
+                Device::Mps
+            );
+            // Forcing CUDA without a GPU falls back to the CPU; forcing the CPU is honoured.
+            assert_eq!(
+                plan_hardware(&machine(), Some(Device::Cuda)).device,
+                Device::Cpu
+            );
+            assert_eq!(plan_hardware(&gpu, Some(Device::Cpu)).device, Device::Cpu);
+            // Unknown RAM assumes 8 GB; a one-thread machine still gets one thread.
+            let tiny = plan_hardware(
+                &Machine {
+                    cpu_threads: 1,
+                    ram_free_gb: None,
+                    ..machine()
+                },
+                None,
+            );
+            assert_eq!((tiny.threads, tiny.memory_budget_gb), (1, 8.0));
+        }
+
+        #[test]
+        fn a_model_uses_the_gpu_only_if_it_fits_with_headroom() {
+            let gpu = Machine {
+                gpu_free_gb: Some(24.0),
+                gpu_bf16: true,
+                ..machine()
+            };
+            let plan = plan_hardware(&gpu, None);
+            assert_eq!(device_for(16.0, &plan, Some(32.0)), (Device::Cuda, None)); // 22.4 <= 24
+            let (d, w) = device_for(18.0, &plan, Some(64.0)); // 25.2 > 24, CPU with 64 GB
+            assert_eq!((d, w), (Device::Cpu, None));
+            let cpu = plan_hardware(&machine(), None);
+            let (d, w) = device_for(7.0, &cpu, Some(11.8));
+            assert_eq!(d, Device::Cpu);
+            assert!(w.unwrap().contains("18.2 GB"), "float32 doubles the size");
+            assert!(device_for(1.0, &cpu, None).1.is_none());
+        }
+
+        #[test]
+        fn the_merge_grid_has_an_equal_recipe_and_one_favouring_each_model() {
+            assert!(
+                merge_grid(1).is_empty() && merge_grid(0).is_empty() && merge_grid(65).is_empty()
+            );
+            let g = merge_grid(3);
+            assert_eq!(g.len(), 4);
+            assert_eq!(g[0], vec![1.0, 1.0, 1.0]);
+            assert_eq!(g[1], vec![0.6, 0.2, 0.2]);
+            assert_eq!(g[3], vec![0.2, 0.2, 0.6]);
+            for r in &g[1..] {
+                assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+            }
+        }
+    }
+}
+
 mod config {
     //! Model hyper-parameters read from GGUF metadata.
 

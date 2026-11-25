@@ -67,7 +67,7 @@ Rules
 5. Resource limits (memory pages, handles, threads) are per job and enforced at creation.
 
 Mapping to MOULI's existing model
-- `mouli-core` `KernelObject` and `CapabilityRegistry` describe **AI-layer** objects (users, agents, models,
+- `mouli-agentic::kernel` `KernelObject` and `CapabilityRegistry` describe **AI-layer** objects (users, agents, models,
   capabilities). They stay in user space. A MOULI capability grants the *right to ask a service* that holds
   the kernel handle; the kernel does not know about agents or models.
 - MOULI-AUTH issues the policy that the device manager and services apply when they hand out handles.

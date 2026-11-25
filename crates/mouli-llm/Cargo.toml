@@ -1,7 +1,7 @@
 [package]
 name = "mouli-llm"
 version = "0.1.0"
-description = "MOULI-LLM: the model engine in one crate: GGUF reader and writer, dequantisation, tokenizer, tensors, weight storage (cache, expert store, block sources), CPU kernels and the forward pass"
+description = "MOULI-LLM: the model engine in one crate: GGUF, dequantisation, tokenizer, tensors, weight storage, CPU kernels, forward pass, theory layer, weight analysis and selective-loading plans"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

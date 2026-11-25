@@ -25,8 +25,7 @@ runs `moulid`'s own console.
 
 | Crate | Purpose |
 |---|---|
-| `mouli-llm` | The model engine in one crate: GGUF reader and writer (`gguf`), dequantisation (`quant`), tokenizer, tensors, weight storage with cache, expert store and block sources (`weights`), CPU kernels and the forward pass |
-| `mouli-compress` | Weight analysis and compression planning |
+| `mouli-llm` | The model engine in one crate: GGUF reader and writer (`gguf`), dequantisation (`quant`), tokenizer, tensors, weight storage with cache, expert store and block sources (`weights`), CPU kernels and the forward pass, the theory layer (`theory`: robust score, gap law, calibration, cascade, TIES merge), weight analysis (`compress`) and selective-loading plans (`sparse`: hot expert sets, neuron slicing, memory tiers) |
 | `mouli-hosted` | Hosted-model chat client (streaming) over MOULI's own HTTPS |
 | `mouli-http`, `mouli-tls`, `mouli-pki`, `mouli-crypto` | Own HTTP/1.1 client, TLS 1.3 client, X.509 verification, crypto primitives |
 
@@ -61,10 +60,8 @@ runs `moulid`'s own console.
 
 | Crate | Purpose |
 |---|---|
-| `mouli-agents`, `mouli-orchestra`, `mouli-forge` | Scheduled agents, multi-agent orchestration, versioned agent manifests |
-| `mouli-runtime`, `mouli-core`, `mouli-adapters`, `mouli-topstar` | Agent loop, kernel objects, TOPSTAR adapters and domain model |
-| `mouli-memory`, `mouli-agentmem` | Local retrieval; agent-memory primitives (provenance, decay, replication, audit journal) |
-| `mouli-cognition`, `mouli-neuro`, `mouli-theory` | Cognitive primitives, spiking runtime, theory layer |
+| `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) and sibling-system adapters |
+| `mouli-forge`, `mouli-topstar`, `mouli-neuro` | Versioned agent manifests, TOPSTAR domain model, spiking runtime |
 | `mouli-lab` | Aetheron research harness with gradient checks (no real-data results yet) |
 
 ## Product specifications (no code yet)

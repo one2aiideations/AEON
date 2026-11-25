@@ -90,6 +90,10 @@ pub struct Desktop {
     last_icon_click: Option<(usize, u64)>,
 }
 
+/// Applications taken out of this version of the desktop (their code is kept for later versions):
+/// no icon, no menu entry and no function key.
+pub const MOVED_OUT: [Tab; 3] = [Tab::Sheet, Tab::Studio, Tab::Player];
+
 impl Desktop {
     /// A desktop for a screen of `width` by `height` pixels (at least 640 by 480).
     pub fn new(width: i32, height: i32) -> Self {
@@ -107,20 +111,8 @@ impl Desktop {
                 tab: Some(Tab::Models),
             },
             IconSpot {
-                label: "Sheet",
-                tab: Some(Tab::Sheet),
-            },
-            IconSpot {
-                label: "Studio",
-                tab: Some(Tab::Studio),
-            },
-            IconSpot {
                 label: "Code",
                 tab: Some(Tab::Editor),
-            },
-            IconSpot {
-                label: "Player",
-                tab: Some(Tab::Player),
             },
         ];
         Self {
@@ -280,7 +272,7 @@ impl Desktop {
             }
             Command::Help => {
                 self.show_alert(&[
-                    "F1 to F10  open a window",
+                    "F1 Chat  F2 Models  F9 Code",
                     "Ctrl-N     new conversation",
                     "Ctrl-W     close the window",
                     "Ctrl-Q     shut down",
@@ -351,7 +343,10 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=10) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
+            Key::F(n @ 1..=10) => Tab::ALL
+                .get(usize::from(n) - 1)
+                .filter(|t| !MOVED_OUT.contains(t))
+                .map(|t| Command::Open(*t)),
             _ => None,
         };
         if let Some(cmd) = command {
@@ -610,7 +605,7 @@ mod tests {
     #[test]
     fn a_double_click_on_an_icon_opens_its_window_a_single_click_only_selects() {
         let (mut d, mut s) = setup();
-        let (x, y) = centre(d.icon_rect(3)); // Sheet
+        let (x, y) = centre(d.icon_rect(3)); // Code
         assert_eq!(click(&mut d, &mut s, x, y, 1000), Action::None);
         assert_eq!(d.selected_icon, Some(3));
         assert!(d.wm.top().is_none());
@@ -621,9 +616,9 @@ mod tests {
         let a = click(&mut d, &mut s, x, y, 5000);
         assert_eq!(a, Action::None);
         let a = click(&mut d, &mut s, x, y, 5200);
-        assert_eq!(a, Action::Show(Tab::Sheet));
-        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Sheet));
-        assert_eq!(s.active, Tab::Sheet);
+        assert_eq!(a, Action::Show(Tab::Editor));
+        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Editor));
+        assert_eq!(s.active, Tab::Editor);
     }
 
     #[test]
@@ -725,8 +720,11 @@ mod tests {
                 "{gone} is not a desktop icon: {labels:?}"
             );
         }
-        for kept in ["Chat", "Models", "Sheet", "Studio", "Code", "Player"] {
+        for kept in ["MOULI HD", "Chat", "Models", "Code"] {
             assert!(labels.contains(&kept), "{kept} stays: {labels:?}");
+        }
+        for moved in ["Sheet", "Studio", "Player"] {
+            assert!(!labels.contains(&moved), "{moved} is moved out: {labels:?}");
         }
         // The keys still open them.
         for (n, tab) in [
@@ -760,7 +758,7 @@ mod tests {
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[10]; // Admin > Security
+        let item = d.menu.item_rects(3)[7]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);

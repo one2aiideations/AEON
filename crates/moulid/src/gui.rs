@@ -648,21 +648,6 @@ impl TtyGuard {
 
 // ------------------------------------------------------------------- the loop
 
-/// What the Player window uses: there is no video player in this image, so it says so instead of
-/// pretending to play.
-struct NoVideo;
-
-impl mouli_player::Backend for NoVideo {
-    fn load(&mut self, _: &mouli_player::Source) -> Result<(), String> {
-        Err("There is no video player in this image yet.".into())
-    }
-    fn pause(&mut self, _: bool) {}
-    fn seek(&mut self, _: u32) {}
-    fn set_volume(&mut self, _: u8) {}
-    fn set_speed(&mut self, _: u16) {}
-    fn stop(&mut self) {}
-}
-
 /// The device's own model route is not used: the desktop talks to the model on its own thread
 /// (so the screen stays alive while it thinks) and keeps the conversation itself.
 pub struct NoRoute;
@@ -677,12 +662,13 @@ impl DeviceBackend for NoRoute {
 const TENANT: &str = "local";
 const USER: &str = "owner";
 
-/// Builds the governed workspace with the Sheet, Studio, Code and Player applications, and the
+/// Builds the governed workspace with the Code application (with its agent approvals), and the
 /// device that connects the screens to it.
 ///
-/// With `data_dir` (the MOULI-DATA partition) the sheet and document are saved under
-/// `<data_dir>/apps` after every change and the Code window opens `<data_dir>/projects`.
-/// Without it nothing is saved.
+/// Sheet, Studio, Player and the CRM are left out of this version on purpose; their code is kept
+/// for later versions (see `MOVED_OUT` in the desktop).
+///
+/// With `data_dir` (the MOULI-DATA partition) the Code window opens `<data_dir>/projects`.
 ///
 /// # Errors
 /// A message when the workspace cannot be set up.
@@ -699,25 +685,10 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
         cost_per_1k: 0,
         quality: 50,
     });
-    let apps = mouli_apps::register(&mut ws).map_err(|e| fail(&e))?;
     let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
-    let player = mouli_apps::register_player(&mut ws, Box::new(NoVideo)).map_err(|e| fail(&e))?;
-    // The CRM has no window yet, but its commands (`/crm.lead.list`, `/crm.forecast`, ...) work
-    // through the chat. Its data is kept in memory only.
-    let clock: mouli_apps::Clock = Box::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    });
-    let _crm = mouli_apps::register_crm(&mut ws, TENANT, clock).map_err(|e| fail(&e))?;
     let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
-    device.attach_apps(apps);
     device.attach_code(code);
-    device.attach_player(player);
     if let Some(dir) = data_dir {
-        let apps_dir = dir.join("apps");
-        std::fs::create_dir_all(&apps_dir).map_err(|e| fail(&e))?;
-        device.keep_apps_in(&apps_dir)?;
         let projects = dir.join("projects");
         std::fs::create_dir_all(&projects).map_err(|e| fail(&e))?;
         // A project that cannot be opened leaves the Code window empty; that is not fatal.
@@ -870,7 +841,7 @@ fn fresh(system_prompt: &str) -> Vec<Turn> {
 /// Runs the desktop until the person shuts down.
 ///
 /// The Chat window talks to the model on its own thread, so the desktop stays responsive while it
-/// thinks. Sheet, Studio, Code, Player, Approvals, Audit and Security run through the governed
+/// thinks. Code, Approvals, Audit and Security run through the governed
 /// workspace of the device.
 ///
 /// # Errors
@@ -913,7 +884,7 @@ where
     if !inputs.has_pointer() {
         device.shell.chat.push(
             Role::Notice,
-            "No mouse or touchpad found. Plug in a USB mouse, or use the keyboard: F1 to F10 open windows, Ctrl+Q shuts down.",
+            "No mouse or touchpad found. Plug in a USB mouse, or use the keyboard: F1 opens Chat, F2 Models, F9 Code, Ctrl+Q shuts down.",
         );
     }
     device.shell.chat.push(Role::Notice, &inputs.line());
@@ -1391,37 +1362,27 @@ mod tests {
         std::fs::create_dir_all(d.join("projects")).unwrap();
         std::fs::write(d.join("projects/hello.txt"), "hi\n").unwrap();
         assert!(build_device(Some(&d)).is_ok());
-        assert!(d.join("apps").is_dir() && d.join("projects").is_dir());
+        assert!(d.join("projects").is_dir());
         // A data disk that cannot be written is an error, not a panic.
         assert!(build_device(Some(Path::new("/proc/mouli-nonexistent"))).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn a_sheet_cell_typed_in_the_desktop_is_saved_on_the_data_disk() {
-        let dir = tmp("sheet");
+    fn the_moved_out_applications_do_not_open() {
+        let dir = tmp("movedout");
         let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = channel();
         let device = build_device(Some(&dir)).unwrap();
         let session = Session::new(Shots(shots), tx.clone(), rx, device);
-        tx.send(Ev::Key(Key::F(7))).unwrap();
-        for e in keys_for("424242\n") {
-            tx.send(e).unwrap();
+        for n in [7u8, 8, 10] {
+            tx.send(Ev::Key(Key::F(n))).unwrap();
         }
         tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
         let end = run(session, Echo, "sys", 1000, &ModelsInfo::only("tiny")).unwrap();
         assert_eq!(end, End::Quit);
-        let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
-        assert!(saved.contains("424242"), "saved sheet: {saved}");
+        assert!(!dir.join("apps").exists(), "no sheet or document is kept");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_player_says_plainly_that_it_cannot_play() {
-        use mouli_player::Backend as _;
-        let mut b = NoVideo;
-        let src = mouli_player::source::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
-        assert!(b.load(&src).unwrap_err().contains("no video player"));
     }
 
     #[test]
@@ -1579,7 +1540,7 @@ mod tests {
         let device = build_device(Some(&dir)).unwrap();
         let session = Session::new(Shots(shots), tx.clone(), rx, device);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for e in keys_for("/sheet.set cell=A1 value=7777\n") {
+        for e in keys_for("/code.status\n") {
             tx.send(e).unwrap();
         }
         tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
@@ -1592,11 +1553,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(end, End::Quit);
-        let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
-        assert!(
-            saved.contains("7777"),
-            "the command edited the sheet: {saved}"
-        );
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -1641,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn the_crm_is_registered_and_answers_its_commands() {
+    fn only_chat_models_and_code_are_registered_in_this_version() {
         let mut d = build_device(None).unwrap();
         let names: Vec<String> = d
             .workspace()
@@ -1649,18 +1605,14 @@ mod tests {
             .iter()
             .map(|(n, _)| (*n).to_string())
             .collect();
-        for want in [
-            "crm.lead.list",
-            "crm.forecast",
-            "sheet.set",
-            "studio.paragraph",
-        ] {
-            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        assert!(names.iter().any(|n| n == "code.status"), "{names:?}");
+        for gone in ["crm.", "sheet.", "studio.", "player."] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(gone)),
+                "{gone} moved out: {names:?}"
+            );
         }
         d.run(Action::Send("/crm.lead.list".into()));
-        let last = d.shell.chat.messages.last().unwrap();
-        assert_eq!(last.role, Role::Tool, "{}", last.text);
-        d.run(Action::Send("/crm.no.such.thing".into()));
         assert_eq!(
             d.shell.chat.messages.last().unwrap().role,
             Role::Notice,

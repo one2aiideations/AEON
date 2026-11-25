@@ -1,0 +1,25443 @@
+//! MOULI-AGENTIC: everything about agents in one crate.
+//!
+//! * [`kernel`]: the typed object model (agents, models, capabilities, workflows, memories) with
+//!   relationships, the agent lifecycle and the event bus. This is the data graph's vocabulary.
+//! * [`memory`]: local retrieval (lexical, vector, fusion), the knowledge graph and the ontology.
+//! * [`agentmem`]: agent-memory primitives (provenance, decay, audit journal, replication).
+//! * [`cognition`]: working memory, inference, causal and vector-symbolic building blocks.
+//! * [`orchestra`]: multi-agent control plane (registry, governance, consensus, resilience).
+//! * [`jobs`]: scheduled agent jobs.
+//! * [`runtime`]: the sensors, cognition, model, action, telemetry loop.
+//! * [`adapters`]: views of sibling systems' messages.
+//!
+//! Merged from nine crates; behaviour and tests are unchanged.
+
+pub mod kernel {
+    //! MOULI object model.
+    //!
+    //! Everything the AI-native layer manages is a typed [`object::KernelObject`]
+    //! (users, agents, models, capabilities, workflows, memories, digital
+    //! twins) with labels, owner, versioned state and relationships.
+    //!
+    //! Design rule: the core does not know what an LLM is. Reasoning backends
+    //! sit behind the [`engine::CognitiveEngine`] trait, tools behind the
+    //! [`capability::CapabilityRegistry`], and agents follow the
+    //! [`agent::Agent`] lifecycle (observe, plan, act, reflect). Plans run as
+    //! [`workflow::Workflow`] DAGs and components talk over the [`bus::EventBus`].
+    #![forbid(unsafe_code)]
+
+    pub mod agent {
+        //! Agent lifecycle: observe, plan, act, reflect.
+        //!
+        //! [`run_episode`] drives an [`Agent`] for at most `max_steps` actions and
+        //! stops when the plan is finished, a step fails too often, or the agent
+        //! decides it is done.
+
+        /// One planned step.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Step {
+            /// Capability to call.
+            pub capability: String,
+            /// Arguments.
+            pub args: String,
+        }
+
+        /// Result of one step.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum Outcome {
+            /// Step succeeded with output.
+            Ok(String),
+            /// Step failed with a reason.
+            Failed(String),
+        }
+
+        /// What the agent wants after reflecting.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum Next {
+            /// Continue with the remaining plan.
+            Continue,
+            /// Replan from the current observation.
+            Replan,
+            /// Goal reached.
+            Done,
+        }
+
+        /// An agent.
+        pub trait Agent {
+            /// Read the current situation into the agent's context.
+            fn observe(&mut self) -> String;
+            /// Produce a plan for `goal` given the observation.
+            fn plan(&mut self, goal: &str, observation: &str) -> Vec<Step>;
+            /// Execute one step.
+            fn act(&mut self, step: &Step) -> Outcome;
+            /// Learn from an outcome and decide what to do next.
+            fn reflect(&mut self, step: &Step, outcome: &Outcome) -> Next;
+        }
+
+        /// How an episode ended.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum EpisodeEnd {
+            /// Agent said done.
+            Done,
+            /// Plan ran out without a done signal.
+            PlanExhausted,
+            /// Step budget used up.
+            Budget,
+            /// Too many failed steps.
+            TooManyFailures,
+        }
+
+        /// Episode result: how it ended and the trace of steps.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Episode {
+            /// End reason.
+            pub end: EpisodeEnd,
+            /// Steps and their outcomes, in order.
+            pub trace: Vec<(Step, Outcome)>,
+        }
+
+        /// Run one goal to completion within budgets.
+        pub fn run_episode(
+            agent: &mut dyn Agent,
+            goal: &str,
+            max_steps: usize,
+            max_failures: usize,
+        ) -> Episode {
+            let mut trace = Vec::new();
+            let mut failures = 0;
+            let obs = agent.observe();
+            let mut plan: std::collections::VecDeque<Step> = agent.plan(goal, &obs).into();
+            while trace.len() < max_steps {
+                let Some(step) = plan.pop_front() else {
+                    return Episode {
+                        end: EpisodeEnd::PlanExhausted,
+                        trace,
+                    };
+                };
+                let outcome = agent.act(&step);
+                if matches!(outcome, Outcome::Failed(_)) {
+                    failures += 1;
+                }
+                let next = agent.reflect(&step, &outcome);
+                trace.push((step, outcome));
+                if failures >= max_failures.max(1) {
+                    return Episode {
+                        end: EpisodeEnd::TooManyFailures,
+                        trace,
+                    };
+                }
+                match next {
+                    Next::Done => {
+                        return Episode {
+                            end: EpisodeEnd::Done,
+                            trace,
+                        }
+                    }
+                    Next::Replan => {
+                        let obs = agent.observe();
+                        plan = agent.plan(goal, &obs).into();
+                    }
+                    Next::Continue => {}
+                }
+            }
+            Episode {
+                end: EpisodeEnd::Budget,
+                trace,
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// Counts up to a target; fails once at 2 and replans.
+            struct Counter {
+                value: u32,
+                target: u32,
+                failed_once: bool,
+            }
+
+            impl Agent for Counter {
+                fn observe(&mut self) -> String {
+                    self.value.to_string()
+                }
+                fn plan(&mut self, _goal: &str, obs: &str) -> Vec<Step> {
+                    let v: u32 = obs.parse().unwrap_or(0);
+                    (v..self.target)
+                        .map(|_| Step {
+                            capability: "inc".into(),
+                            args: String::new(),
+                        })
+                        .collect()
+                }
+                fn act(&mut self, _step: &Step) -> Outcome {
+                    if self.value == 2 && !self.failed_once {
+                        self.failed_once = true;
+                        return Outcome::Failed("transient".into());
+                    }
+                    self.value += 1;
+                    Outcome::Ok(self.value.to_string())
+                }
+                fn reflect(&mut self, _step: &Step, outcome: &Outcome) -> Next {
+                    match outcome {
+                        Outcome::Failed(_) => Next::Replan,
+                        Outcome::Ok(_) if self.value == self.target => Next::Done,
+                        Outcome::Ok(_) => Next::Continue,
+                    }
+                }
+            }
+
+            #[test]
+            fn replans_after_failure_and_finishes() {
+                let mut a = Counter {
+                    value: 0,
+                    target: 4,
+                    failed_once: false,
+                };
+                let ep = run_episode(&mut a, "reach 4", 10, 3);
+                assert_eq!(ep.end, EpisodeEnd::Done);
+                assert_eq!(a.value, 4);
+                assert_eq!(ep.trace.len(), 5);
+            }
+
+            #[test]
+            fn budgets_apply() {
+                let mut a = Counter {
+                    value: 0,
+                    target: 100,
+                    failed_once: true,
+                };
+                assert_eq!(run_episode(&mut a, "far", 3, 3).end, EpisodeEnd::Budget);
+                let mut b = Counter {
+                    value: 2,
+                    target: 5,
+                    failed_once: false,
+                };
+                assert_eq!(
+                    run_episode(&mut b, "x", 10, 1).end,
+                    EpisodeEnd::TooManyFailures
+                );
+                let mut c = Counter {
+                    value: 5,
+                    target: 5,
+                    failed_once: true,
+                };
+                assert_eq!(
+                    run_episode(&mut c, "x", 10, 1).end,
+                    EpisodeEnd::PlanExhausted
+                );
+            }
+        }
+    }
+    pub mod bus {
+        //! In-process event bus with topic prefixes and bounded subscriber queues.
+        //!
+        //! Slow subscribers lose their oldest events (counted) rather than block
+        //! publishers.
+
+        use std::collections::{BTreeMap, VecDeque};
+
+        /// An event.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Event {
+            /// Dotted topic, e.g. "files.created".
+            pub topic: String,
+            /// Payload.
+            pub data: String,
+            /// Publish sequence number.
+            pub seq: u64,
+        }
+
+        /// Subscriber handle.
+        pub type SubId = u32;
+
+        #[derive(Debug, Clone)]
+        struct Sub {
+            prefix: String,
+            queue: VecDeque<Event>,
+            dropped: u64,
+        }
+
+        /// The bus.
+        #[derive(Debug, Clone)]
+        pub struct EventBus {
+            subs: BTreeMap<SubId, Sub>,
+            next_sub: SubId,
+            seq: u64,
+            capacity: usize,
+        }
+
+        fn matches(prefix: &str, topic: &str) -> bool {
+            prefix.is_empty()
+                || topic == prefix
+                || topic
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        }
+
+        impl EventBus {
+            /// Bus whose subscriber queues hold `capacity` events.
+            #[must_use]
+            pub fn new(capacity: usize) -> Self {
+                Self {
+                    subs: BTreeMap::new(),
+                    next_sub: 1,
+                    seq: 0,
+                    capacity: capacity.max(1),
+                }
+            }
+
+            /// Subscribe to `prefix` ("" = everything, "files" = "files" and "files.*").
+            pub fn subscribe(&mut self, prefix: &str) -> SubId {
+                let id = self.next_sub;
+                self.next_sub += 1;
+                self.subs.insert(
+                    id,
+                    Sub {
+                        prefix: prefix.to_owned(),
+                        queue: VecDeque::new(),
+                        dropped: 0,
+                    },
+                );
+                id
+            }
+
+            /// Remove a subscriber.
+            pub fn unsubscribe(&mut self, id: SubId) -> bool {
+                self.subs.remove(&id).is_some()
+            }
+
+            /// Publish; returns how many subscribers received it.
+            pub fn publish(&mut self, topic: &str, data: &str) -> usize {
+                self.seq += 1;
+                let ev = Event {
+                    topic: topic.to_owned(),
+                    data: data.to_owned(),
+                    seq: self.seq,
+                };
+                let mut n = 0;
+                for s in self.subs.values_mut().filter(|s| matches(&s.prefix, topic)) {
+                    if s.queue.len() == self.capacity {
+                        s.queue.pop_front();
+                        s.dropped += 1;
+                    }
+                    s.queue.push_back(ev.clone());
+                    n += 1;
+                }
+                n
+            }
+
+            /// Take all queued events for `id`.
+            pub fn drain(&mut self, id: SubId) -> Vec<Event> {
+                self.subs
+                    .get_mut(&id)
+                    .map(|s| s.queue.drain(..).collect())
+                    .unwrap_or_default()
+            }
+
+            /// Events dropped for `id` because its queue was full.
+            #[must_use]
+            pub fn dropped(&self, id: SubId) -> u64 {
+                self.subs.get(&id).map_or(0, |s| s.dropped)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn prefix_routing_and_overflow() {
+                let mut bus = EventBus::new(2);
+                let files = bus.subscribe("files");
+                let all = bus.subscribe("");
+                assert_eq!(bus.publish("files.created", "a.txt"), 2);
+                assert_eq!(bus.publish("filesystem.full", "/"), 1);
+                assert_eq!(bus.publish("files", "root"), 2);
+                assert_eq!(bus.publish("net.up", "wlan0"), 1);
+                let f: Vec<String> = bus.drain(files).into_iter().map(|e| e.data).collect();
+                assert_eq!(f, vec!["a.txt", "root"]);
+                assert_eq!(bus.drain(all).len(), 2);
+                assert_eq!(bus.dropped(all), 2);
+                assert!(bus.unsubscribe(files));
+                assert!(bus.drain(files).is_empty());
+            }
+        }
+    }
+    pub mod capability {
+        //! Capability registry: the tools agents and engines may call.
+        //!
+        //! A capability declares what it accepts and returns, which permissions a
+        //! caller needs, and its expected cost and latency so planners can choose
+        //! between alternatives.
+
+        use core::fmt;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Description of one callable capability.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Capability {
+            /// Stable name, e.g. "files.search".
+            pub name: String,
+            /// Version (higher replaces lower for the same name).
+            pub version: u32,
+            /// Input schema (JSON Schema text or a type name).
+            pub input_schema: String,
+            /// Output schema.
+            pub output_schema: String,
+            /// Permissions a caller must hold.
+            pub permissions: BTreeSet<String>,
+            /// Relative cost per call.
+            pub cost: f32,
+            /// Expected latency in milliseconds.
+            pub latency_ms: u32,
+            /// Provider (component or user id).
+            pub owner: String,
+        }
+
+        /// Registry errors.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum CapError {
+            /// Name empty.
+            BadName,
+            /// Same or newer version already registered.
+            Stale,
+            /// Not registered.
+            Unknown,
+            /// Caller lacks these permissions.
+            Missing(Vec<String>),
+        }
+
+        impl fmt::Display for CapError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::BadName => f.write_str("capability name empty"),
+                    Self::Stale => f.write_str("same or newer version registered"),
+                    Self::Unknown => f.write_str("unknown capability"),
+                    Self::Missing(p) => write!(f, "missing permissions: {}", p.join(", ")),
+                }
+            }
+        }
+
+        impl std::error::Error for CapError {}
+
+        /// Registered capabilities by name.
+        #[derive(Debug, Clone, Default)]
+        pub struct CapabilityRegistry {
+            caps: BTreeMap<String, Capability>,
+        }
+
+        impl CapabilityRegistry {
+            /// Empty registry.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Register or upgrade a capability.
+            pub fn register(&mut self, c: Capability) -> Result<(), CapError> {
+                if c.name.trim().is_empty() {
+                    return Err(CapError::BadName);
+                }
+                if self
+                    .caps
+                    .get(&c.name)
+                    .is_some_and(|old| old.version >= c.version)
+                {
+                    return Err(CapError::Stale);
+                }
+                self.caps.insert(c.name.clone(), c);
+                Ok(())
+            }
+
+            /// Look up by name.
+            #[must_use]
+            pub fn get(&self, name: &str) -> Option<&Capability> {
+                self.caps.get(name)
+            }
+
+            /// Check that `held` covers `name`'s permissions.
+            pub fn authorize(
+                &self,
+                name: &str,
+                held: &BTreeSet<String>,
+            ) -> Result<&Capability, CapError> {
+                let c = self.caps.get(name).ok_or(CapError::Unknown)?;
+                let missing: Vec<String> = c.permissions.difference(held).cloned().collect();
+                if missing.is_empty() {
+                    Ok(c)
+                } else {
+                    Err(CapError::Missing(missing))
+                }
+            }
+
+            /// Capabilities whose name starts with `prefix`, cheapest first, that
+            /// `held` may call and that meet `max_latency_ms`.
+            #[must_use]
+            pub fn candidates(
+                &self,
+                prefix: &str,
+                held: &BTreeSet<String>,
+                max_latency_ms: u32,
+            ) -> Vec<&Capability> {
+                let mut v: Vec<&Capability> = self
+                    .caps
+                    .values()
+                    .filter(|c| {
+                        c.name.starts_with(prefix)
+                            && c.latency_ms <= max_latency_ms
+                            && c.permissions.is_subset(held)
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+                v
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn cap(
+                name: &str,
+                version: u32,
+                perms: &[&str],
+                cost: f32,
+                latency_ms: u32,
+            ) -> Capability {
+                Capability {
+                    name: name.into(),
+                    version,
+                    input_schema: "Query".into(),
+                    output_schema: "Hits".into(),
+                    permissions: perms.iter().map(|p| p.to_string()).collect(),
+                    cost,
+                    latency_ms,
+                    owner: "system".into(),
+                }
+            }
+
+            fn held(p: &[&str]) -> BTreeSet<String> {
+                p.iter().map(|s| s.to_string()).collect()
+            }
+
+            #[test]
+            fn versions_and_permissions() {
+                let mut r = CapabilityRegistry::new();
+                r.register(cap("files.search", 1, &["files.read"], 1.0, 50))
+                    .unwrap();
+                assert_eq!(
+                    r.register(cap("files.search", 1, &[], 1.0, 50)),
+                    Err(CapError::Stale)
+                );
+                r.register(cap("files.search", 2, &["files.read"], 0.5, 20))
+                    .unwrap();
+                assert_eq!(r.get("files.search").unwrap().version, 2);
+                assert!(r.authorize("files.search", &held(&["files.read"])).is_ok());
+                assert_eq!(
+                    r.authorize("files.search", &held(&[])),
+                    Err(CapError::Missing(vec!["files.read".into()]))
+                );
+                assert_eq!(r.authorize("nope", &held(&[])), Err(CapError::Unknown));
+            }
+
+            #[test]
+            fn candidate_ranking() {
+                let mut r = CapabilityRegistry::new();
+                r.register(cap("web.fetch.fast", 1, &["net"], 3.0, 100))
+                    .unwrap();
+                r.register(cap("web.fetch.cheap", 1, &["net"], 1.0, 900))
+                    .unwrap();
+                r.register(cap("web.fetch.admin", 1, &["net", "admin"], 0.1, 10))
+                    .unwrap();
+                let h = held(&["net"]);
+                let all: Vec<&str> = r
+                    .candidates("web.fetch", &h, 1000)
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert_eq!(all, vec!["web.fetch.cheap", "web.fetch.fast"]);
+                assert_eq!(r.candidates("web.fetch", &h, 200).len(), 1);
+            }
+        }
+    }
+    pub mod engine {
+        //! Cognitive engines: the only place reasoning backends plug in.
+        //!
+        //! The core never names a model family. An engine receives a task and
+        //! context and returns an answer with a confidence and a cost, so the
+        //! router can cascade from cheap to expensive engines.
+
+        use core::fmt;
+
+        /// What the caller wants.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Task {
+            /// Free-form answer.
+            Answer,
+            /// Short summary.
+            Summarise,
+            /// Step-by-step plan.
+            Plan,
+            /// Pick one of the given options.
+            Choose,
+            /// Vector embedding.
+            Embed,
+        }
+
+        /// A request to an engine.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Request {
+            /// Task kind.
+            pub task: Task,
+            /// Main input.
+            pub input: String,
+            /// Supporting context (retrieved memories, files).
+            pub context: Vec<String>,
+            /// Upper bound on output tokens.
+            pub max_tokens: u32,
+        }
+
+        /// An engine's answer.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Response {
+            /// Output text (or a serialised vector for `Embed`).
+            pub output: String,
+            /// Self-reported probability the output is right (0..=1).
+            pub confidence: f32,
+            /// Cost incurred (same unit as `Engine::cost`).
+            pub cost: f32,
+        }
+
+        /// Engine failure.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct EngineError(pub String);
+
+        impl fmt::Display for EngineError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl std::error::Error for EngineError {}
+
+        /// A reasoning backend (local model, rules, remote service).
+        pub trait CognitiveEngine {
+            /// Short name.
+            fn name(&self) -> &str;
+            /// Whether the engine handles `task`.
+            fn supports(&self, task: Task) -> bool;
+            /// Run a request.
+            fn execute(&mut self, req: &Request) -> Result<Response, EngineError>;
+        }
+
+        /// Cheapest-first cascade: try engines in order and stop at the first
+        /// answer whose confidence reaches `threshold`. Returns the last answer if
+        /// none reach it, with the total cost.
+        pub fn cascade(
+            engines: &mut [&mut dyn CognitiveEngine],
+            req: &Request,
+            threshold: f32,
+        ) -> Result<(String, Response), EngineError> {
+            let mut last: Option<(String, Response)> = None;
+            let mut spent = 0.0f32;
+            for e in engines.iter_mut().filter(|e| e.supports(req.task)) {
+                let mut r = e.execute(req)?;
+                spent += r.cost;
+                r.cost = spent;
+                let done = r.confidence >= threshold;
+                last = Some((e.name().to_owned(), r));
+                if done {
+                    break;
+                }
+            }
+            last.ok_or_else(|| EngineError("no engine supports this task".into()))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            struct Fixed {
+                name: &'static str,
+                conf: f32,
+                cost: f32,
+                calls: u32,
+            }
+
+            impl CognitiveEngine for Fixed {
+                fn name(&self) -> &str {
+                    self.name
+                }
+                fn supports(&self, task: Task) -> bool {
+                    task != Task::Embed
+                }
+                fn execute(&mut self, req: &Request) -> Result<Response, EngineError> {
+                    self.calls += 1;
+                    Ok(Response {
+                        output: format!("{}:{}", self.name, req.input),
+                        confidence: self.conf,
+                        cost: self.cost,
+                    })
+                }
+            }
+
+            fn req(task: Task) -> Request {
+                Request {
+                    task,
+                    input: "q".into(),
+                    context: vec![],
+                    max_tokens: 64,
+                }
+            }
+
+            #[test]
+            fn stops_at_confident_engine() {
+                let mut small = Fixed {
+                    name: "small",
+                    conf: 0.4,
+                    cost: 1.0,
+                    calls: 0,
+                };
+                let mut big = Fixed {
+                    name: "big",
+                    conf: 0.9,
+                    cost: 10.0,
+                    calls: 0,
+                };
+                let mut huge = Fixed {
+                    name: "huge",
+                    conf: 0.99,
+                    cost: 100.0,
+                    calls: 0,
+                };
+                let (who, r) = cascade(
+                    &mut [&mut small, &mut big, &mut huge],
+                    &req(Task::Answer),
+                    0.8,
+                )
+                .unwrap();
+                assert_eq!(who, "big");
+                assert!((r.cost - 11.0).abs() < 1e-6);
+                assert_eq!(huge.calls, 0);
+                let mut e = Fixed {
+                    name: "x",
+                    conf: 1.0,
+                    cost: 0.0,
+                    calls: 0,
+                };
+                assert!(cascade(&mut [&mut e], &req(Task::Embed), 0.5).is_err());
+            }
+        }
+    }
+    pub mod object {
+        //! Typed, versioned kernel objects and their relationships.
+
+        use core::fmt;
+        use std::collections::BTreeMap;
+
+        /// Object id.
+        pub type ObjectId = u64;
+
+        /// Kind of object.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum Kind {
+            /// A person using the machine.
+            User,
+            /// An autonomous agent.
+            Agent,
+            /// A model available to engines.
+            Model,
+            /// A callable tool.
+            Capability,
+            /// A multi-step plan.
+            Workflow,
+            /// A stored memory.
+            Memory,
+            /// A live model of a device, file, or service.
+            DigitalTwin,
+            /// A file or document.
+            File,
+        }
+
+        /// Lifecycle state.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum State {
+            /// Created, not yet active.
+            Pending,
+            /// In use.
+            Active,
+            /// Temporarily disabled.
+            Suspended,
+            /// Retired; kept for history.
+            Archived,
+        }
+
+        /// One object.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct KernelObject {
+            /// Id.
+            pub id: ObjectId,
+            /// Kind.
+            pub kind: Kind,
+            /// Name, unique per (namespace, kind).
+            pub name: String,
+            /// Namespace (e.g. a user's home or "system").
+            pub namespace: String,
+            /// Owning user id (0 = system).
+            pub owner: ObjectId,
+            /// Free-form labels.
+            pub labels: BTreeMap<String, String>,
+            /// Lifecycle state.
+            pub state: State,
+            /// Incremented on every change.
+            pub version: u64,
+        }
+
+        /// Store errors.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum ObjError {
+            /// Name empty or already used in this namespace and kind.
+            Name,
+            /// No such object.
+            Unknown(ObjectId),
+            /// Caller passed a stale version.
+            Conflict {
+                /// Version the caller expected.
+                expected: u64,
+                /// Version stored.
+                actual: u64,
+            },
+        }
+
+        impl fmt::Display for ObjError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Name => f.write_str("name empty or taken"),
+                    Self::Unknown(id) => write!(f, "unknown object {id}"),
+                    Self::Conflict { expected, actual } => {
+                        write!(f, "version conflict: expected {expected}, found {actual}")
+                    }
+                }
+            }
+        }
+
+        impl std::error::Error for ObjError {}
+
+        /// Directed, labelled relationship between objects ("owns", "uses", "twin-of").
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct Relation {
+            /// Source.
+            pub from: ObjectId,
+            /// Label.
+            pub label: String,
+            /// Target.
+            pub to: ObjectId,
+        }
+
+        /// In-memory object store with optimistic concurrency.
+        #[derive(Debug, Clone, Default)]
+        pub struct ObjectStore {
+            objects: BTreeMap<ObjectId, KernelObject>,
+            relations: std::collections::BTreeSet<Relation>,
+            next: ObjectId,
+        }
+
+        impl ObjectStore {
+            /// Empty store.
+            #[must_use]
+            pub fn new() -> Self {
+                Self {
+                    next: 1,
+                    ..Self::default()
+                }
+            }
+
+            /// Create an object in `Pending` state.
+            pub fn create(
+                &mut self,
+                kind: Kind,
+                namespace: &str,
+                name: &str,
+                owner: ObjectId,
+            ) -> Result<ObjectId, ObjError> {
+                if name.trim().is_empty() || self.find(kind, namespace, name).is_some() {
+                    return Err(ObjError::Name);
+                }
+                let id = self.next.max(1);
+                self.next = id + 1;
+                self.objects.insert(
+                    id,
+                    KernelObject {
+                        id,
+                        kind,
+                        name: name.to_owned(),
+                        namespace: namespace.to_owned(),
+                        owner,
+                        labels: BTreeMap::new(),
+                        state: State::Pending,
+                        version: 1,
+                    },
+                );
+                Ok(id)
+            }
+
+            /// Get by id.
+            #[must_use]
+            pub fn get(&self, id: ObjectId) -> Option<&KernelObject> {
+                self.objects.get(&id)
+            }
+
+            /// Find by kind, namespace and name.
+            #[must_use]
+            pub fn find(&self, kind: Kind, namespace: &str, name: &str) -> Option<&KernelObject> {
+                self.objects
+                    .values()
+                    .find(|o| o.kind == kind && o.namespace == namespace && o.name == name)
+            }
+
+            /// Apply `change` if `expected_version` matches; bumps the version.
+            pub fn update(
+                &mut self,
+                id: ObjectId,
+                expected_version: u64,
+                change: impl FnOnce(&mut KernelObject),
+            ) -> Result<u64, ObjError> {
+                let o = self.objects.get_mut(&id).ok_or(ObjError::Unknown(id))?;
+                if o.version != expected_version {
+                    return Err(ObjError::Conflict {
+                        expected: expected_version,
+                        actual: o.version,
+                    });
+                }
+                let (kind, ns, name) = (o.kind, o.namespace.clone(), o.name.clone());
+                let mut next = o.clone();
+                change(&mut next);
+                // Identity fields are immutable.
+                next.id = id;
+                next.kind = kind;
+                next.namespace = ns;
+                next.name = name;
+                next.version = expected_version + 1;
+                *o = next;
+                Ok(o.version)
+            }
+
+            /// Link two existing objects.
+            pub fn relate(
+                &mut self,
+                from: ObjectId,
+                label: &str,
+                to: ObjectId,
+            ) -> Result<(), ObjError> {
+                for id in [from, to] {
+                    if !self.objects.contains_key(&id) {
+                        return Err(ObjError::Unknown(id));
+                    }
+                }
+                self.relations.insert(Relation {
+                    from,
+                    label: label.to_owned(),
+                    to,
+                });
+                Ok(())
+            }
+
+            /// Targets of `from` via `label`.
+            pub fn related<'a>(
+                &'a self,
+                from: ObjectId,
+                label: &'a str,
+            ) -> impl Iterator<Item = ObjectId> + 'a {
+                self.relations
+                    .iter()
+                    .filter(move |r| r.from == from && r.label == label)
+                    .map(|r| r.to)
+            }
+
+            /// Objects matching a label selector (all pairs must match).
+            pub fn select<'a>(
+                &'a self,
+                selector: &'a [(&'a str, &'a str)],
+            ) -> impl Iterator<Item = &'a KernelObject> + 'a {
+                self.objects.values().filter(move |o| {
+                    selector
+                        .iter()
+                        .all(|(k, v)| o.labels.get(*k).is_some_and(|x| x == v))
+                })
+            }
+
+            /// Delete an object and its relationships.
+            pub fn delete(&mut self, id: ObjectId) -> Result<KernelObject, ObjError> {
+                let o = self.objects.remove(&id).ok_or(ObjError::Unknown(id))?;
+                self.relations.retain(|r| r.from != id && r.to != id);
+                Ok(o)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn create_update_conflict() {
+                let mut s = ObjectStore::new();
+                let a = s
+                    .create(Kind::Agent, "home/alice", "mail-digest", 7)
+                    .unwrap();
+                assert_eq!(
+                    s.create(Kind::Agent, "home/alice", "mail-digest", 7),
+                    Err(ObjError::Name)
+                );
+                assert!(s
+                    .create(Kind::Model, "home/alice", "mail-digest", 7)
+                    .is_ok());
+                let v = s
+                    .update(a, 1, |o| {
+                        o.state = State::Active;
+                        o.labels.insert("tier".into(), "fast".into());
+                        o.name = "renamed".into();
+                    })
+                    .unwrap();
+                assert_eq!(v, 2);
+                let o = s.get(a).unwrap();
+                assert_eq!(o.state, State::Active);
+                assert_eq!(o.name, "mail-digest");
+                assert_eq!(
+                    s.update(a, 1, |_| {}),
+                    Err(ObjError::Conflict {
+                        expected: 1,
+                        actual: 2
+                    })
+                );
+                assert_eq!(s.select(&[("tier", "fast")]).count(), 1);
+            }
+
+            #[test]
+            fn relations_follow_deletes() {
+                let mut s = ObjectStore::new();
+                let u = s.create(Kind::User, "system", "alice", 0).unwrap();
+                let f = s.create(Kind::File, "home/alice", "report.md", u).unwrap();
+                s.relate(u, "owns", f).unwrap();
+                assert_eq!(s.related(u, "owns").collect::<Vec<_>>(), vec![f]);
+                assert_eq!(s.relate(u, "owns", 99), Err(ObjError::Unknown(99)));
+                s.delete(f).unwrap();
+                assert_eq!(s.related(u, "owns").count(), 0);
+            }
+        }
+    }
+    pub mod workflow {
+        //! Workflows as task DAGs.
+        //!
+        //! A planner emits tasks with dependencies; the runtime asks for ready
+        //! tasks, reports outcomes, and failures cancel everything downstream.
+
+        use core::fmt;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Task id inside a workflow.
+        pub type StepId = u32;
+
+        /// Step state.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum StepState {
+            /// Waiting for dependencies.
+            Blocked,
+            /// Dependencies met; can run.
+            Ready,
+            /// Handed to the runtime.
+            Running,
+            /// Finished with output.
+            Done(String),
+            /// Failed with a reason.
+            Failed(String),
+            /// Skipped because a dependency failed.
+            Cancelled,
+        }
+
+        /// Workflow errors.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum FlowError {
+            /// Step id already used.
+            Duplicate(StepId),
+            /// Dependency names an unknown step.
+            MissingDep(StepId),
+            /// Dependencies form a cycle.
+            Cycle,
+            /// Step not in the expected state.
+            State(StepId),
+        }
+
+        impl fmt::Display for FlowError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Duplicate(s) => write!(f, "duplicate step {s}"),
+                    Self::MissingDep(s) => write!(f, "unknown dependency {s}"),
+                    Self::Cycle => f.write_str("dependency cycle"),
+                    Self::State(s) => write!(f, "step {s} is not in the right state"),
+                }
+            }
+        }
+
+        impl std::error::Error for FlowError {}
+
+        #[derive(Debug, Clone)]
+        struct Node {
+            action: String,
+            deps: BTreeSet<StepId>,
+            state: StepState,
+        }
+
+        /// A validated DAG of steps.
+        #[derive(Debug, Clone)]
+        pub struct Workflow {
+            steps: BTreeMap<StepId, Node>,
+        }
+
+        impl Workflow {
+            /// Build from `(id, action, deps)`; rejects duplicates, unknown deps and cycles.
+            pub fn new(spec: &[(StepId, &str, &[StepId])]) -> Result<Self, FlowError> {
+                let mut steps = BTreeMap::new();
+                for &(id, action, deps) in spec {
+                    let node = Node {
+                        action: action.to_owned(),
+                        deps: deps.iter().copied().collect(),
+                        state: StepState::Blocked,
+                    };
+                    if steps.insert(id, node).is_some() {
+                        return Err(FlowError::Duplicate(id));
+                    }
+                }
+                for n in steps.values() {
+                    if let Some(&d) = n.deps.iter().find(|d| !steps.contains_key(d)) {
+                        return Err(FlowError::MissingDep(d));
+                    }
+                }
+                let mut wf = Self { steps };
+                wf.topo_order()?;
+                wf.refresh();
+                Ok(wf)
+            }
+
+            /// Steps in dependency order (Kahn's algorithm).
+            pub fn topo_order(&self) -> Result<Vec<StepId>, FlowError> {
+                let mut indeg: BTreeMap<StepId, usize> = self
+                    .steps
+                    .iter()
+                    .map(|(&id, n)| (id, n.deps.len()))
+                    .collect();
+                let mut ready: Vec<StepId> = indeg
+                    .iter()
+                    .filter(|(_, &d)| d == 0)
+                    .map(|(&id, _)| id)
+                    .collect();
+                let mut order = Vec::with_capacity(self.steps.len());
+                while let Some(id) = ready.pop() {
+                    order.push(id);
+                    for (&other, n) in &self.steps {
+                        if n.deps.contains(&id) {
+                            let d = indeg.get_mut(&other).ok_or(FlowError::Cycle)?;
+                            *d -= 1;
+                            if *d == 0 {
+                                ready.push(other);
+                            }
+                        }
+                    }
+                }
+                if order.len() == self.steps.len() {
+                    Ok(order)
+                } else {
+                    Err(FlowError::Cycle)
+                }
+            }
+
+            fn refresh(&mut self) {
+                loop {
+                    let mut changed = false;
+                    let snapshot: BTreeMap<StepId, StepState> = self
+                        .steps
+                        .iter()
+                        .map(|(&id, n)| (id, n.state.clone()))
+                        .collect();
+                    for n in self.steps.values_mut() {
+                        if n.state != StepState::Blocked {
+                            continue;
+                        }
+                        let dep_states: Vec<&StepState> =
+                            n.deps.iter().map(|d| &snapshot[d]).collect();
+                        if dep_states
+                            .iter()
+                            .any(|s| matches!(s, StepState::Failed(_) | StepState::Cancelled))
+                        {
+                            n.state = StepState::Cancelled;
+                            changed = true;
+                        } else if dep_states.iter().all(|s| matches!(s, StepState::Done(_))) {
+                            n.state = StepState::Ready;
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+
+            /// Take all ready steps (marks them running).
+            pub fn take_ready(&mut self) -> Vec<(StepId, String)> {
+                let mut out = Vec::new();
+                for (&id, n) in &mut self.steps {
+                    if n.state == StepState::Ready {
+                        n.state = StepState::Running;
+                        out.push((id, n.action.clone()));
+                    }
+                }
+                out
+            }
+
+            /// Report a running step's outcome.
+            pub fn finish(
+                &mut self,
+                id: StepId,
+                result: Result<String, String>,
+            ) -> Result<(), FlowError> {
+                let n = self.steps.get_mut(&id).ok_or(FlowError::State(id))?;
+                if n.state != StepState::Running {
+                    return Err(FlowError::State(id));
+                }
+                n.state = match result {
+                    Ok(o) => StepState::Done(o),
+                    Err(e) => StepState::Failed(e),
+                };
+                self.refresh();
+                Ok(())
+            }
+
+            /// No step is ready, running or blocked.
+            #[must_use]
+            pub fn is_finished(&self) -> bool {
+                self.steps.values().all(|n| {
+                    matches!(
+                        n.state,
+                        StepState::Done(_) | StepState::Failed(_) | StepState::Cancelled
+                    )
+                })
+            }
+
+            /// State of a step.
+            #[must_use]
+            pub fn state(&self, id: StepId) -> Option<&StepState> {
+                self.steps.get(&id).map(|n| &n.state)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn runs_in_dependency_order() {
+                let mut wf = Workflow::new(&[
+                    (1, "fetch mail", &[]),
+                    (2, "fetch calendar", &[]),
+                    (3, "summarise", &[1, 2]),
+                    (4, "notify", &[3]),
+                ])
+                .unwrap();
+                let first: Vec<StepId> = wf.take_ready().into_iter().map(|s| s.0).collect();
+                assert_eq!(first, vec![1, 2]);
+                wf.finish(1, Ok("12 mails".into())).unwrap();
+                assert!(wf.take_ready().is_empty());
+                wf.finish(2, Ok("3 events".into())).unwrap();
+                assert_eq!(wf.take_ready(), vec![(3, "summarise".to_string())]);
+                wf.finish(3, Ok("digest".into())).unwrap();
+                assert_eq!(wf.take_ready()[0].0, 4);
+                wf.finish(4, Ok(String::new())).unwrap();
+                assert!(wf.is_finished());
+            }
+
+            #[test]
+            fn failure_cancels_downstream() {
+                let mut wf =
+                    Workflow::new(&[(1, "a", &[]), (2, "b", &[1]), (3, "c", &[2]), (4, "d", &[])])
+                        .unwrap();
+                wf.take_ready();
+                wf.finish(1, Err("offline".into())).unwrap();
+                assert_eq!(wf.state(3), Some(&StepState::Cancelled));
+                assert!(!wf.is_finished());
+                wf.finish(4, Ok(String::new())).unwrap();
+                assert!(wf.is_finished());
+                assert_eq!(wf.finish(4, Ok(String::new())), Err(FlowError::State(4)));
+            }
+
+            #[test]
+            fn rejects_bad_graphs() {
+                assert_eq!(
+                    Workflow::new(&[(1, "a", &[2]), (2, "b", &[1])]).unwrap_err(),
+                    FlowError::Cycle
+                );
+                assert_eq!(
+                    Workflow::new(&[(1, "a", &[9])]).unwrap_err(),
+                    FlowError::MissingDep(9)
+                );
+                assert_eq!(
+                    Workflow::new(&[(1, "a", &[]), (1, "b", &[])]).unwrap_err(),
+                    FlowError::Duplicate(1)
+                );
+            }
+        }
+    }
+}
+
+pub mod cognition {
+    //! MOULI cognitive primitives.
+    //!
+    //! Small, allocation-light building blocks the agent runtime composes:
+    //!
+    //! * [`vsa`]: 2048-bit binary hypervectors (bind, bundle, permute, distance)
+    //!   and bipolar cleanup memory.
+    //! * [`snn`]: Izhikevich spiking population with neuromodulator traces.
+    //! * [`inference`]: free-energy bookkeeping and active-inference action choice.
+    //! * [`causal`]: weighted cause -> effect graph with a `do()` query.
+    //! * [`memory`]: ring-buffer episodic memory with EWC-style consolidation.
+    //! * [`workspace`]: global workspace (bounded, salience-ranked broadcast).
+    //! * [`working`]: working memory with priorities, expiry and eviction.
+    //!
+    //! Ported from the retired C core (`aeon_cognitive_core`, `aeon_cognitive_engine`).
+    #![forbid(unsafe_code)]
+
+    pub mod causal {
+        //! Weighted causal graph with an interventional query.
+
+        use crate::cognition::{finite, CogError};
+
+        /// One cause -> effect edge.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Edge {
+            /// Caller id.
+            pub id: u64,
+            /// Cause node.
+            pub cause: i32,
+            /// Effect node.
+            pub effect: i32,
+            /// Signed strength (magnitude is the weight).
+            pub strength: f32,
+            /// Edge participates in queries.
+            pub active: bool,
+        }
+
+        /// Bounded causal graph.
+        #[derive(Debug, Clone)]
+        pub struct CausalGraph {
+            edges: Vec<Edge>,
+            max: usize,
+        }
+
+        impl CausalGraph {
+            /// Graph holding at most `max` edges.
+            #[must_use]
+            pub fn new(max: usize) -> Self {
+                Self {
+                    edges: Vec::new(),
+                    max,
+                }
+            }
+
+            /// Add an active edge.
+            pub fn add(
+                &mut self,
+                id: u64,
+                cause: i32,
+                effect: i32,
+                strength: f32,
+            ) -> Result<(), CogError> {
+                if self.edges.len() >= self.max {
+                    return Err(CogError::Full);
+                }
+                self.edges.push(Edge {
+                    id,
+                    cause,
+                    effect,
+                    strength: finite(strength)?,
+                    active: true,
+                });
+                Ok(())
+            }
+
+            /// Disable edge `id`. Returns whether it existed.
+            pub fn deactivate(&mut self, id: u64) -> bool {
+                self.edges
+                    .iter_mut()
+                    .filter(|e| e.id == id)
+                    .fold(false, |_, e| {
+                        e.active = false;
+                        true
+                    })
+            }
+
+            /// `P(target | do(intervention))`: share of the intervention's outgoing
+            /// weight that reaches `target` directly. 0 when it has no edges.
+            #[must_use]
+            pub fn do_query(&self, intervention: i32, target: i32) -> f32 {
+                let (total, hit) = self
+                    .edges
+                    .iter()
+                    .filter(|e| e.active && e.cause == intervention)
+                    .fold((0.0f32, 0.0f32), |(t, h), e| {
+                        let w = e.strength.abs();
+                        (t + w, if e.effect == target { h + w } else { h })
+                    });
+                if total > 0.0 {
+                    hit / total
+                } else {
+                    0.0
+                }
+            }
+
+            /// All edges.
+            #[must_use]
+            pub fn edges(&self) -> &[Edge] {
+                &self.edges
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn do_query_shares() {
+                let mut g = CausalGraph::new(4);
+                g.add(1, 0, 1, 3.0).unwrap();
+                g.add(2, 0, 2, -1.0).unwrap();
+                assert!((g.do_query(0, 1) - 0.75).abs() < 1e-6);
+                assert_eq!(g.do_query(5, 1), 0.0);
+                assert!(g.deactivate(1));
+                assert!((g.do_query(0, 2) - 1.0).abs() < 1e-6);
+                assert!(g.add(3, 0, 0, f32::INFINITY).is_err());
+                g.add(3, 0, 0, 1.0).unwrap();
+                g.add(4, 0, 0, 1.0).unwrap();
+                assert_eq!(g.add(5, 0, 0, 1.0), Err(CogError::Full));
+            }
+        }
+    }
+    pub mod inference {
+        //! Free-energy bookkeeping and active-inference action selection.
+
+        use crate::cognition::{finite, non_negative, CogError};
+
+        /// Snapshot of the agent's belief quality.
+        #[derive(Debug, Clone, Copy, Default, PartialEq)]
+        pub struct InferenceState {
+            /// Observation minus prediction.
+            pub prediction_error: f32,
+            /// `0.5 e^2 + uncertainty`.
+            pub free_energy: f32,
+            /// Free energy plus goal error (or the chosen action's score).
+            pub expected_free_energy: f32,
+            /// `1 / (1 + |e| + uncertainty)`, in (0, 1].
+            pub confidence: f32,
+        }
+
+        impl InferenceState {
+            /// Update from one prediction / observation pair.
+            pub fn update(
+                &mut self,
+                prediction: f32,
+                observation: f32,
+                uncertainty: f32,
+                goal_error: f32,
+            ) -> Result<(), CogError> {
+                let e = finite(observation)? - finite(prediction)?;
+                let u = finite(uncertainty)?.max(0.0);
+                let g = finite(goal_error)?.max(0.0);
+                self.prediction_error = e;
+                self.free_energy = 0.5 * e * e + u;
+                self.expected_free_energy = self.free_energy + g;
+                self.confidence = 1.0 / (1.0 + e.abs() + u);
+                Ok(())
+            }
+        }
+
+        /// Pick the action with the lowest expected free energy.
+        ///
+        /// Action `a` scores `risk = err * (1 + 0.1 a)` plus
+        /// `epistemic = uncertainty / (a + 1)`: higher actions explore more but
+        /// carry more risk. Returns the action and the resulting state.
+        pub fn select_action(
+            prediction_error: f32,
+            uncertainty: f32,
+            actions: usize,
+        ) -> Result<(usize, InferenceState), CogError> {
+            let err = non_negative(prediction_error)?;
+            let unc = non_negative(uncertainty)?;
+            if actions == 0 {
+                return Err(CogError::Empty);
+            }
+            let score = |a: usize| err * (1.0 + 0.1 * a as f32) + unc / (a + 1) as f32;
+            let (best, efe) = (0..actions)
+                .map(|a| (a, score(a)))
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .ok_or(CogError::Empty)?;
+            Ok((
+                best,
+                InferenceState {
+                    prediction_error: err,
+                    free_energy: 0.5 * err * err + unc,
+                    expected_free_energy: efe,
+                    confidence: 1.0 / (1.0 + err + unc),
+                },
+            ))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn exploit_when_certain_explore_when_uncertain() {
+                let (a, s) = select_action(1.0, 0.0, 4).unwrap();
+                assert_eq!(a, 0);
+                assert!((s.confidence - 0.5).abs() < 1e-6);
+                let (a, _) = select_action(0.1, 10.0, 4).unwrap();
+                assert_eq!(a, 3);
+                assert!(select_action(-1.0, 0.0, 4).is_err());
+                assert!(select_action(1.0, 0.0, 0).is_err());
+            }
+
+            #[test]
+            fn update_values() {
+                let mut s = InferenceState::default();
+                s.update(1.0, 3.0, 0.5, 1.0).unwrap();
+                assert!((s.free_energy - 2.5).abs() < 1e-6);
+                assert!((s.expected_free_energy - 3.5).abs() < 1e-6);
+            }
+        }
+    }
+    pub mod memory {
+        //! Ring-buffer episodic memory with elastic-weight-consolidation style updates.
+
+        use crate::cognition::{finite, non_negative, CogError};
+
+        /// One remembered value with its importance (Fisher information).
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Episode {
+            /// Caller id.
+            pub id: u64,
+            /// Stored value.
+            pub value: f32,
+            /// Importance; higher resists change during consolidation.
+            pub fisher: f32,
+        }
+
+        /// Fixed-capacity episodic memory; the oldest entry is overwritten when full.
+        #[derive(Debug, Clone)]
+        pub struct EpisodicMemory {
+            items: Vec<Episode>,
+            cap: usize,
+            cursor: usize,
+        }
+
+        impl EpisodicMemory {
+            /// Memory with room for `cap` episodes.
+            pub fn new(cap: usize) -> Result<Self, CogError> {
+                if cap == 0 {
+                    return Err(CogError::BadValue);
+                }
+                Ok(Self {
+                    items: Vec::with_capacity(cap),
+                    cap,
+                    cursor: 0,
+                })
+            }
+
+            /// Store an episode.
+            pub fn record(&mut self, id: u64, value: f32, fisher: f32) -> Result<(), CogError> {
+                let e = Episode {
+                    id,
+                    value: finite(value)?,
+                    fisher: non_negative(fisher)?,
+                };
+                if self.items.len() < self.cap {
+                    self.items.push(e);
+                } else {
+                    self.items[self.cursor] = e;
+                }
+                self.cursor = (self.cursor + 1) % self.cap;
+                Ok(())
+            }
+
+            /// `v += lr * (v - lambda * fisher * v)`: important values change less.
+            pub fn consolidate(
+                &mut self,
+                learning_rate: f32,
+                ewc_lambda: f32,
+            ) -> Result<(), CogError> {
+                let lr = non_negative(learning_rate)?;
+                let lambda = non_negative(ewc_lambda)?;
+                for e in &mut self.items {
+                    let penalty = lambda * e.fisher * e.value;
+                    e.value += lr * (e.value - penalty);
+                }
+                Ok(())
+            }
+
+            /// Stored episodes (insertion order until the ring wraps).
+            #[must_use]
+            pub fn episodes(&self) -> &[Episode] {
+                &self.items
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn ring_overwrites_oldest() {
+                let mut m = EpisodicMemory::new(2).unwrap();
+                for i in 0..3 {
+                    m.record(i, i as f32, 0.0).unwrap();
+                }
+                let ids: Vec<u64> = m.episodes().iter().map(|e| e.id).collect();
+                assert_eq!(ids, vec![2, 1]);
+                assert!(m.record(9, f32::NAN, 0.0).is_err());
+            }
+
+            #[test]
+            fn consolidation_protects_important() {
+                let mut m = EpisodicMemory::new(2).unwrap();
+                m.record(0, 1.0, 0.0).unwrap();
+                m.record(1, 1.0, 1.0).unwrap();
+                m.consolidate(0.5, 1.0).unwrap();
+                let v: Vec<f32> = m.episodes().iter().map(|e| e.value).collect();
+                assert!((v[0] - 1.5).abs() < 1e-6);
+                assert!((v[1] - 1.0).abs() < 1e-6);
+            }
+        }
+    }
+    pub mod snn {
+        //! Izhikevich spiking population with dopamine / norepinephrine traces.
+
+        use crate::cognition::{finite, CogError};
+
+        #[derive(Debug, Clone, Copy)]
+        struct Neuron {
+            v: f32,
+            u: f32,
+            spikes: u32,
+        }
+
+        /// Regular-spiking parameters (a, b, c, d).
+        const A: f32 = 0.02;
+        const B: f32 = 0.2;
+        const C: f32 = -65.0;
+        const D: f32 = 8.0;
+        const DT: f32 = 0.01;
+
+        /// A population of identical regular-spiking neurons.
+        ///
+        /// Neuron `i` gets a small bias `(i % fan_in) * 0.01` on top of the shared
+        /// input, so the population spreads out in time.
+        #[derive(Debug, Clone)]
+        pub struct Snn {
+            nodes: Vec<Neuron>,
+            fan_in: usize,
+            /// Fraction of neurons that spiked on the last step.
+            pub branching_ratio: f32,
+            /// Reward trace.
+            pub dopamine: f32,
+            /// Arousal trace (input magnitude).
+            pub norepinephrine: f32,
+        }
+
+        impl Snn {
+            /// Population of `n` neurons with bias period `fan_in`.
+            pub fn new(n: usize, fan_in: usize) -> Result<Self, CogError> {
+                if n == 0 || fan_in == 0 {
+                    return Err(CogError::BadValue);
+                }
+                Ok(Self {
+                    nodes: vec![
+                        Neuron {
+                            v: C,
+                            u: B * C,
+                            spikes: 0
+                        };
+                        n
+                    ],
+                    fan_in,
+                    branching_ratio: 0.0,
+                    dopamine: 0.0,
+                    norepinephrine: 0.0,
+                })
+            }
+
+            /// Advance one step; returns how many neurons spiked.
+            pub fn step(&mut self, input: f32, reward: f32) -> Result<usize, CogError> {
+                let input = finite(input)?;
+                let reward = finite(reward)?;
+                self.dopamine += 0.05 * (reward - self.dopamine);
+                self.norepinephrine += 0.05 * (input.abs() - self.norepinephrine);
+                let mut fired = 0;
+                for (i, n) in self.nodes.iter_mut().enumerate() {
+                    let current = input + (i % self.fan_in) as f32 * 0.01;
+                    let dv = 0.04 * n.v * n.v + 5.0 * n.v + 140.0 - n.u + current;
+                    let du = A * (B * n.v - n.u);
+                    n.v += dv * DT;
+                    n.u += du * DT;
+                    if n.v >= 30.0 {
+                        n.v = C;
+                        n.u += D;
+                        n.spikes += 1;
+                        fired += 1;
+                    }
+                }
+                self.branching_ratio = fired as f32 / self.nodes.len() as f32;
+                Ok(fired)
+            }
+
+            /// Total spikes per neuron so far.
+            pub fn spike_counts(&self) -> impl Iterator<Item = u32> + '_ {
+                self.nodes.iter().map(|n| n.spikes)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn strong_input_spikes_weak_does_not() {
+                let mut quiet = Snn::new(16, 4).unwrap();
+                for _ in 0..200 {
+                    quiet.step(0.0, 0.0).unwrap();
+                }
+                assert_eq!(quiet.spike_counts().sum::<u32>(), 0);
+
+                let mut loud = Snn::new(16, 4).unwrap();
+                let mut total = 0;
+                for _ in 0..5000 {
+                    total += loud.step(20.0, 1.0).unwrap();
+                }
+                assert!(total > 0);
+                assert!(loud.dopamine > 0.9);
+                assert!(loud.step(f32::NAN, 0.0).is_err());
+            }
+        }
+    }
+    pub mod vsa {
+        //! Vector-symbolic architecture on 2048-bit binary hypervectors.
+
+        use crate::cognition::CogError;
+
+        /// Bits per hypervector.
+        pub const BITS: usize = 2048;
+        const WORDS: usize = BITS / 64;
+
+        /// A binary hypervector.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct Hv([u64; WORDS]);
+
+        impl Default for Hv {
+            fn default() -> Self {
+                Self([0; WORDS])
+            }
+        }
+
+        impl Hv {
+            /// All-zero vector.
+            #[must_use]
+            pub fn zero() -> Self {
+                Self::default()
+            }
+
+            /// Deterministic pseudo-random vector from a seed (splitmix64).
+            #[must_use]
+            pub fn from_seed(seed: u64) -> Self {
+                let mut s = seed;
+                let mut w = [0u64; WORDS];
+                for x in &mut w {
+                    s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = s;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    *x = z ^ (z >> 31);
+                }
+                Self(w)
+            }
+
+            /// Bit `i`.
+            #[must_use]
+            pub fn bit(&self, i: usize) -> bool {
+                (self.0[i / 64] >> (i % 64)) & 1 == 1
+            }
+
+            fn set(&mut self, i: usize) {
+                self.0[i / 64] |= 1u64 << (i % 64);
+            }
+
+            /// Binding (XOR). Self-inverse: `a.bind(&a.bind(&b)) == b`.
+            #[must_use]
+            pub fn bind(&self, other: &Self) -> Self {
+                let mut out = *self;
+                for (o, b) in out.0.iter_mut().zip(other.0) {
+                    *o ^= b;
+                }
+                out
+            }
+
+            /// Majority bundle; ties resolve to 1.
+            #[must_use]
+            pub fn bundle(items: &[Self]) -> Self {
+                let mut out = Self::zero();
+                if items.is_empty() {
+                    return out;
+                }
+                for i in 0..BITS {
+                    let ones = items.iter().filter(|h| h.bit(i)).count();
+                    if ones * 2 >= items.len() {
+                        out.set(i);
+                    }
+                }
+                out
+            }
+
+            /// Cyclic rotation by `shift` bits (encodes sequence position).
+            #[must_use]
+            pub fn permute(&self, shift: usize) -> Self {
+                let shift = shift % BITS;
+                let mut out = Self::zero();
+                for i in (0..BITS).filter(|&i| self.bit(i)) {
+                    out.set((i + shift) % BITS);
+                }
+                out
+            }
+
+            /// Hamming distance.
+            #[must_use]
+            pub fn hamming(&self, other: &Self) -> u32 {
+                self.0
+                    .iter()
+                    .zip(other.0)
+                    .map(|(a, b)| (a ^ b).count_ones())
+                    .sum()
+            }
+        }
+
+        /// Nearest bipolar (`-1/+1` as i8) dictionary entry by normalised dot product.
+        ///
+        /// Returns `(index, score)`.
+        pub fn cleanup(query: &[i8], dictionary: &[&[i8]]) -> Result<(usize, f32), CogError> {
+            if query.is_empty() || dictionary.is_empty() {
+                return Err(CogError::Empty);
+            }
+            let mut best = (0usize, f32::NEG_INFINITY);
+            for (i, d) in dictionary.iter().enumerate() {
+                if d.len() != query.len() {
+                    return Err(CogError::Shape);
+                }
+                let dot: i64 = query
+                    .iter()
+                    .zip(*d)
+                    .map(|(&a, &b)| i64::from(a) * i64::from(b))
+                    .sum();
+                let score = dot as f32 / query.len() as f32;
+                if score > best.1 {
+                    best = (i, score);
+                }
+            }
+            Ok(best)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn bind_is_self_inverse() {
+                let a = Hv::from_seed(1);
+                let b = Hv::from_seed(2);
+                assert_eq!(a.bind(&a.bind(&b)), b);
+                let d = a.hamming(&b);
+                assert!(d > 900 && d < 1150, "random vectors are ~half apart: {d}");
+            }
+
+            #[test]
+            fn bundle_is_similar_to_members() {
+                let xs = [Hv::from_seed(3), Hv::from_seed(4), Hv::from_seed(5)];
+                let s = Hv::bundle(&xs);
+                let other = Hv::from_seed(99);
+                for x in &xs {
+                    assert!(s.hamming(x) < s.hamming(&other));
+                }
+                assert_eq!(Hv::bundle(&[]), Hv::zero());
+            }
+
+            #[test]
+            fn permute_round_trip() {
+                let a = Hv::from_seed(7);
+                assert_eq!(a.permute(5).permute(BITS - 5), a);
+                assert_eq!(a.permute(BITS), a);
+                assert_ne!(a.permute(1), a);
+            }
+
+            #[test]
+            fn cleanup_finds_nearest() {
+                let q = [1i8, 1, -1, -1];
+                let d0 = [-1i8, -1, 1, 1];
+                let d1 = [1i8, 1, -1, 1];
+                let (i, s) = cleanup(&q, &[&d0, &d1]).unwrap();
+                assert_eq!(i, 1);
+                assert!((s - 0.5).abs() < 1e-6);
+                assert_eq!(cleanup(&q, &[&[1i8][..]]), Err(CogError::Shape));
+            }
+        }
+    }
+    pub mod working {
+        //! Working memory: a small, bounded store with priorities and expiry.
+        //!
+        //! Holds the handful of things the agent is attending to right now. Items carry a priority
+        //! and an optional time-to-live that restarts whenever the item is read, so what is used stays
+        //! and what is ignored fades. When the store is full the least important item makes room; an
+        //! incoming item that is *less* important than everything already held is refused instead.
+        //! Time is a caller-supplied tick count, so behaviour is deterministic.
+
+        use crate::cognition::CogError;
+
+        #[derive(Debug, Clone)]
+        struct Item<V> {
+            key: String,
+            value: V,
+            priority: f32,
+            ttl: Option<u64>,
+            last_access: u64,
+        }
+
+        impl<V> Item<V> {
+            fn expired(&self, now: u64) -> bool {
+                self.ttl
+                    .is_some_and(|t| now.saturating_sub(self.last_access) > t)
+            }
+        }
+
+        /// What happened to a `put`.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum Put {
+            /// Stored (a same-key item was replaced, or there was room).
+            Stored,
+            /// Stored after evicting this key to make room.
+            Evicted(String),
+            /// Not stored: it was less important than every item already held.
+            Refused,
+        }
+
+        /// Bounded working memory.
+        #[derive(Debug, Clone)]
+        pub struct WorkingMemory<V> {
+            cap: usize,
+            items: Vec<Item<V>>,
+        }
+
+        impl<V> WorkingMemory<V> {
+            /// Memory holding at most `cap` items (at least 1).
+            pub fn new(cap: usize) -> Result<Self, CogError> {
+                if cap == 0 {
+                    return Err(CogError::BadValue);
+                }
+                Ok(WorkingMemory {
+                    cap,
+                    items: Vec::with_capacity(cap),
+                })
+            }
+
+            /// Drop every item whose time-to-live has run out; returns how many.
+            pub fn sweep(&mut self, now: u64) -> usize {
+                let before = self.items.len();
+                self.items.retain(|i| !i.expired(now));
+                before - self.items.len()
+            }
+
+            /// Store `value` under `key`. `priority` must be finite. `ttl` is in ticks since the last
+            /// access (`None` never expires). Same-key items are replaced. Expired items are swept first.
+            pub fn put(
+                &mut self,
+                key: &str,
+                value: V,
+                priority: f32,
+                ttl: Option<u64>,
+                now: u64,
+            ) -> Result<Put, CogError> {
+                if !priority.is_finite() {
+                    return Err(CogError::BadValue);
+                }
+                self.sweep(now);
+                let item = Item {
+                    key: key.to_string(),
+                    value,
+                    priority,
+                    ttl,
+                    last_access: now,
+                };
+                if let Some(i) = self.items.iter().position(|e| e.key == key) {
+                    self.items[i] = item;
+                    return Ok(Put::Stored);
+                }
+                if self.items.len() < self.cap {
+                    self.items.push(item);
+                    return Ok(Put::Stored);
+                }
+                // Victim: lowest priority, then least recently used, then earliest inserted.
+                let (vi, victim) = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.priority
+                            .total_cmp(&b.priority)
+                            .then(a.last_access.cmp(&b.last_access))
+                    })
+                    .map(|(i, v)| (i, v.priority))
+                    .ok_or(CogError::Empty)?;
+                if priority < victim {
+                    return Ok(Put::Refused);
+                }
+                let gone = std::mem::replace(&mut self.items[vi], item);
+                Ok(Put::Evicted(gone.key))
+            }
+
+            /// Read an item, restarting its time-to-live. An expired item is removed and not returned.
+            pub fn get(&mut self, key: &str, now: u64) -> Option<&V> {
+                let i = self.items.iter().position(|e| e.key == key)?;
+                if self.items[i].expired(now) {
+                    self.items.remove(i);
+                    return None;
+                }
+                self.items[i].last_access = now;
+                Some(&self.items[i].value)
+            }
+
+            /// Remove an item; `true` if it was present.
+            pub fn remove(&mut self, key: &str) -> bool {
+                match self.items.iter().position(|e| e.key == key) {
+                    Some(i) => {
+                        self.items.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+
+            /// Keys of live items, most important first (ties: most recently used first).
+            pub fn keys_by_priority(&self, now: u64) -> Vec<&str> {
+                let mut live: Vec<&Item<V>> =
+                    self.items.iter().filter(|i| !i.expired(now)).collect();
+                live.sort_by(|a, b| {
+                    b.priority
+                        .total_cmp(&a.priority)
+                        .then(b.last_access.cmp(&a.last_access))
+                });
+                live.into_iter().map(|i| i.key.as_str()).collect()
+            }
+
+            /// Number of stored items (expired ones count until swept or read).
+            pub fn len(&self) -> usize {
+                self.items.len()
+            }
+
+            /// `true` if nothing is stored.
+            pub fn is_empty(&self) -> bool {
+                self.items.is_empty()
+            }
+
+            /// Remove everything.
+            pub fn clear(&mut self) {
+                self.items.clear();
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn capacity_must_be_positive_and_priority_finite() {
+                assert_eq!(WorkingMemory::<u8>::new(0).unwrap_err(), CogError::BadValue);
+                let mut w = WorkingMemory::new(2).unwrap();
+                assert_eq!(w.put("a", 1, f32::NAN, None, 0), Err(CogError::BadValue));
+                assert_eq!(
+                    w.put("a", 1, f32::INFINITY, None, 0),
+                    Err(CogError::BadValue)
+                );
+                assert!(w.is_empty());
+            }
+
+            #[test]
+            fn stores_reads_replaces_and_removes() {
+                let mut w = WorkingMemory::new(3).unwrap();
+                assert_eq!(
+                    w.put("goal", "find keys", 0.9, None, 0).unwrap(),
+                    Put::Stored
+                );
+                assert_eq!(w.get("goal", 1), Some(&"find keys"));
+                assert_eq!(
+                    w.put("goal", "find phone", 0.9, None, 2).unwrap(),
+                    Put::Stored
+                );
+                assert_eq!(w.len(), 1);
+                assert_eq!(w.get("goal", 3), Some(&"find phone"));
+                assert!(w.remove("goal"));
+                assert!(!w.remove("goal"));
+                assert_eq!(w.get("goal", 4), None);
+            }
+
+            #[test]
+            fn full_memory_evicts_the_least_important_item() {
+                let mut w = WorkingMemory::new(2).unwrap();
+                w.put("low", 1, 0.1, None, 0).unwrap();
+                w.put("mid", 2, 0.5, None, 0).unwrap();
+                assert_eq!(
+                    w.put("high", 3, 0.9, None, 1).unwrap(),
+                    Put::Evicted("low".into())
+                );
+                assert_eq!(w.keys_by_priority(1), ["high", "mid"]);
+            }
+
+            #[test]
+            fn less_important_newcomers_are_refused() {
+                let mut w = WorkingMemory::new(2).unwrap();
+                w.put("a", 1, 0.6, None, 0).unwrap();
+                w.put("b", 2, 0.7, None, 0).unwrap();
+                assert_eq!(w.put("c", 3, 0.2, None, 1).unwrap(), Put::Refused);
+                assert_eq!(w.len(), 2);
+                // equal priority to the weakest item displaces it
+                assert_eq!(
+                    w.put("d", 4, 0.6, None, 2).unwrap(),
+                    Put::Evicted("a".into())
+                );
+            }
+
+            #[test]
+            fn priority_ties_evict_the_least_recently_used() {
+                let mut w = WorkingMemory::new(2).unwrap();
+                w.put("old", 1, 0.5, None, 0).unwrap();
+                w.put("new", 2, 0.5, None, 5).unwrap();
+                w.get("old", 9); // touching "old" makes "new" the least recently used
+                assert_eq!(
+                    w.put("x", 3, 0.5, None, 10).unwrap(),
+                    Put::Evicted("new".into())
+                );
+            }
+
+            #[test]
+            fn items_expire_after_their_ttl_and_reads_restart_it() {
+                let mut w = WorkingMemory::new(4).unwrap();
+                w.put("fade", 1, 0.5, Some(10), 0).unwrap();
+                w.put("kept", 2, 0.5, Some(10), 0).unwrap();
+                w.put("forever", 3, 0.5, None, 0).unwrap();
+                assert_eq!(w.get("kept", 8), Some(&2)); // restarts the clock at 8
+                assert_eq!(w.get("fade", 10), Some(&1)); // exactly ttl ticks: still alive
+                assert_eq!(w.get("fade", 25), None); // idle for 15 ticks
+                assert_eq!(w.get("kept", 18), Some(&2)); // 10 ticks since tick 8
+                assert_eq!(w.get("kept", 40), None);
+                assert_eq!(w.get("forever", 1_000_000), Some(&3));
+            }
+
+            #[test]
+            fn sweep_and_put_clear_expired_items_first() {
+                let mut w = WorkingMemory::new(2).unwrap();
+                w.put("a", 1, 0.9, Some(5), 0).unwrap();
+                w.put("b", 2, 0.9, Some(5), 0).unwrap();
+                // both expired by tick 100: the new item finds room without evicting anything live
+                assert_eq!(w.put("c", 3, 0.1, None, 100).unwrap(), Put::Stored);
+                assert_eq!(w.len(), 1);
+                w.put("d", 4, 0.5, Some(1), 100).unwrap();
+                assert_eq!(w.sweep(200), 1);
+                assert_eq!(w.keys_by_priority(200), ["c"]);
+                w.clear();
+                assert!(w.is_empty());
+            }
+
+            #[test]
+            fn keys_by_priority_hides_expired_items() {
+                let mut w = WorkingMemory::new(3).unwrap();
+                w.put("a", 1, 0.9, Some(2), 0).unwrap();
+                w.put("b", 2, 0.4, None, 0).unwrap();
+                w.put("c", 3, 0.4, None, 1).unwrap();
+                assert_eq!(w.keys_by_priority(1), ["a", "c", "b"]);
+                assert_eq!(w.keys_by_priority(10), ["c", "b"]);
+            }
+        }
+    }
+    pub mod workspace {
+        //! Global workspace: a small set of candidate contents competing by salience.
+
+        use crate::cognition::{non_negative, CogError};
+
+        /// Bounded salience-ranked workspace. When full, a new item replaces the
+        /// least salient one if it is more salient.
+        #[derive(Debug, Clone)]
+        pub struct Workspace {
+            items: Vec<(u64, f32)>,
+            cap: usize,
+        }
+
+        impl Workspace {
+            /// Workspace with `cap` slots.
+            pub fn new(cap: usize) -> Result<Self, CogError> {
+                if cap == 0 {
+                    return Err(CogError::BadValue);
+                }
+                Ok(Self {
+                    items: Vec::with_capacity(cap),
+                    cap,
+                })
+            }
+
+            /// Offer `id` with `salience`. Returns whether it entered.
+            pub fn publish(&mut self, id: u64, salience: f32) -> Result<bool, CogError> {
+                let s = non_negative(salience)?;
+                if self.items.len() < self.cap {
+                    self.items.push((id, s));
+                    return Ok(true);
+                }
+                let (low, low_s) = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                    .map(|(i, x)| (i, x.1))
+                    .ok_or(CogError::Empty)?;
+                if s > low_s {
+                    self.items[low] = (id, s);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+
+            /// The most salient item (the current broadcast).
+            pub fn select(&self) -> Result<(u64, f32), CogError> {
+                self.items
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .ok_or(CogError::Empty)
+            }
+
+            /// Number of items.
+            #[must_use]
+            pub fn len(&self) -> usize {
+                self.items.len()
+            }
+
+            /// True when empty.
+            #[must_use]
+            pub fn is_empty(&self) -> bool {
+                self.items.is_empty()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn competition() {
+                let mut w = Workspace::new(2).unwrap();
+                assert_eq!(w.select(), Err(CogError::Empty));
+                w.publish(1, 0.2).unwrap();
+                w.publish(2, 0.9).unwrap();
+                assert!(!w.publish(3, 0.1).unwrap());
+                assert!(w.publish(4, 0.5).unwrap());
+                assert_eq!(w.select().unwrap().0, 2);
+                assert_eq!(w.len(), 2);
+                assert!(w.publish(5, -1.0).is_err());
+            }
+        }
+    }
+
+    use core::fmt;
+
+    /// Errors for invalid inputs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CogError {
+        /// Non-finite or out-of-range number.
+        BadValue,
+        /// Container is full.
+        Full,
+        /// Nothing to select from.
+        Empty,
+        /// Slice lengths disagree.
+        Shape,
+    }
+
+    impl fmt::Display for CogError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::BadValue => "value out of range",
+                Self::Full => "container full",
+                Self::Empty => "empty",
+                Self::Shape => "length mismatch",
+            })
+        }
+    }
+
+    impl std::error::Error for CogError {}
+
+    pub(crate) fn finite(x: f32) -> Result<f32, CogError> {
+        if x.is_finite() {
+            Ok(x)
+        } else {
+            Err(CogError::BadValue)
+        }
+    }
+
+    pub(crate) fn non_negative(x: f32) -> Result<f32, CogError> {
+        if x.is_finite() && x >= 0.0 {
+            Ok(x)
+        } else {
+            Err(CogError::BadValue)
+        }
+    }
+}
+
+pub mod memory {
+    //! MOULI local memory and retrieval.
+    //!
+    //! Everything runs on the device; nothing leaves it.
+    //!
+    //! * [`lexical`]: BM25 keyword index.
+    //! * [`vector`]: cosine similarity over embeddings.
+    //! * [`graph`]: knowledge graph with spreading activation (related ideas
+    //!   light up from a few seeds).
+    //! * [`fusion`]: reciprocal-rank fusion of several ranked lists.
+    //! * [`context`]: versioned claims with trust levels, reviewed evidence and trusted snapshots.
+    //! * [`ontology`]: class hierarchy (is-a) with inherited, typed relations.
+    //! * [`chunk`]: recursive text chunking with overlap and source offsets, to feed the indexes.
+    #![forbid(unsafe_code)]
+
+    pub mod chunk {
+        //! Recursive text chunking for retrieval.
+        //!
+        //! Splits a document into pieces of at most `max_chars` characters, preferring to break at
+        //! paragraph boundaries, then lines, then sentences, then words, and only as a last resort in
+        //! the middle of a word. Consecutive chunks can overlap by up to `overlap` characters so a
+        //! fact that straddles a boundary still appears whole in one chunk.
+        //!
+        //! Every chunk records its byte range in the source text, so a retrieved chunk can be traced
+        //! back to the exact place it came from (for citations). Chunks are deterministic.
+
+        use std::fmt;
+        use std::ops::Range;
+
+        /// Chunking parameters.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct ChunkConfig {
+            /// Largest chunk, in characters (at least 1).
+            pub max_chars: usize,
+            /// How much of the previous chunk to repeat at the start of the next, in characters.
+            /// Must be smaller than `max_chars`.
+            pub overlap: usize,
+        }
+
+        impl Default for ChunkConfig {
+            fn default() -> Self {
+                ChunkConfig {
+                    max_chars: 800,
+                    overlap: 100,
+                }
+            }
+        }
+
+        /// Invalid chunking parameters.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ChunkError {
+            /// `max_chars` is zero.
+            ZeroSize,
+            /// `overlap` is not smaller than `max_chars`.
+            OverlapTooLarge,
+        }
+
+        impl fmt::Display for ChunkError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    ChunkError::ZeroSize => f.write_str("max_chars must be at least 1"),
+                    ChunkError::OverlapTooLarge => {
+                        f.write_str("overlap must be smaller than max_chars")
+                    }
+                }
+            }
+        }
+
+        impl std::error::Error for ChunkError {}
+
+        /// One chunk of a document.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Chunk<'a> {
+            /// Position of this chunk in the document (0-based).
+            pub index: usize,
+            /// Byte range in the source text.
+            pub range: Range<usize>,
+            /// The text, `&source[range]`.
+            pub text: &'a str,
+        }
+
+        /// Separators from coarsest to finest. Each stays attached to the end of the piece before it.
+        const SEPARATORS: [&str; 5] = ["\n\n", "\n", ". ", " ", ""];
+
+        fn chars_in(text: &str, r: &Range<usize>) -> usize {
+            text[r.clone()].chars().count()
+        }
+
+        /// Split `r` into atoms of at most `max` characters that exactly tile `r`.
+        fn atoms(
+            text: &str,
+            r: Range<usize>,
+            level: usize,
+            max: usize,
+            out: &mut Vec<Range<usize>>,
+        ) {
+            if r.is_empty() {
+                return;
+            }
+            if chars_in(text, &r) <= max {
+                out.push(r);
+                return;
+            }
+            if level >= SEPARATORS.len() - 1 {
+                // Last resort: hard split by characters.
+                let mut start = r.start;
+                let mut count = 0;
+                for (i, _) in text[r.clone()].char_indices() {
+                    if count == max {
+                        out.push(start..r.start + i);
+                        start = r.start + i;
+                        count = 0;
+                    }
+                    count += 1;
+                }
+                if start < r.end {
+                    out.push(start..r.end);
+                }
+                return;
+            }
+            let sep = SEPARATORS[level];
+            let slice = &text[r.clone()];
+            let mut start = r.start;
+            let mut search = 0;
+            while let Some(pos) = slice[search..].find(sep) {
+                let end = r.start + search + pos + sep.len();
+                atoms(text, start..end, level + 1, max, out);
+                start = end;
+                search = end - r.start;
+            }
+            if start < r.end {
+                atoms(text, start..r.end, level + 1, max, out);
+            }
+        }
+
+        fn emit<'a>(
+            text: &'a str,
+            parts: &[Range<usize>],
+            cur: &[usize],
+            out: &mut Vec<Chunk<'a>>,
+        ) {
+            let range = parts[cur[0]].start..parts[cur[cur.len() - 1]].end;
+            out.push(Chunk {
+                index: out.len(),
+                text: &text[range.clone()],
+                range,
+            });
+        }
+
+        /// Split `text` into chunks.
+        pub fn chunk(text: &str, cfg: ChunkConfig) -> Result<Vec<Chunk<'_>>, ChunkError> {
+            if cfg.max_chars == 0 {
+                return Err(ChunkError::ZeroSize);
+            }
+            if cfg.overlap >= cfg.max_chars {
+                return Err(ChunkError::OverlapTooLarge);
+            }
+            let mut parts = Vec::new();
+            atoms(text, 0..text.len(), 0, cfg.max_chars, &mut parts);
+            let lens: Vec<usize> = parts.iter().map(|r| chars_in(text, r)).collect();
+
+            let mut out = Vec::new();
+            // Indices into `parts` of the chunk being built, and its length in characters.
+            let mut cur: Vec<usize> = Vec::new();
+            let mut cur_len = 0usize;
+            for i in 0..parts.len() {
+                if !cur.is_empty() && cur_len + lens[i] > cfg.max_chars {
+                    emit(text, &parts, &cur, &mut out);
+                    // Carry over a tail of the finished chunk as overlap, as long as the next atom still fits.
+                    let mut keep = 0usize;
+                    let mut kept_len = 0usize;
+                    for j in (0..cur.len()).rev() {
+                        let l = lens[cur[j]];
+                        if kept_len + l > cfg.overlap || kept_len + l + lens[i] > cfg.max_chars {
+                            break;
+                        }
+                        kept_len += l;
+                        keep += 1;
+                    }
+                    cur = cur[cur.len() - keep..].to_vec();
+                    cur_len = kept_len;
+                }
+                cur.push(i);
+                cur_len += lens[i];
+            }
+            if !cur.is_empty() {
+                emit(text, &parts, &cur, &mut out);
+            }
+            Ok(out)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn cfg(max: usize, overlap: usize) -> ChunkConfig {
+                ChunkConfig {
+                    max_chars: max,
+                    overlap,
+                }
+            }
+
+            #[test]
+            fn rejects_bad_parameters() {
+                assert_eq!(chunk("x", cfg(0, 0)), Err(ChunkError::ZeroSize));
+                assert_eq!(chunk("x", cfg(5, 5)), Err(ChunkError::OverlapTooLarge));
+                assert_eq!(chunk("x", cfg(5, 9)), Err(ChunkError::OverlapTooLarge));
+                assert!(chunk("x", ChunkConfig::default()).is_ok());
+            }
+
+            #[test]
+            fn empty_and_short_text() {
+                assert!(chunk("", cfg(10, 2)).unwrap().is_empty());
+                let c = chunk("short", cfg(10, 2)).unwrap();
+                assert_eq!(c.len(), 1);
+                assert_eq!(
+                    (c[0].index, c[0].range.clone(), c[0].text),
+                    (0, 0..5, "short")
+                );
+            }
+
+            #[test]
+            fn prefers_paragraph_boundaries() {
+                let text = "First paragraph here.\n\nSecond paragraph here.\n\nThird one.";
+                let c = chunk(text, cfg(30, 0)).unwrap();
+                let texts: Vec<&str> = c.iter().map(|c| c.text).collect();
+                assert_eq!(
+                    texts,
+                    [
+                        "First paragraph here.\n\n",
+                        "Second paragraph here.\n\n",
+                        "Third one."
+                    ]
+                );
+            }
+
+            #[test]
+            fn falls_back_to_sentences_then_words_then_characters() {
+                let text = "One two three. Four five six. Seven eight nine.";
+                let c = chunk(text, cfg(16, 0)).unwrap();
+                assert!(c.iter().all(|c| c.text.chars().count() <= 16));
+                assert!(c[0].text.ends_with("three. "));
+                let words = chunk("alpha beta gamma delta", cfg(11, 0)).unwrap();
+                assert_eq!(
+                    words.iter().map(|c| c.text).collect::<Vec<_>>(),
+                    ["alpha beta ", "gamma delta"]
+                );
+                let long = chunk("abcdefghij", cfg(4, 0)).unwrap();
+                assert_eq!(
+                    long.iter().map(|c| c.text).collect::<Vec<_>>(),
+                    ["abcd", "efgh", "ij"]
+                );
+            }
+
+            #[test]
+            fn chunks_without_overlap_tile_the_text() {
+                let text = "Lorem ipsum dolor sit amet. Consectetur adipiscing elit.\n\nSed do eiusmod tempor.\nIncididunt ut labore et dolore magna aliqua.";
+                let c = chunk(text, cfg(25, 0)).unwrap();
+                assert_eq!(c.iter().map(|c| c.text).collect::<String>(), text);
+                let mut end = 0;
+                for ch in &c {
+                    assert_eq!(ch.range.start, end);
+                    assert_eq!(&text[ch.range.clone()], ch.text);
+                    end = ch.range.end;
+                }
+                assert_eq!(end, text.len());
+            }
+
+            #[test]
+            fn overlap_repeats_the_tail_and_respects_the_limit() {
+                let text = "aaa bbb ccc ddd eee fff ggg hhh iii jjj";
+                let c = chunk(text, cfg(16, 8)).unwrap();
+                assert!(c.len() > 2);
+                for w in c.windows(2) {
+                    let (a, b) = (&w[0], &w[1]);
+                    assert!(
+                        b.range.start < a.range.end,
+                        "no overlap between {:?} and {:?}",
+                        a.text,
+                        b.text
+                    );
+                    assert!(b.range.start > a.range.start, "no progress");
+                    let shared = text[b.range.start..a.range.end].chars().count();
+                    assert!(shared <= 8, "overlap {shared} exceeds the limit");
+                }
+                for ch in &c {
+                    assert!(ch.text.chars().count() <= 16);
+                }
+                // every character of the source is covered
+                assert_eq!(c.first().unwrap().range.start, 0);
+                assert_eq!(c.last().unwrap().range.end, text.len());
+            }
+
+            #[test]
+            fn no_overlap_when_atoms_are_larger_than_the_overlap() {
+                // sentences of ~14 chars with overlap 5: nothing small enough to repeat
+                let text = "Hello there. General Kenobi. You are bold.";
+                let c = chunk(text, cfg(20, 5)).unwrap();
+                for w in c.windows(2) {
+                    assert!(w[1].range.start >= w[0].range.end);
+                }
+            }
+
+            #[test]
+            fn unicode_is_never_split_inside_a_character() {
+                let text = "héllo wörld 日本語のテキスト 😀😀😀 ok. 日本語の文章です。";
+                for max in 1..12 {
+                    let overlap = max / 3;
+                    let c = chunk(text, cfg(max, overlap)).unwrap();
+                    for ch in &c {
+                        assert!(
+                            text.is_char_boundary(ch.range.start)
+                                && text.is_char_boundary(ch.range.end)
+                        );
+                        assert!(ch.text.chars().count() <= max, "max {max}: {:?}", ch.text);
+                    }
+                    assert_eq!(c.first().unwrap().range.start, 0);
+                    assert_eq!(c.last().unwrap().range.end, text.len());
+                }
+            }
+
+            #[test]
+            fn indices_are_sequential_and_results_deterministic() {
+                let text = "word ".repeat(200);
+                let a = chunk(&text, cfg(40, 10)).unwrap();
+                let b = chunk(&text, cfg(40, 10)).unwrap();
+                assert_eq!(a, b);
+                for (i, ch) in a.iter().enumerate() {
+                    assert_eq!(ch.index, i);
+                }
+            }
+
+            #[test]
+            fn whitespace_only_and_separator_only_inputs() {
+                assert_eq!(chunk("   ", cfg(10, 0)).unwrap().len(), 1);
+                let c = chunk("\n\n\n\n\n\n", cfg(2, 0)).unwrap();
+                assert_eq!(c.iter().map(|c| c.text).collect::<String>(), "\n\n\n\n\n\n");
+                assert!(c.iter().all(|c| c.text.chars().count() <= 2));
+            }
+
+            #[test]
+            fn large_input_is_handled() {
+                let text = "Sentence number one. ".repeat(50_000);
+                let c = chunk(&text, cfg(500, 50)).unwrap();
+                assert!(c.len() > 1000);
+                assert!(c.iter().all(|c| c.text.chars().count() <= 500));
+            }
+        }
+    }
+    pub mod context {
+        //! Evidence-aware context store and trusted snapshots.
+        //!
+        //! What an agent is told about the world should be traceable and should say how much to trust
+        //! it. This store keeps *entities* and *relationships* as immutable, numbered versions, each
+        //! tagged with an assertion class (observed fact, human validated, inferred, AI hypothesis),
+        //! a confidence and an optional validity window. *Evidence* ties a claim to a source and must
+        //! be reviewed by someone other than its submitter before it counts. An append-only event log
+        //! records every change.
+        //!
+        //! [`ContextStore::snapshot`] assembles a bounded, deterministic packet for an agent from the
+        //! trusted part of the store: only entities that are currently valid and whose assertion class
+        //! passes the policy (inferences only on request, AI hypotheses never), relationships whose both
+        //! ends are in the packet at exactly the packet's versions, and **validated** evidence only.
+        //! Raw attributes never enter a snapshot.
+        //!
+        //! One store belongs to one tenant; separate tenants use separate stores.
+        //! Times are unix seconds supplied by the caller, so everything is deterministic.
+
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::fmt;
+
+        /// Most entities in one snapshot.
+        pub const MAX_ENTITIES: usize = 12;
+        /// Most relationships in one snapshot.
+        pub const MAX_RELATIONSHIPS: usize = 24;
+        /// Most evidence items in one snapshot.
+        pub const MAX_EVIDENCE: usize = 36;
+        /// Largest canonical snapshot, in bytes.
+        pub const MAX_SNAPSHOT_BYTES: usize = 48 * 1024;
+
+        /// How a claim came to be believed.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Assertion {
+            /// Directly observed.
+            ObservedFact,
+            /// Confirmed by a person.
+            HumanValidated,
+            /// Derived by reasoning.
+            Inferred,
+            /// Proposed by a model, unconfirmed.
+            AiHypothesis,
+        }
+
+        impl Assertion {
+            fn as_str(self) -> &'static str {
+                match self {
+                    Assertion::ObservedFact => "observed_fact",
+                    Assertion::HumanValidated => "human_validated",
+                    Assertion::Inferred => "inferred",
+                    Assertion::AiHypothesis => "ai_hypothesis",
+                }
+            }
+        }
+
+        /// Where a piece of evidence comes from.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum SourceKind {
+            /// Database metadata.
+            DatabaseMetadata,
+            /// API metadata.
+            ApiMetadata,
+            /// Repository metadata.
+            RepositoryMetadata,
+            /// Configuration metadata.
+            ConfigurationMetadata,
+            /// An event log.
+            EventLog,
+            /// A person vouches for it.
+            HumanAttestation,
+            /// An agent's analysis.
+            AgentAnalysis,
+            /// Anything else.
+            Other,
+        }
+
+        /// Review state of evidence.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Review {
+            /// Not yet reviewed (does not count).
+            Unverified,
+            /// Accepted by a reviewer.
+            Validated,
+            /// Refused by a reviewer.
+            Rejected,
+        }
+
+        /// Failure of a store operation.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum ContextError {
+            /// A field is empty, too long or out of range (the text says which).
+            Invalid(&'static str),
+            /// An object with this id already exists.
+            Exists(String),
+            /// The named object or version does not exist.
+            NotFound(String),
+            /// The reviewer submitted the evidence themselves.
+            SelfReview,
+            /// Validation needs a recorded source hash and a matching confirmation.
+            HashMismatch,
+            /// The evidence was already reviewed with a different outcome.
+            AlreadyReviewed,
+            /// Nothing in the store passes the snapshot policy.
+            NothingTrusted,
+            /// The snapshot would exceed [`MAX_SNAPSHOT_BYTES`].
+            TooLarge,
+        }
+
+        impl fmt::Display for ContextError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    ContextError::Invalid(w) => write!(f, "invalid {w}"),
+                    ContextError::Exists(i) => write!(f, "{i} already exists"),
+                    ContextError::NotFound(i) => write!(f, "{i} was not found"),
+                    ContextError::SelfReview => {
+                        f.write_str("evidence submitters cannot review their own evidence")
+                    }
+                    ContextError::HashMismatch => {
+                        f.write_str("source hash missing or not confirmed")
+                    }
+                    ContextError::AlreadyReviewed => {
+                        f.write_str("evidence was already reviewed with a different decision")
+                    }
+                    ContextError::NothingTrusted => {
+                        f.write_str("no currently valid entity meets the assertion policy")
+                    }
+                    ContextError::TooLarge => {
+                        f.write_str("assembled context exceeds the size limit")
+                    }
+                }
+            }
+        }
+
+        impl std::error::Error for ContextError {}
+
+        /// What a caller supplies for an entity version.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct EntitySpec {
+            /// Stable id (1 to 128 characters).
+            pub id: String,
+            /// Kind of entity ("table", "service", ...).
+            pub kind: String,
+            /// Display name.
+            pub name: String,
+            /// Longer text.
+            pub description: String,
+            /// Raw attributes (never copied into snapshots).
+            pub attributes: BTreeMap<String, String>,
+            /// How it is believed.
+            pub assertion: Assertion,
+            /// Confidence in `[0, 1]`.
+            pub confidence: f64,
+            /// Valid from this time on (inclusive), if limited.
+            pub valid_from: Option<i64>,
+            /// Valid until this time (inclusive), if limited.
+            pub valid_to: Option<i64>,
+        }
+
+        /// A stored entity version.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Entity {
+            /// The content, as supplied.
+            pub spec: EntitySpec,
+            /// Version number, starting at 1.
+            pub version: u32,
+            /// SHA-256 of the content.
+            pub content_hash: String,
+        }
+
+        /// What a caller supplies for a relationship.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct RelationshipSpec {
+            /// Stable id.
+            pub id: String,
+            /// Relationship type ("depends-on", ...).
+            pub kind: String,
+            /// Source entity and the version this claim is about.
+            pub source: (String, u32),
+            /// Target entity and the version this claim is about.
+            pub target: (String, u32),
+            /// How it is believed.
+            pub assertion: Assertion,
+            /// Confidence in `[0, 1]`.
+            pub confidence: f64,
+            /// Valid from, inclusive.
+            pub valid_from: Option<i64>,
+            /// Valid until, inclusive.
+            pub valid_to: Option<i64>,
+        }
+
+        /// A stored relationship version.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Relationship {
+            /// The content.
+            pub spec: RelationshipSpec,
+            /// Version number, starting at 1.
+            pub version: u32,
+            /// SHA-256 of the content.
+            pub content_hash: String,
+        }
+
+        /// Evidence that supports an entity version (and optionally one relationship).
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Evidence {
+            /// Unique id.
+            pub id: String,
+            /// Entity the evidence is about.
+            pub entity: String,
+            /// Entity version the evidence is about.
+            pub entity_version: u32,
+            /// Relationship it also supports, if any.
+            pub relationship: Option<String>,
+            /// Kind of source.
+            pub source_kind: SourceKind,
+            /// Reference to the source (path, URL, ticket).
+            pub source_ref: String,
+            /// SHA-256 of the source content, lowercase hex, if recorded.
+            pub source_hash: Option<String>,
+            /// When it was observed.
+            pub observed_at: i64,
+            /// Confidence in `[0, 1]`.
+            pub confidence: f64,
+            /// Who submitted it.
+            pub recorded_by: String,
+            /// Review state.
+            pub status: Review,
+            /// Who reviewed it, once reviewed.
+            pub reviewed_by: Option<String>,
+        }
+
+        /// One entry of the append-only log.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Event {
+            /// Position in the log, from 0.
+            pub seq: usize,
+            /// What happened (`entity.created`, `entity.versioned`, `relationship.recorded`,
+            /// `evidence.recorded`, `evidence.reviewed`).
+            pub kind: &'static str,
+            /// Id of the object concerned.
+            pub object_id: String,
+            /// Its version, where it has one.
+            pub object_version: Option<u32>,
+            /// Time supplied by the caller.
+            pub at: i64,
+        }
+
+        /// What a snapshot may contain.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Policy {
+            /// Also include `Inferred` claims (`AiHypothesis` is never included).
+            pub include_inferences: bool,
+            /// Current time, for validity windows.
+            pub now: i64,
+            /// Most entities to include, `1..=`[`MAX_ENTITIES`].
+            pub limit: usize,
+        }
+
+        /// Which entities a snapshot starts from.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Selector {
+            /// Exactly these entities (1 to `limit`, no duplicates).
+            Ids(Vec<String>),
+            /// Entities whose name contains this text, case-insensitively.
+            Search(String),
+        }
+
+        /// An entity as shown in a snapshot (no raw attributes, description cut to 1000 characters).
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct SnapshotEntity {
+            /// Entity id.
+            pub id: String,
+            /// Version.
+            pub version: u32,
+            /// Kind.
+            pub kind: String,
+            /// Name.
+            pub name: String,
+            /// Description (at most 1000 characters).
+            pub description: String,
+            /// Assertion class.
+            pub assertion: Assertion,
+            /// Confidence.
+            pub confidence: f64,
+            /// Content hash of this version.
+            pub content_hash: String,
+        }
+
+        /// A relationship as shown in a snapshot.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct SnapshotRelationship {
+            /// Relationship id.
+            pub id: String,
+            /// Version.
+            pub version: u32,
+            /// Type.
+            pub kind: String,
+            /// Source entity id and version.
+            pub source: (String, u32),
+            /// Target entity id and version.
+            pub target: (String, u32),
+            /// Assertion class.
+            pub assertion: Assertion,
+            /// Confidence.
+            pub confidence: f64,
+        }
+
+        /// A validated piece of evidence as shown in a snapshot.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct SnapshotEvidence {
+            /// Evidence id.
+            pub id: String,
+            /// Entity id.
+            pub entity: String,
+            /// Entity version.
+            pub entity_version: u32,
+            /// Source reference.
+            pub source_ref: String,
+            /// Source hash.
+            pub source_hash: Option<String>,
+            /// Observation time.
+            pub observed_at: i64,
+            /// Confidence.
+            pub confidence: f64,
+        }
+
+        /// The assembled, trusted packet.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Snapshot {
+            /// `context-snapshot:<hash>`.
+            pub reference: String,
+            /// SHA-256 over tenant and content.
+            pub content_hash: String,
+            /// Size of the canonical text.
+            pub byte_length: usize,
+            /// Entities, ordered by (kind, id).
+            pub entities: Vec<SnapshotEntity>,
+            /// Relationships, ordered by id.
+            pub relationships: Vec<SnapshotRelationship>,
+            /// Validated evidence, ordered by id.
+            pub evidence: Vec<SnapshotEvidence>,
+        }
+
+        /// Versioned context for one tenant.
+        #[derive(Debug, Clone)]
+        pub struct ContextStore {
+            tenant: String,
+            entities: BTreeMap<String, Vec<Entity>>,
+            relationships: BTreeMap<String, Vec<Relationship>>,
+            evidence: BTreeMap<String, Evidence>,
+            events: Vec<Event>,
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        fn sha(text: &str) -> String {
+            hex(&Sha256::digest(text.as_bytes()))
+        }
+
+        /// Constant-time equality for equal-length strings (different lengths are unequal at once).
+        fn ct_eq(a: &str, b: &str) -> bool {
+            a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+        }
+
+        fn is_sha256_hex(s: &str) -> bool {
+            s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+
+        fn text(s: &str, max: usize) -> bool {
+            !s.trim().is_empty() && s.chars().count() <= max
+        }
+
+        fn valid_window(from: Option<i64>, to: Option<i64>) -> bool {
+            match (from, to) {
+                (Some(a), Some(b)) => a <= b,
+                _ => true,
+            }
+        }
+
+        fn currently_valid(from: Option<i64>, to: Option<i64>, now: i64) -> bool {
+            from.is_none_or(|f| f <= now) && to.is_none_or(|t| t >= now)
+        }
+
+        fn esc(s: &str) -> String {
+            format!("{s:?}")
+        }
+
+        fn opt<T: fmt::Display>(v: &Option<T>) -> String {
+            v.as_ref().map_or("-".to_string(), |x| x.to_string())
+        }
+
+        impl EntitySpec {
+            fn canonical(&self) -> String {
+                let attrs: Vec<String> = self
+                    .attributes
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", esc(k), esc(v)))
+                    .collect();
+                format!(
+                    "entity|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}",
+                    esc(&self.id),
+                    esc(&self.kind),
+                    esc(&self.name),
+                    esc(&self.description),
+                    attrs.join(","),
+                    self.assertion.as_str(),
+                    self.confidence,
+                    opt(&self.valid_from),
+                    opt(&self.valid_to),
+                    ""
+                )
+            }
+        }
+
+        impl RelationshipSpec {
+            fn canonical(&self) -> String {
+                format!(
+                    "relationship|{}|{}|{}@{}|{}@{}|{}|{:?}|{}|{}",
+                    esc(&self.id),
+                    esc(&self.kind),
+                    esc(&self.source.0),
+                    self.source.1,
+                    esc(&self.target.0),
+                    self.target.1,
+                    self.assertion.as_str(),
+                    self.confidence,
+                    opt(&self.valid_from),
+                    opt(&self.valid_to)
+                )
+            }
+        }
+
+        impl ContextStore {
+            /// An empty store for `tenant`.
+            pub fn new(tenant: &str) -> Result<Self, ContextError> {
+                if !text(tenant, 128) {
+                    return Err(ContextError::Invalid("tenant"));
+                }
+                Ok(ContextStore {
+                    tenant: tenant.to_string(),
+                    entities: BTreeMap::new(),
+                    relationships: BTreeMap::new(),
+                    evidence: BTreeMap::new(),
+                    events: Vec::new(),
+                })
+            }
+
+            fn log(&mut self, kind: &'static str, id: &str, version: Option<u32>, at: i64) {
+                let seq = self.events.len();
+                self.events.push(Event {
+                    seq,
+                    kind,
+                    object_id: id.to_string(),
+                    object_version: version,
+                    at,
+                });
+            }
+
+            fn check_entity(spec: &EntitySpec) -> Result<(), ContextError> {
+                if !text(&spec.id, 128) {
+                    return Err(ContextError::Invalid("entity id"));
+                }
+                if !text(&spec.kind, 128) || !text(&spec.name, 256) {
+                    return Err(ContextError::Invalid("entity kind or name"));
+                }
+                if spec.description.chars().count() > 4000 {
+                    return Err(ContextError::Invalid("entity description"));
+                }
+                if !(0.0..=1.0).contains(&spec.confidence) || spec.confidence.is_nan() {
+                    return Err(ContextError::Invalid("confidence"));
+                }
+                if !valid_window(spec.valid_from, spec.valid_to) {
+                    return Err(ContextError::Invalid("validity window"));
+                }
+                Ok(())
+            }
+
+            /// Record a new entity as version 1.
+            pub fn create_entity(
+                &mut self,
+                spec: EntitySpec,
+                at: i64,
+            ) -> Result<u32, ContextError> {
+                Self::check_entity(&spec)?;
+                if self.entities.contains_key(&spec.id) {
+                    return Err(ContextError::Exists(spec.id));
+                }
+                let id = spec.id.clone();
+                let hash = sha(&spec.canonical());
+                self.entities.insert(
+                    id.clone(),
+                    vec![Entity {
+                        spec,
+                        version: 1,
+                        content_hash: hash,
+                    }],
+                );
+                self.log("entity.created", &id, Some(1), at);
+                Ok(1)
+            }
+
+            /// Record a changed entity as the next version. Identical content creates nothing and
+            /// returns the current version, so retries are harmless.
+            pub fn version_entity(
+                &mut self,
+                spec: EntitySpec,
+                at: i64,
+            ) -> Result<u32, ContextError> {
+                Self::check_entity(&spec)?;
+                let versions = self
+                    .entities
+                    .get_mut(&spec.id)
+                    .ok_or_else(|| ContextError::NotFound(spec.id.clone()))?;
+                let hash = sha(&spec.canonical());
+                let last = versions.last().map_or(0, |v| v.version);
+                if versions.last().is_some_and(|v| v.content_hash == hash) {
+                    return Ok(last);
+                }
+                let version = last + 1;
+                let id = spec.id.clone();
+                versions.push(Entity {
+                    spec,
+                    version,
+                    content_hash: hash,
+                });
+                self.log("entity.versioned", &id, Some(version), at);
+                Ok(version)
+            }
+
+            /// A specific entity version.
+            pub fn entity(&self, id: &str, version: u32) -> Option<&Entity> {
+                self.entities.get(id)?.iter().find(|e| e.version == version)
+            }
+
+            /// The newest version of an entity.
+            pub fn latest_entity(&self, id: &str) -> Option<&Entity> {
+                self.entities.get(id)?.last()
+            }
+
+            /// Record a relationship. Both referenced entity versions must exist. An id that already
+            /// exists gets a new version (identical content creates nothing).
+            pub fn record_relationship(
+                &mut self,
+                spec: RelationshipSpec,
+                at: i64,
+            ) -> Result<u32, ContextError> {
+                if !text(&spec.id, 128) || !text(&spec.kind, 128) {
+                    return Err(ContextError::Invalid("relationship id or kind"));
+                }
+                if !(0.0..=1.0).contains(&spec.confidence) || spec.confidence.is_nan() {
+                    return Err(ContextError::Invalid("confidence"));
+                }
+                if !valid_window(spec.valid_from, spec.valid_to) {
+                    return Err(ContextError::Invalid("validity window"));
+                }
+                for (id, v) in [&spec.source, &spec.target] {
+                    if self.entity(id, *v).is_none() {
+                        return Err(ContextError::NotFound(format!("{id}@{v}")));
+                    }
+                }
+                let hash = sha(&spec.canonical());
+                let versions = self.relationships.entry(spec.id.clone()).or_default();
+                if versions.last().is_some_and(|v| v.content_hash == hash) {
+                    return Ok(versions.len() as u32);
+                }
+                let version = versions.len() as u32 + 1;
+                let id = spec.id.clone();
+                versions.push(Relationship {
+                    spec,
+                    version,
+                    content_hash: hash,
+                });
+                self.log("relationship.recorded", &id, Some(version), at);
+                Ok(version)
+            }
+
+            /// Record evidence (starts `Unverified`). The entity version, and the relationship if named,
+            /// must exist.
+            #[allow(clippy::too_many_arguments)]
+            pub fn add_evidence(
+                &mut self,
+                id: &str,
+                entity: &str,
+                entity_version: u32,
+                relationship: Option<&str>,
+                source_kind: SourceKind,
+                source_ref: &str,
+                source_hash: Option<&str>,
+                observed_at: i64,
+                confidence: f64,
+                recorded_by: &str,
+            ) -> Result<(), ContextError> {
+                if !text(id, 128) || !text(source_ref, 1024) || !text(recorded_by, 256) {
+                    return Err(ContextError::Invalid(
+                        "evidence id, source reference or submitter",
+                    ));
+                }
+                if !(0.0..=1.0).contains(&confidence) || confidence.is_nan() {
+                    return Err(ContextError::Invalid("confidence"));
+                }
+                if source_hash.is_some_and(|h| !is_sha256_hex(h)) {
+                    return Err(ContextError::Invalid("source hash"));
+                }
+                if self.evidence.contains_key(id) {
+                    return Err(ContextError::Exists(id.to_string()));
+                }
+                if self.entity(entity, entity_version).is_none() {
+                    return Err(ContextError::NotFound(format!("{entity}@{entity_version}")));
+                }
+                if let Some(r) = relationship {
+                    if !self.relationships.contains_key(r) {
+                        return Err(ContextError::NotFound(r.to_string()));
+                    }
+                }
+                self.evidence.insert(
+                    id.to_string(),
+                    Evidence {
+                        id: id.to_string(),
+                        entity: entity.to_string(),
+                        entity_version,
+                        relationship: relationship.map(str::to_string),
+                        source_kind,
+                        source_ref: source_ref.to_string(),
+                        source_hash: source_hash.map(str::to_string),
+                        observed_at,
+                        confidence,
+                        recorded_by: recorded_by.to_string(),
+                        status: Review::Unverified,
+                        reviewed_by: None,
+                    },
+                );
+                self.log("evidence.recorded", id, None, observed_at);
+                Ok(())
+            }
+
+            /// Review evidence. Rules: the reviewer must not be the submitter; the reason needs 10 to
+            /// 2000 characters; *validating* needs a recorded source hash and the reviewer's confirmed
+            /// hash must match it. Repeating an identical review is a no-op; a different decision after
+            /// a review is refused.
+            pub fn review_evidence(
+                &mut self,
+                id: &str,
+                reviewer: &str,
+                decision: Review,
+                reason: &str,
+                confirmed_hash: Option<&str>,
+                at: i64,
+            ) -> Result<(), ContextError> {
+                if decision == Review::Unverified {
+                    return Err(ContextError::Invalid("decision"));
+                }
+                if !text(reviewer, 256) {
+                    return Err(ContextError::Invalid("reviewer"));
+                }
+                let reason_len = reason.trim().chars().count();
+                if !(10..=2000).contains(&reason_len) {
+                    return Err(ContextError::Invalid("reason"));
+                }
+                if confirmed_hash.is_some_and(|h| !is_sha256_hex(h)) {
+                    return Err(ContextError::Invalid("confirmed hash"));
+                }
+                let ev = self
+                    .evidence
+                    .get_mut(id)
+                    .ok_or_else(|| ContextError::NotFound(id.to_string()))?;
+                if ev.recorded_by == reviewer {
+                    return Err(ContextError::SelfReview);
+                }
+                if decision == Review::Validated {
+                    match (&ev.source_hash, confirmed_hash) {
+                        (Some(recorded), Some(confirmed)) if ct_eq(recorded, confirmed) => {}
+                        _ => return Err(ContextError::HashMismatch),
+                    }
+                }
+                if ev.status != Review::Unverified {
+                    return if ev.status == decision && ev.reviewed_by.as_deref() == Some(reviewer) {
+                        Ok(())
+                    } else {
+                        Err(ContextError::AlreadyReviewed)
+                    };
+                }
+                ev.status = decision;
+                ev.reviewed_by = Some(reviewer.to_string());
+                self.log("evidence.reviewed", id, None, at);
+                Ok(())
+            }
+
+            /// One evidence record.
+            pub fn evidence(&self, id: &str) -> Option<&Evidence> {
+                self.evidence.get(id)
+            }
+
+            /// The append-only log, oldest first.
+            pub fn events(&self) -> &[Event] {
+                &self.events
+            }
+
+            /// Latest versions of entities, optionally filtered, ordered by (kind, name, id).
+            pub fn query_entities(
+                &self,
+                kind: Option<&str>,
+                assertion: Option<Assertion>,
+                search: Option<&str>,
+                limit: usize,
+                offset: usize,
+            ) -> Result<Vec<&Entity>, ContextError> {
+                if !(1..=100).contains(&limit) {
+                    return Err(ContextError::Invalid("limit"));
+                }
+                if search.is_some_and(|s| !text(s, 128)) {
+                    return Err(ContextError::Invalid("search"));
+                }
+                let needle = search.map(str::to_lowercase);
+                let mut out: Vec<&Entity> = self
+                    .entities
+                    .values()
+                    .filter_map(|v| v.last())
+                    .filter(|e| kind.is_none_or(|k| e.spec.kind == k))
+                    .filter(|e| assertion.is_none_or(|a| e.spec.assertion == a))
+                    .filter(|e| {
+                        needle
+                            .as_ref()
+                            .is_none_or(|n| e.spec.name.to_lowercase().contains(n.as_str()))
+                    })
+                    .collect();
+                out.sort_by(|a, b| {
+                    (&a.spec.kind, &a.spec.name, &a.spec.id).cmp(&(
+                        &b.spec.kind,
+                        &b.spec.name,
+                        &b.spec.id,
+                    ))
+                });
+                Ok(out.into_iter().skip(offset).take(limit).collect())
+            }
+
+            /// Assemble a trusted snapshot. See the module docs for what it may contain.
+            pub fn snapshot(
+                &self,
+                selector: &Selector,
+                policy: &Policy,
+            ) -> Result<Snapshot, ContextError> {
+                if !(1..=MAX_ENTITIES).contains(&policy.limit) {
+                    return Err(ContextError::Invalid("limit"));
+                }
+                let candidates: Vec<&Entity> = match selector {
+                    Selector::Ids(ids) => {
+                        if ids.is_empty() || ids.len() > policy.limit {
+                            return Err(ContextError::Invalid("entity ids"));
+                        }
+                        let mut seen = std::collections::BTreeSet::new();
+                        if ids
+                            .iter()
+                            .any(|i| !text(i, 128) || !seen.insert(i.as_str()))
+                        {
+                            return Err(ContextError::Invalid("entity ids"));
+                        }
+                        ids.iter()
+                            .map(|i| {
+                                self.latest_entity(i)
+                                    .ok_or_else(|| ContextError::NotFound(i.clone()))
+                            })
+                            .collect::<Result<_, _>>()?
+                    }
+                    Selector::Search(s) => {
+                        self.query_entities(None, None, Some(s), policy.limit, 0)?
+                    }
+                };
+                let allowed = |a: Assertion| match a {
+                    Assertion::ObservedFact | Assertion::HumanValidated => true,
+                    Assertion::Inferred => policy.include_inferences,
+                    Assertion::AiHypothesis => false,
+                };
+                let selected: Vec<&Entity> = candidates
+                    .into_iter()
+                    .filter(|e| {
+                        allowed(e.spec.assertion)
+                            && currently_valid(e.spec.valid_from, e.spec.valid_to, policy.now)
+                    })
+                    .take(policy.limit)
+                    .collect();
+                if selected.is_empty() {
+                    return Err(ContextError::NothingTrusted);
+                }
+                let versions: BTreeMap<&str, u32> = selected
+                    .iter()
+                    .map(|e| (e.spec.id.as_str(), e.version))
+                    .collect();
+
+                let mut entities: Vec<SnapshotEntity> = selected
+                    .iter()
+                    .map(|e| SnapshotEntity {
+                        id: e.spec.id.clone(),
+                        version: e.version,
+                        kind: e.spec.kind.clone(),
+                        name: e.spec.name.clone(),
+                        description: e.spec.description.chars().take(1000).collect(),
+                        assertion: e.spec.assertion,
+                        confidence: e.spec.confidence,
+                        content_hash: e.content_hash.clone(),
+                    })
+                    .collect();
+                entities.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+
+                let mut relationships: Vec<SnapshotRelationship> = Vec::new();
+                for versions_of in self.relationships.values() {
+                    // Highest version of each relationship that passes every rule.
+                    let best = versions_of.iter().rev().find(|r| {
+                        let s = &r.spec;
+                        versions.get(s.source.0.as_str()) == Some(&s.source.1)
+                            && versions.get(s.target.0.as_str()) == Some(&s.target.1)
+                            && allowed(s.assertion)
+                            && currently_valid(s.valid_from, s.valid_to, policy.now)
+                    });
+                    if let Some(r) = best {
+                        relationships.push(SnapshotRelationship {
+                            id: r.spec.id.clone(),
+                            version: r.version,
+                            kind: r.spec.kind.clone(),
+                            source: r.spec.source.clone(),
+                            target: r.spec.target.clone(),
+                            assertion: r.spec.assertion,
+                            confidence: r.spec.confidence,
+                        });
+                    }
+                }
+                relationships.sort_by(|a, b| a.id.cmp(&b.id));
+                relationships.truncate(MAX_RELATIONSHIPS);
+
+                let mut evidence: Vec<SnapshotEvidence> = self
+                    .evidence
+                    .values()
+                    .filter(|e| {
+                        e.status == Review::Validated
+                            && versions.get(e.entity.as_str()) == Some(&e.entity_version)
+                    })
+                    .map(|e| SnapshotEvidence {
+                        id: e.id.clone(),
+                        entity: e.entity.clone(),
+                        entity_version: e.entity_version,
+                        source_ref: e.source_ref.clone(),
+                        source_hash: e.source_hash.clone(),
+                        observed_at: e.observed_at,
+                        confidence: e.confidence,
+                    })
+                    .collect();
+                evidence.sort_by(|a, b| a.id.cmp(&b.id));
+                evidence.truncate(MAX_EVIDENCE);
+
+                let mut snap = Snapshot {
+                    reference: String::new(),
+                    content_hash: String::new(),
+                    byte_length: 0,
+                    entities,
+                    relationships,
+                    evidence,
+                };
+                let canonical = snap.canonical();
+                if canonical.len() > MAX_SNAPSHOT_BYTES {
+                    return Err(ContextError::TooLarge);
+                }
+                let digest = sha(&format!("{}\n{canonical}", esc(&self.tenant)));
+                snap.byte_length = canonical.len();
+                snap.reference = format!("context-snapshot:{digest}");
+                snap.content_hash = digest;
+                Ok(snap)
+            }
+        }
+
+        impl Snapshot {
+            /// Deterministic text form (fixed field order, sorted lists), used for size and hashing.
+            pub fn canonical(&self) -> String {
+                let mut out = String::new();
+                for e in &self.entities {
+                    out.push_str(&format!(
+                        "E|{}|{}|{}|{}|{}|{}|{:?}|{}\n",
+                        esc(&e.id),
+                        e.version,
+                        esc(&e.kind),
+                        esc(&e.name),
+                        esc(&e.description),
+                        e.assertion.as_str(),
+                        e.confidence,
+                        e.content_hash
+                    ));
+                }
+                for r in &self.relationships {
+                    out.push_str(&format!(
+                        "R|{}|{}|{}|{}@{}|{}@{}|{}|{:?}\n",
+                        esc(&r.id),
+                        r.version,
+                        esc(&r.kind),
+                        esc(&r.source.0),
+                        r.source.1,
+                        esc(&r.target.0),
+                        r.target.1,
+                        r.assertion.as_str(),
+                        r.confidence
+                    ));
+                }
+                for v in &self.evidence {
+                    out.push_str(&format!(
+                        "V|{}|{}@{}|{}|{}|{}|{:?}\n",
+                        esc(&v.id),
+                        esc(&v.entity),
+                        v.entity_version,
+                        esc(&v.source_ref),
+                        opt(&v.source_hash),
+                        v.observed_at,
+                        v.confidence
+                    ));
+                }
+                out
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+            const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+            fn spec(id: &str, name: &str, assertion: Assertion) -> EntitySpec {
+                EntitySpec {
+                    id: id.into(),
+                    kind: "service".into(),
+                    name: name.into(),
+                    description: format!("{name} description"),
+                    attributes: BTreeMap::from([("secret".to_string(), "raw-value".to_string())]),
+                    assertion,
+                    confidence: 0.9,
+                    valid_from: None,
+                    valid_to: None,
+                }
+            }
+
+            fn policy(include_inferences: bool, now: i64) -> Policy {
+                Policy {
+                    include_inferences,
+                    now,
+                    limit: 12,
+                }
+            }
+
+            fn store() -> ContextStore {
+                ContextStore::new("tenant-1").unwrap()
+            }
+
+            #[test]
+            fn entities_version_immutably_and_retries_are_harmless() {
+                let mut s = store();
+                assert_eq!(
+                    s.create_entity(spec("a", "Billing", Assertion::ObservedFact), 1),
+                    Ok(1)
+                );
+                assert_eq!(
+                    s.create_entity(spec("a", "Billing", Assertion::ObservedFact), 2),
+                    Err(ContextError::Exists("a".into()))
+                );
+                assert_eq!(
+                    s.version_entity(spec("a", "Billing", Assertion::ObservedFact), 3),
+                    Ok(1),
+                    "identical content: no new version"
+                );
+                assert_eq!(
+                    s.version_entity(spec("a", "Billing v2", Assertion::ObservedFact), 4),
+                    Ok(2)
+                );
+                assert_eq!(s.entity("a", 1).unwrap().spec.name, "Billing");
+                assert_eq!(s.latest_entity("a").unwrap().spec.name, "Billing v2");
+                assert_ne!(
+                    s.entity("a", 1).unwrap().content_hash,
+                    s.entity("a", 2).unwrap().content_hash
+                );
+                assert_eq!(
+                    s.version_entity(spec("zz", "x", Assertion::ObservedFact), 5),
+                    Err(ContextError::NotFound("zz".into()))
+                );
+                assert_eq!(
+                    s.events().iter().map(|e| e.kind).collect::<Vec<_>>(),
+                    ["entity.created", "entity.versioned"]
+                );
+                assert_eq!(s.events()[1].object_version, Some(2));
+            }
+
+            #[test]
+            fn validation_of_inputs() {
+                assert!(ContextStore::new("  ").is_err());
+                let mut s = store();
+                let mut bad = spec("a", "x", Assertion::ObservedFact);
+                bad.confidence = 1.5;
+                assert_eq!(
+                    s.create_entity(bad.clone(), 0),
+                    Err(ContextError::Invalid("confidence"))
+                );
+                bad.confidence = f64::NAN;
+                assert!(s.create_entity(bad, 0).is_err());
+                let mut w = spec("a", "x", Assertion::ObservedFact);
+                w.valid_from = Some(10);
+                w.valid_to = Some(5);
+                assert_eq!(
+                    s.create_entity(w, 0),
+                    Err(ContextError::Invalid("validity window"))
+                );
+                assert!(s
+                    .create_entity(spec("", "x", Assertion::ObservedFact), 0)
+                    .is_err());
+                assert!(s
+                    .create_entity(spec("a", " ", Assertion::ObservedFact), 0)
+                    .is_err());
+                assert!(s.events().is_empty(), "failed operations log nothing");
+            }
+
+            #[test]
+            fn relationships_pin_entity_versions_and_version_themselves() {
+                let mut s = store();
+                s.create_entity(spec("a", "A", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.create_entity(spec("b", "B", Assertion::ObservedFact), 0)
+                    .unwrap();
+                let rel = |v: u32, conf: f64| RelationshipSpec {
+                    id: "r1".into(),
+                    kind: "depends-on".into(),
+                    source: ("a".into(), 1),
+                    target: ("b".into(), v),
+                    assertion: Assertion::ObservedFact,
+                    confidence: conf,
+                    valid_from: None,
+                    valid_to: None,
+                };
+                assert_eq!(s.record_relationship(rel(1, 0.8), 1), Ok(1));
+                assert_eq!(
+                    s.record_relationship(rel(1, 0.8), 2),
+                    Ok(1),
+                    "identical: no new version"
+                );
+                assert_eq!(s.record_relationship(rel(1, 0.6), 3), Ok(2));
+                assert_eq!(
+                    s.record_relationship(rel(7, 0.8), 4),
+                    Err(ContextError::NotFound("b@7".into()))
+                );
+                let mut ghost = rel(1, 0.8);
+                ghost.source = ("nope".into(), 1);
+                assert!(matches!(
+                    s.record_relationship(ghost, 5),
+                    Err(ContextError::NotFound(_))
+                ));
+            }
+
+            fn with_evidence() -> ContextStore {
+                let mut s = store();
+                s.create_entity(spec("a", "A", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.add_evidence(
+                    "ev1",
+                    "a",
+                    1,
+                    None,
+                    SourceKind::ConfigurationMetadata,
+                    "repo://cfg.yaml",
+                    Some(H1),
+                    10,
+                    0.9,
+                    "alice",
+                )
+                .unwrap();
+                s
+            }
+
+            #[test]
+            fn evidence_rules() {
+                let mut s = with_evidence();
+                assert_eq!(
+                    s.add_evidence(
+                        "ev1",
+                        "a",
+                        1,
+                        None,
+                        SourceKind::Other,
+                        "x",
+                        None,
+                        0,
+                        0.5,
+                        "bob"
+                    ),
+                    Err(ContextError::Exists("ev1".into()))
+                );
+                assert!(matches!(
+                    s.add_evidence(
+                        "ev2",
+                        "a",
+                        9,
+                        None,
+                        SourceKind::Other,
+                        "x",
+                        None,
+                        0,
+                        0.5,
+                        "bob"
+                    ),
+                    Err(ContextError::NotFound(_))
+                ));
+                assert!(matches!(
+                    s.add_evidence(
+                        "ev2",
+                        "a",
+                        1,
+                        Some("rX"),
+                        SourceKind::Other,
+                        "x",
+                        None,
+                        0,
+                        0.5,
+                        "bob"
+                    ),
+                    Err(ContextError::NotFound(_))
+                ));
+                assert!(s
+                    .add_evidence(
+                        "ev2",
+                        "a",
+                        1,
+                        None,
+                        SourceKind::Other,
+                        "x",
+                        Some("NOTHEX"),
+                        0,
+                        0.5,
+                        "bob"
+                    )
+                    .is_err());
+                assert!(s
+                    .add_evidence(
+                        "ev2",
+                        "a",
+                        1,
+                        None,
+                        SourceKind::Other,
+                        "x",
+                        None,
+                        0,
+                        2.0,
+                        "bob"
+                    )
+                    .is_err());
+                assert_eq!(s.evidence("ev1").unwrap().status, Review::Unverified);
+            }
+
+            #[test]
+            fn review_requires_a_second_person_and_a_matching_hash() {
+                let mut s = with_evidence();
+                let reason = "checked against the repository at the recorded commit";
+                assert_eq!(
+                    s.review_evidence("ev1", "alice", Review::Validated, reason, Some(H1), 20),
+                    Err(ContextError::SelfReview)
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Validated, "short", Some(H1), 20),
+                    Err(ContextError::Invalid("reason"))
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Validated, reason, None, 20),
+                    Err(ContextError::HashMismatch)
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Validated, reason, Some(H2), 20),
+                    Err(ContextError::HashMismatch)
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Unverified, reason, Some(H1), 20),
+                    Err(ContextError::Invalid("decision"))
+                );
+                assert_eq!(
+                    s.review_evidence("nope", "bob", Review::Validated, reason, Some(H1), 20),
+                    Err(ContextError::NotFound("nope".into()))
+                );
+                assert_eq!(
+                    s.evidence("ev1").unwrap().status,
+                    Review::Unverified,
+                    "failed reviews change nothing"
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Validated, reason, Some(H1), 20),
+                    Ok(())
+                );
+                let ev = s.evidence("ev1").unwrap();
+                assert_eq!(
+                    (ev.status, ev.reviewed_by.as_deref()),
+                    (Review::Validated, Some("bob"))
+                );
+                // repeating the same review is a no-op; a different decision or reviewer is refused
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Validated, reason, Some(H1), 21),
+                    Ok(())
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "bob", Review::Rejected, reason, None, 22),
+                    Err(ContextError::AlreadyReviewed)
+                );
+                assert_eq!(
+                    s.review_evidence("ev1", "carol", Review::Validated, reason, Some(H1), 22),
+                    Err(ContextError::AlreadyReviewed)
+                );
+                assert_eq!(
+                    s.events()
+                        .iter()
+                        .filter(|e| e.kind == "evidence.reviewed")
+                        .count(),
+                    1
+                );
+            }
+
+            #[test]
+            fn rejection_needs_no_hash_and_evidence_without_a_hash_cannot_validate() {
+                let mut s = store();
+                s.create_entity(spec("a", "A", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.add_evidence(
+                    "nohash",
+                    "a",
+                    1,
+                    None,
+                    SourceKind::AgentAnalysis,
+                    "log://x",
+                    None,
+                    1,
+                    0.4,
+                    "agent-1",
+                )
+                .unwrap();
+                let reason = "cannot confirm where this came from";
+                assert_eq!(
+                    s.review_evidence("nohash", "bob", Review::Validated, reason, Some(H1), 2),
+                    Err(ContextError::HashMismatch)
+                );
+                assert_eq!(
+                    s.review_evidence("nohash", "bob", Review::Rejected, reason, None, 2),
+                    Ok(())
+                );
+                assert_eq!(s.evidence("nohash").unwrap().status, Review::Rejected);
+            }
+
+            fn graph() -> ContextStore {
+                let mut s = store();
+                s.create_entity(spec("api", "Payments API", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.create_entity(spec("db", "Payments DB", Assertion::HumanValidated), 0)
+                    .unwrap();
+                s.create_entity(spec("guess", "Payments cache", Assertion::AiHypothesis), 0)
+                    .unwrap();
+                s.create_entity(spec("infer", "Payments queue", Assertion::Inferred), 0)
+                    .unwrap();
+                s.create_entity(spec("other", "Search", Assertion::ObservedFact), 0)
+                    .unwrap();
+                let rel = |id: &str, a: &str, b: &str, assertion| RelationshipSpec {
+                    id: id.into(),
+                    kind: "depends-on".into(),
+                    source: (a.into(), 1),
+                    target: (b.into(), 1),
+                    assertion,
+                    confidence: 0.8,
+                    valid_from: None,
+                    valid_to: None,
+                };
+                s.record_relationship(rel("api-db", "api", "db", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.record_relationship(rel("api-guess", "api", "guess", Assertion::ObservedFact), 0)
+                    .unwrap();
+                s.record_relationship(rel("api-infer", "api", "infer", Assertion::Inferred), 0)
+                    .unwrap();
+                s.record_relationship(rel("api-other", "api", "other", Assertion::AiHypothesis), 0)
+                    .unwrap();
+                s
+            }
+
+            #[test]
+            fn snapshot_policy_filters_by_assertion_class() {
+                let s = graph();
+                let sel = Selector::Search("payments".into());
+                let strict = s.snapshot(&sel, &policy(false, 100)).unwrap();
+                let ids: Vec<&str> = strict.entities.iter().map(|e| e.id.as_str()).collect();
+                assert_eq!(ids, ["api", "db"], "no inference, no hypothesis");
+                assert_eq!(
+                    strict
+                        .relationships
+                        .iter()
+                        .map(|r| r.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["api-db"]
+                );
+                let loose = s.snapshot(&sel, &policy(true, 100)).unwrap();
+                let ids: Vec<&str> = loose.entities.iter().map(|e| e.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    ["api", "db", "infer"],
+                    "inference only on request, hypothesis never"
+                );
+                assert_eq!(
+                    loose
+                        .relationships
+                        .iter()
+                        .map(|r| r.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["api-db", "api-infer"]
+                );
+            }
+
+            #[test]
+            fn snapshot_excludes_raw_attributes_and_cuts_descriptions() {
+                let mut s = store();
+                let mut e = spec("a", "A", Assertion::ObservedFact);
+                e.description = "x".repeat(3000);
+                s.create_entity(e, 0).unwrap();
+                let snap = s
+                    .snapshot(&Selector::Ids(vec!["a".into()]), &policy(false, 0))
+                    .unwrap();
+                assert_eq!(snap.entities[0].description.chars().count(), 1000);
+                assert!(!snap.canonical().contains("raw-value"));
+                assert!(!snap.canonical().contains("secret"));
+            }
+
+            #[test]
+            fn validity_windows_are_respected() {
+                let mut s = store();
+                let mut now_only = spec("a", "A", Assertion::ObservedFact);
+                now_only.valid_from = Some(100);
+                now_only.valid_to = Some(200);
+                s.create_entity(now_only, 0).unwrap();
+                let sel = Selector::Ids(vec!["a".into()]);
+                assert_eq!(
+                    s.snapshot(&sel, &policy(false, 99)),
+                    Err(ContextError::NothingTrusted)
+                );
+                assert!(s.snapshot(&sel, &policy(false, 100)).is_ok());
+                assert!(s.snapshot(&sel, &policy(false, 200)).is_ok());
+                assert_eq!(
+                    s.snapshot(&sel, &policy(false, 201)),
+                    Err(ContextError::NothingTrusted)
+                );
+            }
+
+            #[test]
+            fn only_validated_evidence_for_the_selected_version_is_included() {
+                let mut s = with_evidence();
+                let reason = "verified against the stored configuration file";
+                s.add_evidence(
+                    "ev-rejected",
+                    "a",
+                    1,
+                    None,
+                    SourceKind::EventLog,
+                    "log://r",
+                    Some(H2),
+                    11,
+                    0.5,
+                    "alice",
+                )
+                .unwrap();
+                s.add_evidence(
+                    "ev-pending",
+                    "a",
+                    1,
+                    None,
+                    SourceKind::EventLog,
+                    "log://p",
+                    Some(H2),
+                    12,
+                    0.5,
+                    "alice",
+                )
+                .unwrap();
+                s.review_evidence("ev1", "bob", Review::Validated, reason, Some(H1), 20)
+                    .unwrap();
+                s.review_evidence("ev-rejected", "bob", Review::Rejected, reason, None, 21)
+                    .unwrap();
+                let sel = Selector::Ids(vec!["a".into()]);
+                let snap = s.snapshot(&sel, &policy(false, 50)).unwrap();
+                assert_eq!(
+                    snap.evidence
+                        .iter()
+                        .map(|e| e.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["ev1"]
+                );
+                // a new entity version no longer carries the old version's evidence
+                s.version_entity(spec("a", "A renamed", Assertion::ObservedFact), 60)
+                    .unwrap();
+                assert!(s
+                    .snapshot(&sel, &policy(false, 61))
+                    .unwrap()
+                    .evidence
+                    .is_empty());
+            }
+
+            #[test]
+            fn relationships_must_match_the_selected_entity_versions() {
+                let mut s = graph();
+                s.version_entity(spec("db", "Payments DB (v2)", Assertion::HumanValidated), 5)
+                    .unwrap();
+                let snap = s
+                    .snapshot(&Selector::Search("payments".into()), &policy(false, 100))
+                    .unwrap();
+                assert!(snap.entities.iter().any(|e| e.id == "db" && e.version == 2));
+                assert!(
+                    snap.relationships.is_empty(),
+                    "api-db points at db@1, but the snapshot shows db@2"
+                );
+                // re-assert the relationship against the new version
+                s.record_relationship(
+                    RelationshipSpec {
+                        id: "api-db".into(),
+                        kind: "depends-on".into(),
+                        source: ("api".into(), 1),
+                        target: ("db".into(), 2),
+                        assertion: Assertion::ObservedFact,
+                        confidence: 0.9,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    6,
+                )
+                .unwrap();
+                let snap = s
+                    .snapshot(&Selector::Search("payments".into()), &policy(false, 100))
+                    .unwrap();
+                assert_eq!(
+                    (snap.relationships.len(), snap.relationships[0].version),
+                    (1, 2)
+                );
+            }
+
+            #[test]
+            fn selector_validation_and_limits() {
+                let s = graph();
+                let p = |limit| Policy {
+                    include_inferences: false,
+                    now: 0,
+                    limit,
+                };
+                assert!(s.snapshot(&Selector::Ids(vec![]), &p(5)).is_err());
+                assert!(s
+                    .snapshot(&Selector::Ids(vec!["api".into(), "api".into()]), &p(5))
+                    .is_err());
+                assert!(s
+                    .snapshot(&Selector::Ids(vec!["api".into(), "db".into()]), &p(1))
+                    .is_err());
+                assert!(matches!(
+                    s.snapshot(&Selector::Ids(vec!["ghost".into()]), &p(5)),
+                    Err(ContextError::NotFound(_))
+                ));
+                assert!(s.snapshot(&Selector::Search("  ".into()), &p(5)).is_err());
+                assert!(s.snapshot(&Selector::Search("zzz".into()), &p(5)).is_err());
+                assert!(s
+                    .snapshot(&Selector::Ids(vec!["api".into()]), &p(0))
+                    .is_err());
+                assert!(s
+                    .snapshot(&Selector::Ids(vec!["api".into()]), &p(MAX_ENTITIES + 1))
+                    .is_err());
+                // limit applies to the entity count
+                let two = s
+                    .snapshot(&Selector::Search("payments".into()), &p(1))
+                    .unwrap();
+                assert_eq!(two.entities.len(), 1);
+            }
+
+            #[test]
+            fn snapshots_are_deterministic_and_bound_to_the_tenant() {
+                let s = graph();
+                let sel = Selector::Search("payments".into());
+                let a = s.snapshot(&sel, &policy(false, 100)).unwrap();
+                let b = s.snapshot(&sel, &policy(false, 100)).unwrap();
+                assert_eq!(a, b);
+                assert!(a.reference.starts_with("context-snapshot:") && a.content_hash.len() == 64);
+                assert_eq!(a.byte_length, a.canonical().len());
+                // the same content under another tenant hashes differently
+                let mut other = ContextStore::new("tenant-2").unwrap();
+                for e in ["api", "db"] {
+                    other
+                        .create_entity(s.latest_entity(e).unwrap().spec.clone(), 0)
+                        .unwrap();
+                }
+                other
+                    .record_relationship(s.relationships.get("api-db").unwrap()[0].spec.clone(), 0)
+                    .unwrap();
+                let c = other.snapshot(&sel, &policy(false, 100)).unwrap();
+                assert_eq!(a.canonical(), c.canonical());
+                assert_ne!(a.content_hash, c.content_hash);
+            }
+
+            #[test]
+            fn oversized_snapshots_are_refused() {
+                let mut s = store();
+                for i in 0..12 {
+                    let mut e = spec(
+                        &format!("e{i}"),
+                        &format!("Entity {i}"),
+                        Assertion::ObservedFact,
+                    );
+                    e.description = "d".repeat(1000);
+                    s.create_entity(e, 0).unwrap();
+                }
+                let sel = Selector::Search("entity".into());
+                let reason = "verified against the stored configuration";
+                // a few small pieces of evidence still fit
+                for n in 0..3 {
+                    let id = format!("ok{n}");
+                    s.add_evidence(
+                        &id,
+                        "e0",
+                        1,
+                        None,
+                        SourceKind::Other,
+                        "short",
+                        Some(H1),
+                        1,
+                        0.5,
+                        "alice",
+                    )
+                    .unwrap();
+                    s.review_evidence(&id, "bob", Review::Validated, reason, Some(H1), 2)
+                        .unwrap();
+                }
+                assert!(
+                    s.snapshot(&sel, &policy(false, 0)).unwrap().byte_length <= MAX_SNAPSHOT_BYTES
+                );
+                // 36 validated items with long source references push the packet past the cap
+                for n in 0..MAX_EVIDENCE {
+                    let id = format!("big{n:02}");
+                    s.add_evidence(
+                        &id,
+                        "e1",
+                        1,
+                        None,
+                        SourceKind::Other,
+                        &"r".repeat(1024),
+                        Some(H1),
+                        1,
+                        0.5,
+                        "alice",
+                    )
+                    .unwrap();
+                    s.review_evidence(&id, "bob", Review::Validated, reason, Some(H1), 2)
+                        .unwrap();
+                }
+                assert_eq!(
+                    s.snapshot(&sel, &policy(false, 0)),
+                    Err(ContextError::TooLarge)
+                );
+                // a narrower selection that leaves the heavy evidence out still works
+                assert!(s
+                    .snapshot(&Selector::Ids(vec!["e0".into()]), &policy(false, 0))
+                    .is_ok());
+            }
+
+            #[test]
+            fn query_filters_orders_and_pages() {
+                let s = graph();
+                let all = s.query_entities(None, None, None, 100, 0).unwrap();
+                assert_eq!(all.len(), 5);
+                let names: Vec<&str> = all.iter().map(|e| e.spec.name.as_str()).collect();
+                let mut sorted = names.clone();
+                sorted.sort();
+                assert_eq!(names, sorted);
+                assert_eq!(
+                    s.query_entities(None, Some(Assertion::Inferred), None, 10, 0)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    s.query_entities(Some("service"), None, Some("PAYMENTS"), 10, 0)
+                        .unwrap()
+                        .len(),
+                    4
+                );
+                assert_eq!(
+                    s.query_entities(Some("table"), None, None, 10, 0)
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                assert_eq!(s.query_entities(None, None, None, 2, 4).unwrap().len(), 1);
+                assert!(s.query_entities(None, None, None, 0, 0).is_err());
+                assert!(s.query_entities(None, None, None, 101, 0).is_err());
+                assert!(s.query_entities(None, None, Some(" "), 10, 0).is_err());
+            }
+
+            #[test]
+            fn constant_time_compare_and_hash_helpers() {
+                assert!(ct_eq("abc", "abc"));
+                assert!(!ct_eq("abc", "abd"));
+                assert!(!ct_eq("abc", "abcd"));
+                assert!(is_sha256_hex(H1));
+                assert!(is_sha256_hex(&"a".repeat(64)));
+                assert!(
+                    !is_sha256_hex(&"A".repeat(64)),
+                    "only lowercase digests are accepted"
+                );
+                assert!(!is_sha256_hex("abc"));
+                assert_eq!(
+                    sha("abc"),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+            }
+        }
+    }
+    pub mod fusion {
+        //! Reciprocal-rank fusion: combine ranked lists without comparing their
+        //! raw scores. A document's fused score is `sum 1 / (k + rank)`.
+
+        use std::collections::HashMap;
+        use std::hash::Hash;
+
+        /// Fuse `lists` (each best first) with constant `k` (60 is the usual choice).
+        #[must_use]
+        pub fn rrf<T: Copy + Eq + Hash + Ord>(
+            lists: &[Vec<T>],
+            k: f32,
+            top: usize,
+        ) -> Vec<(T, f32)> {
+            let mut score: HashMap<T, f32> = HashMap::new();
+            for list in lists {
+                for (rank, &id) in list.iter().enumerate() {
+                    *score.entry(id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
+                }
+            }
+            let mut v: Vec<(T, f32)> = score.into_iter().collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            v.truncate(top);
+            v
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn agreement_wins() {
+                let lexical = vec![1u64, 2, 3];
+                let vector = vec![2u64, 4, 1];
+                let fused = rrf(&[lexical, vector], 60.0, 3);
+                assert_eq!(fused[0].0, 2);
+                assert_eq!(fused[1].0, 1);
+                assert_eq!(fused.len(), 3);
+                assert!(rrf::<u64>(&[], 60.0, 3).is_empty());
+            }
+        }
+    }
+    pub mod graph {
+        //! Knowledge graph with spreading activation.
+        //!
+        //! Seeds (concepts named in a query) receive activation; each step every
+        //! node passes `tanh(activation) * weight` along its outgoing edges and all
+        //! activations decay. After a few steps the most active nodes are the
+        //! concepts most strongly connected to the seeds.
+
+        use std::collections::{BTreeMap, HashMap};
+
+        /// Node id.
+        pub type NodeId = usize;
+
+        /// A weighted, labelled edge.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Edge {
+            /// Source.
+            pub from: NodeId,
+            /// Target.
+            pub to: NodeId,
+            /// Relation label ("causes", "part-of", ...).
+            pub relation: String,
+            /// Strength (0..=1 recommended).
+            pub weight: f32,
+        }
+
+        /// The graph and its activation state.
+        #[derive(Debug, Clone, Default)]
+        pub struct KnowledgeGraph {
+            labels: Vec<String>,
+            by_label: HashMap<String, NodeId>,
+            edges: Vec<Edge>,
+            activation: Vec<f32>,
+            /// Retention per step (0..=1).
+            pub decay: f32,
+        }
+
+        impl KnowledgeGraph {
+            /// Empty graph with decay 0.9.
+            #[must_use]
+            pub fn new() -> Self {
+                Self {
+                    decay: 0.9,
+                    ..Self::default()
+                }
+            }
+
+            /// Node for `label`, creating it if needed.
+            pub fn node(&mut self, label: &str) -> NodeId {
+                let key = label.trim().to_lowercase();
+                if let Some(&id) = self.by_label.get(&key) {
+                    return id;
+                }
+                let id = self.labels.len();
+                self.labels.push(label.trim().to_owned());
+                self.by_label.insert(key, id);
+                self.activation.push(0.0);
+                id
+            }
+
+            /// Look up a node by label (case-insensitive).
+            #[must_use]
+            pub fn find(&self, label: &str) -> Option<NodeId> {
+                self.by_label.get(&label.trim().to_lowercase()).copied()
+            }
+
+            /// Label of a node.
+            #[must_use]
+            pub fn label(&self, id: NodeId) -> Option<&str> {
+                self.labels.get(id).map(String::as_str)
+            }
+
+            /// Add `from -[relation]-> to` with `weight`; with `both`, also the reverse.
+            pub fn relate(
+                &mut self,
+                from: &str,
+                relation: &str,
+                to: &str,
+                weight: f32,
+                both: bool,
+            ) {
+                let (a, b) = (self.node(from), self.node(to));
+                let w = if weight.is_finite() { weight } else { 0.0 };
+                self.edges.push(Edge {
+                    from: a,
+                    to: b,
+                    relation: relation.to_owned(),
+                    weight: w,
+                });
+                if both {
+                    self.edges.push(Edge {
+                        from: b,
+                        to: a,
+                        relation: relation.to_owned(),
+                        weight: w,
+                    });
+                }
+            }
+
+            /// Clear all activation.
+            pub fn reset(&mut self) {
+                self.activation.iter_mut().for_each(|a| *a = 0.0);
+            }
+
+            /// Add activation to a node.
+            pub fn stimulate(&mut self, id: NodeId, amount: f32) {
+                if let Some(a) = self.activation.get_mut(id) {
+                    if amount.is_finite() {
+                        *a += amount;
+                    }
+                }
+            }
+
+            /// One spreading step.
+            pub fn step(&mut self) {
+                let mut inflow = vec![0.0f32; self.activation.len()];
+                for e in &self.edges {
+                    inflow[e.to] += self.activation[e.from].tanh() * e.weight;
+                }
+                for (a, i) in self.activation.iter_mut().zip(inflow) {
+                    *a = (*a + i) * self.decay;
+                }
+            }
+
+            /// Seed with `seeds`, spread `steps` times, return the top `k`
+            /// non-seed nodes as `(id, activation)`.
+            pub fn associate(
+                &mut self,
+                seeds: &[NodeId],
+                steps: usize,
+                k: usize,
+            ) -> Vec<(NodeId, f32)> {
+                self.reset();
+                for &s in seeds {
+                    self.stimulate(s, 1.0);
+                }
+                for _ in 0..steps {
+                    self.step();
+                }
+                let mut v: Vec<(NodeId, f32)> = self
+                    .activation
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, a)| *a > 1e-6 && !seeds.contains(i))
+                    .collect();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                v.truncate(k);
+                v
+            }
+
+            /// Outgoing relations of a node, grouped by relation label.
+            #[must_use]
+            pub fn neighbours(&self, id: NodeId) -> BTreeMap<&str, Vec<NodeId>> {
+                let mut m: BTreeMap<&str, Vec<NodeId>> = BTreeMap::new();
+                for e in self.edges.iter().filter(|e| e.from == id) {
+                    m.entry(e.relation.as_str()).or_default().push(e.to);
+                }
+                m
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn activation_prefers_close_strong_links() {
+                let mut g = KnowledgeGraph::new();
+                g.relate("Sun", "pulls", "Earth", 0.9, true);
+                g.relate("Earth", "has", "Moon", 0.8, true);
+                g.relate("Sun", "is-a", "Star", 0.3, true);
+                g.relate("Pasta", "is-a", "Food", 1.0, true);
+                let sun = g.find("sun").unwrap();
+                let top = g.associate(&[sun], 3, 10);
+                let labels: Vec<&str> = top.iter().map(|(i, _)| g.label(*i).unwrap()).collect();
+                assert_eq!(labels[0], "Earth");
+                assert!(labels.contains(&"Moon"));
+                assert!(!labels.contains(&"Pasta"));
+                assert_eq!(g.neighbours(sun)["pulls"], vec![g.find("Earth").unwrap()]);
+                assert_eq!(g.node("EARTH"), g.find("earth").unwrap());
+            }
+        }
+    }
+    pub mod lexical {
+        //! BM25 keyword index.
+
+        use crate::memory::DocId;
+        use std::collections::{BTreeMap, HashMap};
+
+        /// Lowercase alphanumeric tokens.
+        #[must_use]
+        pub fn tokenize(text: &str) -> Vec<String> {
+            text.split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_lowercase)
+                .collect()
+        }
+
+        /// Inverted index with BM25 scoring.
+        #[derive(Debug, Clone)]
+        pub struct Bm25 {
+            postings: HashMap<String, BTreeMap<DocId, u32>>,
+            lengths: BTreeMap<DocId, u32>,
+            total_len: u64,
+            /// Term-frequency saturation.
+            pub k1: f32,
+            /// Length normalisation.
+            pub b: f32,
+        }
+
+        impl Default for Bm25 {
+            fn default() -> Self {
+                Self {
+                    postings: HashMap::new(),
+                    lengths: BTreeMap::new(),
+                    total_len: 0,
+                    k1: 1.2,
+                    b: 0.75,
+                }
+            }
+        }
+
+        impl Bm25 {
+            /// Empty index.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Index (or re-index) a document.
+            pub fn add(&mut self, id: DocId, text: &str) {
+                self.remove(id);
+                let toks = tokenize(text);
+                let len = u32::try_from(toks.len()).unwrap_or(u32::MAX);
+                for t in toks {
+                    *self.postings.entry(t).or_default().entry(id).or_insert(0) += 1;
+                }
+                self.lengths.insert(id, len);
+                self.total_len += u64::from(len);
+            }
+
+            /// Remove a document. Returns whether it was indexed.
+            pub fn remove(&mut self, id: DocId) -> bool {
+                let Some(len) = self.lengths.remove(&id) else {
+                    return false;
+                };
+                self.total_len -= u64::from(len);
+                self.postings.retain(|_, p| {
+                    p.remove(&id);
+                    !p.is_empty()
+                });
+                true
+            }
+
+            /// Number of documents.
+            #[must_use]
+            pub fn len(&self) -> usize {
+                self.lengths.len()
+            }
+
+            /// True when empty.
+            #[must_use]
+            pub fn is_empty(&self) -> bool {
+                self.lengths.is_empty()
+            }
+
+            /// Top `k` documents for `query`, best first.
+            #[must_use]
+            pub fn search(&self, query: &str, k: usize) -> Vec<(DocId, f32)> {
+                if self.lengths.is_empty() {
+                    return Vec::new();
+                }
+                let n = self.lengths.len() as f32;
+                let avg = self.total_len as f32 / n;
+                let mut scores: HashMap<DocId, f32> = HashMap::new();
+                let mut terms = tokenize(query);
+                terms.sort();
+                terms.dedup();
+                for t in terms {
+                    let Some(p) = self.postings.get(&t) else {
+                        continue;
+                    };
+                    let df = p.len() as f32;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                    for (&d, &tf) in p {
+                        let tf = tf as f32;
+                        let dl = self.lengths[&d] as f32;
+                        let norm = tf * (self.k1 + 1.0)
+                            / (tf + self.k1 * (1.0 - self.b + self.b * dl / avg.max(1e-6)));
+                        *scores.entry(d).or_insert(0.0) += idf * norm;
+                    }
+                }
+                let mut v: Vec<(DocId, f32)> = scores.into_iter().collect();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                v.truncate(k);
+                v
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn ranks_relevant_first() {
+                let mut ix = Bm25::new();
+                ix.add(1, "The laptop GPU runs the local model");
+                ix.add(2, "Cooking pasta with tomato sauce");
+                ix.add(3, "GPU drivers for Vulkan on Linux laptops; GPU GPU");
+                let r = ix.search("gpu vulkan", 10);
+                assert_eq!(r[0].0, 3);
+                assert_eq!(r.len(), 2);
+                assert!(ix.search("nothing-matches", 5).is_empty());
+                assert!(ix.remove(3));
+                assert_eq!(ix.search("vulkan", 5).len(), 0);
+                ix.add(1, "pasta");
+                assert_eq!(ix.search("laptop", 5).len(), 0);
+                assert_eq!(tokenize("Hi, MOULI-OS 2!"), vec!["hi", "mouli", "os", "2"]);
+            }
+        }
+    }
+    pub mod ontology {
+        //! A class hierarchy with typed relations.
+        //!
+        //! Gives the knowledge graph a vocabulary: classes form an is-a tree, and relations declared
+        //! on a class are inherited by its subclasses. That supports questions like "is a `Sparrow` a
+        //! `Bird`?", "what is the nearest class two things share?" and "what can a `Bird` do?" without
+        //! listing every fact on every subclass.
+
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+        use std::fmt;
+
+        /// What kind of thing a class describes.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ClassKind {
+            /// An abstract idea.
+            Concept,
+            /// A kind of thing that exists.
+            Entity,
+            /// A property.
+            Attribute,
+            /// Something that can be done.
+            Action,
+            /// Something that happens.
+            Event,
+            /// A relationship type.
+            Relation,
+        }
+
+        /// One class.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Class {
+            /// Unique name.
+            pub name: String,
+            /// Kind.
+            pub kind: ClassKind,
+            /// Free text.
+            pub description: String,
+            /// Direct superclass, if any.
+            pub parent: Option<String>,
+        }
+
+        /// A relation between two classes.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Relation {
+            /// Source class.
+            pub source: String,
+            /// Relation name ("can", "has", "part-of", ...).
+            pub name: String,
+            /// Target class.
+            pub target: String,
+            /// Strength.
+            pub weight: f32,
+        }
+
+        /// Ontology failure.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum OntologyError {
+            /// A class with this name exists.
+            Duplicate(String),
+            /// A named class does not exist.
+            Unknown(String),
+            /// A weight is NaN or infinite.
+            BadWeight,
+            /// The class name or relation name is empty.
+            EmptyName,
+        }
+
+        impl fmt::Display for OntologyError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    OntologyError::Duplicate(n) => write!(f, "class {n:?} already exists"),
+                    OntologyError::Unknown(n) => write!(f, "unknown class {n:?}"),
+                    OntologyError::BadWeight => f.write_str("weight must be finite"),
+                    OntologyError::EmptyName => f.write_str("names must not be empty"),
+                }
+            }
+        }
+
+        impl std::error::Error for OntologyError {}
+
+        /// The ontology.
+        #[derive(Debug, Clone, Default)]
+        pub struct Ontology {
+            classes: BTreeMap<String, Class>,
+            children: BTreeMap<String, BTreeSet<String>>,
+            relations: Vec<Relation>,
+        }
+
+        impl Ontology {
+            /// Empty ontology.
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Add a class. A parent must already exist, so the hierarchy can never contain a cycle.
+            pub fn add_class(
+                &mut self,
+                name: &str,
+                kind: ClassKind,
+                description: &str,
+                parent: Option<&str>,
+            ) -> Result<(), OntologyError> {
+                if name.is_empty() {
+                    return Err(OntologyError::EmptyName);
+                }
+                if self.classes.contains_key(name) {
+                    return Err(OntologyError::Duplicate(name.to_string()));
+                }
+                if let Some(p) = parent {
+                    if !self.classes.contains_key(p) {
+                        return Err(OntologyError::Unknown(p.to_string()));
+                    }
+                    self.children
+                        .entry(p.to_string())
+                        .or_default()
+                        .insert(name.to_string());
+                }
+                self.classes.insert(
+                    name.to_string(),
+                    Class {
+                        name: name.to_string(),
+                        kind,
+                        description: description.to_string(),
+                        parent: parent.map(str::to_string),
+                    },
+                );
+                Ok(())
+            }
+
+            /// Look a class up.
+            pub fn class(&self, name: &str) -> Option<&Class> {
+                self.classes.get(name)
+            }
+
+            /// Number of classes.
+            pub fn len(&self) -> usize {
+                self.classes.len()
+            }
+
+            /// `true` if there are no classes.
+            pub fn is_empty(&self) -> bool {
+                self.classes.is_empty()
+            }
+
+            /// Superclasses of `name`, nearest first. Empty for roots and unknown names.
+            pub fn ancestors(&self, name: &str) -> Vec<&str> {
+                let mut out = Vec::new();
+                let mut cur = self.classes.get(name).and_then(|c| c.parent.as_deref());
+                while let Some(p) = cur {
+                    out.push(p);
+                    cur = self.classes.get(p).and_then(|c| c.parent.as_deref());
+                }
+                out
+            }
+
+            /// All subclasses of `name` (children, grandchildren, ...), breadth first, siblings by name.
+            pub fn descendants(&self, name: &str) -> Vec<&str> {
+                let mut out = Vec::new();
+                let mut queue: VecDeque<&str> = VecDeque::new();
+                queue.push_back(name);
+                while let Some(n) = queue.pop_front() {
+                    if let Some(kids) = self.children.get(n) {
+                        for k in kids {
+                            out.push(k.as_str());
+                            queue.push_back(k.as_str());
+                        }
+                    }
+                }
+                out
+            }
+
+            /// `true` if `child` is `ancestor` or a (transitive) subclass of it. Unknown names give `false`.
+            pub fn is_a(&self, child: &str, ancestor: &str) -> bool {
+                self.classes.contains_key(child)
+                    && self.classes.contains_key(ancestor)
+                    && (child == ancestor || self.ancestors(child).contains(&ancestor))
+            }
+
+            /// Distance from the root: roots are 0.
+            pub fn depth(&self, name: &str) -> Option<usize> {
+                self.classes
+                    .contains_key(name)
+                    .then(|| self.ancestors(name).len())
+            }
+
+            /// The nearest class that both `a` and `b` are (or descend from). `None` if either is
+            /// unknown or they live in different trees.
+            pub fn lowest_common_ancestor(&self, a: &str, b: &str) -> Option<&str> {
+                if !self.classes.contains_key(a) || !self.classes.contains_key(b) {
+                    return None;
+                }
+                let mut chain_a: Vec<&str> = vec![self.classes.get_key_value(a)?.0.as_str()];
+                chain_a.extend(self.ancestors(a));
+                let set_b: BTreeSet<&str> =
+                    std::iter::once(self.classes.get_key_value(b)?.0.as_str())
+                        .chain(self.ancestors(b))
+                        .collect();
+                chain_a.into_iter().find(|n| set_b.contains(n))
+            }
+
+            /// Declare `source --name--> target`. Both classes must exist.
+            pub fn add_relation(
+                &mut self,
+                source: &str,
+                name: &str,
+                target: &str,
+                weight: f32,
+            ) -> Result<(), OntologyError> {
+                if name.is_empty() {
+                    return Err(OntologyError::EmptyName);
+                }
+                if !weight.is_finite() {
+                    return Err(OntologyError::BadWeight);
+                }
+                for c in [source, target] {
+                    if !self.classes.contains_key(c) {
+                        return Err(OntologyError::Unknown(c.to_string()));
+                    }
+                }
+                self.relations.push(Relation {
+                    source: source.to_string(),
+                    name: name.to_string(),
+                    target: target.to_string(),
+                    weight,
+                });
+                Ok(())
+            }
+
+            /// Relations of `name` declared directly on `source`.
+            pub fn direct(&self, source: &str, name: &str) -> Vec<&Relation> {
+                self.relations
+                    .iter()
+                    .filter(|r| r.source == source && r.name == name)
+                    .collect()
+            }
+
+            /// Relations of `name` that apply to `source`: its own plus those inherited from every
+            /// ancestor. Own relations come first, then nearer ancestors before farther ones.
+            pub fn inherited(&self, source: &str, name: &str) -> Vec<&Relation> {
+                if !self.classes.contains_key(source) {
+                    return Vec::new();
+                }
+                let mut out = self.direct(source, name);
+                for a in self.ancestors(source) {
+                    out.extend(self.direct(a, name));
+                }
+                out
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn animals() -> Ontology {
+                let mut o = Ontology::new();
+                let e = ClassKind::Entity;
+                o.add_class("Animal", e, "living thing", None).unwrap();
+                o.add_class("Bird", e, "", Some("Animal")).unwrap();
+                o.add_class("Mammal", e, "", Some("Animal")).unwrap();
+                o.add_class("Sparrow", e, "", Some("Bird")).unwrap();
+                o.add_class("Penguin", e, "", Some("Bird")).unwrap();
+                o.add_class("Dog", e, "", Some("Mammal")).unwrap();
+                o.add_class("Rock", e, "", None).unwrap();
+                o
+            }
+
+            #[test]
+            fn building_validates() {
+                let mut o = animals();
+                assert_eq!(o.len(), 7);
+                assert!(!o.is_empty());
+                assert_eq!(
+                    o.add_class("Bird", ClassKind::Entity, "", None),
+                    Err(OntologyError::Duplicate("Bird".into()))
+                );
+                assert_eq!(
+                    o.add_class("Cat", ClassKind::Entity, "", Some("Feline")),
+                    Err(OntologyError::Unknown("Feline".into()))
+                );
+                assert_eq!(
+                    o.add_class("", ClassKind::Entity, "", None),
+                    Err(OntologyError::EmptyName)
+                );
+                assert_eq!(o.len(), 7, "failed adds change nothing");
+                assert_eq!(o.class("Sparrow").unwrap().parent.as_deref(), Some("Bird"));
+                assert!(o.class("Nope").is_none());
+            }
+
+            #[test]
+            fn is_a_is_reflexive_transitive_and_directional() {
+                let o = animals();
+                assert!(o.is_a("Sparrow", "Sparrow"));
+                assert!(o.is_a("Sparrow", "Bird"));
+                assert!(o.is_a("Sparrow", "Animal"));
+                assert!(!o.is_a("Bird", "Sparrow"));
+                assert!(!o.is_a("Sparrow", "Mammal"));
+                assert!(!o.is_a("Sparrow", "Rock"));
+                assert!(!o.is_a("Ghost", "Ghost"));
+                assert!(!o.is_a("Sparrow", "Ghost"));
+            }
+
+            #[test]
+            fn ancestors_descendants_and_depth() {
+                let o = animals();
+                assert_eq!(o.ancestors("Sparrow"), ["Bird", "Animal"]);
+                assert!(o.ancestors("Animal").is_empty());
+                assert!(o.ancestors("Ghost").is_empty());
+                assert_eq!(
+                    o.descendants("Animal"),
+                    ["Bird", "Mammal", "Penguin", "Sparrow", "Dog"]
+                );
+                assert_eq!(o.descendants("Bird"), ["Penguin", "Sparrow"]);
+                assert!(o.descendants("Dog").is_empty());
+                assert_eq!(o.depth("Animal"), Some(0));
+                assert_eq!(o.depth("Sparrow"), Some(2));
+                assert_eq!(o.depth("Ghost"), None);
+            }
+
+            #[test]
+            fn lowest_common_ancestor() {
+                let o = animals();
+                assert_eq!(o.lowest_common_ancestor("Sparrow", "Penguin"), Some("Bird"));
+                assert_eq!(o.lowest_common_ancestor("Sparrow", "Dog"), Some("Animal"));
+                assert_eq!(o.lowest_common_ancestor("Sparrow", "Bird"), Some("Bird"));
+                assert_eq!(o.lowest_common_ancestor("Dog", "Dog"), Some("Dog"));
+                assert_eq!(o.lowest_common_ancestor("Sparrow", "Rock"), None);
+                assert_eq!(o.lowest_common_ancestor("Sparrow", "Ghost"), None);
+            }
+
+            #[test]
+            fn relations_validate() {
+                let mut o = animals();
+                assert_eq!(
+                    o.add_relation("Bird", "can", "Fly", 1.0),
+                    Err(OntologyError::Unknown("Fly".into()))
+                );
+                assert_eq!(
+                    o.add_relation("Ghost", "can", "Bird", 1.0),
+                    Err(OntologyError::Unknown("Ghost".into()))
+                );
+                assert_eq!(
+                    o.add_relation("Bird", "", "Animal", 1.0),
+                    Err(OntologyError::EmptyName)
+                );
+                assert_eq!(
+                    o.add_relation("Bird", "eats", "Animal", f32::NAN),
+                    Err(OntologyError::BadWeight)
+                );
+                assert!(o.add_relation("Bird", "eats", "Animal", 0.2).is_ok());
+            }
+
+            #[test]
+            fn relations_are_inherited_down_the_hierarchy() {
+                let mut o = animals();
+                o.add_class("Flying", ClassKind::Action, "", None).unwrap();
+                o.add_class("Swimming", ClassKind::Action, "", None)
+                    .unwrap();
+                o.add_relation("Bird", "can", "Flying", 0.9).unwrap();
+                o.add_relation("Penguin", "can", "Swimming", 1.0).unwrap();
+                o.add_relation("Animal", "can", "Swimming", 0.1).unwrap();
+                let targets = |c: &str| {
+                    o.inherited(c, "can")
+                        .iter()
+                        .map(|r| (r.target.as_str(), r.weight))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(targets("Sparrow"), [("Flying", 0.9), ("Swimming", 0.1)]);
+                assert_eq!(
+                    targets("Penguin"),
+                    [("Swimming", 1.0), ("Flying", 0.9), ("Swimming", 0.1)]
+                );
+                assert_eq!(targets("Rock"), Vec::<(&str, f32)>::new());
+                assert!(o.inherited("Ghost", "can").is_empty());
+                assert_eq!(o.direct("Sparrow", "can").len(), 0);
+                assert_eq!(o.direct("Penguin", "can").len(), 1);
+                assert!(o.inherited("Sparrow", "eats").is_empty());
+            }
+        }
+    }
+    pub mod vector {
+        //! Exact cosine-similarity index (fine for a personal device's memory size).
+
+        use crate::memory::DocId;
+        use std::collections::BTreeMap;
+
+        /// Vector index errors.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum VecError {
+            /// Wrong dimension.
+            Dim,
+            /// Zero or non-finite vector.
+            Bad,
+        }
+
+        /// Stores unit-normalised embeddings.
+        #[derive(Debug, Clone)]
+        pub struct VectorIndex {
+            dim: usize,
+            vecs: BTreeMap<DocId, Vec<f32>>,
+        }
+
+        fn normalise(v: &[f32]) -> Option<Vec<f32>> {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            (n.is_finite() && n > 0.0).then(|| v.iter().map(|x| x / n).collect())
+        }
+
+        impl VectorIndex {
+            /// Index for `dim`-dimensional vectors.
+            #[must_use]
+            pub fn new(dim: usize) -> Self {
+                Self {
+                    dim,
+                    vecs: BTreeMap::new(),
+                }
+            }
+
+            /// Insert or replace.
+            pub fn insert(&mut self, id: DocId, v: &[f32]) -> Result<(), VecError> {
+                if v.len() != self.dim {
+                    return Err(VecError::Dim);
+                }
+                self.vecs.insert(id, normalise(v).ok_or(VecError::Bad)?);
+                Ok(())
+            }
+
+            /// Remove.
+            pub fn remove(&mut self, id: DocId) -> bool {
+                self.vecs.remove(&id).is_some()
+            }
+
+            /// Top `k` by cosine similarity.
+            pub fn search(&self, q: &[f32], k: usize) -> Result<Vec<(DocId, f32)>, VecError> {
+                if q.len() != self.dim {
+                    return Err(VecError::Dim);
+                }
+                let q = normalise(q).ok_or(VecError::Bad)?;
+                let mut v: Vec<(DocId, f32)> = self
+                    .vecs
+                    .iter()
+                    .map(|(&id, e)| (id, e.iter().zip(&q).map(|(a, b)| a * b).sum()))
+                    .collect();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                v.truncate(k);
+                Ok(v)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn cosine_order() {
+                let mut ix = VectorIndex::new(2);
+                ix.insert(1, &[1.0, 0.0]).unwrap();
+                ix.insert(2, &[0.0, 3.0]).unwrap();
+                ix.insert(3, &[1.0, 1.0]).unwrap();
+                let r = ix.search(&[2.0, 0.1], 2).unwrap();
+                assert_eq!(r[0].0, 1);
+                assert_eq!(r[1].0, 3);
+                assert_eq!(ix.insert(4, &[0.0, 0.0]), Err(VecError::Bad));
+                assert_eq!(ix.search(&[1.0], 1), Err(VecError::Dim));
+                assert!(ix.remove(2));
+            }
+        }
+    }
+
+    /// Document id shared by all indexes.
+    pub type DocId = u64;
+}
+
+pub mod orchestra {
+    //! MOULI multi-agent orchestration.
+    //!
+    //! Autonomous agents are only useful on a personal machine if they are
+    //! bounded. This crate is the control plane that keeps them bounded:
+    //!
+    //! * [`registry`]: agents, their capabilities and a trust score learned
+    //!   from outcomes.
+    //! * [`select`]: choose a model or agent for a capability given urgency,
+    //!   device, cost and risk, with fallback chains.
+    //! * [`consensus`]: trust-weighted voting between agent proposals.
+    //! * [`governance`]: constitution rules (allow / deny / needs approval),
+    //!   spending budgets and rate quotas.
+    //! * [`resilience`]: circuit breakers, retry backoff, a leased job queue
+    //!   and leader leases.
+    //! * [`evolve`]: self-repair that only accepts a change when it passes
+    //!   validation and does not regress, with rollback history.
+    //! * [`orchestrator`]: ties the pieces together for one objective.
+    //!
+    //! Time is passed in explicitly (milliseconds or seconds as documented) so
+    //! every policy is deterministic and testable.
+    #![forbid(unsafe_code)]
+
+    pub mod consensus {
+        //! Trust-weighted consensus between agent proposals.
+        //!
+        //! Each agent proposes an answer with a confidence. Identical answers pool
+        //! their weight `trust * confidence`. The winner must hold at least
+        //! `quorum` of the total weight, otherwise there is no consensus and the
+        //! decision should go to a stronger model or to the user.
+
+        use crate::orchestra::registry::AgentId;
+        use std::collections::BTreeMap;
+
+        /// One proposal.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Proposal {
+            /// Proposing agent.
+            pub agent: AgentId,
+            /// Proposed answer (normalised by the caller).
+            pub answer: String,
+            /// Agent confidence in [0, 1].
+            pub confidence: f32,
+            /// Agent trust in [0, 1].
+            pub trust: f32,
+        }
+
+        /// Consensus outcome.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Outcome {
+            /// Agreed answer, its share of the weight, and supporting agents.
+            Agreed {
+                /// Answer.
+                answer: String,
+                /// Share of total weight (0..=1).
+                share: f32,
+                /// Agents that proposed it.
+                supporters: Vec<AgentId>,
+            },
+            /// No answer reached the quorum; the leading answer is given.
+            Split {
+                /// Leading answer.
+                leader: String,
+                /// Its share.
+                share: f32,
+            },
+            /// No usable proposals.
+            Empty,
+        }
+
+        /// Decide with `quorum` in (0, 1].
+        #[must_use]
+        pub fn decide(proposals: &[Proposal], quorum: f32) -> Outcome {
+            let mut pools: BTreeMap<&str, (f32, Vec<AgentId>)> = BTreeMap::new();
+            let mut total = 0.0f32;
+            for p in proposals {
+                let w = p.trust.clamp(0.0, 1.0) * p.confidence.clamp(0.0, 1.0);
+                if !w.is_finite() || w <= 0.0 {
+                    continue;
+                }
+                total += w;
+                let e = pools.entry(p.answer.as_str()).or_default();
+                e.0 += w;
+                e.1.push(p.agent);
+            }
+            let Some((answer, (weight, supporters))) = pools
+                .into_iter()
+                .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(b.0.cmp(a.0)))
+            else {
+                return Outcome::Empty;
+            };
+            let share = weight / total;
+            if share >= quorum {
+                Outcome::Agreed {
+                    answer: answer.to_owned(),
+                    share,
+                    supporters,
+                }
+            } else {
+                Outcome::Split {
+                    leader: answer.to_owned(),
+                    share,
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn p(agent: AgentId, answer: &str, confidence: f32, trust: f32) -> Proposal {
+                Proposal {
+                    agent,
+                    answer: answer.into(),
+                    confidence,
+                    trust,
+                }
+            }
+
+            #[test]
+            fn trusted_majority_wins() {
+                let v = [
+                    p(1, "A", 0.9, 0.9),
+                    p(2, "A", 0.6, 0.8),
+                    p(3, "B", 1.0, 0.3),
+                ];
+                match decide(&v, 0.6) {
+                    Outcome::Agreed {
+                        answer,
+                        share,
+                        supporters,
+                    } => {
+                        assert_eq!(answer, "A");
+                        assert!(share > 0.7);
+                        assert_eq!(supporters, vec![1, 2]);
+                    }
+                    o => panic!("{o:?}"),
+                }
+            }
+
+            #[test]
+            fn split_and_empty() {
+                let v = [p(1, "A", 1.0, 0.5), p(2, "B", 1.0, 0.5)];
+                assert!(matches!(decide(&v, 0.6), Outcome::Split { .. }));
+                assert_eq!(decide(&[], 0.5), Outcome::Empty);
+                assert_eq!(decide(&[p(1, "A", 0.0, 1.0)], 0.5), Outcome::Empty);
+            }
+        }
+    }
+    pub mod evolve {
+        //! Gated self-repair and improvement.
+        //!
+        //! When something fails, a generator proposes candidate fixes. Each
+        //! candidate runs in a validator (sandboxed tests, benchmarks). A
+        //! candidate is accepted only if it passes every check and scores at least
+        //! the current baseline; otherwise the current version stays. Accepted
+        //! versions are kept so any change can be rolled back.
+
+        /// Proposes candidate versions.
+        pub trait Generator {
+            /// Up to `n` candidates fixing `failure` in `current`.
+            fn propose(&mut self, current: &str, failure: &str, n: usize) -> Vec<String>;
+        }
+
+        /// Validation of one candidate.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Validation {
+            /// All required checks passed.
+            pub passed: bool,
+            /// Quality score (higher is better), e.g. a robust score from `mouli-theory`.
+            pub score: f64,
+            /// Notes (failing checks, metrics).
+            pub notes: String,
+        }
+
+        /// Runs checks on a candidate (in a sandbox).
+        pub trait Validator {
+            /// Validate `candidate`.
+            fn validate(&mut self, candidate: &str) -> Validation;
+        }
+
+        /// What one repair round did.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum RoundResult {
+            /// A candidate was accepted.
+            Accepted {
+                /// Its score.
+                score: f64,
+                /// Candidates tried.
+                tried: usize,
+            },
+            /// No candidate qualified; the current version stays.
+            Kept {
+                /// Candidates tried.
+                tried: usize,
+                /// Best rejected candidate's notes.
+                best_notes: String,
+            },
+        }
+
+        /// Versioned artefact under repair (a skill, prompt, config or code unit).
+        #[derive(Debug, Clone)]
+        pub struct Evolver {
+            history: Vec<(String, f64)>,
+            /// Candidates requested per round.
+            pub candidates_per_round: usize,
+            /// Minimum improvement over baseline to accept (0 = no regression).
+            pub min_gain: f64,
+        }
+
+        impl Evolver {
+            /// Start from `initial` with its measured `score`.
+            #[must_use]
+            pub fn new(initial: &str, score: f64) -> Self {
+                Self {
+                    history: vec![(initial.to_owned(), score)],
+                    candidates_per_round: 3,
+                    min_gain: 0.0,
+                }
+            }
+
+            /// Current version and score.
+            #[must_use]
+            pub fn current(&self) -> (&str, f64) {
+                let (v, s) = self
+                    .history
+                    .last()
+                    .map_or(("", 0.0), |(v, s)| (v.as_str(), *s));
+                (v, s)
+            }
+
+            /// Number of accepted versions (including the initial one).
+            #[must_use]
+            pub fn versions(&self) -> usize {
+                self.history.len()
+            }
+
+            /// One repair round for `failure`.
+            pub fn round(
+                &mut self,
+                failure: &str,
+                gen: &mut dyn Generator,
+                val: &mut dyn Validator,
+            ) -> RoundResult {
+                let (current, baseline) = {
+                    let (c, s) = self.current();
+                    (c.to_owned(), s)
+                };
+                let candidates = gen.propose(&current, failure, self.candidates_per_round);
+                let tried = candidates.len();
+                let mut best: Option<(String, Validation)> = None;
+                let mut best_rejected = String::new();
+                for c in candidates {
+                    if c == current {
+                        continue;
+                    }
+                    let v = val.validate(&c);
+                    if v.passed && v.score >= baseline + self.min_gain {
+                        if best.as_ref().is_none_or(|(_, b)| v.score > b.score) {
+                            best = Some((c, v));
+                        }
+                    } else if best_rejected.is_empty() {
+                        best_rejected = v.notes;
+                    }
+                }
+                match best {
+                    Some((c, v)) => {
+                        self.history.push((c, v.score));
+                        RoundResult::Accepted {
+                            score: v.score,
+                            tried,
+                        }
+                    }
+                    None => RoundResult::Kept {
+                        tried,
+                        best_notes: best_rejected,
+                    },
+                }
+            }
+
+            /// Undo the last accepted change. Returns false at the initial version.
+            pub fn rollback(&mut self) -> bool {
+                if self.history.len() > 1 {
+                    self.history.pop();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// Proposes appending digits; the validator likes larger numbers but
+            /// rejects anything containing '9'.
+            struct Digits;
+            impl Generator for Digits {
+                fn propose(&mut self, current: &str, _failure: &str, n: usize) -> Vec<String> {
+                    (0..n)
+                        .map(|i| format!("{current}{}", [9, 3, 1][i % 3]))
+                        .collect()
+                }
+            }
+            struct NoNines;
+            impl Validator for NoNines {
+                fn validate(&mut self, c: &str) -> Validation {
+                    Validation {
+                        passed: !c.contains('9'),
+                        score: c.parse::<f64>().unwrap_or(0.0),
+                        notes: if c.contains('9') {
+                            "contains 9".into()
+                        } else {
+                            String::new()
+                        },
+                    }
+                }
+            }
+
+            #[test]
+            fn accepts_best_valid_and_rolls_back() {
+                let mut e = Evolver::new("1", 1.0);
+                let r = e.round("too small", &mut Digits, &mut NoNines);
+                assert_eq!(
+                    r,
+                    RoundResult::Accepted {
+                        score: 13.0,
+                        tried: 3
+                    }
+                );
+                assert_eq!(e.current().0, "13");
+                assert!(e.rollback());
+                assert_eq!(e.current(), ("1", 1.0));
+                assert!(!e.rollback());
+            }
+
+            #[test]
+            fn keeps_current_when_nothing_qualifies() {
+                struct Worse;
+                impl Generator for Worse {
+                    fn propose(&mut self, _c: &str, _f: &str, _n: usize) -> Vec<String> {
+                        vec!["9".into(), "0".into()]
+                    }
+                }
+                let mut e = Evolver::new("5", 5.0);
+                let r = e.round("x", &mut Worse, &mut NoNines);
+                assert_eq!(
+                    r,
+                    RoundResult::Kept {
+                        tried: 2,
+                        best_notes: "contains 9".into()
+                    }
+                );
+                assert_eq!(e.versions(), 1);
+            }
+        }
+    }
+    pub mod governance {
+        //! Governance: constitution rules, budgets and quotas.
+        //!
+        //! The constitution is an ordered list of rules over action names
+        //! (`"files.delete"`, `"net.post"`, `"payments.send"`). The first matching
+        //! rule decides; no match means the default verdict. Deny always beats an
+        //! approval: an approval only satisfies `RequireApproval`.
+
+        use std::collections::{BTreeMap, VecDeque};
+
+        /// What a rule says.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Verdict {
+            /// May run.
+            Allow,
+            /// Must ask the user first.
+            RequireApproval,
+            /// Never.
+            Deny,
+        }
+
+        /// One rule. `pattern` matches an exact action, or a prefix ending in `*`
+        /// (`"files.*"`), or everything (`"*"`).
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Rule {
+            /// Pattern.
+            pub pattern: String,
+            /// Verdict.
+            pub verdict: Verdict,
+            /// Why (shown to the user).
+            pub reason: String,
+        }
+
+        fn matches(pattern: &str, action: &str) -> bool {
+            match pattern.strip_suffix('*') {
+                Some(prefix) => action.starts_with(prefix),
+                None => pattern == action,
+            }
+        }
+
+        /// Ordered rule set.
+        #[derive(Debug, Clone)]
+        pub struct Constitution {
+            rules: Vec<Rule>,
+            /// Verdict when no rule matches.
+            pub default: Verdict,
+        }
+
+        impl Default for Constitution {
+            fn default() -> Self {
+                Self {
+                    rules: Vec::new(),
+                    default: Verdict::RequireApproval,
+                }
+            }
+        }
+
+        impl Constitution {
+            /// Empty constitution; unknown actions need approval.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Append a rule (earlier rules take precedence).
+            pub fn rule(&mut self, pattern: &str, verdict: Verdict, reason: &str) -> &mut Self {
+                self.rules.push(Rule {
+                    pattern: pattern.to_owned(),
+                    verdict,
+                    reason: reason.to_owned(),
+                });
+                self
+            }
+
+            /// Verdict and reason for `action`.
+            #[must_use]
+            pub fn judge(&self, action: &str) -> (Verdict, &str) {
+                self.rules
+                    .iter()
+                    .find(|r| matches(&r.pattern, action))
+                    .map_or((self.default, "no rule matched"), |r| {
+                        (r.verdict, r.reason.as_str())
+                    })
+            }
+
+            /// Final permission given whether the user approved this action.
+            #[must_use]
+            pub fn permits(&self, action: &str, approved: bool) -> bool {
+                match self.judge(action).0 {
+                    Verdict::Allow => true,
+                    Verdict::RequireApproval => approved,
+                    Verdict::Deny => false,
+                }
+            }
+        }
+
+        /// Spending result.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Spend {
+            /// Charged.
+            Ok,
+            /// Charged, but past the warning threshold.
+            Warn,
+            /// Refused (hard stop).
+            Refused,
+        }
+
+        /// Per-period spending budget (e.g. API credits, energy units).
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Budget {
+            /// Limit per period.
+            pub limit: f64,
+            /// Refuse spending past the limit (otherwise only warn).
+            pub hard_stop: bool,
+            /// Warn at this fraction of the limit.
+            pub warn_at: f64,
+            spent: f64,
+            period: u64,
+        }
+
+        impl Budget {
+            /// Budget with `limit` per period.
+            #[must_use]
+            pub fn new(limit: f64, hard_stop: bool) -> Self {
+                Self {
+                    limit,
+                    hard_stop,
+                    warn_at: 0.8,
+                    spent: 0.0,
+                    period: 0,
+                }
+            }
+
+            /// Try to spend `amount` in `period` (a new period resets the total).
+            pub fn spend(&mut self, period: u64, amount: f64) -> Spend {
+                if period != self.period {
+                    self.period = period;
+                    self.spent = 0.0;
+                }
+                let amount = amount.max(0.0);
+                if self.hard_stop && self.spent + amount > self.limit {
+                    return Spend::Refused;
+                }
+                self.spent += amount;
+                if self.spent >= self.limit * self.warn_at {
+                    Spend::Warn
+                } else {
+                    Spend::Ok
+                }
+            }
+
+            /// Spent this period.
+            #[must_use]
+            pub fn spent(&self) -> f64 {
+                self.spent
+            }
+        }
+
+        /// Sliding-window call quota per key (user, agent or capability).
+        #[derive(Debug, Clone)]
+        pub struct Quota {
+            window: u64,
+            limit: usize,
+            calls: BTreeMap<String, VecDeque<u64>>,
+        }
+
+        impl Quota {
+            /// At most `limit` calls per `window` time units per key.
+            #[must_use]
+            pub fn new(limit: usize, window: u64) -> Self {
+                Self {
+                    window,
+                    limit,
+                    calls: BTreeMap::new(),
+                }
+            }
+
+            /// Record a call at `now` if allowed.
+            pub fn allow(&mut self, key: &str, now: u64) -> bool {
+                let q = self.calls.entry(key.to_owned()).or_default();
+                while q
+                    .front()
+                    .is_some_and(|&t| now.saturating_sub(t) >= self.window)
+                {
+                    q.pop_front();
+                }
+                if q.len() >= self.limit {
+                    return false;
+                }
+                q.push_back(now);
+                true
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn first_rule_wins() {
+                let mut c = Constitution::new();
+                c.rule("payments.*", Verdict::Deny, "agents never move money")
+                    .rule("files.read", Verdict::Allow, "reading is safe")
+                    .rule("files.*", Verdict::RequireApproval, "changes need the user");
+                assert_eq!(c.judge("payments.send").0, Verdict::Deny);
+                assert!(
+                    !c.permits("payments.send", true),
+                    "approval cannot override deny"
+                );
+                assert!(c.permits("files.read", false));
+                assert!(!c.permits("files.delete", false));
+                assert!(c.permits("files.delete", true));
+                assert_eq!(
+                    c.judge("net.post"),
+                    (Verdict::RequireApproval, "no rule matched")
+                );
+            }
+
+            #[test]
+            fn budget_and_quota() {
+                let mut b = Budget::new(10.0, true);
+                assert_eq!(b.spend(1, 5.0), Spend::Ok);
+                assert_eq!(b.spend(1, 3.5), Spend::Warn);
+                assert_eq!(b.spend(1, 2.0), Spend::Refused);
+                assert_eq!(b.spend(2, 2.0), Spend::Ok, "new period resets");
+                let mut soft = Budget::new(1.0, false);
+                assert_eq!(soft.spend(0, 5.0), Spend::Warn);
+
+                let mut q = Quota::new(2, 60);
+                assert!(q.allow("agent:1", 0));
+                assert!(q.allow("agent:1", 10));
+                assert!(!q.allow("agent:1", 20));
+                assert!(q.allow("agent:2", 20));
+                assert!(q.allow("agent:1", 60));
+            }
+        }
+    }
+    pub mod orchestrator {
+        //! Orchestrating one objective.
+        //!
+        //! A planner decomposes the objective into steps (capability + action +
+        //! dependencies). Each ready step is checked against the constitution,
+        //! budget and quota, assigned to the most trusted capable agent, and run
+        //! through a circuit breaker with retries. Outcomes update agent trust.
+
+        use crate::orchestra::governance::{Budget, Constitution, Quota, Spend, Verdict};
+        use crate::orchestra::registry::{AgentId, Registry};
+        use crate::orchestra::resilience::CircuitBreaker;
+        use std::collections::BTreeMap;
+
+        /// One planned step.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct PlanStep {
+            /// Step id.
+            pub id: u32,
+            /// Capability needed ("web.read", "code.write").
+            pub capability: String,
+            /// Governed action name ("net.get", "files.write").
+            pub action: String,
+            /// Instruction for the agent.
+            pub instruction: String,
+            /// Steps that must finish first.
+            pub deps: Vec<u32>,
+            /// Estimated cost charged to the budget.
+            pub cost: u32,
+        }
+
+        /// Decomposes objectives.
+        pub trait Planner {
+            /// Steps for `objective`.
+            fn decompose(&mut self, objective: &str) -> Vec<PlanStep>;
+        }
+
+        /// Runs a step on an agent.
+        pub trait Worker {
+            /// Execute `step` on `agent`; returns output or error.
+            fn run(&mut self, agent: AgentId, step: &PlanStep) -> Result<String, String>;
+        }
+
+        /// Final state of a step.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum StepOutcome {
+            /// Finished.
+            Done {
+                /// Agent that did it.
+                agent: AgentId,
+                /// Output.
+                output: String,
+            },
+            /// Failed after retries.
+            Failed(String),
+            /// Blocked by governance (deny, missing approval, budget, quota).
+            Blocked(String),
+            /// Skipped because a dependency did not finish.
+            Skipped,
+            /// No capable agent.
+            Unassigned,
+        }
+
+        /// Orchestrator state.
+        #[derive(Debug)]
+        pub struct Orchestrator {
+            /// Agents.
+            pub registry: Registry,
+            /// Rules.
+            pub constitution: Constitution,
+            /// Spending budget (cost units per period).
+            pub budget: Budget,
+            /// Per-agent call quota.
+            pub quota: Quota,
+            breakers: BTreeMap<String, CircuitBreaker>,
+            /// Attempts per step.
+            pub max_attempts: u32,
+        }
+
+        impl Orchestrator {
+            /// New orchestrator.
+            #[must_use]
+            pub fn new(
+                registry: Registry,
+                constitution: Constitution,
+                budget: Budget,
+                quota: Quota,
+            ) -> Self {
+                Self {
+                    registry,
+                    constitution,
+                    budget,
+                    quota,
+                    breakers: BTreeMap::new(),
+                    max_attempts: 2,
+                }
+            }
+
+            fn govern(
+                &mut self,
+                step: &PlanStep,
+                approved: &dyn Fn(&PlanStep) -> bool,
+                period: u64,
+            ) -> Option<String> {
+                let (verdict, reason) = self.constitution.judge(&step.action);
+                let reason = reason.to_owned();
+                match verdict {
+                    Verdict::Deny => return Some(format!("denied: {reason}")),
+                    Verdict::RequireApproval if !approved(step) => {
+                        return Some(format!("needs approval: {reason}"))
+                    }
+                    _ => {}
+                }
+                if self.budget.spend(period, f64::from(step.cost)) == Spend::Refused {
+                    return Some("budget exhausted".into());
+                }
+                None
+            }
+
+            /// Run `objective` to completion at time `now` (ms) in budget `period`.
+            /// `approved` answers whether the user approved a step needing approval.
+            pub fn run(
+                &mut self,
+                objective: &str,
+                planner: &mut dyn Planner,
+                worker: &mut dyn Worker,
+                approved: &dyn Fn(&PlanStep) -> bool,
+                now: u64,
+                period: u64,
+            ) -> BTreeMap<u32, StepOutcome> {
+                let steps = planner.decompose(objective);
+                let mut out: BTreeMap<u32, StepOutcome> = BTreeMap::new();
+                // Process in rounds: each round runs every step whose deps are resolved.
+                loop {
+                    let pending: Vec<&PlanStep> =
+                        steps.iter().filter(|s| !out.contains_key(&s.id)).collect();
+                    if pending.is_empty() {
+                        break;
+                    }
+                    let mut progressed = false;
+                    for step in pending {
+                        let unresolved = step.deps.iter().any(|d| !out.contains_key(d));
+                        let all_exist = step.deps.iter().all(|d| steps.iter().any(|s| s.id == *d));
+                        if unresolved && all_exist {
+                            continue;
+                        }
+                        progressed = true;
+                        let deps_done = step
+                            .deps
+                            .iter()
+                            .all(|d| matches!(out.get(d), Some(StepOutcome::Done { .. })));
+                        if !deps_done {
+                            out.insert(step.id, StepOutcome::Skipped);
+                            continue;
+                        }
+                        if let Some(why) = self.govern(step, approved, period) {
+                            out.insert(step.id, StepOutcome::Blocked(why));
+                            continue;
+                        }
+                        out.insert(step.id, self.execute(step, worker, now));
+                    }
+                    if !progressed {
+                        // Cycle: skip the rest.
+                        let rest: Vec<u32> = steps
+                            .iter()
+                            .map(|s| s.id)
+                            .filter(|id| !out.contains_key(id))
+                            .collect();
+                        for id in rest {
+                            out.insert(id, StepOutcome::Skipped);
+                        }
+                        break;
+                    }
+                }
+                out
+            }
+
+            fn execute(
+                &mut self,
+                step: &PlanStep,
+                worker: &mut dyn Worker,
+                now: u64,
+            ) -> StepOutcome {
+                let mut last_err = String::from("no attempt made");
+                let mut tried: Vec<AgentId> = Vec::new();
+                for attempt in 0..self.max_attempts {
+                    let t = now + u64::from(attempt);
+                    let breaker = self
+                        .breakers
+                        .entry(step.capability.clone())
+                        .or_insert_with(|| CircuitBreaker::new(3, 30_000));
+                    if !breaker.allow(t) {
+                        return StepOutcome::Failed(format!(
+                            "circuit open for {}",
+                            step.capability
+                        ));
+                    }
+                    // Prefer an agent not tried yet for this step.
+                    let agent = self
+                        .registry
+                        .with_capability(&step.capability)
+                        .filter(|a| a.enabled && a.load < a.max_load && !tried.contains(&a.id))
+                        .max_by(|a, b| a.trust.total_cmp(&b.trust).then(b.id.cmp(&a.id)))
+                        .map(|a| a.id)
+                        .or_else(|| self.registry.assign(&step.capability));
+                    let Some(agent) = agent else {
+                        return if tried.is_empty() {
+                            StepOutcome::Unassigned
+                        } else {
+                            StepOutcome::Failed(last_err)
+                        };
+                    };
+                    if !self.quota.allow(&format!("agent:{agent}"), t) {
+                        return StepOutcome::Blocked(format!("quota reached for agent {agent}"));
+                    }
+                    tried.push(agent);
+                    self.registry.start(agent);
+                    let r = worker.run(agent, step);
+                    let ok = r.is_ok();
+                    self.registry.finish(agent, ok);
+                    if let Some(b) = self.breakers.get_mut(&step.capability) {
+                        b.record(t, ok);
+                    }
+                    match r {
+                        Ok(output) => return StepOutcome::Done { agent, output },
+                        Err(e) => last_err = e,
+                    }
+                }
+                StepOutcome::Failed(last_err)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            struct Fixed(Vec<PlanStep>);
+            impl Planner for Fixed {
+                fn decompose(&mut self, _objective: &str) -> Vec<PlanStep> {
+                    self.0.clone()
+                }
+            }
+
+            fn step(id: u32, cap: &str, action: &str, deps: &[u32]) -> PlanStep {
+                PlanStep {
+                    id,
+                    capability: cap.into(),
+                    action: action.into(),
+                    instruction: format!("step {id}"),
+                    deps: deps.to_vec(),
+                    cost: 1,
+                }
+            }
+
+            fn orch() -> (Orchestrator, AgentId, AgentId) {
+                let mut reg = Registry::new();
+                let researcher = reg.register("researcher", &["web.read"], 2);
+                let writer = reg.register("writer", &["doc.write"], 2);
+                let mut c = Constitution::new();
+                c.rule("net.get", Verdict::Allow, "reading the web is fine")
+                    .rule(
+                        "files.write",
+                        Verdict::RequireApproval,
+                        "writes need the user",
+                    )
+                    .rule("payments.*", Verdict::Deny, "never");
+                (
+                    Orchestrator::new(reg, c, Budget::new(10.0, true), Quota::new(100, 60_000)),
+                    researcher,
+                    writer,
+                )
+            }
+
+            #[test]
+            fn runs_plan_with_governance() {
+                let (mut o, researcher, writer) = orch();
+                let mut plan = Fixed(vec![
+                    step(1, "web.read", "net.get", &[]),
+                    step(2, "doc.write", "files.write", &[1]),
+                    step(3, "doc.write", "payments.send", &[]),
+                    step(4, "video.edit", "net.get", &[]),
+                ]);
+                let mut worker = |agent: AgentId, s: &PlanStep| -> Result<String, String> {
+                    Ok(format!("{agent}:{}", s.id))
+                };
+                struct W<F>(F);
+                impl<F: FnMut(AgentId, &PlanStep) -> Result<String, String>> Worker for W<F> {
+                    fn run(&mut self, agent: AgentId, step: &PlanStep) -> Result<String, String> {
+                        (self.0)(agent, step)
+                    }
+                }
+                let res = o.run("brief me", &mut plan, &mut W(&mut worker), &|_| true, 0, 1);
+                assert_eq!(
+                    res[&1],
+                    StepOutcome::Done {
+                        agent: researcher,
+                        output: format!("{researcher}:1")
+                    }
+                );
+                assert!(matches!(res[&2], StepOutcome::Done { agent, .. } if agent == writer));
+                assert!(matches!(&res[&3], StepOutcome::Blocked(w) if w.starts_with("denied")));
+                assert_eq!(res[&4], StepOutcome::Unassigned);
+
+                let res = o.run("again", &mut plan, &mut W(&mut worker), &|_| false, 0, 1);
+                assert!(
+                    matches!(&res[&2], StepOutcome::Blocked(w) if w.starts_with("needs approval"))
+                );
+            }
+
+            #[test]
+            fn retries_on_other_agent_and_skips_dependents() {
+                let (mut o, _r, _w) = orch();
+                let backup = o.registry.register("researcher-2", &["web.read"], 1);
+                let mut plan = Fixed(vec![
+                    step(1, "web.read", "net.get", &[]),
+                    step(2, "doc.write", "net.get", &[1]),
+                ]);
+                struct FailFirst(Vec<AgentId>);
+                impl Worker for FailFirst {
+                    fn run(&mut self, agent: AgentId, _s: &PlanStep) -> Result<String, String> {
+                        self.0.push(agent);
+                        if self.0.len() == 1 {
+                            Err("timeout".into())
+                        } else {
+                            Ok("found".into())
+                        }
+                    }
+                }
+                let mut w = FailFirst(Vec::new());
+                let res = o.run("x", &mut plan, &mut w, &|_| true, 0, 1);
+                assert!(matches!(res[&1], StepOutcome::Done { agent, .. } if agent == backup));
+                assert!(matches!(res[&2], StepOutcome::Done { .. }));
+
+                struct AlwaysFail;
+                impl Worker for AlwaysFail {
+                    fn run(&mut self, _a: AgentId, _s: &PlanStep) -> Result<String, String> {
+                        Err("down".into())
+                    }
+                }
+                let res = o.run("y", &mut plan, &mut AlwaysFail, &|_| true, 100, 2);
+                assert_eq!(res[&1], StepOutcome::Failed("down".into()));
+                assert_eq!(res[&2], StepOutcome::Skipped);
+            }
+        }
+    }
+    pub mod registry {
+        //! Agent registry with learned trust.
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Agent id.
+        pub type AgentId = u32;
+
+        /// A registered agent.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct AgentInfo {
+            /// Id.
+            pub id: AgentId,
+            /// Name ("planner", "coder", "researcher", ...).
+            pub name: String,
+            /// Capabilities it offers ("plan", "code.write", "web.read", ...).
+            pub capabilities: BTreeSet<String>,
+            /// Trust in [0, 1], an exponential average of outcomes.
+            pub trust: f32,
+            /// Tasks in flight.
+            pub load: u32,
+            /// Maximum concurrent tasks.
+            pub max_load: u32,
+            /// Disabled agents receive no work.
+            pub enabled: bool,
+            /// Completed tasks.
+            pub successes: u64,
+            /// Failed tasks.
+            pub failures: u64,
+        }
+
+        /// Registry of agents.
+        #[derive(Debug, Clone)]
+        pub struct Registry {
+            agents: BTreeMap<AgentId, AgentInfo>,
+            next: AgentId,
+            /// Weight of the newest outcome in the trust average.
+            pub learning_rate: f32,
+            /// Agents whose trust falls below this are disabled automatically.
+            pub min_trust: f32,
+        }
+
+        impl Default for Registry {
+            fn default() -> Self {
+                Self {
+                    agents: BTreeMap::new(),
+                    next: 1,
+                    learning_rate: 0.2,
+                    min_trust: 0.2,
+                }
+            }
+        }
+
+        impl Registry {
+            /// Empty registry.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Register an agent with neutral trust 0.5.
+            pub fn register(
+                &mut self,
+                name: &str,
+                capabilities: &[&str],
+                max_load: u32,
+            ) -> AgentId {
+                let id = self.next;
+                self.next += 1;
+                self.agents.insert(
+                    id,
+                    AgentInfo {
+                        id,
+                        name: name.to_owned(),
+                        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+                        trust: 0.5,
+                        load: 0,
+                        max_load: max_load.max(1),
+                        enabled: true,
+                        successes: 0,
+                        failures: 0,
+                    },
+                );
+                id
+            }
+
+            /// Look up.
+            #[must_use]
+            pub fn get(&self, id: AgentId) -> Option<&AgentInfo> {
+                self.agents.get(&id)
+            }
+
+            /// Enable or disable.
+            pub fn set_enabled(&mut self, id: AgentId, enabled: bool) -> bool {
+                self.agents
+                    .get_mut(&id)
+                    .map(|a| a.enabled = enabled)
+                    .is_some()
+            }
+
+            /// Best available agent for `capability`: highest trust, then lowest
+            /// relative load, then lowest id.
+            #[must_use]
+            pub fn assign(&self, capability: &str) -> Option<AgentId> {
+                self.agents
+                    .values()
+                    .filter(|a| {
+                        a.enabled && a.load < a.max_load && a.capabilities.contains(capability)
+                    })
+                    .max_by(|a, b| {
+                        a.trust
+                            .total_cmp(&b.trust)
+                            .then(
+                                (u64::from(b.load) * u64::from(a.max_load))
+                                    .cmp(&(u64::from(a.load) * u64::from(b.max_load))),
+                            )
+                            .then(b.id.cmp(&a.id))
+                    })
+                    .map(|a| a.id)
+            }
+
+            /// Mark a task started on `id`.
+            pub fn start(&mut self, id: AgentId) {
+                if let Some(a) = self.agents.get_mut(&id) {
+                    a.load = a.load.saturating_add(1);
+                }
+            }
+
+            /// Record a finished task; updates trust and may disable the agent.
+            pub fn finish(&mut self, id: AgentId, success: bool) {
+                let (lr, min) = (self.learning_rate, self.min_trust);
+                if let Some(a) = self.agents.get_mut(&id) {
+                    a.load = a.load.saturating_sub(1);
+                    let target = if success { 1.0 } else { 0.0 };
+                    a.trust += lr * (target - a.trust);
+                    if success {
+                        a.successes += 1;
+                    } else {
+                        a.failures += 1;
+                    }
+                    if a.trust < min {
+                        a.enabled = false;
+                    }
+                }
+            }
+
+            /// Agents offering `capability`.
+            pub fn with_capability<'a>(
+                &'a self,
+                capability: &'a str,
+            ) -> impl Iterator<Item = &'a AgentInfo> + 'a {
+                self.agents
+                    .values()
+                    .filter(move |a| a.capabilities.contains(capability))
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn trust_drives_assignment() {
+                let mut r = Registry::new();
+                let a = r.register("coder-a", &["code.write"], 2);
+                let b = r.register("coder-b", &["code.write", "code.review"], 2);
+                assert_eq!(r.assign("code.write"), Some(a), "tie -> lower id");
+                r.start(b);
+                r.finish(b, true);
+                assert_eq!(r.assign("code.write"), Some(b));
+                assert_eq!(r.assign("code.review"), Some(b));
+                assert_eq!(r.assign("web.read"), None);
+                r.start(b);
+                r.start(b);
+                assert_eq!(r.assign("code.write"), Some(a), "b is full");
+            }
+
+            #[test]
+            fn repeated_failure_disables() {
+                let mut r = Registry::new();
+                let a = r.register("flaky", &["x"], 1);
+                for _ in 0..5 {
+                    r.start(a);
+                    r.finish(a, false);
+                }
+                let info = r.get(a).unwrap();
+                assert!(!info.enabled);
+                assert_eq!(info.failures, 5);
+                assert_eq!(r.assign("x"), None);
+                assert_eq!(r.with_capability("x").count(), 1);
+            }
+        }
+    }
+    pub mod resilience {
+        //! Resilience primitives: circuit breaker, retry backoff, leased job
+        //! queue and leader lease. Times are milliseconds.
+
+        use std::collections::{BTreeMap, VecDeque};
+
+        /// Breaker state.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum BreakerState {
+            /// Calls flow.
+            Closed,
+            /// Calls are refused until `until`.
+            Open {
+                /// Reopen probe time.
+                until: u64,
+            },
+            /// One trial call allowed.
+            HalfOpen,
+        }
+
+        /// Circuit breaker around a flaky dependency (model server, network).
+        #[derive(Debug, Clone)]
+        pub struct CircuitBreaker {
+            state: BreakerState,
+            failures: u32,
+            /// Consecutive failures that open the breaker.
+            pub threshold: u32,
+            /// How long it stays open.
+            pub cooldown_ms: u64,
+        }
+
+        impl CircuitBreaker {
+            /// Breaker opening after `threshold` failures for `cooldown_ms`.
+            #[must_use]
+            pub fn new(threshold: u32, cooldown_ms: u64) -> Self {
+                Self {
+                    state: BreakerState::Closed,
+                    failures: 0,
+                    threshold: threshold.max(1),
+                    cooldown_ms,
+                }
+            }
+
+            /// Whether a call may go out at `now`.
+            pub fn allow(&mut self, now: u64) -> bool {
+                match self.state {
+                    BreakerState::Closed | BreakerState::HalfOpen => true,
+                    BreakerState::Open { until } if now >= until => {
+                        self.state = BreakerState::HalfOpen;
+                        true
+                    }
+                    BreakerState::Open { .. } => false,
+                }
+            }
+
+            /// Report a call's result.
+            pub fn record(&mut self, now: u64, success: bool) {
+                if success {
+                    self.failures = 0;
+                    self.state = BreakerState::Closed;
+                    return;
+                }
+                self.failures += 1;
+                if self.state == BreakerState::HalfOpen || self.failures >= self.threshold {
+                    self.state = BreakerState::Open {
+                        until: now + self.cooldown_ms,
+                    };
+                }
+            }
+
+            /// Current state.
+            #[must_use]
+            pub fn state(&self) -> BreakerState {
+                self.state
+            }
+        }
+
+        /// Exponential backoff with deterministic jitter.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Backoff {
+            /// First delay.
+            pub base_ms: u64,
+            /// Upper bound.
+            pub max_ms: u64,
+            /// Attempts allowed (including the first).
+            pub max_attempts: u32,
+        }
+
+        impl Backoff {
+            /// Delay before retry number `attempt` (1-based), or `None` when out of
+            /// attempts. `seed` spreads retries of different jobs (up to +25%).
+            #[must_use]
+            pub fn delay(&self, attempt: u32, seed: u64) -> Option<u64> {
+                if attempt == 0 || attempt >= self.max_attempts {
+                    return None;
+                }
+                let exp = self
+                    .base_ms
+                    .saturating_mul(1u64 << (attempt - 1).min(32))
+                    .min(self.max_ms);
+                let mix = seed
+                    .wrapping_add(u64::from(attempt))
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    >> 33;
+                let jitter = exp / 4 * (mix % 1000) / 1000;
+                Some(exp + jitter)
+            }
+        }
+
+        /// A job in the queue.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Job {
+            /// Id.
+            pub id: u64,
+            /// Payload.
+            pub payload: String,
+            /// Deliveries so far.
+            pub deliveries: u32,
+        }
+
+        /// At-least-once queue: claimed jobs are leased; unacknowledged jobs
+        /// return to the queue when the lease expires. Jobs delivered too often go
+        /// to the dead-letter list.
+        #[derive(Debug, Clone)]
+        pub struct LeasedQueue {
+            ready: VecDeque<Job>,
+            leased: BTreeMap<u64, (Job, u64, u32)>,
+            dead: Vec<Job>,
+            next: u64,
+            /// Lease length.
+            pub lease_ms: u64,
+            /// Deliveries before a job is dead-lettered.
+            pub max_deliveries: u32,
+        }
+
+        impl LeasedQueue {
+            /// Queue with the given lease length and delivery limit.
+            #[must_use]
+            pub fn new(lease_ms: u64, max_deliveries: u32) -> Self {
+                Self {
+                    ready: VecDeque::new(),
+                    leased: BTreeMap::new(),
+                    dead: Vec::new(),
+                    next: 1,
+                    lease_ms,
+                    max_deliveries: max_deliveries.max(1),
+                }
+            }
+
+            /// Add a job.
+            pub fn push(&mut self, payload: &str) -> u64 {
+                let id = self.next;
+                self.next += 1;
+                self.ready.push_back(Job {
+                    id,
+                    payload: payload.to_owned(),
+                    deliveries: 0,
+                });
+                id
+            }
+
+            fn expire(&mut self, now: u64) {
+                let expired: Vec<u64> = self
+                    .leased
+                    .iter()
+                    .filter(|(_, (_, until, _))| *until <= now)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for id in expired {
+                    if let Some((job, _, _)) = self.leased.remove(&id) {
+                        if job.deliveries >= self.max_deliveries {
+                            self.dead.push(job);
+                        } else {
+                            self.ready.push_back(job);
+                        }
+                    }
+                }
+            }
+
+            /// Claim the next job for `worker` at `now`.
+            pub fn claim(&mut self, worker: u32, now: u64) -> Option<Job> {
+                self.expire(now);
+                let mut job = self.ready.pop_front()?;
+                job.deliveries += 1;
+                self.leased
+                    .insert(job.id, (job.clone(), now + self.lease_ms, worker));
+                Some(job)
+            }
+
+            /// Acknowledge completion. Only the current lease holder may ack.
+            pub fn ack(&mut self, id: u64, worker: u32) -> bool {
+                match self.leased.get(&id) {
+                    Some((_, _, w)) if *w == worker => {
+                        self.leased.remove(&id);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+
+            /// Jobs waiting.
+            #[must_use]
+            pub fn ready_len(&self) -> usize {
+                self.ready.len()
+            }
+
+            /// Jobs that failed too often.
+            #[must_use]
+            pub fn dead_letters(&self) -> &[Job] {
+                &self.dead
+            }
+        }
+
+        /// Leader lease: one coordinator at a time among cooperating processes.
+        #[derive(Debug, Clone, Default)]
+        pub struct LeaderLease {
+            holder: Option<(u32, u64)>,
+            term: u64,
+        }
+
+        impl LeaderLease {
+            /// Try to become (or stay) leader until `now + ttl`. Returns the term
+            /// on success; a higher term fences out the previous leader.
+            pub fn acquire(&mut self, node: u32, now: u64, ttl: u64) -> Option<u64> {
+                match self.holder {
+                    Some((h, until)) if h != node && until > now => None,
+                    Some((h, _)) if h == node => {
+                        self.holder = Some((node, now + ttl));
+                        Some(self.term)
+                    }
+                    _ => {
+                        self.term += 1;
+                        self.holder = Some((node, now + ttl));
+                        Some(self.term)
+                    }
+                }
+            }
+
+            /// Current leader at `now`.
+            #[must_use]
+            pub fn leader(&self, now: u64) -> Option<u32> {
+                self.holder
+                    .filter(|&(_, until)| until > now)
+                    .map(|(h, _)| h)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn breaker_cycle() {
+                let mut b = CircuitBreaker::new(2, 1000);
+                assert!(b.allow(0));
+                b.record(0, false);
+                assert!(b.allow(1));
+                b.record(1, false);
+                assert_eq!(b.state(), BreakerState::Open { until: 1001 });
+                assert!(!b.allow(500));
+                assert!(b.allow(1001));
+                assert_eq!(b.state(), BreakerState::HalfOpen);
+                b.record(1001, false);
+                assert!(!b.allow(1500), "failed probe reopens");
+                assert!(b.allow(2001));
+                b.record(2001, true);
+                assert_eq!(b.state(), BreakerState::Closed);
+            }
+
+            #[test]
+            fn backoff_grows_and_caps() {
+                let b = Backoff {
+                    base_ms: 100,
+                    max_ms: 1000,
+                    max_attempts: 6,
+                };
+                let d1 = b.delay(1, 7).unwrap();
+                let d3 = b.delay(3, 7).unwrap();
+                assert!((100..=125).contains(&d1));
+                assert!((400..=500).contains(&d3));
+                assert!(b.delay(5, 7).unwrap() <= 1250);
+                assert!(b.delay(6, 7).is_none());
+                assert!(b.delay(0, 7).is_none());
+            }
+
+            #[test]
+            fn leased_queue_redelivers_and_dead_letters() {
+                let mut q = LeasedQueue::new(100, 2);
+                let id = q.push("summarise inbox");
+                let j = q.claim(1, 0).unwrap();
+                assert_eq!(j.id, id);
+                assert!(q.claim(2, 50).is_none());
+                let j = q.claim(2, 100).unwrap();
+                assert_eq!(j.deliveries, 2);
+                assert!(!q.ack(id, 1), "old lease holder cannot ack");
+                assert!(q.claim(3, 200).is_none());
+                assert_eq!(q.dead_letters().len(), 1);
+                let id2 = q.push("ok job");
+                q.claim(4, 300).unwrap();
+                assert!(q.ack(id2, 4));
+                assert_eq!(q.ready_len(), 0);
+            }
+
+            #[test]
+            fn leader_lease_fencing() {
+                let mut l = LeaderLease::default();
+                assert_eq!(l.acquire(1, 0, 100), Some(1));
+                assert_eq!(l.acquire(2, 50, 100), None);
+                assert_eq!(l.acquire(1, 90, 100), Some(1), "renewal keeps term");
+                assert_eq!(l.leader(150), Some(1));
+                assert_eq!(l.acquire(2, 200, 100), Some(2));
+                assert_eq!(l.leader(250), Some(2));
+                assert_eq!(l.leader(400), None);
+            }
+        }
+    }
+    pub mod select {
+        //! Model selection by context, with fallbacks.
+
+        use std::collections::BTreeMap;
+
+        /// How fast an answer is needed.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Urgency {
+            /// Interactive.
+            High,
+            /// Background.
+            Normal,
+        }
+
+        /// Where the work runs and under which rules.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Environment {
+            /// On this device; cost (battery, heat) matters.
+            Local,
+            /// Remote service allowed.
+            Remote,
+            /// Sensitive data: only low-risk models.
+            Regulated,
+        }
+
+        /// Compute available.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Device {
+            /// CPU only.
+            Cpu,
+            /// GPU available.
+            Gpu,
+        }
+
+        /// Selection context.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Context {
+            /// Urgency.
+            pub urgency: Urgency,
+            /// Environment.
+            pub environment: Environment,
+            /// Device.
+            pub device: Device,
+            /// Input language code (for `*.AUTO` capabilities).
+            pub language: String,
+            /// Target language code (for translation).
+            pub target_language: String,
+        }
+
+        /// A model offering one capability.
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct ModelEntry {
+            /// Name.
+            pub name: String,
+            /// Measured accuracy in [0, 1] (from `mouli-theory` robust score where available).
+            pub accuracy: f32,
+            /// Typical latency in milliseconds.
+            pub latency_ms: u32,
+            /// Relative running cost.
+            pub cost: f32,
+            /// Data-handling risk is low (safe for regulated data).
+            pub low_risk: bool,
+            /// Needs a GPU.
+            pub gpu_required: bool,
+        }
+
+        /// Score a model for a context; `None` means it may not be used at all.
+        #[must_use]
+        pub fn score(m: &ModelEntry, ctx: &Context) -> Option<f32> {
+            if m.gpu_required && ctx.device == Device::Cpu {
+                return None;
+            }
+            if ctx.environment == Environment::Regulated && !m.low_risk {
+                return None;
+            }
+            let latency_scale = match ctx.urgency {
+                Urgency::High => 500.0,
+                Urgency::Normal => 1500.0,
+            };
+            let mut s = m.accuracy * 5.0 - m.latency_ms as f32 / latency_scale;
+            if ctx.environment == Environment::Local {
+                s -= m.cost;
+            }
+            Some(s)
+        }
+
+        /// Resolve `ocr.AUTO`, `asr.AUTO`, `tts.AUTO`, `translate.AUTO` from the context.
+        #[must_use]
+        pub fn resolve_capability(capability: &str, ctx: &Context) -> Option<String> {
+            let Some(base) = capability.strip_suffix(".AUTO") else {
+                return Some(capability.to_owned());
+            };
+            if ctx.language.is_empty() {
+                return None;
+            }
+            match base {
+                "ocr" | "asr" | "tts" => Some(format!("{base}.{}", ctx.language)),
+                "translate" if !ctx.target_language.is_empty() => Some(format!(
+                    "translate.{}_to_{}",
+                    ctx.language, ctx.target_language
+                )),
+                _ => None,
+            }
+        }
+
+        /// Models per capability.
+        #[derive(Debug, Clone, Default)]
+        pub struct ModelCatalog {
+            models: BTreeMap<String, Vec<ModelEntry>>,
+        }
+
+        impl ModelCatalog {
+            /// Empty catalog.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Add a model for `capability`.
+            pub fn add(&mut self, capability: &str, m: ModelEntry) {
+                self.models
+                    .entry(capability.to_owned())
+                    .or_default()
+                    .push(m);
+            }
+
+            /// Usable models for `capability`, best first: the first is the choice,
+            /// the rest are the fallback chain.
+            #[must_use]
+            pub fn ranked(&self, capability: &str, ctx: &Context) -> Vec<&ModelEntry> {
+                let Some(cap) = resolve_capability(capability, ctx) else {
+                    return Vec::new();
+                };
+                let mut v: Vec<(f32, &ModelEntry)> = self
+                    .models
+                    .get(&cap)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| score(m, ctx).map(|s| (s, m)))
+                    .collect();
+                v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+                v.into_iter().map(|(_, m)| m).collect()
+            }
+
+            /// Run `call` down the fallback chain until one succeeds. Returns the
+            /// model used and its output, or every error.
+            pub fn run_with_fallback<T>(
+                &self,
+                capability: &str,
+                ctx: &Context,
+                mut call: impl FnMut(&ModelEntry) -> Result<T, String>,
+            ) -> Result<(String, T), Vec<String>> {
+                let mut errors = Vec::new();
+                for m in self.ranked(capability, ctx) {
+                    match call(m) {
+                        Ok(v) => return Ok((m.name.clone(), v)),
+                        Err(e) => errors.push(format!("{}: {e}", m.name)),
+                    }
+                }
+                if errors.is_empty() {
+                    errors.push(format!("no usable model for {capability}"));
+                }
+                Err(errors)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn m(
+                name: &str,
+                accuracy: f32,
+                latency_ms: u32,
+                cost: f32,
+                low_risk: bool,
+                gpu: bool,
+            ) -> ModelEntry {
+                ModelEntry {
+                    name: name.into(),
+                    accuracy,
+                    latency_ms,
+                    cost,
+                    low_risk,
+                    gpu_required: gpu,
+                }
+            }
+
+            fn ctx(urgency: Urgency, environment: Environment, device: Device) -> Context {
+                Context {
+                    urgency,
+                    environment,
+                    device,
+                    language: "ta".into(),
+                    target_language: "en".into(),
+                }
+            }
+
+            fn catalog() -> ModelCatalog {
+                let mut c = ModelCatalog::new();
+                c.add("chat", m("big-gpu", 0.9, 800, 2.0, true, true));
+                c.add("chat", m("small-cpu", 0.7, 200, 0.2, true, false));
+                c.add("chat", m("cloud", 0.99, 1200, 0.0, false, false));
+                c.add("asr.ta", m("whisper-ta", 0.8, 300, 0.5, true, false));
+                c
+            }
+
+            #[test]
+            fn context_changes_choice() {
+                let c = catalog();
+                let cpu_regulated = c.ranked(
+                    "chat",
+                    &ctx(Urgency::High, Environment::Regulated, Device::Cpu),
+                );
+                assert_eq!(cpu_regulated.len(), 1);
+                assert_eq!(cpu_regulated[0].name, "small-cpu");
+                let remote = c.ranked(
+                    "chat",
+                    &ctx(Urgency::Normal, Environment::Remote, Device::Gpu),
+                );
+                assert_eq!(remote[0].name, "cloud");
+                assert_eq!(
+                    c.ranked(
+                        "asr.AUTO",
+                        &ctx(Urgency::High, Environment::Local, Device::Cpu)
+                    )[0]
+                    .name,
+                    "whisper-ta"
+                );
+            }
+
+            #[test]
+            fn fallback_chain() {
+                let c = catalog();
+                let x = ctx(Urgency::Normal, Environment::Remote, Device::Gpu);
+                let (used, out) = c
+                    .run_with_fallback("chat", &x, |m| {
+                        if m.name == "cloud" {
+                            Err("offline".into())
+                        } else {
+                            Ok(1)
+                        }
+                    })
+                    .unwrap();
+                assert_ne!(used, "cloud");
+                assert_eq!(out, 1);
+                let errs = c
+                    .run_with_fallback::<()>("chat", &x, |_| Err("down".into()))
+                    .unwrap_err();
+                assert_eq!(errs.len(), 3);
+                assert!(c.run_with_fallback::<()>("nope", &x, |_| Ok(())).is_err());
+            }
+
+            #[test]
+            fn auto_resolution() {
+                let x = ctx(Urgency::High, Environment::Local, Device::Cpu);
+                assert_eq!(
+                    resolve_capability("translate.AUTO", &x).unwrap(),
+                    "translate.ta_to_en"
+                );
+                assert_eq!(resolve_capability("chat", &x).unwrap(), "chat");
+                assert!(resolve_capability("video.AUTO", &x).is_none());
+            }
+        }
+    }
+}
+
+pub mod jobs {
+    //! MOULI scheduled agents.
+    //!
+    //! Users and the system register agent jobs that run once, every N
+    //! seconds, or daily at a time. The [`scheduler::Scheduler`] hands out due
+    //! jobs; [`runner::Runner`] executes them through a caller-supplied
+    //! executor and writes every outcome to the hash-chained [`audit::AuditLog`].
+    //!
+    //! Time is passed in explicitly (Unix seconds, UTC) so the logic is
+    //! deterministic and testable; the OS service feeds it the real clock.
+    #![forbid(unsafe_code)]
+
+    pub mod audit {
+        //! Append-only, hash-chained audit log.
+        //!
+        //! Each entry stores the SHA-256 of the previous entry, so editing or
+        //! removing any entry breaks [`AuditLog::verify`].
+
+        use sha2::{Digest, Sha256};
+
+        /// One audit record.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Entry {
+            /// Position in the log.
+            pub seq: u64,
+            /// Unix seconds.
+            pub time: u64,
+            /// Who acted (user, agent, system).
+            pub actor: String,
+            /// What was done.
+            pub action: String,
+            /// What it was done to.
+            pub resource: String,
+            /// Outcome text.
+            pub outcome: String,
+            /// Hash of the previous entry (zeros for the first).
+            pub prev: [u8; 32],
+            /// Hash of this entry.
+            pub hash: [u8; 32],
+        }
+
+        fn field(h: &mut Sha256, s: &str) {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+
+        fn entry_hash(e: &Entry) -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(e.seq.to_le_bytes());
+            h.update(e.time.to_le_bytes());
+            field(&mut h, &e.actor);
+            field(&mut h, &e.action);
+            field(&mut h, &e.resource);
+            field(&mut h, &e.outcome);
+            h.update(e.prev);
+            h.finalize().into()
+        }
+
+        /// The log.
+        #[derive(Debug, Clone, Default)]
+        pub struct AuditLog {
+            entries: Vec<Entry>,
+        }
+
+        impl AuditLog {
+            /// Empty log.
+            #[must_use]
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Append a record and return its hash.
+            pub fn append(
+                &mut self,
+                time: u64,
+                actor: &str,
+                action: &str,
+                resource: &str,
+                outcome: &str,
+            ) -> [u8; 32] {
+                let prev = self.entries.last().map_or([0; 32], |e| e.hash);
+                let mut e = Entry {
+                    seq: self.entries.len() as u64,
+                    time,
+                    actor: actor.to_owned(),
+                    action: action.to_owned(),
+                    resource: resource.to_owned(),
+                    outcome: outcome.to_owned(),
+                    prev,
+                    hash: [0; 32],
+                };
+                e.hash = entry_hash(&e);
+                let h = e.hash;
+                self.entries.push(e);
+                h
+            }
+
+            /// Index of the first broken entry, or `None` if the chain is intact.
+            #[must_use]
+            pub fn verify(&self) -> Option<usize> {
+                let mut prev = [0u8; 32];
+                for (i, e) in self.entries.iter().enumerate() {
+                    if e.seq != i as u64 || e.prev != prev || entry_hash(e) != e.hash {
+                        return Some(i);
+                    }
+                    prev = e.hash;
+                }
+                None
+            }
+
+            /// All entries.
+            #[must_use]
+            pub fn entries(&self) -> &[Entry] {
+                &self.entries
+            }
+
+            /// Mutable access (for repair tools and tamper tests).
+            pub fn entries_mut(&mut self) -> &mut [Entry] {
+                &mut self.entries
+            }
+
+            /// Hash of the newest entry (the value to anchor externally).
+            #[must_use]
+            pub fn head(&self) -> [u8; 32] {
+                self.entries.last().map_or([0; 32], |e| e.hash)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn chain_detects_tampering() {
+                let mut log = AuditLog::new();
+                log.append(1, "agent:mail", "summarise", "inbox", "ok");
+                log.append(2, "user", "share", "file:report", "ok");
+                log.append(3, "agent:sync", "upload", "photos", "denied");
+                assert_eq!(log.verify(), None);
+                log.entries_mut()[1].outcome = "denied".into();
+                assert_eq!(log.verify(), Some(1));
+            }
+
+            #[test]
+            fn field_boundaries_matter() {
+                let mut a = AuditLog::new();
+                let mut b = AuditLog::new();
+                let ha = a.append(0, "ab", "c", "", "");
+                let hb = b.append(0, "a", "bc", "", "");
+                assert_ne!(ha, hb);
+            }
+        }
+    }
+    pub mod runner {
+        //! Runs due jobs through an executor and audits each run.
+
+        use crate::jobs::audit::AuditLog;
+        use crate::jobs::scheduler::{Job, Scheduler};
+
+        /// Executes a job's action. Returns an outcome summary or an error message.
+        pub trait Executor {
+            /// Run `job` at time `now`.
+            fn run(&mut self, job: &Job, now: u64) -> Result<String, String>;
+        }
+
+        impl<F: FnMut(&Job, u64) -> Result<String, String>> Executor for F {
+            fn run(&mut self, job: &Job, now: u64) -> Result<String, String> {
+                self(job, now)
+            }
+        }
+
+        /// Scheduler plus audit log.
+        #[derive(Debug, Clone)]
+        pub struct Runner {
+            /// Job table.
+            pub scheduler: Scheduler,
+            /// Audit trail of every run.
+            pub audit: AuditLog,
+        }
+
+        impl Runner {
+            /// New runner.
+            #[must_use]
+            pub fn new(scheduler: Scheduler) -> Self {
+                Self {
+                    scheduler,
+                    audit: AuditLog::new(),
+                }
+            }
+
+            /// Run every job due at `now`, at most `limit` runs. Returns runs made.
+            pub fn tick(&mut self, now: u64, limit: usize, exec: &mut dyn Executor) -> usize {
+                let mut runs = 0;
+                while runs < limit {
+                    let Some(job) = self.scheduler.pop_due(now) else {
+                        break;
+                    };
+                    let result = exec.run(&job, now);
+                    let (ok, outcome) = match &result {
+                        Ok(s) => (true, format!("ok: {s}")),
+                        Err(e) => (false, format!("error: {e}")),
+                    };
+                    self.audit.append(
+                        now,
+                        &format!("agent:{}", job.owner),
+                        &job.action,
+                        &format!("job:{}", job.id),
+                        &outcome,
+                    );
+                    // The job was popped, so it still exists unless the executor removed it.
+                    let _ = self.scheduler.complete(job.id, now, ok);
+                    runs += 1;
+                }
+                runs
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::jobs::schedule::Schedule;
+
+            #[test]
+            fn runs_and_audits() {
+                let mut r = Runner::new(Scheduler::new(4));
+                r.scheduler
+                    .add(
+                        "alice",
+                        "daily digest",
+                        Schedule::Every {
+                            start: 0,
+                            period: 100,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                r.scheduler
+                    .add("bob", "flaky sync", Schedule::Once { at: 0 }, 0)
+                    .unwrap();
+                let mut exec = |job: &Job, _now: u64| {
+                    if job.owner == "bob" {
+                        Err("network down".to_string())
+                    } else {
+                        Ok("3 items".to_string())
+                    }
+                };
+                assert_eq!(r.tick(0, 10, &mut exec), 2);
+                assert_eq!(r.tick(50, 10, &mut exec), 0);
+                assert_eq!(r.tick(100, 10, &mut exec), 1);
+                assert_eq!(r.audit.entries().len(), 3);
+                assert!(r
+                    .audit
+                    .entries()
+                    .iter()
+                    .any(|e| e.outcome == "error: network down"));
+                assert_eq!(r.audit.verify(), None);
+            }
+
+            #[test]
+            fn limit_caps_runs() {
+                let mut r = Runner::new(Scheduler::new(4));
+                for i in 0..3 {
+                    r.scheduler
+                        .add("u", &format!("job {i}"), Schedule::Once { at: 0 }, 0)
+                        .unwrap();
+                }
+                let mut exec = |_: &Job, _: u64| -> Result<String, String> { Ok(String::new()) };
+                assert_eq!(r.tick(0, 2, &mut exec), 2);
+                assert_eq!(r.tick(0, 2, &mut exec), 1);
+            }
+        }
+    }
+    pub mod schedule {
+        //! When a job runs.
+
+        /// Seconds per day.
+        pub const DAY: u64 = 86_400;
+
+        /// A job schedule. Times are Unix seconds (UTC).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Schedule {
+            /// Run once at `at`.
+            Once {
+                /// Run time.
+                at: u64,
+            },
+            /// Run every `period` seconds, first at `start`.
+            Every {
+                /// First run.
+                start: u64,
+                /// Interval in seconds (> 0).
+                period: u64,
+            },
+            /// Run daily at `second_of_day` (0..86400) shifted by `utc_offset` seconds.
+            Daily {
+                /// Local time of day in seconds.
+                second_of_day: u32,
+                /// Local offset from UTC in seconds (for example +19800 for UTC+5:30).
+                utc_offset: i32,
+            },
+        }
+
+        impl Schedule {
+            /// Check parameters.
+            #[must_use]
+            pub fn is_valid(&self) -> bool {
+                match *self {
+                    Self::Once { .. } => true,
+                    Self::Every { period, .. } => period > 0,
+                    Self::Daily {
+                        second_of_day,
+                        utc_offset,
+                    } => {
+                        u64::from(second_of_day) < DAY && i64::from(utc_offset).unsigned_abs() < DAY
+                    }
+                }
+            }
+
+            /// First run time at or after `t`.
+            #[must_use]
+            pub fn next_at_or_after(&self, t: u64) -> Option<u64> {
+                match t.checked_sub(1) {
+                    Some(p) => self.next_after(p),
+                    None if !self.is_valid() => None,
+                    None => Some(match *self {
+                        Self::Once { at } => at,
+                        Self::Every { start, .. } => start,
+                        Self::Daily {
+                            second_of_day,
+                            utc_offset,
+                        } => daily_target(second_of_day, utc_offset),
+                    }),
+                }
+            }
+
+            /// First run time strictly after `after`, or `None` if it never runs again.
+            #[must_use]
+            pub fn next_after(&self, after: u64) -> Option<u64> {
+                if !self.is_valid() {
+                    return None;
+                }
+                match *self {
+                    Self::Once { at } => (at > after).then_some(at),
+                    Self::Every { start, period } => {
+                        if start > after {
+                            Some(start)
+                        } else {
+                            let k = (after - start) / period + 1;
+                            start.checked_add(k.checked_mul(period)?)
+                        }
+                    }
+                    Self::Daily {
+                        second_of_day,
+                        utc_offset,
+                    } => {
+                        let target = daily_target(second_of_day, utc_offset);
+                        let day_start = after - after % DAY;
+                        let today = day_start + target;
+                        Some(if today > after { today } else { today + DAY })
+                    }
+                }
+            }
+        }
+
+        /// UTC second-of-day at which local `second_of_day` is reached.
+        fn daily_target(second_of_day: u32, utc_offset: i32) -> u64 {
+            (i64::from(second_of_day) - i64::from(utc_offset)).rem_euclid(DAY as i64) as u64
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn once() {
+                let s = Schedule::Once { at: 100 };
+                assert_eq!(s.next_after(50), Some(100));
+                assert_eq!(s.next_after(100), None);
+            }
+
+            #[test]
+            fn every() {
+                let s = Schedule::Every {
+                    start: 10,
+                    period: 5,
+                };
+                assert_eq!(s.next_after(0), Some(10));
+                assert_eq!(s.next_after(10), Some(15));
+                assert_eq!(s.next_after(17), Some(20));
+                assert!(!Schedule::Every {
+                    start: 0,
+                    period: 0
+                }
+                .is_valid());
+            }
+
+            #[test]
+            fn daily_with_offset() {
+                // 09:00 at UTC+5:30 is 03:30 UTC.
+                let s = Schedule::Daily {
+                    second_of_day: 9 * 3600,
+                    utc_offset: 19_800,
+                };
+                let day0 = 20_000 * DAY;
+                assert_eq!(s.next_after(day0), Some(day0 + 3 * 3600 + 1800));
+                assert_eq!(
+                    s.next_after(day0 + 4 * 3600),
+                    Some(day0 + DAY + 3 * 3600 + 1800)
+                );
+                // 02:00 at UTC+5:30 is 20:30 UTC the previous day.
+                let early = Schedule::Daily {
+                    second_of_day: 2 * 3600,
+                    utc_offset: 19_800,
+                };
+                assert_eq!(early.next_after(day0), Some(day0 + 20 * 3600 + 1800));
+                assert!(!Schedule::Daily {
+                    second_of_day: 90_000,
+                    utc_offset: 0
+                }
+                .is_valid());
+            }
+        }
+    }
+    pub mod scheduler {
+        //! Job table and due queue.
+
+        use crate::jobs::schedule::Schedule;
+        use core::fmt;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Job id.
+        pub type JobId = u64;
+
+        /// A registered agent job.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Job {
+            /// Id.
+            pub id: JobId,
+            /// Owner (user or system component).
+            pub owner: String,
+            /// What the agent should do (an instruction or a tool call name).
+            pub action: String,
+            /// When it runs.
+            pub schedule: Schedule,
+            /// Next run time, if any.
+            pub next_run: Option<u64>,
+            /// Paused jobs keep their schedule but are not handed out.
+            pub paused: bool,
+            /// Consecutive failures.
+            pub failures: u32,
+        }
+
+        /// Scheduler errors.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum SchedError {
+            /// Schedule parameters invalid.
+            BadSchedule,
+            /// Owner or action empty.
+            BadJob,
+            /// No such job.
+            Unknown,
+            /// Job limit reached.
+            Full,
+        }
+
+        impl fmt::Display for SchedError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(match self {
+                    Self::BadSchedule => "invalid schedule",
+                    Self::BadJob => "owner and action are required",
+                    Self::Unknown => "unknown job",
+                    Self::Full => "job limit reached",
+                })
+            }
+        }
+
+        impl std::error::Error for SchedError {}
+
+        /// Holds jobs and orders them by next run time.
+        #[derive(Debug, Clone)]
+        pub struct Scheduler {
+            jobs: BTreeMap<JobId, Job>,
+            queue: BTreeSet<(u64, JobId)>,
+            next_id: JobId,
+            max_jobs: usize,
+            /// Failures after which a job is paused automatically.
+            pub max_failures: u32,
+        }
+
+        impl Scheduler {
+            /// Scheduler with room for `max_jobs`.
+            #[must_use]
+            pub fn new(max_jobs: usize) -> Self {
+                Self {
+                    jobs: BTreeMap::new(),
+                    queue: BTreeSet::new(),
+                    next_id: 1,
+                    max_jobs,
+                    max_failures: 3,
+                }
+            }
+
+            fn enqueue(&mut self, id: JobId) {
+                if let Some(j) = self.jobs.get(&id) {
+                    if let (Some(t), false) = (j.next_run, j.paused) {
+                        self.queue.insert((t, id));
+                    }
+                }
+            }
+
+            fn dequeue(&mut self, id: JobId) {
+                if let Some(t) = self.jobs.get(&id).and_then(|j| j.next_run) {
+                    self.queue.remove(&(t, id));
+                }
+            }
+
+            /// Register a job; its first run is computed from `now`.
+            pub fn add(
+                &mut self,
+                owner: &str,
+                action: &str,
+                schedule: Schedule,
+                now: u64,
+            ) -> Result<JobId, SchedError> {
+                if !schedule.is_valid() {
+                    return Err(SchedError::BadSchedule);
+                }
+                if owner.trim().is_empty() || action.trim().is_empty() {
+                    return Err(SchedError::BadJob);
+                }
+                if self.jobs.len() >= self.max_jobs {
+                    return Err(SchedError::Full);
+                }
+                let id = self.next_id;
+                self.next_id += 1;
+                // A job due exactly now still runs.
+                let next_run = schedule.next_at_or_after(now);
+                self.jobs.insert(
+                    id,
+                    Job {
+                        id,
+                        owner: owner.to_owned(),
+                        action: action.to_owned(),
+                        schedule,
+                        next_run,
+                        paused: false,
+                        failures: 0,
+                    },
+                );
+                self.enqueue(id);
+                Ok(id)
+            }
+
+            /// Remove a job.
+            pub fn remove(&mut self, id: JobId) -> Result<Job, SchedError> {
+                self.dequeue(id);
+                self.jobs.remove(&id).ok_or(SchedError::Unknown)
+            }
+
+            /// Pause or resume.
+            pub fn set_paused(&mut self, id: JobId, paused: bool) -> Result<(), SchedError> {
+                self.dequeue(id);
+                let j = self.jobs.get_mut(&id).ok_or(SchedError::Unknown)?;
+                j.paused = paused;
+                if !paused {
+                    j.failures = 0;
+                }
+                self.enqueue(id);
+                Ok(())
+            }
+
+            /// Pop the earliest job due at or before `now`.
+            pub fn pop_due(&mut self, now: u64) -> Option<Job> {
+                let &(t, id) = self.queue.first()?;
+                if t > now {
+                    return None;
+                }
+                self.queue.remove(&(t, id));
+                self.jobs.get(&id).cloned()
+            }
+
+            /// Record the outcome of a run that started at `ran_at` and reschedule.
+            pub fn complete(&mut self, id: JobId, ran_at: u64, ok: bool) -> Result<(), SchedError> {
+                self.dequeue(id);
+                let max_failures = self.max_failures;
+                let j = self.jobs.get_mut(&id).ok_or(SchedError::Unknown)?;
+                if ok {
+                    j.failures = 0;
+                } else {
+                    j.failures += 1;
+                    if j.failures >= max_failures {
+                        j.paused = true;
+                    }
+                }
+                j.next_run = j.schedule.next_after(ran_at);
+                self.enqueue(id);
+                Ok(())
+            }
+
+            /// Earliest pending run time (for sleeping until then).
+            #[must_use]
+            pub fn next_wake(&self) -> Option<u64> {
+                self.queue.first().map(|&(t, _)| t)
+            }
+
+            /// Look up a job.
+            #[must_use]
+            pub fn get(&self, id: JobId) -> Option<&Job> {
+                self.jobs.get(&id)
+            }
+
+            /// Jobs of one owner.
+            pub fn by_owner<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a Job> + 'a {
+                self.jobs.values().filter(move |j| j.owner == owner)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn due_order_and_reschedule() {
+                let mut s = Scheduler::new(8);
+                let a = s
+                    .add(
+                        "u",
+                        "summarise mail",
+                        Schedule::Every {
+                            start: 100,
+                            period: 60,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                let b = s.add("u", "backup", Schedule::Once { at: 50 }, 0).unwrap();
+                assert_eq!(s.next_wake(), Some(50));
+                assert!(s.pop_due(49).is_none());
+                assert_eq!(s.pop_due(120).unwrap().id, b);
+                s.complete(b, 120, true).unwrap();
+                assert_eq!(s.get(b).unwrap().next_run, None);
+                assert_eq!(s.pop_due(120).unwrap().id, a);
+                s.complete(a, 120, true).unwrap();
+                assert_eq!(s.get(a).unwrap().next_run, Some(160));
+                assert!(s.pop_due(159).is_none());
+                assert_eq!(s.by_owner("u").count(), 2);
+            }
+
+            #[test]
+            fn failures_pause_job() {
+                let mut s = Scheduler::new(2);
+                s.max_failures = 2;
+                let id = s
+                    .add(
+                        "sys",
+                        "sync",
+                        Schedule::Every {
+                            start: 0,
+                            period: 10,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                for t in [0, 10] {
+                    assert_eq!(s.pop_due(t).unwrap().id, id);
+                    s.complete(id, t, false).unwrap();
+                }
+                assert!(s.get(id).unwrap().paused);
+                assert!(s.pop_due(1000).is_none());
+                s.set_paused(id, false).unwrap();
+                assert_eq!(s.pop_due(1000).unwrap().id, id);
+            }
+
+            #[test]
+            fn validation() {
+                let mut s = Scheduler::new(1);
+                assert_eq!(
+                    s.add("", "x", Schedule::Once { at: 1 }, 0),
+                    Err(SchedError::BadJob)
+                );
+                assert_eq!(
+                    s.add(
+                        "u",
+                        "x",
+                        Schedule::Every {
+                            start: 0,
+                            period: 0
+                        },
+                        0
+                    ),
+                    Err(SchedError::BadSchedule)
+                );
+                s.add("u", "x", Schedule::Once { at: 1 }, 0).unwrap();
+                assert_eq!(
+                    s.add("u", "y", Schedule::Once { at: 1 }, 0),
+                    Err(SchedError::Full)
+                );
+                assert_eq!(s.remove(99), Err(SchedError::Unknown));
+            }
+        }
+    }
+
+    pub use schedule::Schedule;
+}
+
+pub mod adapters {
+    //! MOULI adapters to sibling systems.
+    //!
+    //! Each adapter is MOULI's own view of the other system's messages. None of
+    //! them claims wire or ABI compatibility until a wire profile is written and
+    //! tested against the real peer.
+    //!
+    //! * [`topstar`]: validation of TOPSTAR protocol messages.
+    #![forbid(unsafe_code)]
+
+    pub mod topstar {
+        //! TOPSTAR message adapter.
+        //!
+        //! Validates a decoded TOPSTAR message before MOULI acts on it. Protocol
+        //! metadata is never trusted for authentication: only the host-supplied
+        //! [`Verifier`] (signature over canonical bytes, sender bound to key) can
+        //! accept a message.
+
+        use core::fmt;
+
+        /// Protocol major version accepted.
+        pub const PROTOCOL_MAJOR: u16 = 1;
+        /// Highest protocol minor version accepted.
+        pub const PROTOCOL_MINOR: u16 = 0;
+        /// Largest payload accepted.
+        pub const MAX_PAYLOAD: usize = 64 * 1024;
+        /// Longest schema name, content type or key id.
+        pub const MAX_LABEL: usize = 63;
+
+        /// Message kind.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Kind {
+            /// Request expecting a response.
+            Request,
+            /// Response to a request.
+            Response,
+            /// Unsolicited event.
+            Event,
+            /// Progress update.
+            Progress,
+            /// Cancel a request.
+            Cancel,
+            /// Error report.
+            Error,
+        }
+
+        /// MOULI-side view of a TOPSTAR message.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct Message {
+            /// Protocol major version.
+            pub major: u16,
+            /// Protocol minor version.
+            pub minor: u16,
+            /// Kind.
+            pub kind: Kind,
+            /// Correlation UUID (may be empty).
+            pub correlation_id: String,
+            /// Sender UUID.
+            pub sender_id: String,
+            /// Payload schema name.
+            pub schema: String,
+            /// Payload content type.
+            pub content_type: String,
+            /// Signing key id.
+            pub key_id: String,
+            /// Payload.
+            pub payload: Vec<u8>,
+            /// Signature over canonical bytes.
+            pub signature: Vec<u8>,
+            /// Request timeout.
+            pub timeout_ms: u32,
+            /// Request retries allowed.
+            pub retry_attempts: u32,
+            /// Request carries an intent.
+            pub has_intent: bool,
+            /// Request carries an action.
+            pub has_action: bool,
+        }
+
+        /// Why a message was rejected.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Reject {
+            /// Unsupported protocol version.
+            Version,
+            /// Schema name or content type missing or too long.
+            Schema,
+            /// Sender, correlation or key id invalid.
+            Identity,
+            /// Payload too large.
+            Payload,
+            /// Request lacks intent/action, timeout or retries.
+            Request,
+            /// No signature.
+            Signature,
+            /// Verifier refused.
+            Authentication,
+        }
+
+        impl fmt::Display for Reject {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(match self {
+                    Self::Version => "unsupported protocol version",
+                    Self::Schema => "bad schema or content type",
+                    Self::Identity => "bad sender, correlation or key id",
+                    Self::Payload => "payload too large",
+                    Self::Request => "incomplete request",
+                    Self::Signature => "missing signature",
+                    Self::Authentication => "authentication failed",
+                })
+            }
+        }
+
+        impl std::error::Error for Reject {}
+
+        /// Host-side cryptographic check bound to a trusted key registry.
+        pub trait Verifier {
+            /// True only after verifying the signature over canonical bytes and
+            /// binding `sender_id` to the verified key.
+            fn verify(&self, msg: &Message) -> bool;
+        }
+
+        impl<F: Fn(&Message) -> bool> Verifier for F {
+            fn verify(&self, msg: &Message) -> bool {
+                self(msg)
+            }
+        }
+
+        /// Canonical UUID text: 8-4-4-4-12 hex digits.
+        #[must_use]
+        pub fn is_uuid(s: &str) -> bool {
+            let b = s.as_bytes();
+            b.len() == 36
+                && b.iter().enumerate().all(|(i, &c)| match i {
+                    8 | 13 | 18 | 23 => c == b'-',
+                    _ => c.is_ascii_hexdigit(),
+                })
+        }
+
+        fn label_ok(s: &str) -> bool {
+            !s.is_empty() && s.len() <= MAX_LABEL && !s.contains('\0')
+        }
+
+        /// Validate `msg`; checks run cheapest first and the verifier runs last.
+        pub fn validate(msg: &Message, verifier: &dyn Verifier) -> Result<(), Reject> {
+            if msg.major != PROTOCOL_MAJOR || msg.minor > PROTOCOL_MINOR {
+                return Err(Reject::Version);
+            }
+            if !label_ok(&msg.schema) || !label_ok(&msg.content_type) {
+                return Err(Reject::Schema);
+            }
+            if !is_uuid(&msg.sender_id)
+                || !(msg.correlation_id.is_empty() || is_uuid(&msg.correlation_id))
+                || !label_ok(&msg.key_id)
+            {
+                return Err(Reject::Identity);
+            }
+            if msg.payload.len() > MAX_PAYLOAD {
+                return Err(Reject::Payload);
+            }
+            if msg.kind == Kind::Request
+                && (!(msg.has_intent || msg.has_action)
+                    || msg.timeout_ms == 0
+                    || msg.retry_attempts == 0)
+            {
+                return Err(Reject::Request);
+            }
+            if msg.signature.is_empty() {
+                return Err(Reject::Signature);
+            }
+            if !verifier.verify(msg) {
+                return Err(Reject::Authentication);
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn msg() -> Message {
+                Message {
+                    major: 1,
+                    minor: 0,
+                    kind: Kind::Request,
+                    correlation_id: String::new(),
+                    sender_id: "123e4567-e89b-12d3-a456-426614174000".into(),
+                    schema: "mouli.task.v1".into(),
+                    content_type: "application/json".into(),
+                    key_id: "k1".into(),
+                    payload: b"{}".to_vec(),
+                    signature: vec![1; 64],
+                    timeout_ms: 1000,
+                    retry_attempts: 1,
+                    has_intent: true,
+                    has_action: false,
+                }
+            }
+
+            fn yes(_: &Message) -> bool {
+                true
+            }
+
+            #[test]
+            fn accepts_good_message() {
+                assert_eq!(validate(&msg(), &yes), Ok(()));
+            }
+
+            #[test]
+            fn rejections() {
+                let no = |_: &Message| false;
+                assert_eq!(validate(&msg(), &no), Err(Reject::Authentication));
+
+                let mut m = msg();
+                m.major = 2;
+                assert_eq!(validate(&m, &yes), Err(Reject::Version));
+
+                let mut m = msg();
+                m.sender_id = "not-a-uuid".into();
+                assert_eq!(validate(&m, &yes), Err(Reject::Identity));
+
+                let mut m = msg();
+                m.has_intent = false;
+                assert_eq!(validate(&m, &yes), Err(Reject::Request));
+                m.kind = Kind::Event;
+                assert_eq!(validate(&m, &yes), Ok(()));
+
+                let mut m = msg();
+                m.payload = vec![0; MAX_PAYLOAD + 1];
+                assert_eq!(validate(&m, &yes), Err(Reject::Payload));
+
+                let mut m = msg();
+                m.signature.clear();
+                assert_eq!(validate(&m, &yes), Err(Reject::Signature));
+            }
+
+            #[test]
+            fn uuid_shape() {
+                assert!(is_uuid("00000000-0000-0000-0000-00000000000A"));
+                assert!(!is_uuid("00000000-0000-0000-0000-00000000000"));
+                assert!(!is_uuid("00000000x0000-0000-0000-000000000000"));
+            }
+        }
+    }
+}
+
+pub mod runtime {
+    //! MOULI agent runtime.
+    //!
+    //! One [`Runtime::tick`] runs the phases
+    //! sensors -> cognition -> model -> action -> telemetry.
+    //! Tools are invoked through a capability-checked [`tools::ToolBus`] and every
+    //! actuator command passes the [`action::ActionGate`].
+    //!
+    //! Ported from the retired C core (`aeon_runtime`, `aeon_system_embodiment`).
+    #![forbid(unsafe_code)]
+
+    pub mod action {
+        //! Actuator gate: commands pass only when motors are enabled, no emergency
+        //! stop is active and the magnitude is within limits.
+
+        /// Actuator policy.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct ActionGate {
+            /// Motors may move.
+            pub motors_enabled: bool,
+            /// Hard stop; overrides everything.
+            pub emergency_stop: bool,
+            /// Largest allowed `|command|`.
+            pub max_command: f32,
+        }
+
+        /// Gate output.
+        #[derive(Debug, Clone, Copy, Default, PartialEq)]
+        pub struct Command {
+            /// Command to send (0 when refused).
+            pub value: f32,
+            /// Whether it was approved.
+            pub approved: bool,
+        }
+
+        impl ActionGate {
+            /// Limits are finite and non-negative.
+            #[must_use]
+            pub fn is_valid(&self) -> bool {
+                self.max_command.is_finite() && self.max_command >= 0.0
+            }
+
+            /// Decide `requested`. Refusals return a zero, unapproved command.
+            #[must_use]
+            pub fn check(&self, requested: f32) -> Command {
+                if self.emergency_stop
+                    || !self.motors_enabled
+                    || !self.is_valid()
+                    || !requested.is_finite()
+                    || requested.abs() > self.max_command
+                {
+                    return Command::default();
+                }
+                Command {
+                    value: requested,
+                    approved: true,
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn gate_rules() {
+                let mut g = ActionGate {
+                    motors_enabled: true,
+                    emergency_stop: false,
+                    max_command: 1.0,
+                };
+                assert!(g.check(-1.0).approved);
+                assert!(!g.check(1.5).approved);
+                assert!(!g.check(f32::NAN).approved);
+                g.emergency_stop = true;
+                assert_eq!(g.check(0.5), Command::default());
+            }
+        }
+    }
+    pub mod sensors {
+        //! Bounded frame of recent sensor samples (oldest dropped when full).
+
+        use std::collections::VecDeque;
+
+        /// One sample.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub struct Sample {
+            /// Sensor kind.
+            pub kind: u32,
+            /// Timestamp (caller units).
+            pub timestamp: u64,
+            /// Reading.
+            pub value: f32,
+        }
+
+        /// Recent samples, newest last.
+        #[derive(Debug, Clone)]
+        pub struct SensorFrame {
+            samples: VecDeque<Sample>,
+            cap: usize,
+        }
+
+        /// Non-finite reading.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct BadReading;
+
+        impl SensorFrame {
+            /// Frame keeping at most `cap` samples (minimum 1).
+            #[must_use]
+            pub fn new(cap: usize) -> Self {
+                let cap = cap.max(1);
+                Self {
+                    samples: VecDeque::with_capacity(cap),
+                    cap,
+                }
+            }
+
+            /// Add a reading.
+            pub fn push(
+                &mut self,
+                kind: u32,
+                timestamp: u64,
+                value: f32,
+            ) -> Result<(), BadReading> {
+                if !value.is_finite() {
+                    return Err(BadReading);
+                }
+                if self.samples.len() == self.cap {
+                    self.samples.pop_front();
+                }
+                self.samples.push_back(Sample {
+                    kind,
+                    timestamp,
+                    value,
+                });
+                Ok(())
+            }
+
+            /// Newest sample.
+            #[must_use]
+            pub fn latest(&self) -> Option<Sample> {
+                self.samples.back().copied()
+            }
+
+            /// Newest sample of `kind`.
+            #[must_use]
+            pub fn latest_of(&self, kind: u32) -> Option<Sample> {
+                self.samples.iter().rev().find(|s| s.kind == kind).copied()
+            }
+
+            /// Number of samples.
+            #[must_use]
+            pub fn len(&self) -> usize {
+                self.samples.len()
+            }
+
+            /// True when empty.
+            #[must_use]
+            pub fn is_empty(&self) -> bool {
+                self.samples.is_empty()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn drops_oldest() {
+                let mut f = SensorFrame::new(2);
+                f.push(1, 0, 1.0).unwrap();
+                f.push(2, 1, 2.0).unwrap();
+                f.push(1, 2, 3.0).unwrap();
+                assert_eq!(f.len(), 2);
+                assert_eq!(f.latest_of(2).unwrap().value, 2.0);
+                assert_eq!(f.latest().unwrap().value, 3.0);
+                assert_eq!(f.push(0, 0, f32::INFINITY), Err(BadReading));
+            }
+        }
+    }
+    pub mod tools {
+        //! Capability-checked tool bus.
+        //!
+        //! A tool declares the capability bits it needs; a caller must hold all of
+        //! them to invoke it.
+
+        use core::fmt;
+
+        /// Tool handler: bytes in, bytes out.
+        pub type Handler = Box<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+
+        /// Tool bus errors.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum ToolError {
+            /// Bus is full.
+            Full,
+            /// Tool id already registered.
+            Duplicate,
+            /// No such tool.
+            Unknown,
+            /// Caller lacks required capabilities.
+            Denied,
+            /// The tool reported a failure.
+            Failed(String),
+        }
+
+        impl fmt::Display for ToolError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Full => f.write_str("tool bus full"),
+                    Self::Duplicate => f.write_str("tool already registered"),
+                    Self::Unknown => f.write_str("unknown tool"),
+                    Self::Denied => f.write_str("missing capability"),
+                    Self::Failed(e) => write!(f, "tool failed: {e}"),
+                }
+            }
+        }
+
+        impl std::error::Error for ToolError {}
+
+        struct Entry {
+            id: u32,
+            required: u32,
+            handler: Handler,
+        }
+
+        /// Registered tools.
+        pub struct ToolBus {
+            entries: Vec<Entry>,
+            cap: usize,
+        }
+
+        impl fmt::Debug for ToolBus {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("ToolBus")
+                    .field(
+                        "tools",
+                        &self.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+                    )
+                    .field("cap", &self.cap)
+                    .finish()
+            }
+        }
+
+        impl ToolBus {
+            /// Bus holding at most `cap` tools.
+            #[must_use]
+            pub fn new(cap: usize) -> Self {
+                Self {
+                    entries: Vec::new(),
+                    cap,
+                }
+            }
+
+            /// Register tool `id` requiring capability bits `required`.
+            pub fn register(
+                &mut self,
+                id: u32,
+                required: u32,
+                handler: Handler,
+            ) -> Result<(), ToolError> {
+                if self.entries.len() >= self.cap {
+                    return Err(ToolError::Full);
+                }
+                if self.entries.iter().any(|e| e.id == id) {
+                    return Err(ToolError::Duplicate);
+                }
+                self.entries.push(Entry {
+                    id,
+                    required,
+                    handler,
+                });
+                Ok(())
+            }
+
+            /// Call tool `id` holding capability bits `caps`.
+            pub fn invoke(&self, id: u32, caps: u32, input: &[u8]) -> Result<Vec<u8>, ToolError> {
+                let e = self
+                    .entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .ok_or(ToolError::Unknown)?;
+                if e.required & caps != e.required {
+                    return Err(ToolError::Denied);
+                }
+                (e.handler)(input).map_err(ToolError::Failed)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn capability_checks() {
+                let mut bus = ToolBus::new(2);
+                bus.register(
+                    1,
+                    0b11,
+                    Box::new(|i: &[u8]| Ok(i.iter().rev().copied().collect())),
+                )
+                .unwrap();
+                bus.register(2, 0, Box::new(|_: &[u8]| Err("boom".into())))
+                    .unwrap();
+                assert_eq!(
+                    bus.register(3, 0, Box::new(|_: &[u8]| Ok(vec![]))),
+                    Err(ToolError::Full)
+                );
+                assert_eq!(bus.invoke(1, 0b111, b"ab").unwrap(), b"ba");
+                assert_eq!(bus.invoke(1, 0b01, b"ab"), Err(ToolError::Denied));
+                assert_eq!(bus.invoke(2, 0, b""), Err(ToolError::Failed("boom".into())));
+                assert_eq!(bus.invoke(9, 0, b""), Err(ToolError::Unknown));
+            }
+        }
+    }
+
+    use crate::cognition::inference::{select_action, InferenceState};
+    use crate::cognition::memory::EpisodicMemory;
+    use crate::cognition::workspace::Workspace;
+    use action::{ActionGate, Command};
+    use core::fmt;
+    use sensors::SensorFrame;
+    use tools::{ToolBus, ToolError};
+
+    /// Runtime phase.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Phase {
+        /// Between ticks.
+        Idle,
+        /// Reading sensors.
+        Sensors,
+        /// Updating beliefs.
+        Cognition,
+        /// Model step.
+        Model,
+        /// Tool call.
+        Tools,
+        /// Actuator command.
+        Action,
+        /// Recording.
+        Telemetry,
+    }
+
+    impl Phase {
+        const ALL: [Self; 7] = [
+            Self::Idle,
+            Self::Sensors,
+            Self::Cognition,
+            Self::Model,
+            Self::Tools,
+            Self::Action,
+            Self::Telemetry,
+        ];
+
+        fn index(self) -> usize {
+            Self::ALL.iter().position(|&p| p == self).unwrap_or(0)
+        }
+    }
+
+    /// Runtime errors.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RuntimeError {
+        /// Bad configuration.
+        Config,
+        /// A cognition step rejected its input.
+        Cognition,
+        /// A kernel failed.
+        Model,
+        /// Tool bus error.
+        Tool(ToolError),
+        /// Command not finite.
+        BadCommand,
+    }
+
+    impl fmt::Display for RuntimeError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Config => f.write_str("bad runtime configuration"),
+                Self::Cognition => f.write_str("cognition step failed"),
+                Self::Model => f.write_str("model step failed"),
+                Self::Tool(e) => write!(f, "tool error: {e}"),
+                Self::BadCommand => f.write_str("non-finite command"),
+            }
+        }
+    }
+
+    impl std::error::Error for RuntimeError {}
+
+    /// Runtime configuration.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Config {
+        /// Number of discrete actions to choose between (1..=1024).
+        pub actions: usize,
+        /// RMS-norm epsilon for the model step.
+        pub epsilon: f32,
+        /// Actuator limits.
+        pub gate: ActionGate,
+        /// Episodic memory size.
+        pub memory: usize,
+        /// Workspace size.
+        pub workspace: usize,
+    }
+
+    /// The agent runtime.
+    #[derive(Debug)]
+    pub struct Runtime {
+        cfg: Config,
+        phase: Phase,
+        ticks: u64,
+        phase_count: [u64; 7],
+        /// Latest sensor samples.
+        pub sensors: SensorFrame,
+        /// Registered tools.
+        pub tools: ToolBus,
+        gate: ActionGate,
+        memory: EpisodicMemory,
+        workspace: Workspace,
+        inference: InferenceState,
+        model_output: [f32; 4],
+        selected: usize,
+        last_command: Command,
+    }
+
+    impl Runtime {
+        /// Build a runtime.
+        pub fn new(cfg: Config) -> Result<Self, RuntimeError> {
+            if cfg.actions == 0
+                || cfg.actions > 1024
+                || !cfg.epsilon.is_finite()
+                || cfg.epsilon <= 0.0
+                || !cfg.gate.is_valid()
+            {
+                return Err(RuntimeError::Config);
+            }
+            Ok(Self {
+                memory: EpisodicMemory::new(cfg.memory).map_err(|_| RuntimeError::Config)?,
+                workspace: Workspace::new(cfg.workspace).map_err(|_| RuntimeError::Config)?,
+                gate: cfg.gate,
+                cfg,
+                phase: Phase::Idle,
+                ticks: 0,
+                phase_count: [0; 7],
+                sensors: SensorFrame::new(16),
+                tools: ToolBus::new(16),
+                inference: InferenceState::default(),
+                model_output: [0.0; 4],
+                selected: 0,
+                last_command: Command::default(),
+            })
+        }
+
+        fn enter(&mut self, p: Phase) {
+            self.phase = p;
+            self.phase_count[p.index()] += 1;
+        }
+
+        /// Run one full cycle at `timestamp`.
+        pub fn tick(&mut self, timestamp: u64) -> Result<(), RuntimeError> {
+            self.enter(Phase::Sensors);
+            if self.sensors.is_empty() {
+                self.sensors
+                    .push(0, timestamp, 0.0)
+                    .map_err(|_| RuntimeError::Cognition)?;
+            }
+            let observation = self.sensors.latest().map_or(0.0, |s| s.value);
+
+            self.enter(Phase::Cognition);
+            let (action, state) = select_action(observation.abs(), 1.0, self.cfg.actions)
+                .map_err(|_| RuntimeError::Cognition)?;
+            self.selected = action;
+            self.inference = state;
+            let id = self.ticks + 1;
+            self.workspace
+                .publish(id, state.confidence)
+                .map_err(|_| RuntimeError::Cognition)?;
+            self.memory
+                .record(id, observation, 1.0)
+                .map_err(|_| RuntimeError::Cognition)?;
+
+            self.enter(Phase::Model);
+            let x = [observation, 1.0, 0.0, -observation];
+            mouli_llm::kernels::ops::rmsnorm(&x, &[], self.cfg.epsilon, &mut self.model_output)
+                .map_err(|_| RuntimeError::Model)?;
+
+            self.enter(Phase::Action);
+            self.last_command = self.gate.check(action as f32);
+
+            self.enter(Phase::Telemetry);
+            self.ticks += 1;
+            self.phase = Phase::Idle;
+            Ok(())
+        }
+
+        /// Invoke a tool with the caller's capability bits.
+        pub fn invoke_tool(
+            &mut self,
+            id: u32,
+            caps: u32,
+            input: &[u8],
+        ) -> Result<Vec<u8>, RuntimeError> {
+            self.enter(Phase::Tools);
+            self.tools
+                .invoke(id, caps, input)
+                .map_err(RuntimeError::Tool)
+        }
+
+        /// Ask the actuator for `command`; the gate decides.
+        pub fn request_action(&mut self, command: f32) -> Result<Command, RuntimeError> {
+            if !command.is_finite() {
+                return Err(RuntimeError::BadCommand);
+            }
+            self.enter(Phase::Action);
+            self.last_command = self.gate.check(command);
+            Ok(self.last_command)
+        }
+
+        /// Engage the emergency stop; all later commands are refused.
+        pub fn shutdown(&mut self) {
+            self.gate.emergency_stop = true;
+            self.last_command = Command::default();
+            self.phase = Phase::Idle;
+        }
+
+        /// Completed ticks.
+        #[must_use]
+        pub fn ticks(&self) -> u64 {
+            self.ticks
+        }
+
+        /// Current phase.
+        #[must_use]
+        pub fn phase(&self) -> Phase {
+            self.phase
+        }
+
+        /// Times each phase was entered.
+        #[must_use]
+        pub fn phase_count(&self, p: Phase) -> u64 {
+            self.phase_count[p.index()]
+        }
+
+        /// Latest belief state.
+        #[must_use]
+        pub fn inference(&self) -> InferenceState {
+            self.inference
+        }
+
+        /// Action chosen on the last tick.
+        #[must_use]
+        pub fn selected_action(&self) -> usize {
+            self.selected
+        }
+
+        /// Last gated command.
+        #[must_use]
+        pub fn last_command(&self) -> Command {
+            self.last_command
+        }
+
+        /// Output of the last model step.
+        #[must_use]
+        pub fn model_output(&self) -> [f32; 4] {
+            self.model_output
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cfg() -> Config {
+            Config {
+                actions: 4,
+                epsilon: 1e-5,
+                gate: ActionGate {
+                    motors_enabled: true,
+                    emergency_stop: false,
+                    max_command: 4.0,
+                },
+                memory: 8,
+                workspace: 4,
+            }
+        }
+
+        #[test]
+        fn tick_runs_all_phases() {
+            let mut r = Runtime::new(cfg()).unwrap();
+            r.sensors.push(1, 10, 0.5).unwrap();
+            r.tick(10).unwrap();
+            r.tick(11).unwrap();
+            assert_eq!(r.ticks(), 2);
+            assert_eq!(r.phase(), Phase::Idle);
+            assert_eq!(r.phase_count(Phase::Model), 2);
+            assert!(r.last_command().approved);
+            assert!(r.inference().confidence > 0.0);
+        }
+
+        #[test]
+        fn shutdown_blocks_actions() {
+            let mut r = Runtime::new(cfg()).unwrap();
+            assert!(r.request_action(1.0).unwrap().approved);
+            assert!(!r.request_action(5.0).unwrap().approved);
+            r.shutdown();
+            assert!(!r.request_action(1.0).unwrap().approved);
+            assert_eq!(r.request_action(f32::NAN), Err(RuntimeError::BadCommand));
+        }
+
+        #[test]
+        fn rejects_bad_config() {
+            let mut c = cfg();
+            c.actions = 0;
+            assert!(Runtime::new(c).is_err());
+            let mut c = cfg();
+            c.gate.max_command = -1.0;
+            assert!(Runtime::new(c).is_err());
+        }
+    }
+}
+
+#[allow(missing_docs, clippy::field_reassign_with_default)]
+pub mod agentmem {
+    //! Agent-memory primitives. Each module is self-contained and std-only.
+    //! Adapted from external sketches: linted, tested and fixed here; not load or hardware tested.
+    //!
+    //! The `xNNN` modules are the replay-checkpoint chain; the module list below gives each one's purpose.
+
+    pub mod access {
+        //! Tenant- and principal-scoped access control for agent memory records.
+        //!
+        //! Pure authorization policy: authentication and durable policy storage are
+        //! supplied by the host. Deny rules take precedence over allow rules.
+
+        pub type TenantId = u64;
+        pub type PrincipalId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum MemoryAction {
+            Read,
+            Search,
+            Append,
+            Update,
+            Delete,
+            Share,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Effect {
+            Allow,
+            Deny,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct AccessRule {
+            pub tenant_id: TenantId,
+            /// `None` means any authenticated principal in the tenant.
+            pub principal_id: Option<PrincipalId>,
+            /// `None` means every memory record in the tenant.
+            pub memory_id: Option<MemoryId>,
+            pub action: MemoryAction,
+            pub effect: Effect,
+            pub priority: i32,
+            pub expires_at_ns: Option<u64>,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct AccessRequest {
+            pub tenant_id: TenantId,
+            pub principal_id: PrincipalId,
+            pub memory_id: MemoryId,
+            pub action: MemoryAction,
+            pub now_ns: u64,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum DecisionReason {
+            ExplicitDeny,
+            ExplicitAllow,
+            DefaultDeny,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct AccessDecision {
+            pub allowed: bool,
+            pub reason: DecisionReason,
+            pub matched_rule: Option<usize>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum PolicyError {
+            CapacityReached,
+            InvalidExpiry,
+        }
+
+        pub struct MemoryAccessPolicy {
+            rules: Vec<AccessRule>,
+            max_rules: usize,
+        }
+
+        impl MemoryAccessPolicy {
+            pub fn new(max_rules: usize) -> Self {
+                Self {
+                    rules: Vec::new(),
+                    max_rules,
+                }
+            }
+
+            pub fn add_rule(&mut self, rule: AccessRule) -> Result<usize, PolicyError> {
+                if self.rules.len() >= self.max_rules {
+                    return Err(PolicyError::CapacityReached);
+                }
+                if rule.expires_at_ns.is_some_and(|expiry| expiry == 0) {
+                    return Err(PolicyError::InvalidExpiry);
+                }
+                let index = self.rules.len();
+                self.rules.push(rule);
+                Ok(index)
+            }
+
+            pub fn remove_rule(&mut self, index: usize) -> bool {
+                if index >= self.rules.len() {
+                    return false;
+                }
+                self.rules.remove(index);
+                true
+            }
+
+            pub fn authorize(&self, request: AccessRequest) -> AccessDecision {
+                let mut matching: Vec<(usize, &AccessRule)> = self
+                    .rules
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rule)| rule_matches(rule, request))
+                    .collect();
+
+                // Any matching deny overrides all allows, independent of priority.
+                if let Some((index, _)) = matching
+                    .iter()
+                    .find(|(_, rule)| rule.effect == Effect::Deny)
+                {
+                    return AccessDecision {
+                        allowed: false,
+                        reason: DecisionReason::ExplicitDeny,
+                        matched_rule: Some(*index),
+                    };
+                }
+
+                matching.sort_by(|(index_a, a), (index_b, b)| {
+                    b.priority
+                        .cmp(&a.priority)
+                        .then_with(|| index_a.cmp(index_b))
+                });
+
+                if let Some((index, _)) = matching.first() {
+                    AccessDecision {
+                        allowed: true,
+                        reason: DecisionReason::ExplicitAllow,
+                        matched_rule: Some(*index),
+                    }
+                } else {
+                    AccessDecision {
+                        allowed: false,
+                        reason: DecisionReason::DefaultDeny,
+                        matched_rule: None,
+                    }
+                }
+            }
+
+            pub fn rule_count(&self) -> usize {
+                self.rules.len()
+            }
+        }
+
+        fn rule_matches(rule: &AccessRule, request: AccessRequest) -> bool {
+            rule.tenant_id == request.tenant_id
+                && rule
+                    .principal_id
+                    .is_none_or(|id| id == request.principal_id)
+                && rule.memory_id.is_none_or(|id| id == request.memory_id)
+                && rule.action == request.action
+                && rule
+                    .expires_at_ns
+                    .is_none_or(|expiry| request.now_ns < expiry)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn rule(effect: Effect, principal_id: Option<u64>, priority: i32) -> AccessRule {
+                AccessRule {
+                    tenant_id: 5,
+                    principal_id,
+                    memory_id: None,
+                    action: MemoryAction::Read,
+                    effect,
+                    priority,
+                    expires_at_ns: None,
+                }
+            }
+
+            fn request() -> AccessRequest {
+                AccessRequest {
+                    tenant_id: 5,
+                    principal_id: 42,
+                    memory_id: 100,
+                    action: MemoryAction::Read,
+                    now_ns: 10,
+                }
+            }
+
+            #[test]
+            fn deny_overrides_allow() {
+                let mut policy = MemoryAccessPolicy::new(10);
+                assert!(policy.add_rule(rule(Effect::Allow, None, 100)).is_ok());
+                assert!(policy.add_rule(rule(Effect::Deny, Some(42), -100)).is_ok());
+                let decision = policy.authorize(request());
+                assert!(!decision.allowed);
+                assert_eq!(decision.reason, DecisionReason::ExplicitDeny);
+            }
+
+            #[test]
+            fn tenant_and_expiry_are_enforced() {
+                let mut policy = MemoryAccessPolicy::new(10);
+                let mut allow = rule(Effect::Allow, None, 1);
+                allow.tenant_id = 6;
+                assert!(policy.add_rule(allow).is_ok());
+                let mut expired = rule(Effect::Allow, Some(42), 2);
+                expired.expires_at_ns = Some(10);
+                assert!(policy.add_rule(expired).is_ok());
+                assert_eq!(
+                    policy.authorize(request()).reason,
+                    DecisionReason::DefaultDeny
+                );
+            }
+
+            #[test]
+            fn capacity_and_rule_removal_are_bounded() {
+                let mut policy = MemoryAccessPolicy::new(1);
+                assert!(policy.add_rule(rule(Effect::Allow, None, 1)).is_ok());
+                assert_eq!(
+                    policy.add_rule(rule(Effect::Deny, None, 2)),
+                    Err(PolicyError::CapacityReached)
+                );
+                assert!(policy.remove_rule(0));
+                assert_eq!(policy.rule_count(), 0);
+            }
+        }
+    }
+    pub mod anti_entropy {
+        //! Bounded anti-entropy comparison primitives for replicated agent memories.
+        //!
+        //! Builds deterministic tenant-scoped range fingerprints and identifies
+        //! missing or divergent record IDs between peer inventories. The FNV digest
+        //! is for accidental mismatch detection only, not cryptographic integrity.
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        pub type TenantId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct InventoryEntry {
+            pub memory_id: MemoryId,
+            pub version: u64,
+            pub content_digest: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RangeFingerprint {
+            pub tenant_id: TenantId,
+            pub start_id: MemoryId,
+            pub end_id: MemoryId,
+            pub entry_count: usize,
+            pub digest: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ReconcilePlan {
+            pub request_from_peer: Vec<MemoryId>,
+            pub send_to_peer: Vec<MemoryId>,
+            pub divergent: Vec<MemoryId>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum AntiEntropyError {
+            ZeroRangeLimit,
+            TooManyEntries,
+            DuplicateMemoryId,
+            InvalidRange,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct AntiEntropyConfig {
+            pub max_entries: usize,
+            pub max_ranges: usize,
+        }
+
+        impl Default for AntiEntropyConfig {
+            fn default() -> Self {
+                Self {
+                    max_entries: 1_000_000,
+                    max_ranges: 100_000,
+                }
+            }
+        }
+
+        /// Sort and validate an inventory before computing fingerprints.
+        pub fn normalize_inventory(
+            entries: &[InventoryEntry],
+            config: &AntiEntropyConfig,
+        ) -> Result<Vec<InventoryEntry>, AntiEntropyError> {
+            if entries.len() > config.max_entries {
+                return Err(AntiEntropyError::TooManyEntries);
+            }
+            let mut sorted = entries.to_vec();
+            sorted.sort_by_key(|entry| entry.memory_id);
+            for pair in sorted.windows(2) {
+                if pair[0].memory_id == pair[1].memory_id {
+                    return Err(AntiEntropyError::DuplicateMemoryId);
+                }
+            }
+            Ok(sorted)
+        }
+
+        /// Partition a tenant inventory into consecutive ID-ordered ranges.
+        pub fn fingerprint_ranges(
+            tenant_id: TenantId,
+            entries: &[InventoryEntry],
+            range_size: usize,
+            config: &AntiEntropyConfig,
+        ) -> Result<Vec<RangeFingerprint>, AntiEntropyError> {
+            if range_size == 0 {
+                return Err(AntiEntropyError::ZeroRangeLimit);
+            }
+            let sorted = normalize_inventory(entries, config)?;
+            let range_count = sorted.len().saturating_add(range_size - 1) / range_size;
+            if range_count > config.max_ranges {
+                return Err(AntiEntropyError::TooManyEntries);
+            }
+
+            let mut result = Vec::with_capacity(range_count);
+            for chunk in sorted.chunks(range_size) {
+                let Some(first) = chunk.first() else {
+                    continue;
+                };
+                let Some(last) = chunk.last() else {
+                    continue;
+                };
+                result.push(RangeFingerprint {
+                    tenant_id,
+                    start_id: first.memory_id,
+                    end_id: last.memory_id,
+                    entry_count: chunk.len(),
+                    digest: digest_entries(chunk),
+                });
+            }
+            Ok(result)
+        }
+
+        /// Compare two inventories for one tenant.
+        ///
+        /// `request_from_peer` contains IDs present locally but absent remotely;
+        /// `send_to_peer` contains IDs absent locally but present remotely;
+        /// `divergent` contains IDs present on both sides with different version or
+        /// content digest.
+        pub fn reconcile(
+            local: &[InventoryEntry],
+            remote: &[InventoryEntry],
+            config: &AntiEntropyConfig,
+        ) -> Result<ReconcilePlan, AntiEntropyError> {
+            let local = normalize_inventory(local, config)?;
+            let remote = normalize_inventory(remote, config)?;
+            let local_map: BTreeMap<MemoryId, &InventoryEntry> =
+                local.iter().map(|entry| (entry.memory_id, entry)).collect();
+            let remote_map: BTreeMap<MemoryId, &InventoryEntry> = remote
+                .iter()
+                .map(|entry| (entry.memory_id, entry))
+                .collect();
+
+            let mut plan = ReconcilePlan {
+                request_from_peer: Vec::new(),
+                send_to_peer: Vec::new(),
+                divergent: Vec::new(),
+            };
+
+            let all_ids: BTreeSet<MemoryId> =
+                local_map.keys().chain(remote_map.keys()).copied().collect();
+
+            for id in all_ids {
+                match (local_map.get(&id), remote_map.get(&id)) {
+                    (Some(_), None) => plan.request_from_peer.push(id),
+                    (None, Some(_)) => plan.send_to_peer.push(id),
+                    (Some(local_entry), Some(remote_entry))
+                        if local_entry.version != remote_entry.version
+                            || local_entry.content_digest != remote_entry.content_digest =>
+                    {
+                        plan.divergent.push(id);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(plan)
+        }
+
+        fn digest_entries(entries: &[InventoryEntry]) -> u64 {
+            let mut hash = 0xcbf29ce484222325u64;
+            for entry in entries {
+                for byte in entry
+                    .memory_id
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(entry.version.to_le_bytes())
+                    .chain(entry.content_digest.to_le_bytes())
+                {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+            hash
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn entry(id: u128, version: u64, digest: u64) -> InventoryEntry {
+                InventoryEntry {
+                    memory_id: id,
+                    version,
+                    content_digest: digest,
+                }
+            }
+
+            #[test]
+            fn range_fingerprints_are_stable_and_bounded() {
+                let entries = vec![entry(3, 1, 30), entry(1, 1, 10), entry(2, 2, 20)];
+                let config = AntiEntropyConfig::default();
+                let ranges = fingerprint_ranges(8, &entries, 2, &config);
+                assert!(ranges.is_ok());
+                let ranges = ranges.unwrap_or_default();
+                assert_eq!(ranges.len(), 2);
+                assert_eq!(ranges[0].start_id, 1);
+                assert_eq!(ranges[0].end_id, 2);
+                assert_eq!(
+                    ranges[0].digest,
+                    digest_entries(&[entry(1, 1, 10), entry(2, 2, 20)])
+                );
+            }
+
+            #[test]
+            fn reconciliation_finds_missing_and_divergent_ids() {
+                let local = vec![entry(1, 1, 10), entry(2, 1, 20)];
+                let remote = vec![entry(2, 2, 20), entry(3, 1, 30)];
+                let plan = reconcile(&local, &remote, &AntiEntropyConfig::default());
+                assert_eq!(
+                    plan,
+                    Ok(ReconcilePlan {
+                        request_from_peer: vec![1],
+                        send_to_peer: vec![3],
+                        divergent: vec![2],
+                    })
+                );
+            }
+
+            #[test]
+            fn rejects_duplicate_ids_and_zero_range_size() {
+                let config = AntiEntropyConfig::default();
+                assert_eq!(
+                    normalize_inventory(&[entry(1, 1, 1), entry(1, 2, 2)], &config),
+                    Err(AntiEntropyError::DuplicateMemoryId)
+                );
+                assert_eq!(
+                    fingerprint_ranges(1, &[entry(1, 1, 1)], 0, &config),
+                    Err(AntiEntropyError::ZeroRangeLimit)
+                );
+            }
+        }
+    }
+    pub mod cdc {
+        //! M030: incremental SQLite WAL commit-frame parser and bounded CDC fan-out.
+        //! Emits committed page-frame batches. A database-specific decoder can translate
+        //! these page images into row-level INSERT/UPDATE/DELETE events before publishing.
+
+        use std::collections::BTreeMap;
+        use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+
+        const WAL_HEADER_BYTES: usize = 32;
+        const FRAME_HEADER_BYTES: usize = 24;
+        const MIN_PAGE_SIZE: u32 = 512;
+        const MAX_PAGE_SIZE: u32 = 65_536;
+        const MAX_BATCH_FRAMES: usize = 65_536;
+        const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct WalHeader {
+            pub magic: u32,
+            pub version: u32,
+            pub page_size: u32,
+            pub checkpoint_sequence: u32,
+            pub salt1: u32,
+            pub salt2: u32,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct PageFrame {
+            pub frame_number: u64,
+            pub page_number: u32,
+            pub database_size_after_commit: u32,
+            pub page_data: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct CommitBatch {
+            pub epoch: u64,
+            pub commit_sequence: u64,
+            pub database_pages: u32,
+            pub frames: Vec<PageFrame>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum WalError {
+            InvalidHeader,
+            UnsupportedVersion,
+            InvalidPageSize,
+            InvalidFrame,
+            SaltMismatch,
+            FrameLimitExceeded,
+            BatchByteLimitExceeded,
+            EpochExhausted,
+            SequenceExhausted,
+            SubscriberLagged,
+        }
+
+        fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+            let end = offset.checked_add(4)?;
+            let slice = bytes.get(offset..end)?;
+            let array: [u8; 4] = slice.try_into().ok()?;
+            Some(u32::from_be_bytes(array))
+        }
+
+        impl WalHeader {
+            pub fn parse(bytes: &[u8]) -> Result<Self, WalError> {
+                if bytes.len() < WAL_HEADER_BYTES {
+                    return Err(WalError::InvalidHeader);
+                }
+                let magic = be_u32(bytes, 0).ok_or(WalError::InvalidHeader)?;
+                if magic != 0x377f0682 && magic != 0x377f0683 {
+                    return Err(WalError::InvalidHeader);
+                }
+                let version = be_u32(bytes, 4).ok_or(WalError::InvalidHeader)?;
+                if version != 3_007_000 {
+                    return Err(WalError::UnsupportedVersion);
+                }
+                let page_size = be_u32(bytes, 8).ok_or(WalError::InvalidHeader)?;
+                if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size)
+                    || !page_size.is_power_of_two()
+                {
+                    return Err(WalError::InvalidPageSize);
+                }
+                Ok(Self {
+                    magic,
+                    version,
+                    page_size,
+                    checkpoint_sequence: be_u32(bytes, 12).ok_or(WalError::InvalidHeader)?,
+                    salt1: be_u32(bytes, 16).ok_or(WalError::InvalidHeader)?,
+                    salt2: be_u32(bytes, 20).ok_or(WalError::InvalidHeader)?,
+                })
+            }
+            pub fn frame_size(&self) -> Option<usize> {
+                FRAME_HEADER_BYTES.checked_add(usize::try_from(self.page_size).ok()?)
+            }
+        }
+
+        pub struct WalTailer {
+            header: Option<WalHeader>,
+            epoch: u64,
+            next_frame: u64,
+            next_commit: u64,
+            pending: Vec<PageFrame>,
+            pending_bytes: usize,
+            buffer: Vec<u8>,
+        }
+        impl Default for WalTailer {
+            fn default() -> Self {
+                Self {
+                    header: None,
+                    epoch: 0,
+                    next_frame: 1,
+                    next_commit: 1,
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                    buffer: Vec::new(),
+                }
+            }
+        }
+        impl WalTailer {
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// Feed any contiguous WAL byte range. Incomplete header/frame bytes are retained.
+            /// Call reset_epoch after detecting a WAL truncate/restart or changed salts.
+            pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<CommitBatch>, WalError> {
+                let combined = self
+                    .buffer
+                    .len()
+                    .checked_add(bytes.len())
+                    .ok_or(WalError::BatchByteLimitExceeded)?;
+                if combined
+                    > MAX_BATCH_BYTES
+                        .saturating_add(WAL_HEADER_BYTES)
+                        .saturating_add(65_560)
+                {
+                    return Err(WalError::BatchByteLimitExceeded);
+                }
+                self.buffer.extend_from_slice(bytes);
+                let mut committed = Vec::new();
+
+                if self.header.is_none() {
+                    if self.buffer.len() < WAL_HEADER_BYTES {
+                        return Ok(committed);
+                    }
+                    let header = WalHeader::parse(&self.buffer)?;
+                    self.buffer.drain(..WAL_HEADER_BYTES);
+                    self.header = Some(header);
+                }
+
+                while let Some(header) = self.header.as_ref() {
+                    let frame_size = header.frame_size().ok_or(WalError::InvalidFrame)?;
+                    if self.buffer.len() < frame_size {
+                        break;
+                    }
+                    let page_number = be_u32(&self.buffer, 0).ok_or(WalError::InvalidFrame)?;
+                    let database_size = be_u32(&self.buffer, 4).ok_or(WalError::InvalidFrame)?;
+                    let salt1 = be_u32(&self.buffer, 8).ok_or(WalError::InvalidFrame)?;
+                    let salt2 = be_u32(&self.buffer, 12).ok_or(WalError::InvalidFrame)?;
+                    if page_number == 0 {
+                        return Err(WalError::InvalidFrame);
+                    }
+                    if salt1 != header.salt1 || salt2 != header.salt2 {
+                        return Err(WalError::SaltMismatch);
+                    }
+                    if self.pending.len() >= MAX_BATCH_FRAMES {
+                        return Err(WalError::FrameLimitExceeded);
+                    }
+                    let page_start = FRAME_HEADER_BYTES;
+                    let page_end = page_start
+                        .checked_add(header.page_size as usize)
+                        .ok_or(WalError::InvalidFrame)?;
+                    let page_data = self
+                        .buffer
+                        .get(page_start..page_end)
+                        .ok_or(WalError::InvalidFrame)?
+                        .to_vec();
+                    self.buffer.drain(..frame_size);
+                    let page_bytes = page_data.len();
+                    self.pending_bytes = self
+                        .pending_bytes
+                        .checked_add(page_bytes)
+                        .ok_or(WalError::BatchByteLimitExceeded)?;
+                    if self.pending_bytes > MAX_BATCH_BYTES {
+                        return Err(WalError::BatchByteLimitExceeded);
+                    }
+                    let frame_number = self.next_frame;
+                    self.next_frame = self
+                        .next_frame
+                        .checked_add(1)
+                        .ok_or(WalError::SequenceExhausted)?;
+                    self.pending.push(PageFrame {
+                        frame_number,
+                        page_number,
+                        database_size_after_commit: database_size,
+                        page_data,
+                    });
+                    if database_size != 0 {
+                        let batch = CommitBatch {
+                            epoch: self.epoch,
+                            commit_sequence: self.next_commit,
+                            database_pages: database_size,
+                            frames: std::mem::take(&mut self.pending),
+                        };
+                        self.next_commit = self
+                            .next_commit
+                            .checked_add(1)
+                            .ok_or(WalError::SequenceExhausted)?;
+                        self.pending_bytes = 0;
+                        committed.push(batch);
+                    }
+                }
+                Ok(committed)
+            }
+
+            /// Starts a new WAL salt epoch. Pending uncommitted frames are discarded.
+            pub fn reset_epoch(&mut self) -> Result<(), WalError> {
+                self.epoch = self.epoch.checked_add(1).ok_or(WalError::EpochExhausted)?;
+                self.header = None;
+                self.next_frame = 1;
+                self.next_commit = 1;
+                self.pending.clear();
+                self.pending_bytes = 0;
+                self.buffer.clear();
+                Ok(())
+            }
+
+            pub fn pending_frame_count(&self) -> usize {
+                self.pending.len()
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum RowOperation {
+            Insert,
+            Update,
+            Delete,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RowChange {
+            pub table: String,
+            pub operation: RowOperation,
+            pub primary_key: Vec<u8>,
+            pub before: Option<Vec<u8>>,
+            pub after: Option<Vec<u8>>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct CdcEvent {
+            pub tenant_id: u64,
+            pub source_id: String,
+            pub epoch: u64,
+            pub commit_sequence: u64,
+            pub changes: Vec<RowChange>,
+        }
+
+        pub struct Subscriber {
+            pub id: u64,
+            sender: SyncSender<CdcEvent>,
+        }
+        #[derive(Default)]
+        pub struct EventHub {
+            subscribers: BTreeMap<u64, Subscriber>,
+            next_id: u64,
+        }
+        impl EventHub {
+            pub fn subscribe(
+                &mut self,
+                capacity: usize,
+            ) -> Result<(u64, Receiver<CdcEvent>), WalError> {
+                if capacity == 0 || capacity > 65_536 {
+                    return Err(WalError::SubscriberLagged);
+                }
+                self.next_id = self
+                    .next_id
+                    .checked_add(1)
+                    .ok_or(WalError::SequenceExhausted)?;
+                let id = self.next_id;
+                let (tx, rx) = mpsc::sync_channel(capacity);
+                self.subscribers.insert(id, Subscriber { id, sender: tx });
+                Ok((id, rx))
+            }
+            pub fn unsubscribe(&mut self, id: u64) -> bool {
+                self.subscribers.remove(&id).is_some()
+            }
+
+            /// Fan-out is non-blocking. Full or disconnected subscribers are evicted so
+            /// a slow consumer cannot stall WAL ingestion; it must resnapshot/reconnect.
+            pub fn publish(&mut self, event: CdcEvent) -> usize {
+                let mut evict = Vec::new();
+                let mut delivered = 0usize;
+                for (id, subscriber) in &self.subscribers {
+                    match subscriber.sender.try_send(event.clone()) {
+                        Ok(()) => delivered = delivered.saturating_add(1),
+                        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                            evict.push(*id)
+                        }
+                    }
+                }
+                for id in evict {
+                    self.subscribers.remove(&id);
+                }
+                delivered
+            }
+            pub fn subscriber_count(&self) -> usize {
+                self.subscribers.len()
+            }
+        }
+
+        /// Converts decoded row changes into a tenant-scoped event. Page-to-row decoding
+        /// is deliberately delegated to a SQLite-aware adapter.
+        pub fn make_event(
+            tenant_id: u64,
+            source_id: String,
+            batch: &CommitBatch,
+            changes: Vec<RowChange>,
+        ) -> Result<CdcEvent, WalError> {
+            if source_id.is_empty() || source_id.len() > 256 {
+                return Err(WalError::InvalidFrame);
+            }
+            if changes.len() > 1_000_000 {
+                return Err(WalError::FrameLimitExceeded);
+            }
+            for change in &changes {
+                if change.table.is_empty()
+                    || change.table.len() > 256
+                    || change.primary_key.len() > 4096
+                {
+                    return Err(WalError::InvalidFrame);
+                }
+            }
+            Ok(CdcEvent {
+                tenant_id,
+                source_id,
+                epoch: batch.epoch,
+                commit_sequence: batch.commit_sequence,
+                changes,
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn wal_header() -> Vec<u8> {
+                let mut h = vec![0u8; 32];
+                h[0..4].copy_from_slice(&0x377f0682u32.to_be_bytes());
+                h[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+                h[8..12].copy_from_slice(&512u32.to_be_bytes());
+                h[16..20].copy_from_slice(&11u32.to_be_bytes());
+                h[20..24].copy_from_slice(&22u32.to_be_bytes());
+                h
+            }
+            fn frame(commit: u32, page: u8) -> Vec<u8> {
+                let mut f = vec![0u8; 24 + 512];
+                f[0..4].copy_from_slice(&1u32.to_be_bytes());
+                f[4..8].copy_from_slice(&commit.to_be_bytes());
+                f[8..12].copy_from_slice(&11u32.to_be_bytes());
+                f[12..16].copy_from_slice(&22u32.to_be_bytes());
+                f[24..].fill(page);
+                f
+            }
+            #[test]
+            fn incremental_input_emits_only_at_commit_marker() {
+                let mut tail = WalTailer::new();
+                let header = wal_header();
+                assert!(tail.push(&header).expect("header").is_empty());
+                assert!(tail.push(&frame(0, 1)).expect("frame").is_empty());
+                assert_eq!(tail.pending_frame_count(), 1);
+                let batches = tail.push(&frame(3, 2)).expect("commit");
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].frames.len(), 2);
+                assert_eq!(batches[0].database_pages, 3);
+            }
+            #[test]
+            fn split_frame_is_buffered() {
+                let mut tail = WalTailer::new();
+                let mut data = wal_header();
+                data.extend(frame(2, 7));
+                let split = data.len() - 20;
+                assert!(tail.push(&data[..split]).expect("partial").is_empty());
+                assert_eq!(tail.push(&data[split..]).expect("rest").len(), 1);
+            }
+            #[test]
+            fn slow_subscriber_is_evicted_without_blocking() {
+                let mut hub = EventHub::default();
+                let (id, _rx) = hub.subscribe(1).expect("subscribe");
+                let event = CdcEvent {
+                    tenant_id: 1,
+                    source_id: "db".into(),
+                    epoch: 0,
+                    commit_sequence: 1,
+                    changes: Vec::new(),
+                };
+                assert_eq!(hub.publish(event.clone()), 1);
+                assert_eq!(hub.publish(event), 0);
+                assert_eq!(hub.subscriber_count(), 0);
+                assert!(!hub.unsubscribe(id));
+            }
+        }
+    }
+    pub mod checkpoint_codec {
+        //! Deterministic, bounded snapshot codec for replication replay-window checkpoints.
+        //!
+        //! The codec provides complete encode/decode and validation logic. It does not write
+        //! files, encrypt snapshots, authenticate their origin, or atomically install state.
+
+        use std::collections::BTreeSet;
+        use std::convert::TryFrom;
+
+        const MAGIC: &[u8; 4] = b"ARCP";
+        const VERSION: u8 = 1;
+        const HEADER_LEN: usize = 10;
+        const CHECKSUM_LEN: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct StreamCheckpoint {
+            pub tenant_id: String,
+            pub peer_id: String,
+            pub highest_sequence: u64,
+            pub accepted_sequences: BTreeSet<u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpoint {
+            pub window_size: u64,
+            pub streams: Vec<StreamCheckpoint>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CodecLimits {
+            pub max_snapshot_bytes: usize,
+            pub max_streams: usize,
+            pub max_identity_bytes: usize,
+            pub max_sequences_per_stream: usize,
+        }
+
+        impl Default for CodecLimits {
+            fn default() -> Self {
+                Self {
+                    max_snapshot_bytes: 16 * 1024 * 1024,
+                    max_streams: 65_536,
+                    max_identity_bytes: 4096,
+                    max_sequences_per_stream: 4096,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum CheckpointError {
+            InvalidLimits,
+            SnapshotTooLarge,
+            SnapshotTooShort,
+            BadMagic,
+            UnsupportedVersion(u8),
+            LengthOverflow,
+            Truncated,
+            TrailingBytes,
+            ChecksumMismatch,
+            InvalidUtf8,
+            EmptyIdentity,
+            IdentityTooLarge,
+            TooManyStreams,
+            TooManySequences,
+            InvalidWindow,
+            InvalidSequence,
+            DuplicateStream,
+            DuplicateSequence,
+            SequenceOutsideWindow,
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+
+            fn take(&mut self, count: usize) -> Result<&'a [u8], CheckpointError> {
+                let end = self
+                    .offset
+                    .checked_add(count)
+                    .ok_or(CheckpointError::LengthOverflow)?;
+                let value = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(CheckpointError::Truncated)?;
+                self.offset = end;
+                Ok(value)
+            }
+
+            fn u8(&mut self) -> Result<u8, CheckpointError> {
+                self.take(1)?
+                    .first()
+                    .copied()
+                    .ok_or(CheckpointError::Truncated)
+            }
+
+            fn u32(&mut self) -> Result<u32, CheckpointError> {
+                let b = self.take(4)?;
+                let mut a = [0_u8; 4];
+                a.copy_from_slice(b);
+                Ok(u32::from_be_bytes(a))
+            }
+
+            fn u64(&mut self) -> Result<u64, CheckpointError> {
+                let b = self.take(8)?;
+                let mut a = [0_u8; 8];
+                a.copy_from_slice(b);
+                Ok(u64::from_be_bytes(a))
+            }
+
+            fn string(&mut self, limits: &CodecLimits) -> Result<String, CheckpointError> {
+                let len =
+                    usize::try_from(self.u32()?).map_err(|_| CheckpointError::LengthOverflow)?;
+                if len > limits.max_identity_bytes {
+                    return Err(CheckpointError::IdentityTooLarge);
+                }
+                let bytes = self.take(len)?;
+                let value = std::str::from_utf8(bytes).map_err(|_| CheckpointError::InvalidUtf8)?;
+                if value.trim().is_empty() {
+                    return Err(CheckpointError::EmptyIdentity);
+                }
+                Ok(value.to_owned())
+            }
+
+            fn is_done(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn put_string(
+            out: &mut Vec<u8>,
+            value: &str,
+            limits: &CodecLimits,
+        ) -> Result<(), CheckpointError> {
+            if value.trim().is_empty() {
+                return Err(CheckpointError::EmptyIdentity);
+            }
+            if value.len() > limits.max_identity_bytes {
+                return Err(CheckpointError::IdentityTooLarge);
+            }
+            put_u32(
+                out,
+                u32::try_from(value.len()).map_err(|_| CheckpointError::LengthOverflow)?,
+            );
+            out.extend_from_slice(value.as_bytes());
+            Ok(())
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0_u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        fn validate_limits(limits: &CodecLimits) -> Result<(), CheckpointError> {
+            if limits.max_snapshot_bytes < HEADER_LEN + CHECKSUM_LEN
+                || limits.max_identity_bytes == 0
+                || limits.max_streams == 0
+                || limits.max_sequences_per_stream == 0
+            {
+                return Err(CheckpointError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn validate_checkpoint(
+            checkpoint: &ReplayCheckpoint,
+            limits: &CodecLimits,
+        ) -> Result<(), CheckpointError> {
+            if checkpoint.window_size == 0 {
+                return Err(CheckpointError::InvalidWindow);
+            }
+            if checkpoint.streams.len() > limits.max_streams {
+                return Err(CheckpointError::TooManyStreams);
+            }
+
+            let mut stream_keys = BTreeSet::new();
+            for stream in &checkpoint.streams {
+                if stream.tenant_id.trim().is_empty() || stream.peer_id.trim().is_empty() {
+                    return Err(CheckpointError::EmptyIdentity);
+                }
+                if stream.tenant_id.len() > limits.max_identity_bytes
+                    || stream.peer_id.len() > limits.max_identity_bytes
+                {
+                    return Err(CheckpointError::IdentityTooLarge);
+                }
+                if !stream_keys.insert((stream.tenant_id.as_str(), stream.peer_id.as_str())) {
+                    return Err(CheckpointError::DuplicateStream);
+                }
+                if stream.accepted_sequences.len() > limits.max_sequences_per_stream {
+                    return Err(CheckpointError::TooManySequences);
+                }
+                if stream
+                    .accepted_sequences
+                    .iter()
+                    .any(|sequence| *sequence == 0)
+                {
+                    return Err(CheckpointError::InvalidSequence);
+                }
+                if stream
+                    .accepted_sequences
+                    .iter()
+                    .any(|sequence| *sequence > stream.highest_sequence)
+                {
+                    return Err(CheckpointError::InvalidSequence);
+                }
+                let oldest = stream
+                    .highest_sequence
+                    .saturating_sub(checkpoint.window_size.saturating_sub(1));
+                if stream
+                    .accepted_sequences
+                    .iter()
+                    .any(|sequence| *sequence < oldest)
+                {
+                    return Err(CheckpointError::SequenceOutsideWindow);
+                }
+            }
+            Ok(())
+        }
+
+        /// Encodes a canonical snapshot. Streams and accepted sequence numbers are sorted
+        /// deterministically regardless of their original input order.
+        pub fn encode(
+            checkpoint: &ReplayCheckpoint,
+            limits: &CodecLimits,
+        ) -> Result<Vec<u8>, CheckpointError> {
+            validate_limits(limits)?;
+            validate_checkpoint(checkpoint, limits)?;
+
+            let mut streams = checkpoint.streams.clone();
+            streams.sort_by(|a, b| {
+                a.tenant_id
+                    .cmp(&b.tenant_id)
+                    .then_with(|| a.peer_id.cmp(&b.peer_id))
+            });
+
+            let mut body = Vec::new();
+            put_u64(&mut body, checkpoint.window_size);
+            put_u32(
+                &mut body,
+                u32::try_from(streams.len()).map_err(|_| CheckpointError::LengthOverflow)?,
+            );
+
+            for stream in streams {
+                put_string(&mut body, &stream.tenant_id, limits)?;
+                put_string(&mut body, &stream.peer_id, limits)?;
+                put_u64(&mut body, stream.highest_sequence);
+                put_u32(
+                    &mut body,
+                    u32::try_from(stream.accepted_sequences.len())
+                        .map_err(|_| CheckpointError::LengthOverflow)?,
+                );
+                for sequence in stream.accepted_sequences {
+                    put_u64(&mut body, sequence);
+                }
+            }
+
+            let total = HEADER_LEN
+                .checked_add(body.len())
+                .and_then(|size| size.checked_add(CHECKSUM_LEN))
+                .ok_or(CheckpointError::LengthOverflow)?;
+            if total > limits.max_snapshot_bytes {
+                return Err(CheckpointError::SnapshotTooLarge);
+            }
+
+            let mut output = Vec::with_capacity(total);
+            output.extend_from_slice(MAGIC);
+            output.push(VERSION);
+            output.push(0);
+            put_u32(
+                &mut output,
+                u32::try_from(body.len()).map_err(|_| CheckpointError::LengthOverflow)?,
+            );
+            output.extend_from_slice(&body);
+            let checksum = crc32(&output);
+            put_u32(&mut output, checksum);
+            Ok(output)
+        }
+
+        /// Decodes and fully validates a snapshot before returning any checkpoint state.
+        pub fn decode(
+            bytes: &[u8],
+            limits: &CodecLimits,
+        ) -> Result<ReplayCheckpoint, CheckpointError> {
+            validate_limits(limits)?;
+            if bytes.len() > limits.max_snapshot_bytes {
+                return Err(CheckpointError::SnapshotTooLarge);
+            }
+            if bytes.len() < HEADER_LEN + CHECKSUM_LEN {
+                return Err(CheckpointError::SnapshotTooShort);
+            }
+
+            let mut header = Reader::new(bytes);
+            if header.take(4)? != MAGIC {
+                return Err(CheckpointError::BadMagic);
+            }
+            let version = header.u8()?;
+            if version != VERSION {
+                return Err(CheckpointError::UnsupportedVersion(version));
+            }
+            let flags = header.u8()?;
+            if flags != 0 {
+                return Err(CheckpointError::TrailingBytes);
+            }
+            let body_len =
+                usize::try_from(header.u32()?).map_err(|_| CheckpointError::LengthOverflow)?;
+            let expected_total = HEADER_LEN
+                .checked_add(body_len)
+                .and_then(|size| size.checked_add(CHECKSUM_LEN))
+                .ok_or(CheckpointError::LengthOverflow)?;
+            if expected_total != bytes.len() {
+                return Err(CheckpointError::TrailingBytes);
+            }
+
+            let checksum_offset = bytes
+                .len()
+                .checked_sub(CHECKSUM_LEN)
+                .ok_or(CheckpointError::SnapshotTooShort)?;
+            let checksum_bytes = bytes
+                .get(checksum_offset..)
+                .ok_or(CheckpointError::Truncated)?;
+            let mut checksum_reader = Reader::new(checksum_bytes);
+            let expected_checksum = checksum_reader.u32()?;
+            if crc32(
+                bytes
+                    .get(..checksum_offset)
+                    .ok_or(CheckpointError::Truncated)?,
+            ) != expected_checksum
+            {
+                return Err(CheckpointError::ChecksumMismatch);
+            }
+
+            let body_start = HEADER_LEN;
+            let body_end = body_start
+                .checked_add(body_len)
+                .ok_or(CheckpointError::LengthOverflow)?;
+            let body = bytes
+                .get(body_start..body_end)
+                .ok_or(CheckpointError::Truncated)?;
+            let mut reader = Reader::new(body);
+
+            let window_size = reader.u64()?;
+            if window_size == 0 {
+                return Err(CheckpointError::InvalidWindow);
+            }
+            let stream_count =
+                usize::try_from(reader.u32()?).map_err(|_| CheckpointError::LengthOverflow)?;
+            if stream_count > limits.max_streams {
+                return Err(CheckpointError::TooManyStreams);
+            }
+
+            let mut streams = Vec::with_capacity(stream_count);
+            let mut keys = BTreeSet::new();
+            for _ in 0..stream_count {
+                let tenant_id = reader.string(limits)?;
+                let peer_id = reader.string(limits)?;
+                if !keys.insert((tenant_id.clone(), peer_id.clone())) {
+                    return Err(CheckpointError::DuplicateStream);
+                }
+                let highest_sequence = reader.u64()?;
+                let sequence_count =
+                    usize::try_from(reader.u32()?).map_err(|_| CheckpointError::LengthOverflow)?;
+                if sequence_count > limits.max_sequences_per_stream {
+                    return Err(CheckpointError::TooManySequences);
+                }
+                let oldest = highest_sequence.saturating_sub(window_size.saturating_sub(1));
+                let mut accepted_sequences = BTreeSet::new();
+                for _ in 0..sequence_count {
+                    let sequence = reader.u64()?;
+                    if sequence == 0 || sequence > highest_sequence {
+                        return Err(CheckpointError::InvalidSequence);
+                    }
+                    if sequence < oldest {
+                        return Err(CheckpointError::SequenceOutsideWindow);
+                    }
+                    if !accepted_sequences.insert(sequence) {
+                        return Err(CheckpointError::DuplicateSequence);
+                    }
+                }
+                streams.push(StreamCheckpoint {
+                    tenant_id,
+                    peer_id,
+                    highest_sequence,
+                    accepted_sequences,
+                });
+            }
+
+            if !reader.is_done() {
+                return Err(CheckpointError::TrailingBytes);
+            }
+            let checkpoint = ReplayCheckpoint {
+                window_size,
+                streams,
+            };
+            validate_checkpoint(&checkpoint, limits)?;
+            Ok(checkpoint)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn sample() -> ReplayCheckpoint {
+                let mut sequences = BTreeSet::new();
+                sequences.insert(7);
+                sequences.insert(9);
+                ReplayCheckpoint {
+                    window_size: 4,
+                    streams: vec![
+                        StreamCheckpoint {
+                            tenant_id: "tenant-a".to_owned(),
+                            peer_id: "peer-2".to_owned(),
+                            highest_sequence: 9,
+                            accepted_sequences: sequences,
+                        },
+                        StreamCheckpoint {
+                            tenant_id: "tenant-b".to_owned(),
+                            peer_id: "peer-1".to_owned(),
+                            highest_sequence: 3,
+                            accepted_sequences: [1, 3].into_iter().collect(),
+                        },
+                    ],
+                }
+            }
+
+            #[test]
+            fn round_trip_preserves_checkpoint() {
+                let limits = CodecLimits::default();
+                let original = sample();
+                let encoded = encode(&original, &limits);
+                assert!(encoded.is_ok());
+                let decoded = match encoded {
+                    Ok(bytes) => decode(&bytes, &limits),
+                    Err(error) => Err(error),
+                };
+                assert_eq!(decoded, Ok(original));
+            }
+
+            #[test]
+            fn encoding_is_canonical() {
+                let limits = CodecLimits::default();
+                let mut a = sample();
+                let mut b = sample();
+                a.streams.reverse();
+                b.streams.reverse();
+                assert_eq!(encode(&a, &limits), encode(&b, &limits));
+            }
+
+            #[test]
+            fn detects_corruption_and_truncation() {
+                let limits = CodecLimits::default();
+                let mut bytes = match encode(&sample(), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let last_body_byte = bytes.len().saturating_sub(CHECKSUM_LEN + 1);
+                if let Some(byte) = bytes.get_mut(last_body_byte) {
+                    *byte ^= 0x01;
+                }
+                assert_eq!(
+                    decode(&bytes, &limits),
+                    Err(CheckpointError::ChecksumMismatch)
+                );
+                assert_eq!(
+                    decode(&bytes[..bytes.len().saturating_sub(1)], &limits),
+                    Err(CheckpointError::TrailingBytes)
+                );
+            }
+
+            #[test]
+            fn rejects_invalid_window_and_out_of_window_sequence() {
+                let limits = CodecLimits::default();
+                let invalid = ReplayCheckpoint {
+                    window_size: 0,
+                    streams: Vec::new(),
+                };
+                assert_eq!(
+                    encode(&invalid, &limits),
+                    Err(CheckpointError::InvalidWindow)
+                );
+
+                let mut sequences = BTreeSet::new();
+                sequences.insert(1);
+                sequences.insert(9);
+                let invalid = ReplayCheckpoint {
+                    window_size: 4,
+                    streams: vec![StreamCheckpoint {
+                        tenant_id: "t".to_owned(),
+                        peer_id: "p".to_owned(),
+                        highest_sequence: 9,
+                        accepted_sequences: sequences,
+                    }],
+                };
+                assert_eq!(
+                    encode(&invalid, &limits),
+                    Err(CheckpointError::SequenceOutsideWindow)
+                );
+            }
+
+            #[test]
+            fn enforces_stream_and_payload_limits() {
+                let mut limits = CodecLimits::default();
+                limits.max_streams = 1;
+                assert_eq!(
+                    encode(&sample(), &limits),
+                    Err(CheckpointError::TooManyStreams)
+                );
+                limits.max_streams = 10;
+                limits.max_snapshot_bytes = HEADER_LEN + CHECKSUM_LEN; // smallest valid limit
+                assert_eq!(
+                    encode(&sample(), &limits),
+                    Err(CheckpointError::SnapshotTooLarge)
+                );
+            }
+        }
+    }
+    pub mod consolidation {
+        //! Deterministic memory consolidation and retention planning.
+        //!
+        //! Pure logic only: callers persist records and execute deletion/compaction.
+        //! The planner groups related records by tenant, agent, and normalized topic,
+        //! then selects bounded candidates without crossing isolation boundaries.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type AgentId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct MemoryItem {
+            pub id: MemoryId,
+            pub tenant_id: TenantId,
+            pub agent_id: AgentId,
+            pub topic: String,
+            pub created_at_ns: u64,
+            pub last_accessed_ns: u64,
+            pub importance: u8,
+            pub text_bytes: usize,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ConsolidationGroup {
+            pub tenant_id: TenantId,
+            pub agent_id: AgentId,
+            pub topic: String,
+            pub memory_ids: Vec<MemoryId>,
+            pub estimated_bytes: usize,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RetentionDecision {
+            pub keep: Vec<MemoryId>,
+            pub archive_candidates: Vec<MemoryId>,
+            pub delete_candidates: Vec<MemoryId>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum ConsolidationError {
+            EmptyTopic,
+            TopicTooLarge,
+            ZeroGroupLimit,
+            ZeroKeepLimit,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct ConsolidationConfig {
+            pub max_topic_bytes: usize,
+            pub max_group_items: usize,
+            pub max_groups: usize,
+        }
+
+        impl Default for ConsolidationConfig {
+            fn default() -> Self {
+                Self {
+                    max_topic_bytes: 256,
+                    max_group_items: 256,
+                    max_groups: 10_000,
+                }
+            }
+        }
+
+        pub fn plan_groups(
+            items: &[MemoryItem],
+            config: &ConsolidationConfig,
+        ) -> Result<Vec<ConsolidationGroup>, ConsolidationError> {
+            if config.max_group_items == 0 || config.max_groups == 0 {
+                return Err(ConsolidationError::ZeroGroupLimit);
+            }
+
+            let mut grouped: BTreeMap<(TenantId, AgentId, String), Vec<&MemoryItem>> =
+                BTreeMap::new();
+
+            for item in items {
+                let topic = normalize_topic(&item.topic);
+                if topic.is_empty() {
+                    return Err(ConsolidationError::EmptyTopic);
+                }
+                if topic.len() > config.max_topic_bytes {
+                    return Err(ConsolidationError::TopicTooLarge);
+                }
+                grouped
+                    .entry((item.tenant_id, item.agent_id, topic))
+                    .or_default()
+                    .push(item);
+            }
+
+            let mut result = Vec::new();
+            for ((tenant_id, agent_id, topic), mut group) in grouped {
+                group.sort_by(|a, b| {
+                    b.importance
+                        .cmp(&a.importance)
+                        .then_with(|| b.last_accessed_ns.cmp(&a.last_accessed_ns))
+                        .then_with(|| b.created_at_ns.cmp(&a.created_at_ns))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                for chunk in group.chunks(config.max_group_items) {
+                    let mut memory_ids = Vec::with_capacity(chunk.len());
+                    let mut estimated_bytes = 0usize;
+                    for item in chunk {
+                        memory_ids.push(item.id);
+                        estimated_bytes = estimated_bytes.saturating_add(item.text_bytes);
+                    }
+                    result.push(ConsolidationGroup {
+                        tenant_id,
+                        agent_id,
+                        topic: topic.clone(),
+                        memory_ids,
+                        estimated_bytes,
+                    });
+                    if result.len() >= config.max_groups {
+                        return Ok(result);
+                    }
+                }
+            }
+            Ok(result)
+        }
+
+        /// Produce a retention plan. Importance is the primary keep criterion;
+        /// recent access and creation timestamps break ties deterministically.
+        /// Items older than `archive_before_ns` are archive candidates unless kept.
+        pub fn plan_retention(
+            items: &[MemoryItem],
+            keep_limit: usize,
+            archive_before_ns: u64,
+        ) -> Result<RetentionDecision, ConsolidationError> {
+            if keep_limit == 0 {
+                return Err(ConsolidationError::ZeroKeepLimit);
+            }
+
+            let mut ranked: Vec<&MemoryItem> = items.iter().collect();
+            ranked.sort_by(|a, b| {
+                b.importance
+                    .cmp(&a.importance)
+                    .then_with(|| b.last_accessed_ns.cmp(&a.last_accessed_ns))
+                    .then_with(|| b.created_at_ns.cmp(&a.created_at_ns))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            let mut keep = Vec::new();
+            let mut archive_candidates = Vec::new();
+            let mut delete_candidates = Vec::new();
+
+            for (index, item) in ranked.into_iter().enumerate() {
+                if index < keep_limit {
+                    keep.push(item.id);
+                } else if item.created_at_ns < archive_before_ns {
+                    archive_candidates.push(item.id);
+                } else {
+                    delete_candidates.push(item.id);
+                }
+            }
+
+            Ok(RetentionDecision {
+                keep,
+                archive_candidates,
+                delete_candidates,
+            })
+        }
+
+        fn normalize_topic(topic: &str) -> String {
+            topic.trim().chars().flat_map(char::to_lowercase).collect()
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn item(id: u128, tenant: u64, agent: u64, topic: &str, importance: u8) -> MemoryItem {
+                MemoryItem {
+                    id,
+                    tenant_id: tenant,
+                    agent_id: agent,
+                    topic: topic.to_owned(),
+                    created_at_ns: id as u64,
+                    last_accessed_ns: id as u64,
+                    importance,
+                    text_bytes: 100,
+                }
+            }
+
+            #[test]
+            fn groups_normalize_topics_without_crossing_tenants_or_agents() {
+                let items = vec![
+                    item(1, 7, 2, "Project Alpha", 2),
+                    item(2, 7, 2, " project alpha ", 5),
+                    item(3, 8, 2, "project alpha", 3),
+                    item(4, 7, 3, "project alpha", 3),
+                ];
+                let groups = plan_groups(&items, &ConsolidationConfig::default());
+                assert!(groups.is_ok());
+                let groups = groups.unwrap_or_default();
+                assert_eq!(groups.len(), 3);
+                assert_eq!(groups[0].memory_ids, vec![2, 1]);
+            }
+
+            #[test]
+            fn retention_keeps_high_importance_and_splits_archive_from_delete() {
+                let items = vec![
+                    item(1, 1, 1, "a", 1),
+                    item(2, 1, 1, "a", 9),
+                    item(3, 1, 1, "a", 2),
+                ];
+                let decision = plan_retention(&items, 1, 3);
+                assert!(decision.is_ok());
+                let decision = decision.unwrap_or(RetentionDecision {
+                    keep: Vec::new(),
+                    archive_candidates: Vec::new(),
+                    delete_candidates: Vec::new(),
+                });
+                assert_eq!(decision.keep, vec![2]);
+                // archive_before_ns = 3 is exclusive: item 1 (created 1) is archived, item 3 is not older.
+                assert_eq!(decision.archive_candidates, vec![1]);
+                assert_eq!(decision.delete_candidates, vec![3]);
+            }
+
+            #[test]
+            fn group_size_and_topic_limits_are_enforced() {
+                let config = ConsolidationConfig {
+                    max_topic_bytes: 3,
+                    ..ConsolidationConfig::default()
+                };
+                let result = plan_groups(&[item(1, 1, 1, "long", 1)], &config);
+                assert_eq!(result, Err(ConsolidationError::TopicTooLarge));
+            }
+        }
+    }
+    pub mod decay {
+        //! Deterministic temporal scoring and expiry planning for agent memories.
+        //!
+        //! Pure policy logic. It does not delete records, schedule jobs, or access a
+        //! clock; callers provide the evaluation timestamp and execute returned plans.
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct TemporalMemory {
+            pub id: u128,
+            pub created_at_ns: u64,
+            pub last_accessed_ns: u64,
+            pub base_importance: u16,
+            pub pinned: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct TemporalScore {
+            pub id: u128,
+            pub score: u32,
+            pub age_ns: u64,
+            pub idle_ns: u64,
+            pub expired: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum TemporalError {
+            ZeroHalfLife,
+            ZeroExpiry,
+            ZeroLimit,
+            FutureTimestamp,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct TemporalConfig {
+            /// Time after which recency contribution halves.
+            pub half_life_ns: u64,
+            /// Idle duration after which an unpinned memory is eligible for expiry.
+            pub expiry_idle_ns: u64,
+            /// Maximum number of returned records.
+            pub max_results: usize,
+        }
+
+        impl Default for TemporalConfig {
+            fn default() -> Self {
+                Self {
+                    half_life_ns: 7 * 24 * 60 * 60 * 1_000_000_000,
+                    expiry_idle_ns: 90 * 24 * 60 * 60 * 1_000_000_000,
+                    max_results: 10_000,
+                }
+            }
+        }
+
+        /// Score importance plus exponentially decaying recency.
+        ///
+        /// The recency component starts at 1000 and is halved once per half-life.
+        /// Arithmetic is integer-only and saturating for deterministic behavior.
+        pub fn score_memory(
+            memory: &TemporalMemory,
+            now_ns: u64,
+            config: &TemporalConfig,
+        ) -> Result<TemporalScore, TemporalError> {
+            validate(config)?;
+            if memory.created_at_ns > now_ns || memory.last_accessed_ns > now_ns {
+                return Err(TemporalError::FutureTimestamp);
+            }
+            let age_ns = now_ns.saturating_sub(memory.created_at_ns);
+            let idle_ns = now_ns.saturating_sub(memory.last_accessed_ns);
+            let recency = decay_score(idle_ns, config.half_life_ns);
+            let importance = u32::from(memory.base_importance).min(1000);
+            let score = importance.saturating_add(recency).min(2000);
+            Ok(TemporalScore {
+                id: memory.id,
+                score,
+                age_ns,
+                idle_ns,
+                expired: !memory.pinned && idle_ns >= config.expiry_idle_ns,
+            })
+        }
+
+        /// Rank a bounded collection by score, then recency, then stable ID.
+        pub fn rank_memories(
+            memories: &[TemporalMemory],
+            now_ns: u64,
+            config: &TemporalConfig,
+        ) -> Result<Vec<TemporalScore>, TemporalError> {
+            validate(config)?;
+            if memories.len() > config.max_results {
+                return Err(TemporalError::ZeroLimit);
+            }
+            let mut scores = Vec::with_capacity(memories.len());
+            for memory in memories {
+                scores.push(score_memory(memory, now_ns, config)?);
+            }
+            scores.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.idle_ns.cmp(&b.idle_ns))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            Ok(scores)
+        }
+
+        /// Return IDs eligible for expiry. Pinned records are never selected.
+        pub fn expiry_candidates(
+            memories: &[TemporalMemory],
+            now_ns: u64,
+            config: &TemporalConfig,
+        ) -> Result<Vec<u128>, TemporalError> {
+            let ranked = rank_memories(memories, now_ns, config)?;
+            Ok(ranked
+                .into_iter()
+                .filter(|score| score.expired)
+                .map(|score| score.id)
+                .collect())
+        }
+
+        fn decay_score(idle_ns: u64, half_life_ns: u64) -> u32 {
+            let periods = idle_ns / half_life_ns;
+            if periods >= 11 {
+                return 0;
+            }
+            1000u32 >> u32::try_from(periods).unwrap_or(11)
+        }
+
+        fn validate(config: &TemporalConfig) -> Result<(), TemporalError> {
+            if config.half_life_ns == 0 {
+                return Err(TemporalError::ZeroHalfLife);
+            }
+            if config.expiry_idle_ns == 0 {
+                return Err(TemporalError::ZeroExpiry);
+            }
+            if config.max_results == 0 {
+                return Err(TemporalError::ZeroLimit);
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn config() -> TemporalConfig {
+                TemporalConfig {
+                    half_life_ns: 100,
+                    expiry_idle_ns: 250,
+                    max_results: 20,
+                }
+            }
+
+            #[test]
+            fn recency_decays_by_half_life() {
+                let memory = TemporalMemory {
+                    id: 1,
+                    created_at_ns: 0,
+                    last_accessed_ns: 100,
+                    base_importance: 0,
+                    pinned: false,
+                };
+                let score = score_memory(&memory, 200, &config());
+                assert_eq!(score.map(|value| value.score), Ok(500));
+            }
+
+            #[test]
+            fn expiry_excludes_pinned_memories() {
+                let memories = vec![
+                    TemporalMemory {
+                        id: 1,
+                        created_at_ns: 0,
+                        last_accessed_ns: 0,
+                        base_importance: 10,
+                        pinned: false,
+                    },
+                    TemporalMemory {
+                        id: 2,
+                        created_at_ns: 0,
+                        last_accessed_ns: 0,
+                        base_importance: 10,
+                        pinned: true,
+                    },
+                ];
+                assert_eq!(expiry_candidates(&memories, 300, &config()), Ok(vec![1]));
+            }
+
+            #[test]
+            fn rejects_future_timestamps_and_oversized_input() {
+                let future = TemporalMemory {
+                    id: 1,
+                    created_at_ns: 101,
+                    last_accessed_ns: 101,
+                    base_importance: 1,
+                    pinned: false,
+                };
+                assert_eq!(
+                    score_memory(&future, 100, &config()),
+                    Err(TemporalError::FutureTimestamp)
+                );
+                let mut cfg = config();
+                cfg.max_results = 1;
+                assert_eq!(
+                    rank_memories(&[future.clone(), future], 200, &cfg),
+                    Err(TemporalError::ZeroLimit)
+                );
+            }
+        }
+    }
+    pub mod dispatcher {
+        //! Lease-based dispatch coordination for replication repair tasks.
+        //!
+        //! This crate provides an in-memory state machine. It does not perform network I/O,
+        //! persist leases, or guarantee exactly-once delivery across process restarts.
+
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct TaskKey {
+            pub tenant_id: String,
+            pub peer_id: String,
+            pub cursor: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DispatchTask {
+            pub key: TaskKey,
+            pub estimated_bytes: u64,
+            pub priority: u8,
+            pub available_at_ms: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Lease {
+            pub token: u64,
+            pub task: DispatchTask,
+            pub expires_at_ms: u64,
+            pub delivery_attempt: u32,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum DispatchError {
+            EmptyIdentity,
+            DuplicateTask,
+            CapacityReached,
+            InvalidLeaseDuration,
+            TokenExhausted,
+            UnknownLease,
+            LeaseExpired,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DispatchLimits {
+            pub max_pending: usize,
+            pub max_leased: usize,
+            pub max_attempts: u32,
+        }
+
+        impl Default for DispatchLimits {
+            fn default() -> Self {
+                Self {
+                    max_pending: 8192,
+                    max_leased: 1024,
+                    max_attempts: 8,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct Entry {
+            task: DispatchTask,
+            attempts: u32,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Dispatcher {
+            limits: DispatchLimits,
+            pending: BTreeMap<TaskKey, Entry>,
+            leased: BTreeMap<u64, Lease>,
+            next_token: u64,
+        }
+
+        impl Dispatcher {
+            pub fn new(limits: DispatchLimits) -> Self {
+                Self {
+                    limits,
+                    pending: BTreeMap::new(),
+                    leased: BTreeMap::new(),
+                    next_token: 1,
+                }
+            }
+
+            pub fn pending_len(&self) -> usize {
+                self.pending.len()
+            }
+            pub fn leased_len(&self) -> usize {
+                self.leased.len()
+            }
+
+            pub fn enqueue(&mut self, task: DispatchTask) -> Result<(), DispatchError> {
+                if task.key.tenant_id.trim().is_empty() || task.key.peer_id.trim().is_empty() {
+                    return Err(DispatchError::EmptyIdentity);
+                }
+                if self.pending.contains_key(&task.key)
+                    || self.leased.values().any(|lease| lease.task.key == task.key)
+                {
+                    return Err(DispatchError::DuplicateTask);
+                }
+                if self.pending.len() >= self.limits.max_pending {
+                    return Err(DispatchError::CapacityReached);
+                }
+                self.pending
+                    .insert(task.key.clone(), Entry { task, attempts: 0 });
+                Ok(())
+            }
+
+            /// Claims one available task, preferring higher priority and then earlier availability.
+            pub fn claim(
+                &mut self,
+                now_ms: u64,
+                lease_duration_ms: u64,
+            ) -> Result<Option<Lease>, DispatchError> {
+                if lease_duration_ms == 0 {
+                    return Err(DispatchError::InvalidLeaseDuration);
+                }
+                if self.leased.len() >= self.limits.max_leased {
+                    return Ok(None);
+                }
+
+                let selected_key = self
+                    .pending
+                    .values()
+                    .filter(|entry| {
+                        entry.task.available_at_ms <= now_ms
+                            && entry.attempts < self.limits.max_attempts
+                    })
+                    .min_by(|a, b| {
+                        b.task
+                            .priority
+                            .cmp(&a.task.priority)
+                            .then_with(|| a.task.available_at_ms.cmp(&b.task.available_at_ms))
+                            .then_with(|| a.task.key.cmp(&b.task.key))
+                    })
+                    .map(|entry| entry.task.key.clone());
+
+                let Some(key) = selected_key else {
+                    return Ok(None);
+                };
+                let Some(entry) = self.pending.remove(&key) else {
+                    return Ok(None);
+                };
+                let token = self.next_token;
+                self.next_token = self
+                    .next_token
+                    .checked_add(1)
+                    .ok_or(DispatchError::TokenExhausted)?;
+                let expires_at_ms = now_ms.saturating_add(lease_duration_ms);
+                let lease = Lease {
+                    token,
+                    task: entry.task,
+                    expires_at_ms,
+                    delivery_attempt: entry.attempts.saturating_add(1),
+                };
+                self.leased.insert(token, lease.clone());
+                Ok(Some(lease))
+            }
+
+            /// Acknowledges a lease only while it is still valid.
+            pub fn acknowledge(
+                &mut self,
+                token: u64,
+                now_ms: u64,
+            ) -> Result<DispatchTask, DispatchError> {
+                let lease = self.leased.get(&token).ok_or(DispatchError::UnknownLease)?;
+                if now_ms >= lease.expires_at_ms {
+                    return Err(DispatchError::LeaseExpired);
+                }
+                self.leased
+                    .remove(&token)
+                    .map(|lease| lease.task)
+                    .ok_or(DispatchError::UnknownLease)
+            }
+
+            /// Releases a lease back to pending with a caller-selected retry time.
+            pub fn release(
+                &mut self,
+                token: u64,
+                available_at_ms: u64,
+            ) -> Result<(), DispatchError> {
+                let lease = self
+                    .leased
+                    .remove(&token)
+                    .ok_or(DispatchError::UnknownLease)?;
+                if lease.delivery_attempt >= self.limits.max_attempts {
+                    return Ok(());
+                }
+                let mut task = lease.task;
+                task.available_at_ms = available_at_ms;
+                self.pending.insert(
+                    task.key.clone(),
+                    Entry {
+                        task,
+                        attempts: lease.delivery_attempt,
+                    },
+                );
+                Ok(())
+            }
+
+            /// Reclaims expired leases. Exhausted tasks are dropped and counted separately.
+            pub fn reclaim_expired(&mut self, now_ms: u64) -> (usize, usize) {
+                let expired_tokens: Vec<u64> = self
+                    .leased
+                    .iter()
+                    .filter(|(_, lease)| lease.expires_at_ms <= now_ms)
+                    .map(|(token, _)| *token)
+                    .collect();
+
+                let mut requeued = 0_usize;
+                let mut exhausted = 0_usize;
+                for token in expired_tokens {
+                    if let Some(lease) = self.leased.remove(&token) {
+                        if lease.delivery_attempt >= self.limits.max_attempts {
+                            exhausted = exhausted.saturating_add(1);
+                        } else {
+                            let mut task = lease.task;
+                            task.available_at_ms = now_ms;
+                            self.pending.insert(
+                                task.key.clone(),
+                                Entry {
+                                    task,
+                                    attempts: lease.delivery_attempt,
+                                },
+                            );
+                            requeued = requeued.saturating_add(1);
+                        }
+                    }
+                }
+                (requeued, exhausted)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn task(peer: &str, priority: u8) -> DispatchTask {
+                DispatchTask {
+                    key: TaskKey {
+                        tenant_id: "tenant-a".to_owned(),
+                        peer_id: peer.to_owned(),
+                        cursor: 7,
+                    },
+                    estimated_bytes: 512,
+                    priority,
+                    available_at_ms: 0,
+                }
+            }
+
+            #[test]
+            fn claim_prefers_priority_and_acknowledges() {
+                let mut dispatcher = Dispatcher::new(DispatchLimits::default());
+                assert!(dispatcher.enqueue(task("low", 1)).is_ok());
+                assert!(dispatcher.enqueue(task("high", 9)).is_ok());
+                let lease = dispatcher.claim(10, 100).ok().flatten();
+                assert!(lease.is_some());
+                let lease = match lease {
+                    Some(value) => value,
+                    None => return,
+                };
+                assert_eq!(lease.task.key.peer_id, "high");
+                assert!(dispatcher.acknowledge(lease.token, 20).is_ok());
+                assert_eq!(dispatcher.leased_len(), 0);
+            }
+
+            #[test]
+            fn expired_lease_is_requeued() {
+                let mut dispatcher = Dispatcher::new(DispatchLimits::default());
+                assert!(dispatcher.enqueue(task("peer", 3)).is_ok());
+                let lease = dispatcher.claim(10, 5).ok().flatten();
+                let lease = match lease {
+                    Some(value) => value,
+                    None => return,
+                };
+                assert_eq!(dispatcher.reclaim_expired(15), (1, 0));
+                assert_eq!(dispatcher.pending_len(), 1);
+                assert_eq!(
+                    dispatcher.acknowledge(lease.token, 15),
+                    Err(DispatchError::UnknownLease)
+                );
+            }
+
+            #[test]
+            fn duplicate_is_rejected_while_task_is_leased() {
+                let mut dispatcher = Dispatcher::new(DispatchLimits::default());
+                assert!(dispatcher.enqueue(task("peer", 3)).is_ok());
+                let lease = dispatcher.claim(0, 50).ok().flatten();
+                assert!(lease.is_some());
+                assert_eq!(
+                    dispatcher.enqueue(task("peer", 3)),
+                    Err(DispatchError::DuplicateTask)
+                );
+            }
+        }
+    }
+    pub mod hnsw {
+        //! M022 — bounded, tenant-isolated HNSW vector memory with per-vector SQ8.
+        //!
+        //! This module is deliberately self-contained and uses only the Rust standard
+        //! library. Each tenant owns a separate HNSW graph. Vectors are stored as
+        //! per-vector 8-bit scalar quantized values; search decodes them for cosine
+        //! distance evaluation. This trades memory for approximation error.
+        //!
+        //! The index is in-memory only. Persistence, embedding generation, metadata
+        //! filtering, distributed replication and an HTTP protocol are intentionally
+        //! left to higher-level AgentOS services.
+
+        use std::{
+            cmp::{Ordering, Reverse},
+            collections::{BinaryHeap, HashMap},
+            error::Error,
+            fmt,
+        };
+
+        const DEFAULT_DIMENSIONS: usize = 384;
+        const DEFAULT_MAX_TENANTS: usize = 10_000;
+        const DEFAULT_MAX_VECTORS_PER_TENANT: usize = 100_000;
+        const DEFAULT_M: usize = 12;
+        const DEFAULT_EF_CONSTRUCTION: usize = 96;
+        const DEFAULT_EF_SEARCH: usize = 64;
+        const MAX_DIMENSIONS: usize = 16_384;
+        const MAX_M: usize = 64;
+        const MAX_EF: usize = 4096;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum VectorError {
+            InvalidTenant,
+            InvalidDimensions,
+            DimensionMismatch { expected: usize, actual: usize },
+            InvalidConfiguration(String),
+            CapacityExceeded,
+            DuplicateId(u64),
+            InvalidVector,
+            NotFound(u64),
+            SearchLimit,
+        }
+
+        impl fmt::Display for VectorError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::InvalidTenant => write!(f, "tenant ID must be non-zero"),
+                    Self::InvalidDimensions => {
+                        write!(f, "dimensions must be within 1..={MAX_DIMENSIONS}")
+                    }
+                    Self::DimensionMismatch { expected, actual } => write!(
+                        f,
+                        "dimension mismatch: expected {expected}, received {actual}"
+                    ),
+                    Self::InvalidConfiguration(message) => {
+                        write!(f, "invalid configuration: {message}")
+                    }
+                    Self::CapacityExceeded => write!(f, "configured index capacity exceeded"),
+                    Self::DuplicateId(id) => write!(f, "vector ID {id} already exists"),
+                    Self::InvalidVector => {
+                        write!(f, "vector contains non-finite values or has zero norm")
+                    }
+                    Self::NotFound(id) => write!(f, "vector ID {id} not found"),
+                    Self::SearchLimit => write!(f, "search limit is outside the supported range"),
+                }
+            }
+        }
+
+        impl Error for VectorError {}
+
+        type VectorResult<T> = Result<T, VectorError>;
+
+        #[derive(Clone, Copy, Debug)]
+        struct Candidate {
+            distance: f32,
+            node: usize,
+        }
+
+        impl PartialEq for Candidate {
+            fn eq(&self, other: &Self) -> bool {
+                self.distance.to_bits() == other.distance.to_bits() && self.node == other.node
+            }
+        }
+        impl Eq for Candidate {}
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Candidate {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.distance
+                    .total_cmp(&other.distance)
+                    .then_with(|| self.node.cmp(&other.node))
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct QuantizedVector {
+            values: Vec<u8>,
+            min: f32,
+            scale: f32,
+        }
+
+        impl QuantizedVector {
+            fn encode(vector: &[f32]) -> VectorResult<Self> {
+                if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+                    return Err(VectorError::InvalidVector);
+                }
+                let mut min = f32::INFINITY;
+                let mut max = f32::NEG_INFINITY;
+                for value in vector {
+                    min = min.min(*value);
+                    max = max.max(*value);
+                }
+                let range = max - min;
+                let scale = if range > f32::EPSILON {
+                    range / 255.0
+                } else {
+                    0.0
+                };
+                let mut values = Vec::with_capacity(vector.len());
+                for value in vector {
+                    let quantized = if scale == 0.0 {
+                        0
+                    } else {
+                        ((*value - min) / scale).round().clamp(0.0, 255.0) as u8
+                    };
+                    values.push(quantized);
+                }
+                Ok(Self { values, min, scale })
+            }
+
+            fn decode(&self, output: &mut [f32]) -> VectorResult<()> {
+                if output.len() != self.values.len() {
+                    return Err(VectorError::DimensionMismatch {
+                        expected: self.values.len(),
+                        actual: output.len(),
+                    });
+                }
+                for (target, encoded) in output.iter_mut().zip(self.values.iter()) {
+                    *target = self.min + f32::from(*encoded) * self.scale;
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct Node {
+            id: u64,
+            vector: QuantizedVector,
+            #[allow(dead_code)] // recorded for inspection; layering is carried by `links`
+            level: usize,
+            links: Vec<Vec<usize>>,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct HnswConfig {
+            pub dimensions: usize,
+            pub max_vectors: usize,
+            pub m: usize,
+            pub ef_construction: usize,
+            pub ef_search: usize,
+            pub max_level: usize,
+            pub seed: u64,
+        }
+
+        impl Default for HnswConfig {
+            fn default() -> Self {
+                Self {
+                    dimensions: DEFAULT_DIMENSIONS,
+                    max_vectors: DEFAULT_MAX_VECTORS_PER_TENANT,
+                    m: DEFAULT_M,
+                    ef_construction: DEFAULT_EF_CONSTRUCTION,
+                    ef_search: DEFAULT_EF_SEARCH,
+                    max_level: 16,
+                    seed: 0x9e37_79b9_7f4a_7c15,
+                }
+            }
+        }
+
+        impl HnswConfig {
+            fn validate(&self) -> VectorResult<()> {
+                if self.dimensions == 0 || self.dimensions > MAX_DIMENSIONS {
+                    return Err(VectorError::InvalidDimensions);
+                }
+                if self.max_vectors == 0 {
+                    return Err(VectorError::InvalidConfiguration(
+                        "max_vectors must be non-zero".into(),
+                    ));
+                }
+                if self.m < 2 || self.m > MAX_M {
+                    return Err(VectorError::InvalidConfiguration(format!(
+                        "m must be 2..={MAX_M}"
+                    )));
+                }
+                if self.ef_construction < self.m || self.ef_construction > MAX_EF {
+                    return Err(VectorError::InvalidConfiguration(format!(
+                        "ef_construction must be m..={MAX_EF}"
+                    )));
+                }
+                if self.ef_search == 0 || self.ef_search > MAX_EF {
+                    return Err(VectorError::InvalidConfiguration(format!(
+                        "ef_search must be 1..={MAX_EF}"
+                    )));
+                }
+                if self.max_level == 0 || self.max_level > 32 {
+                    return Err(VectorError::InvalidConfiguration(
+                        "max_level must be 1..=32".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct SearchHit {
+            pub id: u64,
+            /// Cosine distance: 0 is identical, 2 is opposite.
+            pub distance: f32,
+        }
+
+        pub struct HnswIndex {
+            config: HnswConfig,
+            nodes: Vec<Node>,
+            ids: HashMap<u64, usize>,
+            entrypoint: Option<usize>,
+            current_max_level: usize,
+            rng_state: u64,
+        }
+
+        impl HnswIndex {
+            pub fn new(config: HnswConfig) -> VectorResult<Self> {
+                config.validate()?;
+                let rng_state = if config.seed == 0 { 1 } else { config.seed };
+                Ok(Self {
+                    config,
+                    nodes: Vec::new(),
+                    ids: HashMap::new(),
+                    entrypoint: None,
+                    current_max_level: 0,
+                    rng_state,
+                })
+            }
+
+            pub fn len(&self) -> usize {
+                self.nodes.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.nodes.is_empty()
+            }
+
+            pub fn dimensions(&self) -> usize {
+                self.config.dimensions
+            }
+
+            fn random_u64(&mut self) -> u64 {
+                // xorshift64*: deterministic, local PRNG for graph-level assignment.
+                let mut x = self.rng_state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.rng_state = x;
+                x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            }
+
+            fn random_level(&mut self) -> usize {
+                let mut level = 0usize;
+                let threshold = u64::MAX / u64::from(self.config.m as u32);
+                while level < self.config.max_level && self.random_u64() > threshold {
+                    level = level.saturating_add(1);
+                }
+                level
+            }
+
+            fn decode_node(&self, node: usize, output: &mut [f32]) -> VectorResult<()> {
+                let stored = self.nodes.get(node).ok_or(VectorError::CapacityExceeded)?;
+                stored.vector.decode(output)
+            }
+
+            fn cosine_distance(&self, left: &[f32], right: &[f32]) -> f32 {
+                let mut dot = 0.0f64;
+                let mut left_norm = 0.0f64;
+                let mut right_norm = 0.0f64;
+                for (a, b) in left.iter().zip(right.iter()) {
+                    let a = f64::from(*a);
+                    let b = f64::from(*b);
+                    dot += a * b;
+                    left_norm += a * a;
+                    right_norm += b * b;
+                }
+                if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
+                    return 1.0;
+                }
+                let cosine = (dot / (left_norm.sqrt() * right_norm.sqrt())).clamp(-1.0, 1.0);
+                (1.0 - cosine) as f32
+            }
+
+            fn distance_to_node(&self, query: &[f32], node: usize, scratch: &mut [f32]) -> f32 {
+                if self.decode_node(node, scratch).is_err() {
+                    return f32::INFINITY;
+                }
+                self.cosine_distance(query, scratch)
+            }
+
+            fn greedy_search(
+                &self,
+                query: &[f32],
+                mut current: usize,
+                level: usize,
+                scratch: &mut [f32],
+            ) -> usize {
+                let mut current_distance = self.distance_to_node(query, current, scratch);
+                loop {
+                    let mut changed = false;
+                    let neighbors = match self
+                        .nodes
+                        .get(current)
+                        .and_then(|node| node.links.get(level))
+                    {
+                        Some(value) => value,
+                        None => break,
+                    };
+                    for neighbor in neighbors {
+                        let distance = self.distance_to_node(query, *neighbor, scratch);
+                        if distance < current_distance {
+                            current = *neighbor;
+                            current_distance = distance;
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+                current
+            }
+
+            fn search_layer(
+                &self,
+                query: &[f32],
+                entry_points: &[usize],
+                ef: usize,
+                level: usize,
+            ) -> Vec<Candidate> {
+                let mut visited = vec![false; self.nodes.len()];
+                let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+                let mut best: BinaryHeap<Candidate> = BinaryHeap::new();
+                let mut scratch = vec![0.0f32; self.config.dimensions];
+
+                for entry in entry_points {
+                    if *entry >= self.nodes.len() || visited.get(*entry).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    if let Some(slot) = visited.get_mut(*entry) {
+                        *slot = true;
+                    }
+                    let distance = self.distance_to_node(query, *entry, &mut scratch);
+                    let candidate = Candidate {
+                        distance,
+                        node: *entry,
+                    };
+                    candidates.push(Reverse(candidate));
+                    best.push(candidate);
+                }
+
+                while let Some(Reverse(candidate)) = candidates.pop() {
+                    let worst = best
+                        .peek()
+                        .map(|item| item.distance)
+                        .unwrap_or(f32::INFINITY);
+                    if best.len() >= ef && candidate.distance > worst {
+                        break;
+                    }
+                    let neighbors = match self
+                        .nodes
+                        .get(candidate.node)
+                        .and_then(|node| node.links.get(level))
+                    {
+                        Some(value) => value,
+                        None => continue,
+                    };
+                    for neighbor in neighbors {
+                        if *neighbor >= visited.len()
+                            || visited.get(*neighbor).copied().unwrap_or(true)
+                        {
+                            continue;
+                        }
+                        if let Some(slot) = visited.get_mut(*neighbor) {
+                            *slot = true;
+                        }
+                        let distance = self.distance_to_node(query, *neighbor, &mut scratch);
+                        let worst = best
+                            .peek()
+                            .map(|item| item.distance)
+                            .unwrap_or(f32::INFINITY);
+                        if best.len() < ef || distance < worst {
+                            let next = Candidate {
+                                distance,
+                                node: *neighbor,
+                            };
+                            candidates.push(Reverse(next));
+                            best.push(next);
+                            if best.len() > ef {
+                                let _ = best.pop();
+                            }
+                        }
+                    }
+                }
+                let mut results = best.into_vec();
+                results.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+                results
+            }
+
+            fn select_neighbors(&self, candidates: &[Candidate], limit: usize) -> Vec<usize> {
+                let mut selected = Vec::with_capacity(limit.min(candidates.len()));
+                for candidate in candidates {
+                    if selected.len() >= limit {
+                        break;
+                    }
+                    if candidate.node < self.nodes.len() && !selected.contains(&candidate.node) {
+                        selected.push(candidate.node);
+                    }
+                }
+                selected
+            }
+
+            fn connect(&mut self, node_index: usize, neighbors: &[usize], level: usize) {
+                let Some(node) = self.nodes.get_mut(node_index) else {
+                    return;
+                };
+                if let Some(links) = node.links.get_mut(level) {
+                    for neighbor in neighbors {
+                        if *neighbor != node_index && !links.contains(neighbor) {
+                            links.push(*neighbor);
+                        }
+                    }
+                }
+                for neighbor in neighbors {
+                    if *neighbor == node_index {
+                        continue;
+                    }
+                    if let Some(other) = self.nodes.get_mut(*neighbor) {
+                        if let Some(other_links) = other.links.get_mut(level) {
+                            if !other_links.contains(&node_index) {
+                                other_links.push(node_index);
+                            }
+                            if other_links.len() > self.config.m.saturating_mul(2) {
+                                other_links.truncate(self.config.m.saturating_mul(2));
+                            }
+                        }
+                    }
+                }
+            }
+
+            pub fn insert(&mut self, id: u64, vector: &[f32]) -> VectorResult<()> {
+                if vector.len() != self.config.dimensions {
+                    return Err(VectorError::DimensionMismatch {
+                        expected: self.config.dimensions,
+                        actual: vector.len(),
+                    });
+                }
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err(VectorError::InvalidVector);
+                }
+                let norm = vector.iter().fold(0.0f64, |sum, value| {
+                    sum + f64::from(*value) * f64::from(*value)
+                });
+                if norm <= f64::EPSILON {
+                    return Err(VectorError::InvalidVector);
+                }
+                if self.ids.contains_key(&id) {
+                    return Err(VectorError::DuplicateId(id));
+                }
+                if self.nodes.len() >= self.config.max_vectors {
+                    return Err(VectorError::CapacityExceeded);
+                }
+                let quantized = QuantizedVector::encode(vector)?;
+                let level = self.random_level();
+                let new_index = self.nodes.len();
+                let mut node_links = Vec::with_capacity(level.saturating_add(1));
+                for _ in 0..=level {
+                    node_links.push(Vec::new());
+                }
+                self.nodes.push(Node {
+                    id,
+                    vector: quantized,
+                    level,
+                    links: node_links,
+                });
+                self.ids.insert(id, new_index);
+
+                let Some(mut entry) = self.entrypoint else {
+                    self.entrypoint = Some(new_index);
+                    self.current_max_level = level;
+                    return Ok(());
+                };
+
+                let mut scratch = vec![0.0f32; self.config.dimensions];
+                if self.current_max_level > level {
+                    for layer in ((level + 1)..=self.current_max_level).rev() {
+                        entry = self.greedy_search(vector, entry, layer, &mut scratch);
+                    }
+                }
+
+                let upper = level.min(self.current_max_level);
+                for layer in (0..=upper).rev() {
+                    let candidates =
+                        self.search_layer(vector, &[entry], self.config.ef_construction, layer);
+                    let selected = self.select_neighbors(&candidates, self.config.m);
+                    self.connect(new_index, &selected, layer);
+                    if let Some(best) = candidates.first() {
+                        entry = best.node;
+                    }
+                }
+
+                if level > self.current_max_level {
+                    self.entrypoint = Some(new_index);
+                    self.current_max_level = level;
+                }
+                Ok(())
+            }
+
+            pub fn search(
+                &self,
+                query: &[f32],
+                limit: usize,
+                ef_search: Option<usize>,
+            ) -> VectorResult<Vec<SearchHit>> {
+                if query.len() != self.config.dimensions {
+                    return Err(VectorError::DimensionMismatch {
+                        expected: self.config.dimensions,
+                        actual: query.len(),
+                    });
+                }
+                if query.iter().any(|value| !value.is_finite()) {
+                    return Err(VectorError::InvalidVector);
+                }
+                let norm = query.iter().fold(0.0f64, |sum, value| {
+                    sum + f64::from(*value) * f64::from(*value)
+                });
+                if norm <= f64::EPSILON {
+                    return Err(VectorError::InvalidVector);
+                }
+                if limit == 0 || limit > self.config.max_vectors {
+                    return Err(VectorError::SearchLimit);
+                }
+                let Some(mut entry) = self.entrypoint else {
+                    return Ok(Vec::new());
+                };
+                let mut scratch = vec![0.0f32; self.config.dimensions];
+                for layer in (1..=self.current_max_level).rev() {
+                    entry = self.greedy_search(query, entry, layer, &mut scratch);
+                }
+                let ef = ef_search.unwrap_or(self.config.ef_search).max(limit);
+                if ef > MAX_EF {
+                    return Err(VectorError::SearchLimit);
+                }
+                let candidates = self.search_layer(query, &[entry], ef, 0);
+                let mut hits = Vec::with_capacity(limit.min(candidates.len()));
+                for candidate in candidates.into_iter().take(limit) {
+                    let id = self
+                        .nodes
+                        .get(candidate.node)
+                        .map(|node| node.id)
+                        .ok_or(VectorError::CapacityExceeded)?;
+                    hits.push(SearchHit {
+                        id,
+                        distance: candidate.distance,
+                    });
+                }
+                Ok(hits)
+            }
+
+            pub fn contains_id(&self, id: u64) -> bool {
+                self.ids.contains_key(&id)
+            }
+
+            pub fn memory_bytes_estimate(&self) -> usize {
+                self.nodes.iter().fold(0usize, |total, node| {
+                    let vector_bytes = node.vector.values.len();
+                    let links_bytes = node.links.iter().fold(0usize, |sum, links| {
+                        sum.saturating_add(links.len().saturating_mul(std::mem::size_of::<usize>()))
+                    });
+                    total
+                        .saturating_add(vector_bytes)
+                        .saturating_add(links_bytes)
+                        .saturating_add(std::mem::size_of::<Node>())
+                })
+            }
+        }
+
+        pub struct TenantVectorMemory {
+            config: HnswConfig,
+            max_tenants: usize,
+            indexes: HashMap<u64, HnswIndex>,
+        }
+
+        impl TenantVectorMemory {
+            pub fn new(config: HnswConfig, max_tenants: usize) -> VectorResult<Self> {
+                config.validate()?;
+                if max_tenants == 0 || max_tenants > DEFAULT_MAX_TENANTS {
+                    return Err(VectorError::InvalidConfiguration(format!(
+                        "max_tenants must be 1..={DEFAULT_MAX_TENANTS}"
+                    )));
+                }
+                Ok(Self {
+                    config,
+                    max_tenants,
+                    indexes: HashMap::new(),
+                })
+            }
+
+            pub fn insert(
+                &mut self,
+                tenant_id: u64,
+                vector_id: u64,
+                vector: &[f32],
+            ) -> VectorResult<()> {
+                if tenant_id == 0 {
+                    return Err(VectorError::InvalidTenant);
+                }
+                if !self.indexes.contains_key(&tenant_id) && self.indexes.len() >= self.max_tenants
+                {
+                    return Err(VectorError::CapacityExceeded);
+                }
+                if !self.indexes.contains_key(&tenant_id) {
+                    let index = HnswIndex::new(self.config.clone())?;
+                    self.indexes.insert(tenant_id, index);
+                }
+                let index = self
+                    .indexes
+                    .get_mut(&tenant_id)
+                    .ok_or(VectorError::InvalidTenant)?;
+                index.insert(vector_id, vector)
+            }
+
+            pub fn search(
+                &self,
+                tenant_id: u64,
+                query: &[f32],
+                limit: usize,
+                ef_search: Option<usize>,
+            ) -> VectorResult<Vec<SearchHit>> {
+                if tenant_id == 0 {
+                    return Err(VectorError::InvalidTenant);
+                }
+                match self.indexes.get(&tenant_id) {
+                    Some(index) => index.search(query, limit, ef_search),
+                    None => Ok(Vec::new()),
+                }
+            }
+
+            pub fn tenant_count(&self) -> usize {
+                self.indexes.len()
+            }
+
+            pub fn tenant_vector_count(&self, tenant_id: u64) -> usize {
+                self.indexes
+                    .get(&tenant_id)
+                    .map(HnswIndex::len)
+                    .unwrap_or(0)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn config(dimensions: usize) -> HnswConfig {
+                HnswConfig {
+                    dimensions,
+                    max_vectors: 128,
+                    m: 4,
+                    ef_construction: 24,
+                    ef_search: 24,
+                    max_level: 8,
+                    seed: 42,
+                }
+            }
+
+            #[test]
+            fn sq8_round_trip_is_bounded() {
+                let input = [-1.0, -0.25, 0.0, 0.5, 1.0];
+                let encoded = QuantizedVector::encode(&input).expect("valid vector");
+                let mut decoded = [0.0f32; 5];
+                encoded.decode(&mut decoded).expect("matching dimensions");
+                for (original, restored) in input.iter().zip(decoded.iter()) {
+                    assert!((original - restored).abs() <= 0.01);
+                }
+            }
+
+            #[test]
+            fn inserts_and_searches_nearest_vector() {
+                let mut index = HnswIndex::new(config(3)).expect("valid config");
+                index.insert(10, &[1.0, 0.0, 0.0]).expect("insert");
+                index.insert(11, &[0.0, 1.0, 0.0]).expect("insert");
+                index.insert(12, &[0.9, 0.1, 0.0]).expect("insert");
+                let hits = index.search(&[1.0, 0.0, 0.0], 2, Some(16)).expect("search");
+                assert_eq!(hits.first().map(|hit| hit.id), Some(10));
+                assert_eq!(hits.get(1).map(|hit| hit.id), Some(12));
+            }
+
+            #[test]
+            fn tenant_indexes_are_isolated() {
+                let mut memory = TenantVectorMemory::new(config(2), 4).expect("valid config");
+                memory.insert(1, 7, &[1.0, 0.0]).expect("tenant one insert");
+                memory.insert(2, 7, &[0.0, 1.0]).expect("tenant two insert");
+                let tenant_one = memory.search(1, &[1.0, 0.0], 1, None).expect("search");
+                let tenant_two = memory.search(2, &[1.0, 0.0], 1, None).expect("search");
+                assert_eq!(tenant_one.first().map(|hit| hit.distance), Some(0.0));
+                assert!(tenant_two.first().map(|hit| hit.distance).unwrap_or(0.0) > 0.5);
+                assert_eq!(memory.tenant_vector_count(1), 1);
+                assert_eq!(memory.tenant_vector_count(2), 1);
+            }
+
+            #[test]
+            fn rejects_invalid_vectors_and_duplicate_ids() {
+                let mut index = HnswIndex::new(config(2)).expect("valid config");
+                assert_eq!(
+                    index.insert(1, &[0.0, 0.0]),
+                    Err(VectorError::InvalidVector)
+                );
+                assert!(index.insert(1, &[1.0, 0.0]).is_ok());
+                assert_eq!(
+                    index.insert(1, &[0.0, 1.0]),
+                    Err(VectorError::DuplicateId(1))
+                );
+                assert_eq!(
+                    index.insert(2, &[f32::NAN, 1.0]),
+                    Err(VectorError::InvalidVector)
+                );
+            }
+
+            #[test]
+            fn capacity_is_enforced() {
+                let mut cfg = config(2);
+                cfg.max_vectors = 1;
+                let mut index = HnswIndex::new(cfg).expect("valid config");
+                index.insert(1, &[1.0, 0.0]).expect("first insert");
+                assert_eq!(
+                    index.insert(2, &[0.0, 1.0]),
+                    Err(VectorError::CapacityExceeded)
+                );
+            }
+
+            #[test]
+            fn empty_tenant_search_is_empty() {
+                let memory = TenantVectorMemory::new(config(2), 2).expect("valid config");
+                assert!(memory
+                    .search(1, &[1.0, 0.0], 4, None)
+                    .expect("search")
+                    .is_empty());
+            }
+        }
+    }
+    pub mod journal {
+        //! Bounded, append-only-in-process audit journal for agent memory operations.
+        //!
+        //! Records decisions and lifecycle actions without storing memory contents.
+        //! This is an in-memory component, not tamper-proof or durable audit storage.
+
+        use std::collections::VecDeque;
+
+        pub type TenantId = u64;
+        pub type PrincipalId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum MemoryOperation {
+            Read,
+            Search,
+            Append,
+            Update,
+            Delete,
+            Share,
+            Export,
+            Import,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum AuditOutcome {
+            Allowed,
+            Denied,
+            Succeeded,
+            Failed,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct AuditEvent {
+            pub sequence: u64,
+            pub timestamp_ns: u64,
+            pub tenant_id: TenantId,
+            pub principal_id: PrincipalId,
+            pub operation: MemoryOperation,
+            pub memory_id: Option<MemoryId>,
+            pub outcome: AuditOutcome,
+            /// Short, non-sensitive reason code; never put memory content here.
+            pub reason_code: String,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum JournalError {
+            CapacityZero,
+            ReasonTooLarge,
+            SequenceExhausted,
+            InvalidTimeOrder,
+            InvalidRange,
+        }
+
+        pub struct AuditJournal {
+            events: VecDeque<AuditEvent>,
+            capacity: usize,
+            next_sequence: u64,
+            last_timestamp_ns: Option<u64>,
+            max_reason_bytes: usize,
+        }
+
+        impl AuditJournal {
+            pub fn new(capacity: usize, max_reason_bytes: usize) -> Result<Self, JournalError> {
+                if capacity == 0 {
+                    return Err(JournalError::CapacityZero);
+                }
+                Ok(Self {
+                    events: VecDeque::with_capacity(capacity),
+                    capacity,
+                    next_sequence: 1,
+                    last_timestamp_ns: None,
+                    max_reason_bytes,
+                })
+            }
+
+            /// Append an event. When full, the oldest event is evicted.
+            /// Timestamps must be nondecreasing within this process.
+            #[allow(clippy::too_many_arguments)]
+            pub fn append(
+                &mut self,
+                timestamp_ns: u64,
+                tenant_id: TenantId,
+                principal_id: PrincipalId,
+                operation: MemoryOperation,
+                memory_id: Option<MemoryId>,
+                outcome: AuditOutcome,
+                reason_code: &str,
+            ) -> Result<u64, JournalError> {
+                if reason_code.len() > self.max_reason_bytes {
+                    return Err(JournalError::ReasonTooLarge);
+                }
+                if self
+                    .last_timestamp_ns
+                    .is_some_and(|last| timestamp_ns < last)
+                {
+                    return Err(JournalError::InvalidTimeOrder);
+                }
+                let sequence = self.next_sequence;
+                let next = sequence
+                    .checked_add(1)
+                    .ok_or(JournalError::SequenceExhausted)?;
+
+                if self.events.len() == self.capacity {
+                    self.events.pop_front();
+                }
+                self.events.push_back(AuditEvent {
+                    sequence,
+                    timestamp_ns,
+                    tenant_id,
+                    principal_id,
+                    operation,
+                    memory_id,
+                    outcome,
+                    reason_code: reason_code.to_owned(),
+                });
+                self.next_sequence = next;
+                self.last_timestamp_ns = Some(timestamp_ns);
+                Ok(sequence)
+            }
+
+            /// Return events for one tenant and inclusive sequence bounds.
+            pub fn read_range(
+                &self,
+                tenant_id: TenantId,
+                start_sequence: u64,
+                end_sequence: u64,
+            ) -> Result<Vec<AuditEvent>, JournalError> {
+                if start_sequence > end_sequence {
+                    return Err(JournalError::InvalidRange);
+                }
+                Ok(self
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.tenant_id == tenant_id
+                            && event.sequence >= start_sequence
+                            && event.sequence <= end_sequence
+                    })
+                    .cloned()
+                    .collect())
+            }
+
+            pub fn oldest_sequence(&self) -> Option<u64> {
+                self.events.front().map(|event| event.sequence)
+            }
+
+            pub fn newest_sequence(&self) -> Option<u64> {
+                self.events.back().map(|event| event.sequence)
+            }
+
+            pub fn len(&self) -> usize {
+                self.events.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.events.is_empty()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn append(
+                journal: &mut AuditJournal,
+                ts: u64,
+                tenant: u64,
+            ) -> Result<u64, JournalError> {
+                journal.append(
+                    ts,
+                    tenant,
+                    9,
+                    MemoryOperation::Read,
+                    Some(42),
+                    AuditOutcome::Allowed,
+                    "policy_allow",
+                )
+            }
+
+            #[test]
+            fn journal_evicts_oldest_and_keeps_monotonic_sequence() {
+                let mut journal = AuditJournal::new(2, 32).expect("valid capacity");
+                assert_eq!(append(&mut journal, 1, 7), Ok(1));
+                assert_eq!(append(&mut journal, 2, 7), Ok(2));
+                assert_eq!(append(&mut journal, 3, 7), Ok(3));
+                assert_eq!(journal.oldest_sequence(), Some(2));
+                assert_eq!(journal.newest_sequence(), Some(3));
+                assert_eq!(journal.len(), 2);
+            }
+
+            #[test]
+            fn range_reads_are_tenant_scoped() {
+                let mut journal = AuditJournal::new(8, 32).expect("valid capacity");
+                assert!(append(&mut journal, 1, 7).is_ok());
+                assert!(append(&mut journal, 2, 8).is_ok());
+                let events = journal.read_range(7, 1, 10);
+                assert_eq!(events.map(|items| items.len()), Ok(1));
+            }
+
+            #[test]
+            fn rejects_bad_time_and_oversized_reason() {
+                let mut journal = AuditJournal::new(4, 14).expect("valid capacity");
+                assert!(append(&mut journal, 10, 1).is_ok());
+                let out_of_order = journal.append(
+                    9,
+                    1,
+                    1,
+                    MemoryOperation::Delete,
+                    None,
+                    AuditOutcome::Denied,
+                    "no",
+                );
+                assert_eq!(out_of_order, Err(JournalError::InvalidTimeOrder));
+                let too_long = journal.append(
+                    11,
+                    1,
+                    1,
+                    MemoryOperation::Delete,
+                    None,
+                    AuditOutcome::Denied,
+                    "reason-too-long",
+                );
+                assert_eq!(too_long, Err(JournalError::ReasonTooLarge));
+            }
+        }
+    }
+    pub mod migrator {
+        //! M029: deterministic schema diff planner and guarded migration runner.
+        //! Database execution is delegated to an adapter; this module owns planning,
+        //! dependency ordering, checksums, compatibility classification and locking.
+
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::fmt;
+        use std::sync::{Arc, Mutex};
+
+        pub type ObjectName = String;
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum SqlType {
+            Integer,
+            BigInt,
+            Text,
+            Boolean,
+            Timestamp,
+            Decimal,
+            Blob,
+            Custom(String),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct ColumnDef {
+            pub name: String,
+            pub sql_type: SqlType,
+            pub nullable: bool,
+            pub default_sql: Option<String>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct ForeignKey {
+            pub name: String,
+            pub columns: Vec<String>,
+            pub referenced_table: String,
+            pub referenced_columns: Vec<String>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct IndexDef {
+            pub name: String,
+            pub columns: Vec<String>,
+            pub unique: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, Default)]
+        pub struct TableDef {
+            pub name: String,
+            pub columns: BTreeMap<String, ColumnDef>,
+            pub primary_key: Vec<String>,
+            pub foreign_keys: BTreeMap<String, ForeignKey>,
+            pub indexes: BTreeMap<String, IndexDef>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, Default)]
+        pub struct Schema {
+            pub tables: BTreeMap<String, TableDef>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum Step {
+            CreateTable(TableDef),
+            DropTable(String),
+            AddColumn {
+                table: String,
+                column: ColumnDef,
+            },
+            DropColumn {
+                table: String,
+                column: String,
+            },
+            AlterColumn {
+                table: String,
+                before: ColumnDef,
+                after: ColumnDef,
+            },
+            AddIndex {
+                table: String,
+                index: IndexDef,
+            },
+            DropIndex {
+                table: String,
+                index: String,
+            },
+            AddForeignKey {
+                table: String,
+                foreign_key: ForeignKey,
+            },
+            DropForeignKey {
+                table: String,
+                foreign_key: String,
+            },
+            SetPrimaryKey {
+                table: String,
+                columns: Vec<String>,
+            },
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Compatibility {
+            BackwardCompatible,
+            ForwardCompatible,
+            Breaking,
+            Unknown,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct PlannedStep {
+            pub step: Step,
+            pub compatibility: Compatibility,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum MigrationError {
+            InvalidSchema(&'static str),
+            DuplicateMigrationVersion,
+            InvalidMigrationName,
+            ChecksumMismatch(String),
+            AlreadyApplied(String),
+            LockUnavailable,
+            Adapter(String),
+            PlanLimitExceeded,
+            UnsafeSql,
+        }
+        impl fmt::Display for MigrationError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for MigrationError {}
+
+        pub fn validate_schema(schema: &Schema) -> Result<(), MigrationError> {
+            for (table_name, table) in &schema.tables {
+                if table_name.is_empty() || table.name != *table_name {
+                    return Err(MigrationError::InvalidSchema("table key/name mismatch"));
+                }
+                if table.columns.is_empty() {
+                    return Err(MigrationError::InvalidSchema("table must have columns"));
+                }
+                for (name, col) in &table.columns {
+                    if name.is_empty() || col.name != *name {
+                        return Err(MigrationError::InvalidSchema("column key/name mismatch"));
+                    }
+                }
+                for key in &table.primary_key {
+                    if !table.columns.contains_key(key) {
+                        return Err(MigrationError::InvalidSchema("primary key column missing"));
+                    }
+                }
+                for fk in table.foreign_keys.values() {
+                    if fk.columns.is_empty() || fk.columns.len() != fk.referenced_columns.len() {
+                        return Err(MigrationError::InvalidSchema("foreign key arity mismatch"));
+                    }
+                    if fk.columns.iter().any(|c| !table.columns.contains_key(c)) {
+                        return Err(MigrationError::InvalidSchema(
+                            "foreign key local column missing",
+                        ));
+                    }
+                    let referenced = schema.tables.get(&fk.referenced_table).ok_or(
+                        MigrationError::InvalidSchema("foreign key target table missing"),
+                    )?;
+                    if fk
+                        .referenced_columns
+                        .iter()
+                        .any(|c| !referenced.columns.contains_key(c))
+                    {
+                        return Err(MigrationError::InvalidSchema(
+                            "foreign key target column missing",
+                        ));
+                    }
+                }
+                for index in table.indexes.values() {
+                    if index.columns.is_empty()
+                        || index.columns.iter().any(|c| !table.columns.contains_key(c))
+                    {
+                        return Err(MigrationError::InvalidSchema("index column missing"));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        pub fn diff_schemas(
+            old: &Schema,
+            new: &Schema,
+            max_steps: usize,
+        ) -> Result<Vec<PlannedStep>, MigrationError> {
+            validate_schema(old)?;
+            validate_schema(new)?;
+            let mut steps = Vec::new();
+            let mut push =
+                |step: Step, compatibility: Compatibility| -> Result<(), MigrationError> {
+                    if steps.len() >= max_steps {
+                        return Err(MigrationError::PlanLimitExceeded);
+                    }
+                    steps.push(PlannedStep {
+                        step,
+                        compatibility,
+                    });
+                    Ok(())
+                };
+
+            for (name, before) in &old.tables {
+                if !new.tables.contains_key(name) {
+                    push(Step::DropTable(name.clone()), Compatibility::Breaking)?;
+                    continue;
+                }
+                let after = new
+                    .tables
+                    .get(name)
+                    .ok_or(MigrationError::InvalidSchema("table disappeared"))?;
+                for (col_name, old_col) in &before.columns {
+                    match after.columns.get(col_name) {
+                        None => push(
+                            Step::DropColumn {
+                                table: name.clone(),
+                                column: col_name.clone(),
+                            },
+                            Compatibility::Breaking,
+                        )?,
+                        Some(new_col) if old_col != new_col => {
+                            let compat = if old_col.sql_type == new_col.sql_type
+                                && old_col.nullable
+                                && !new_col.nullable
+                            {
+                                Compatibility::Breaking
+                            } else {
+                                Compatibility::Unknown
+                            };
+                            push(
+                                Step::AlterColumn {
+                                    table: name.clone(),
+                                    before: old_col.clone(),
+                                    after: new_col.clone(),
+                                },
+                                compat,
+                            )?;
+                        }
+                        _ => {}
+                    }
+                }
+                for (col_name, col) in &after.columns {
+                    if !before.columns.contains_key(col_name) {
+                        let compat = if col.nullable || col.default_sql.is_some() {
+                            Compatibility::BackwardCompatible
+                        } else {
+                            Compatibility::Breaking
+                        };
+                        push(
+                            Step::AddColumn {
+                                table: name.clone(),
+                                column: col.clone(),
+                            },
+                            compat,
+                        )?;
+                    }
+                }
+                for idx_name in before.indexes.keys() {
+                    if !after.indexes.contains_key(idx_name) {
+                        push(
+                            Step::DropIndex {
+                                table: name.clone(),
+                                index: idx_name.clone(),
+                            },
+                            Compatibility::Unknown,
+                        )?;
+                    }
+                }
+                for (idx_name, idx) in &after.indexes {
+                    if !before.indexes.contains_key(idx_name)
+                        || before.indexes.get(idx_name) != Some(idx)
+                    {
+                        if before.indexes.contains_key(idx_name) {
+                            push(
+                                Step::DropIndex {
+                                    table: name.clone(),
+                                    index: idx_name.clone(),
+                                },
+                                Compatibility::Unknown,
+                            )?;
+                        }
+                        push(
+                            Step::AddIndex {
+                                table: name.clone(),
+                                index: idx.clone(),
+                            },
+                            Compatibility::BackwardCompatible,
+                        )?;
+                    }
+                }
+                for (fk_name, fk) in &before.foreign_keys {
+                    if after.foreign_keys.get(fk_name) != Some(fk) {
+                        push(
+                            Step::DropForeignKey {
+                                table: name.clone(),
+                                foreign_key: fk_name.clone(),
+                            },
+                            Compatibility::Unknown,
+                        )?;
+                    }
+                }
+                for (fk_name, fk) in &after.foreign_keys {
+                    if before.foreign_keys.get(fk_name) != Some(fk) {
+                        push(
+                            Step::AddForeignKey {
+                                table: name.clone(),
+                                foreign_key: fk.clone(),
+                            },
+                            Compatibility::Unknown,
+                        )?;
+                    }
+                }
+                if before.primary_key != after.primary_key {
+                    push(
+                        Step::SetPrimaryKey {
+                            table: name.clone(),
+                            columns: after.primary_key.clone(),
+                        },
+                        Compatibility::Breaking,
+                    )?;
+                }
+            }
+            for (name, table) in &new.tables {
+                if !old.tables.contains_key(name) {
+                    push(
+                        Step::CreateTable(table.clone()),
+                        Compatibility::BackwardCompatible,
+                    )?;
+                }
+            }
+            Ok(steps)
+        }
+
+        /// Deterministic FNV-1a fingerprint. This is a drift detector, not a cryptographic signature.
+        pub fn checksum(bytes: &[u8]) -> u64 {
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in bytes {
+                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct Migration {
+            pub version: u64,
+            pub name: String,
+            pub up_sql: String,
+            pub down_sql: Option<String>,
+            pub checksum: u64,
+        }
+        impl Migration {
+            pub fn new(
+                version: u64,
+                name: String,
+                up_sql: String,
+                down_sql: Option<String>,
+            ) -> Result<Self, MigrationError> {
+                if version == 0
+                    || name.is_empty()
+                    || name.len() > 128
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(MigrationError::InvalidMigrationName);
+                }
+                let sum = checksum(up_sql.as_bytes());
+                Ok(Self {
+                    version,
+                    name,
+                    up_sql,
+                    down_sql,
+                    checksum: sum,
+                })
+            }
+            pub fn verify(&self) -> Result<(), MigrationError> {
+                if checksum(self.up_sql.as_bytes()) != self.checksum {
+                    return Err(MigrationError::ChecksumMismatch(self.name.clone()));
+                }
+                Ok(())
+            }
+        }
+
+        pub trait DatabaseAdapter {
+            fn begin(&mut self) -> Result<(), String>;
+            fn execute(&mut self, sql: &str) -> Result<(), String>;
+            fn record_applied(
+                &mut self,
+                version: u64,
+                name: &str,
+                checksum: u64,
+            ) -> Result<(), String>;
+            fn commit(&mut self) -> Result<(), String>;
+            fn rollback(&mut self) -> Result<(), String>;
+        }
+
+        #[derive(Default)]
+        pub struct MigrationRunner {
+            applied: BTreeMap<u64, (String, u64)>,
+        }
+        impl MigrationRunner {
+            pub fn applied_versions(&self) -> Vec<u64> {
+                self.applied.keys().copied().collect()
+            }
+
+            pub fn apply<A: DatabaseAdapter>(
+                &mut self,
+                adapter: &mut A,
+                migrations: &[Migration],
+                max_sql_bytes: usize,
+            ) -> Result<Vec<u64>, MigrationError> {
+                let mut ordered = migrations.to_vec();
+                ordered.sort_by_key(|m| m.version);
+                let mut previous = None;
+                let mut pending = Vec::new();
+                for migration in &ordered {
+                    migration.verify()?;
+                    if previous == Some(migration.version) {
+                        return Err(MigrationError::DuplicateMigrationVersion);
+                    }
+                    previous = Some(migration.version);
+                    if migration.up_sql.len() > max_sql_bytes {
+                        return Err(MigrationError::PlanLimitExceeded);
+                    }
+                    if migration.up_sql.trim().is_empty() {
+                        return Err(MigrationError::UnsafeSql);
+                    }
+                    if let Some((name, sum)) = self.applied.get(&migration.version) {
+                        if name != &migration.name || sum != &migration.checksum {
+                            return Err(MigrationError::ChecksumMismatch(migration.name.clone()));
+                        }
+                        return Err(MigrationError::AlreadyApplied(migration.name.clone()));
+                    }
+                    pending.push(migration);
+                }
+                let mut done = Vec::new();
+                for migration in pending {
+                    adapter.begin().map_err(MigrationError::Adapter)?;
+                    let operation = adapter
+                        .execute(&migration.up_sql)
+                        .and_then(|_| {
+                            adapter.record_applied(
+                                migration.version,
+                                &migration.name,
+                                migration.checksum,
+                            )
+                        })
+                        .and_then(|_| adapter.commit());
+                    if let Err(error) = operation {
+                        let _ = adapter.rollback();
+                        return Err(MigrationError::Adapter(error));
+                    }
+                    self.applied.insert(
+                        migration.version,
+                        (migration.name.clone(), migration.checksum),
+                    );
+                    done.push(migration.version);
+                }
+                Ok(done)
+            }
+        }
+
+        #[derive(Clone, Default)]
+        pub struct MigrationLock {
+            held: Arc<Mutex<BTreeSet<String>>>,
+        }
+        pub struct LockGuard {
+            name: String,
+            held: Arc<Mutex<BTreeSet<String>>>,
+        }
+        impl MigrationLock {
+            pub fn acquire(&self, scope: &str) -> Result<LockGuard, MigrationError> {
+                if scope.is_empty() || scope.len() > 256 {
+                    return Err(MigrationError::InvalidSchema("invalid lock scope"));
+                }
+                let mut held = self
+                    .held
+                    .lock()
+                    .map_err(|_| MigrationError::LockUnavailable)?;
+                if !held.insert(scope.to_owned()) {
+                    return Err(MigrationError::LockUnavailable);
+                }
+                Ok(LockGuard {
+                    name: scope.to_owned(),
+                    held: Arc::clone(&self.held),
+                })
+            }
+        }
+        impl Drop for LockGuard {
+            fn drop(&mut self) {
+                if let Ok(mut held) = self.held.lock() {
+                    held.remove(&self.name);
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            #[derive(Default)]
+            struct FakeDb {
+                sql: Vec<String>,
+                versions: Vec<u64>,
+                in_tx: bool,
+            }
+            impl DatabaseAdapter for FakeDb {
+                fn begin(&mut self) -> Result<(), String> {
+                    self.in_tx = true;
+                    Ok(())
+                }
+                fn execute(&mut self, sql: &str) -> Result<(), String> {
+                    self.sql.push(sql.to_owned());
+                    Ok(())
+                }
+                fn record_applied(
+                    &mut self,
+                    version: u64,
+                    _name: &str,
+                    _checksum: u64,
+                ) -> Result<(), String> {
+                    self.versions.push(version);
+                    Ok(())
+                }
+                fn commit(&mut self) -> Result<(), String> {
+                    self.in_tx = false;
+                    Ok(())
+                }
+                fn rollback(&mut self) -> Result<(), String> {
+                    self.in_tx = false;
+                    Ok(())
+                }
+            }
+            fn col(name: &str, nullable: bool) -> ColumnDef {
+                ColumnDef {
+                    name: name.into(),
+                    sql_type: SqlType::Text,
+                    nullable,
+                    default_sql: None,
+                }
+            }
+            #[test]
+            fn schema_diff_adds_nullable_column() {
+                let mut old = Schema::default();
+                old.tables.insert(
+                    "users".into(),
+                    TableDef {
+                        name: "users".into(),
+                        columns: BTreeMap::from([("id".into(), col("id", false))]),
+                        ..TableDef::default()
+                    },
+                );
+                let mut new = old.clone();
+                if let Some(t) = new.tables.get_mut("users") {
+                    t.columns.insert("nickname".into(), col("nickname", true));
+                }
+                let diff = diff_schemas(&old, &new, 20).expect("diff");
+                assert_eq!(diff.len(), 1);
+                assert_eq!(diff[0].compatibility, Compatibility::BackwardCompatible);
+            }
+            #[test]
+            fn migration_apply_is_ordered_and_tracked() {
+                let mut runner = MigrationRunner::default();
+                let mut db = FakeDb::default();
+                let second =
+                    Migration::new(2, "second".into(), "SELECT 2".into(), None).expect("migration");
+                let first =
+                    Migration::new(1, "first".into(), "SELECT 1".into(), None).expect("migration");
+                assert_eq!(
+                    runner.apply(&mut db, &[second, first], 100).expect("apply"),
+                    vec![1, 2]
+                );
+                assert_eq!(db.versions, vec![1, 2]);
+            }
+            #[test]
+            fn lock_is_exclusive_and_released() {
+                let lock = MigrationLock::default();
+                let guard = lock.acquire("tenant:7").expect("lock");
+                assert_eq!(
+                    lock.acquire("tenant:7").err(),
+                    Some(MigrationError::LockUnavailable)
+                );
+                drop(guard);
+                assert!(lock.acquire("tenant:7").is_ok());
+            }
+        }
+    }
+    pub mod policy {
+        //! M033 — Agent Capability Policy Engine.
+        //! Deterministic tenant-scoped authorization with explicit deny precedence,
+        //! bounded policy storage, capability budgets and append-only decision records.
+        //! Authentication and trusted identity issuance remain upstream responsibilities.
+
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::fmt;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pub type TenantId = u64;
+        pub type AgentId = u128;
+        pub type PolicyId = u64;
+
+        const MAX_POLICIES: usize = 100_000;
+        const MAX_AUDIT_RECORDS: usize = 1_000_000;
+        const MAX_NAME_BYTES: usize = 256;
+        const MAX_CONTEXT_FIELDS: usize = 64;
+        const MAX_CONTEXT_VALUE_BYTES: usize = 4096;
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Effect {
+            Allow,
+            Deny,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum MatchValue {
+            Any,
+            Exact(String),
+            Prefix(String),
+            OneOf(BTreeSet<String>),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct CapabilityBudget {
+            pub max_calls: Option<u64>,
+            pub max_bytes_in: Option<u64>,
+            pub max_bytes_out: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct Policy {
+            pub id: PolicyId,
+            pub tenant_id: TenantId,
+            pub agent: MatchValue,
+            pub resource: MatchValue,
+            pub action: MatchValue,
+            pub effect: Effect,
+            pub priority: i32,
+            pub expires_at_unix_ms: Option<u64>,
+            pub required_context: BTreeMap<String, MatchValue>,
+            pub budget: Option<CapabilityBudget>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, Default)]
+        pub struct RequestContext {
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct AuthorizationRequest {
+            pub tenant_id: TenantId,
+            pub agent_id: AgentId,
+            pub resource: String,
+            pub action: String,
+            pub context: RequestContext,
+            pub bytes_in: u64,
+            pub bytes_out: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum DecisionReason {
+            ExplicitDeny,
+            AllowedByPolicy,
+            NoMatchingPolicy,
+            PolicyExpired,
+            BudgetExceeded,
+            InvalidRequest,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct AuthorizationDecision {
+            pub allowed: bool,
+            pub policy_id: Option<PolicyId>,
+            pub reason: DecisionReason,
+            pub remaining_calls: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct AuditRecord {
+            pub sequence: u64,
+            pub timestamp_unix_ms: u64,
+            pub tenant_id: TenantId,
+            pub agent_id: AgentId,
+            pub resource: String,
+            pub action: String,
+            pub allowed: bool,
+            pub policy_id: Option<PolicyId>,
+            pub reason: DecisionReason,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum PolicyError {
+            InvalidPolicy(&'static str),
+            PolicyLimit,
+            AuditLimit,
+            IdExhausted,
+            DuplicatePolicy,
+            NotFound,
+            Poisoned,
+        }
+        impl fmt::Display for PolicyError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for PolicyError {}
+
+        #[derive(Clone, Debug, Default)]
+        struct Usage {
+            calls: u64,
+            bytes_in: u64,
+            bytes_out: u64,
+        }
+
+        #[derive(Default)]
+        struct EngineState {
+            policies: BTreeMap<PolicyId, Policy>,
+            usage: BTreeMap<(PolicyId, TenantId, AgentId), Usage>,
+            audit: Vec<AuditRecord>,
+            next_policy_id: PolicyId,
+            next_audit_sequence: u64,
+        }
+
+        #[derive(Clone)]
+        pub struct PolicyEngine {
+            state: Arc<Mutex<EngineState>>,
+        }
+
+        fn now_unix_ms() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
+                .unwrap_or(0)
+        }
+
+        fn valid_name(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= MAX_NAME_BYTES
+                && !value.chars().any(char::is_control)
+        }
+
+        fn match_value(rule: &MatchValue, value: &str) -> bool {
+            match rule {
+                MatchValue::Any => true,
+                MatchValue::Exact(expected) => expected == value,
+                MatchValue::Prefix(prefix) => value.starts_with(prefix),
+                MatchValue::OneOf(values) => values.contains(value),
+            }
+        }
+
+        impl PolicyEngine {
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            pub fn add_policy(&self, mut policy: Policy) -> Result<PolicyId, PolicyError> {
+                validate_policy(&policy)?;
+                let mut state = self.state.lock().map_err(|_| PolicyError::Poisoned)?;
+                if state.policies.len() >= MAX_POLICIES {
+                    return Err(PolicyError::PolicyLimit);
+                }
+                if policy.id != 0 && state.policies.contains_key(&policy.id) {
+                    return Err(PolicyError::DuplicatePolicy);
+                }
+                if policy.id == 0 {
+                    state.next_policy_id = state
+                        .next_policy_id
+                        .checked_add(1)
+                        .ok_or(PolicyError::IdExhausted)?;
+                    policy.id = state.next_policy_id;
+                } else if policy.id > state.next_policy_id {
+                    state.next_policy_id = policy.id;
+                }
+                let id = policy.id;
+                state.policies.insert(id, policy);
+                Ok(id)
+            }
+
+            pub fn remove_policy(&self, id: PolicyId) -> Result<Policy, PolicyError> {
+                let mut state = self.state.lock().map_err(|_| PolicyError::Poisoned)?;
+                state.policies.remove(&id).ok_or(PolicyError::NotFound)
+            }
+
+            pub fn list_policies(&self, tenant_id: TenantId) -> Result<Vec<Policy>, PolicyError> {
+                let state = self.state.lock().map_err(|_| PolicyError::Poisoned)?;
+                Ok(state
+                    .policies
+                    .values()
+                    .filter(|p| p.tenant_id == tenant_id)
+                    .cloned()
+                    .collect())
+            }
+
+            pub fn authorize(
+                &self,
+                request: AuthorizationRequest,
+            ) -> Result<AuthorizationDecision, PolicyError> {
+                validate_request(&request).map_err(PolicyError::InvalidPolicy)?;
+                let now = now_unix_ms();
+                let mut state = self.state.lock().map_err(|_| PolicyError::Poisoned)?;
+                if state.audit.len() >= MAX_AUDIT_RECORDS {
+                    return Err(PolicyError::AuditLimit);
+                }
+                let mut candidates: Vec<&Policy> = state
+                    .policies
+                    .values()
+                    .filter(|policy| policy.tenant_id == request.tenant_id)
+                    .filter(|policy| {
+                        policy
+                            .expires_at_unix_ms
+                            .map(|expiry| expiry > now)
+                            .unwrap_or(true)
+                    })
+                    .filter(|policy| match_value(&policy.agent, &request.agent_id.to_string()))
+                    .filter(|policy| match_value(&policy.resource, &request.resource))
+                    .filter(|policy| match_value(&policy.action, &request.action))
+                    .filter(|policy| {
+                        policy.required_context.iter().all(|(key, matcher)| {
+                            request
+                                .context
+                                .fields
+                                .get(key)
+                                .map(|value| match_value(matcher, value))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .collect();
+
+                // Explicit deny wins regardless of priority. Within an effect, highest
+                // priority wins; policy ID is the deterministic tie breaker.
+                candidates.sort_by(|a, b| {
+                    let effect_rank = |effect: &Effect| if *effect == Effect::Deny { 0 } else { 1 };
+                    effect_rank(&a.effect)
+                        .cmp(&effect_rank(&b.effect))
+                        .then_with(|| b.priority.cmp(&a.priority))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+
+                let selected = candidates.first().copied().cloned();
+                let decision = match selected {
+                    None => AuthorizationDecision {
+                        allowed: false,
+                        policy_id: None,
+                        reason: DecisionReason::NoMatchingPolicy,
+                        remaining_calls: None,
+                    },
+                    Some(policy) if policy.effect == Effect::Deny => AuthorizationDecision {
+                        allowed: false,
+                        policy_id: Some(policy.id),
+                        reason: DecisionReason::ExplicitDeny,
+                        remaining_calls: None,
+                    },
+                    Some(policy) => {
+                        let key = (policy.id, request.tenant_id, request.agent_id);
+                        let usage = state.usage.entry(key).or_default();
+                        let exceeded = policy
+                            .budget
+                            .as_ref()
+                            .map(|budget| {
+                                budget
+                                    .max_calls
+                                    .map(|limit| usage.calls >= limit)
+                                    .unwrap_or(false)
+                                    || budget
+                                        .max_bytes_in
+                                        .map(|limit| {
+                                            request.bytes_in > limit.saturating_sub(usage.bytes_in)
+                                        })
+                                        .unwrap_or(false)
+                                    || budget
+                                        .max_bytes_out
+                                        .map(|limit| {
+                                            request.bytes_out
+                                                > limit.saturating_sub(usage.bytes_out)
+                                        })
+                                        .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if exceeded {
+                            AuthorizationDecision {
+                                allowed: false,
+                                policy_id: Some(policy.id),
+                                reason: DecisionReason::BudgetExceeded,
+                                remaining_calls: policy
+                                    .budget
+                                    .as_ref()
+                                    .and_then(|b| b.max_calls)
+                                    .map(|limit| limit.saturating_sub(usage.calls)),
+                            }
+                        } else {
+                            usage.calls = usage.calls.saturating_add(1);
+                            usage.bytes_in = usage.bytes_in.saturating_add(request.bytes_in);
+                            usage.bytes_out = usage.bytes_out.saturating_add(request.bytes_out);
+                            AuthorizationDecision {
+                                allowed: true,
+                                policy_id: Some(policy.id),
+                                reason: DecisionReason::AllowedByPolicy,
+                                remaining_calls: policy
+                                    .budget
+                                    .as_ref()
+                                    .and_then(|b| b.max_calls)
+                                    .map(|limit| limit.saturating_sub(usage.calls)),
+                            }
+                        }
+                    }
+                };
+                append_audit(&mut state, &request, &decision)?;
+                Ok(decision)
+            }
+
+            pub fn audit_records(
+                &self,
+                tenant_id: TenantId,
+                limit: usize,
+            ) -> Result<Vec<AuditRecord>, PolicyError> {
+                let state = self.state.lock().map_err(|_| PolicyError::Poisoned)?;
+                Ok(state
+                    .audit
+                    .iter()
+                    .rev()
+                    .filter(|record| record.tenant_id == tenant_id)
+                    .take(limit.min(MAX_AUDIT_RECORDS))
+                    .cloned()
+                    .collect())
+            }
+        }
+
+        impl Default for PolicyEngine {
+            fn default() -> Self {
+                Self {
+                    state: Arc::new(Mutex::new(EngineState::default())),
+                }
+            }
+        }
+
+        fn validate_policy(policy: &Policy) -> Result<(), PolicyError> {
+            if !valid_name(&policy.resource_name_for_validation()) {
+                return Err(PolicyError::InvalidPolicy("invalid resource matcher"));
+            }
+            if policy.required_context.len() > MAX_CONTEXT_FIELDS {
+                return Err(PolicyError::InvalidPolicy("too many context fields"));
+            }
+            for (key, matcher) in &policy.required_context {
+                if !valid_name(key) {
+                    return Err(PolicyError::InvalidPolicy("invalid context key"));
+                }
+                if let MatchValue::Exact(value) | MatchValue::Prefix(value) = matcher {
+                    if value.len() > MAX_CONTEXT_VALUE_BYTES {
+                        return Err(PolicyError::InvalidPolicy("context matcher too large"));
+                    }
+                }
+                if let MatchValue::OneOf(values) = matcher {
+                    if values.len() > 256
+                        || values.iter().any(|v| v.len() > MAX_CONTEXT_VALUE_BYTES)
+                    {
+                        return Err(PolicyError::InvalidPolicy("context set too large"));
+                    }
+                }
+            }
+            for matcher in [&policy.agent, &policy.resource, &policy.action] {
+                match matcher {
+                    MatchValue::Exact(value) | MatchValue::Prefix(value)
+                        if value.len() > MAX_NAME_BYTES =>
+                    {
+                        return Err(PolicyError::InvalidPolicy("matcher too large"))
+                    }
+                    MatchValue::OneOf(values)
+                        if values.len() > 1024
+                            || values.iter().any(|v| v.len() > MAX_NAME_BYTES) =>
+                    {
+                        return Err(PolicyError::InvalidPolicy("matcher set too large"))
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+
+        impl Policy {
+            fn resource_name_for_validation(&self) -> String {
+                match &self.resource {
+                    MatchValue::Exact(value) | MatchValue::Prefix(value) => value.clone(),
+                    MatchValue::OneOf(values) => values.iter().next().cloned().unwrap_or_default(),
+                    MatchValue::Any => "*".to_owned(),
+                }
+            }
+        }
+
+        fn validate_request(request: &AuthorizationRequest) -> Result<(), &'static str> {
+            if !valid_name(&request.resource) || !valid_name(&request.action) {
+                return Err("resource/action name invalid");
+            }
+            if request.context.fields.len() > MAX_CONTEXT_FIELDS {
+                return Err("too many context fields");
+            }
+            for (key, value) in &request.context.fields {
+                if !valid_name(key) || value.len() > MAX_CONTEXT_VALUE_BYTES {
+                    return Err("context field invalid or too large");
+                }
+            }
+            Ok(())
+        }
+
+        fn append_audit(
+            state: &mut EngineState,
+            request: &AuthorizationRequest,
+            decision: &AuthorizationDecision,
+        ) -> Result<(), PolicyError> {
+            if state.audit.len() >= MAX_AUDIT_RECORDS {
+                return Err(PolicyError::AuditLimit);
+            }
+            state.next_audit_sequence = state
+                .next_audit_sequence
+                .checked_add(1)
+                .ok_or(PolicyError::IdExhausted)?;
+            state.audit.push(AuditRecord {
+                sequence: state.next_audit_sequence,
+                timestamp_unix_ms: now_unix_ms(),
+                tenant_id: request.tenant_id,
+                agent_id: request.agent_id,
+                resource: request.resource.clone(),
+                action: request.action.clone(),
+                allowed: decision.allowed,
+                policy_id: decision.policy_id,
+                reason: decision.reason.clone(),
+            });
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn policy(tenant: u64, effect: Effect, priority: i32) -> Policy {
+                Policy {
+                    id: 0,
+                    tenant_id: tenant,
+                    agent: MatchValue::Any,
+                    resource: MatchValue::Exact("mcp.tool.text.echo".into()),
+                    action: MatchValue::Exact("invoke".into()),
+                    effect,
+                    priority,
+                    expires_at_unix_ms: None,
+                    required_context: BTreeMap::new(),
+                    budget: None,
+                }
+            }
+            fn request(tenant: u64) -> AuthorizationRequest {
+                AuthorizationRequest {
+                    tenant_id: tenant,
+                    agent_id: 77,
+                    resource: "mcp.tool.text.echo".into(),
+                    action: "invoke".into(),
+                    context: RequestContext::default(),
+                    bytes_in: 10,
+                    bytes_out: 20,
+                }
+            }
+
+            #[test]
+            fn deny_overrides_allow_and_is_audited() {
+                let engine = PolicyEngine::new();
+                engine
+                    .add_policy(policy(4, Effect::Allow, 100))
+                    .expect("allow");
+                engine
+                    .add_policy(policy(4, Effect::Deny, -10))
+                    .expect("deny");
+                let decision = engine.authorize(request(4)).expect("authorize");
+                assert!(!decision.allowed);
+                assert_eq!(decision.reason, DecisionReason::ExplicitDeny);
+                assert_eq!(engine.audit_records(4, 10).expect("audit").len(), 1);
+            }
+
+            #[test]
+            fn tenant_scoping_prevents_cross_tenant_grants() {
+                let engine = PolicyEngine::new();
+                engine
+                    .add_policy(policy(4, Effect::Allow, 1))
+                    .expect("policy");
+                assert!(!engine.authorize(request(5)).expect("authorize").allowed);
+            }
+
+            #[test]
+            fn call_budget_is_enforced() {
+                let engine = PolicyEngine::new();
+                let mut p = policy(4, Effect::Allow, 1);
+                p.budget = Some(CapabilityBudget {
+                    max_calls: Some(1),
+                    max_bytes_in: None,
+                    max_bytes_out: None,
+                });
+                engine.add_policy(p).expect("policy");
+                assert!(engine.authorize(request(4)).expect("first").allowed);
+                let second = engine.authorize(request(4)).expect("second");
+                assert!(!second.allowed);
+                assert_eq!(second.reason, DecisionReason::BudgetExceeded);
+            }
+        }
+    }
+    pub mod provenance {
+        //! Provenance and conflict-resolution primitives for agent memories.
+        //!
+        //! This crate does not decide whether a source is truthful. It records source
+        //! metadata and produces deterministic candidate precedence decisions for the
+        //! caller to review or apply.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type MemoryId = u128;
+        pub type SourceId = u128;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct Provenance {
+            pub source_id: SourceId,
+            pub source_kind: String,
+            pub observed_at_ns: u64,
+            pub confidence_milli: u16,
+            pub authority_rank: u16,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct SourcedMemory {
+            pub id: MemoryId,
+            pub tenant_id: TenantId,
+            pub fact_key: String,
+            pub value: String,
+            pub provenance: Provenance,
+            pub supersedes: Vec<MemoryId>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum ProvenanceError {
+            EmptyFactKey,
+            EmptyValue,
+            MetadataTooLarge,
+            ConfidenceOutOfRange,
+            DuplicateMemory,
+            TenantMismatch,
+            UnknownSupersededMemory,
+            ConflictingSupersession,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ConflictSet {
+            pub tenant_id: TenantId,
+            pub fact_key: String,
+            pub candidates: Vec<MemoryId>,
+            pub preferred: Option<MemoryId>,
+        }
+
+        #[derive(Default)]
+        pub struct ProvenanceLedger {
+            memories: BTreeMap<(TenantId, MemoryId), SourcedMemory>,
+            superseded_by: BTreeMap<(TenantId, MemoryId), MemoryId>,
+            max_key_bytes: usize,
+            max_value_bytes: usize,
+            max_source_kind_bytes: usize,
+            max_supersedes: usize,
+        }
+
+        impl ProvenanceLedger {
+            pub fn new(
+                max_key_bytes: usize,
+                max_value_bytes: usize,
+                max_source_kind_bytes: usize,
+                max_supersedes: usize,
+            ) -> Self {
+                Self {
+                    memories: BTreeMap::new(),
+                    superseded_by: BTreeMap::new(),
+                    max_key_bytes,
+                    max_value_bytes,
+                    max_source_kind_bytes,
+                    max_supersedes,
+                }
+            }
+
+            pub fn insert(&mut self, memory: SourcedMemory) -> Result<(), ProvenanceError> {
+                if memory.fact_key.trim().is_empty() {
+                    return Err(ProvenanceError::EmptyFactKey);
+                }
+                if memory.value.trim().is_empty() {
+                    return Err(ProvenanceError::EmptyValue);
+                }
+                if memory.fact_key.len() > self.max_key_bytes
+                    || memory.value.len() > self.max_value_bytes
+                    || memory.provenance.source_kind.len() > self.max_source_kind_bytes
+                {
+                    return Err(ProvenanceError::MetadataTooLarge);
+                }
+                if memory.provenance.confidence_milli > 1000 {
+                    return Err(ProvenanceError::ConfidenceOutOfRange);
+                }
+                let key = (memory.tenant_id, memory.id);
+                if self.memories.contains_key(&key) {
+                    return Err(ProvenanceError::DuplicateMemory);
+                }
+                if memory.supersedes.len() > self.max_supersedes {
+                    return Err(ProvenanceError::MetadataTooLarge);
+                }
+
+                for old_id in &memory.supersedes {
+                    if !self.memories.contains_key(&(memory.tenant_id, *old_id)) {
+                        return Err(ProvenanceError::UnknownSupersededMemory);
+                    }
+                    if self
+                        .superseded_by
+                        .contains_key(&(memory.tenant_id, *old_id))
+                    {
+                        return Err(ProvenanceError::ConflictingSupersession);
+                    }
+                }
+
+                for old_id in &memory.supersedes {
+                    self.superseded_by
+                        .insert((memory.tenant_id, *old_id), memory.id);
+                }
+                self.memories.insert(key, memory);
+                Ok(())
+            }
+
+            pub fn get(&self, tenant_id: TenantId, id: MemoryId) -> Option<&SourcedMemory> {
+                self.memories.get(&(tenant_id, id))
+            }
+
+            pub fn is_superseded(&self, tenant_id: TenantId, id: MemoryId) -> bool {
+                self.superseded_by.contains_key(&(tenant_id, id))
+            }
+
+            pub fn superseding_memory(
+                &self,
+                tenant_id: TenantId,
+                id: MemoryId,
+            ) -> Option<MemoryId> {
+                self.superseded_by.get(&(tenant_id, id)).copied()
+            }
+
+            /// Return active competing facts, grouped by normalized fact key.
+            /// Preferred candidate is selected by authority, confidence, observation
+            /// time, then lower memory ID. This is ranking, not truth verification.
+            pub fn conflicts(&self, tenant_id: TenantId) -> Vec<ConflictSet> {
+                let mut groups: BTreeMap<String, Vec<&SourcedMemory>> = BTreeMap::new();
+                for ((record_tenant, id), memory) in &self.memories {
+                    if *record_tenant != tenant_id || self.is_superseded(tenant_id, *id) {
+                        continue;
+                    }
+                    groups
+                        .entry(normalize_key(&memory.fact_key))
+                        .or_default()
+                        .push(memory);
+                }
+
+                let mut result = Vec::new();
+                for (fact_key, mut candidates) in groups {
+                    if candidates.len() < 2 {
+                        continue;
+                    }
+                    candidates.sort_by(|a, b| precedence(b, a));
+                    let preferred = candidates.first().map(|memory| memory.id);
+                    result.push(ConflictSet {
+                        tenant_id,
+                        fact_key,
+                        candidates: candidates.iter().map(|memory| memory.id).collect(),
+                        preferred,
+                    });
+                }
+                result
+            }
+
+            pub fn len(&self) -> usize {
+                self.memories.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.memories.is_empty()
+            }
+        }
+
+        fn precedence(a: &SourcedMemory, b: &SourcedMemory) -> std::cmp::Ordering {
+            a.provenance
+                .authority_rank
+                .cmp(&b.provenance.authority_rank)
+                .then_with(|| {
+                    a.provenance
+                        .confidence_milli
+                        .cmp(&b.provenance.confidence_milli)
+                })
+                .then_with(|| {
+                    a.provenance
+                        .observed_at_ns
+                        .cmp(&b.provenance.observed_at_ns)
+                })
+                .then_with(|| b.id.cmp(&a.id))
+        }
+
+        fn normalize_key(value: &str) -> String {
+            value.trim().chars().flat_map(char::to_lowercase).collect()
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn memory(
+                id: u128,
+                tenant: u64,
+                key: &str,
+                value: &str,
+                authority: u16,
+            ) -> SourcedMemory {
+                SourcedMemory {
+                    id,
+                    tenant_id: tenant,
+                    fact_key: key.to_owned(),
+                    value: value.to_owned(),
+                    provenance: Provenance {
+                        source_id: id + 100,
+                        source_kind: "operator".to_owned(),
+                        observed_at_ns: id as u64,
+                        confidence_milli: 900,
+                        authority_rank: authority,
+                    },
+                    supersedes: Vec::new(),
+                }
+            }
+
+            fn ledger() -> ProvenanceLedger {
+                ProvenanceLedger::new(128, 2048, 64, 16)
+            }
+
+            #[test]
+            fn ranks_conflicts_and_isolates_tenants() {
+                let mut ledger = ledger();
+                assert!(ledger
+                    .insert(memory(1, 4, "account.status", "pending", 1))
+                    .is_ok());
+                assert!(ledger
+                    .insert(memory(2, 4, " ACCOUNT.STATUS ", "active", 5))
+                    .is_ok());
+                assert!(ledger
+                    .insert(memory(3, 5, "account.status", "closed", 9))
+                    .is_ok());
+                let conflicts = ledger.conflicts(4);
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].preferred, Some(2));
+                assert_eq!(ledger.conflicts(5).len(), 0);
+            }
+
+            #[test]
+            fn explicit_supersession_removes_old_fact_from_active_conflicts() {
+                let mut ledger = ledger();
+                assert!(ledger.insert(memory(10, 1, "status", "old", 1)).is_ok());
+                let mut replacement = memory(11, 1, "status", "new", 2);
+                replacement.supersedes.push(10);
+                assert!(ledger.insert(replacement).is_ok());
+                assert!(ledger.is_superseded(1, 10));
+                assert_eq!(ledger.superseding_memory(1, 10), Some(11));
+                assert!(ledger.conflicts(1).is_empty());
+            }
+
+            #[test]
+            fn rejects_cross_tenant_or_unknown_supersession() {
+                let mut ledger = ledger();
+                let mut candidate = memory(2, 9, "k", "v", 1);
+                candidate.supersedes.push(1);
+                assert_eq!(
+                    ledger.insert(candidate),
+                    Err(ProvenanceError::UnknownSupersededMemory)
+                );
+            }
+        }
+    }
+    pub mod repair {
+        //! Bounded repair planning for divergent replicated memory inventories.
+        //!
+        //! Produces explicit transfer instructions. It never performs network I/O or
+        //! overwrites records. When versions tie but digests differ, it reports a
+        //! conflict rather than guessing which peer is authoritative.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type MemoryId = u128;
+        pub type ReplicaId = u64;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RepairEntry {
+            pub memory_id: MemoryId,
+            pub version: u64,
+            pub content_digest: u64,
+            pub estimated_bytes: u64,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum RepairAction {
+            FetchFromPeer,
+            SendToPeer,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct TransferInstruction {
+            pub tenant_id: TenantId,
+            pub memory_id: MemoryId,
+            pub action: RepairAction,
+            pub expected_version: u64,
+            pub estimated_bytes: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct UnresolvedConflict {
+            pub memory_id: MemoryId,
+            pub local_version: u64,
+            pub remote_version: u64,
+            pub local_digest: u64,
+            pub remote_digest: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RepairPlan {
+            pub tenant_id: TenantId,
+            pub local_replica: ReplicaId,
+            pub remote_replica: ReplicaId,
+            pub transfers: Vec<TransferInstruction>,
+            pub conflicts: Vec<UnresolvedConflict>,
+            pub total_estimated_bytes: u64,
+            pub truncated: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum RepairError {
+            ZeroOperationLimit,
+            DuplicateMemoryId,
+            InventoryTooLarge,
+            TransferBudgetExceeded,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct RepairConfig {
+            pub max_inventory_entries: usize,
+            pub max_operations: usize,
+            pub max_transfer_bytes: u64,
+        }
+
+        impl Default for RepairConfig {
+            fn default() -> Self {
+                Self {
+                    max_inventory_entries: 1_000_000,
+                    max_operations: 10_000,
+                    max_transfer_bytes: 1024 * 1024 * 1024,
+                }
+            }
+        }
+
+        pub fn plan_repair(
+            tenant_id: TenantId,
+            local_replica: ReplicaId,
+            remote_replica: ReplicaId,
+            local: &[RepairEntry],
+            remote: &[RepairEntry],
+            config: &RepairConfig,
+        ) -> Result<RepairPlan, RepairError> {
+            if config.max_operations == 0 {
+                return Err(RepairError::ZeroOperationLimit);
+            }
+            if local.len() > config.max_inventory_entries
+                || remote.len() > config.max_inventory_entries
+            {
+                return Err(RepairError::InventoryTooLarge);
+            }
+
+            let local_map = index_inventory(local)?;
+            let remote_map = index_inventory(remote)?;
+            let mut ids: Vec<MemoryId> =
+                local_map.keys().chain(remote_map.keys()).copied().collect();
+            ids.sort_unstable();
+            ids.dedup();
+
+            let mut plan = RepairPlan {
+                tenant_id,
+                local_replica,
+                remote_replica,
+                transfers: Vec::new(),
+                conflicts: Vec::new(),
+                total_estimated_bytes: 0,
+                truncated: false,
+            };
+
+            for id in ids {
+                let instruction = match (local_map.get(&id), remote_map.get(&id)) {
+                    (None, Some(remote_entry)) => Some(TransferInstruction {
+                        tenant_id,
+                        memory_id: id,
+                        action: RepairAction::FetchFromPeer,
+                        expected_version: remote_entry.version,
+                        estimated_bytes: remote_entry.estimated_bytes,
+                    }),
+                    (Some(local_entry), None) => Some(TransferInstruction {
+                        tenant_id,
+                        memory_id: id,
+                        action: RepairAction::SendToPeer,
+                        expected_version: local_entry.version,
+                        estimated_bytes: local_entry.estimated_bytes,
+                    }),
+                    (Some(local_entry), Some(remote_entry))
+                        if local_entry.version > remote_entry.version =>
+                    {
+                        Some(TransferInstruction {
+                            tenant_id,
+                            memory_id: id,
+                            action: RepairAction::SendToPeer,
+                            expected_version: local_entry.version,
+                            estimated_bytes: local_entry.estimated_bytes,
+                        })
+                    }
+                    (Some(local_entry), Some(remote_entry))
+                        if remote_entry.version > local_entry.version =>
+                    {
+                        Some(TransferInstruction {
+                            tenant_id,
+                            memory_id: id,
+                            action: RepairAction::FetchFromPeer,
+                            expected_version: remote_entry.version,
+                            estimated_bytes: remote_entry.estimated_bytes,
+                        })
+                    }
+                    (Some(local_entry), Some(remote_entry))
+                        if local_entry.content_digest != remote_entry.content_digest =>
+                    {
+                        plan.conflicts.push(UnresolvedConflict {
+                            memory_id: id,
+                            local_version: local_entry.version,
+                            remote_version: remote_entry.version,
+                            local_digest: local_entry.content_digest,
+                            remote_digest: remote_entry.content_digest,
+                        });
+                        None
+                    }
+                    _ => None,
+                };
+
+                if let Some(instruction) = instruction {
+                    if plan.transfers.len() >= config.max_operations {
+                        plan.truncated = true;
+                        break;
+                    }
+                    let next_total = plan
+                        .total_estimated_bytes
+                        .checked_add(instruction.estimated_bytes)
+                        .ok_or(RepairError::TransferBudgetExceeded)?;
+                    if next_total > config.max_transfer_bytes {
+                        return Err(RepairError::TransferBudgetExceeded);
+                    }
+                    plan.total_estimated_bytes = next_total;
+                    plan.transfers.push(instruction);
+                }
+            }
+            Ok(plan)
+        }
+
+        fn index_inventory(
+            entries: &[RepairEntry],
+        ) -> Result<BTreeMap<MemoryId, &RepairEntry>, RepairError> {
+            let mut map = BTreeMap::new();
+            for entry in entries {
+                if map.insert(entry.memory_id, entry).is_some() {
+                    return Err(RepairError::DuplicateMemoryId);
+                }
+            }
+            Ok(map)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn entry(id: u128, version: u64, digest: u64, bytes: u64) -> RepairEntry {
+                RepairEntry {
+                    memory_id: id,
+                    version,
+                    content_digest: digest,
+                    estimated_bytes: bytes,
+                }
+            }
+
+            fn config() -> RepairConfig {
+                RepairConfig {
+                    max_inventory_entries: 100,
+                    max_operations: 10,
+                    max_transfer_bytes: 1000,
+                }
+            }
+
+            #[test]
+            fn plans_missing_and_newer_version_transfers() {
+                let local = vec![entry(1, 2, 10, 100), entry(2, 1, 20, 50)];
+                let remote = vec![entry(1, 1, 10, 90), entry(3, 4, 30, 70)];
+                let plan = plan_repair(8, 1, 2, &local, &remote, &config());
+                assert!(plan.is_ok());
+                let plan = plan.unwrap_or_else(|_| unreachable!());
+                assert_eq!(plan.transfers.len(), 3);
+                assert_eq!(plan.transfers[0].action, RepairAction::SendToPeer);
+                assert_eq!(plan.transfers[1].action, RepairAction::SendToPeer);
+                assert_eq!(plan.transfers[2].action, RepairAction::FetchFromPeer);
+            }
+
+            #[test]
+            fn equal_version_digest_mismatch_is_not_guessed() {
+                let plan = plan_repair(
+                    8,
+                    1,
+                    2,
+                    &[entry(7, 3, 10, 10)],
+                    &[entry(7, 3, 11, 10)],
+                    &config(),
+                );
+                assert!(plan.is_ok());
+                let plan = plan.unwrap_or_else(|_| unreachable!());
+                assert!(plan.transfers.is_empty());
+                assert_eq!(plan.conflicts.len(), 1);
+            }
+
+            #[test]
+            fn enforces_inventory_operation_and_byte_limits() {
+                let mut cfg = config();
+                cfg.max_operations = 1;
+                let plan = plan_repair(
+                    1,
+                    1,
+                    2,
+                    &[entry(1, 1, 1, 10), entry(2, 1, 2, 10)],
+                    &[],
+                    &cfg,
+                );
+                assert_eq!(
+                    plan.map(|p| (p.transfers.len(), p.truncated)),
+                    Ok((1, true))
+                );
+
+                cfg.max_transfer_bytes = 5;
+                assert_eq!(
+                    plan_repair(1, 1, 2, &[entry(1, 1, 1, 10)], &[], &cfg),
+                    Err(RepairError::TransferBudgetExceeded)
+                );
+            }
+        }
+    }
+    pub mod repl_checkpoint {
+        //! Tenant-scoped replication checkpoint tracking.
+        //!
+        //! Tracks the highest contiguous source sequence acknowledged by each
+        //! destination replica. This is an in-memory coordinator primitive: durable
+        //! checkpoint persistence, peer authentication, and transport are external.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type ReplicaId = u64;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct CheckpointKey {
+            pub tenant_id: TenantId,
+            pub source_replica: ReplicaId,
+            pub destination_replica: ReplicaId,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct Checkpoint {
+            pub key: CheckpointKey,
+            pub applied_sequence: u64,
+            pub updated_at_ns: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum CheckpointError {
+            ZeroCapacity,
+            CapacityReached,
+            SequenceRegression,
+            TimestampRegression,
+            UnknownCheckpoint,
+            ZeroBatchSize,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct CheckpointConfig {
+            pub max_checkpoints: usize,
+        }
+
+        impl Default for CheckpointConfig {
+            fn default() -> Self {
+                Self {
+                    max_checkpoints: 100_000,
+                }
+            }
+        }
+
+        pub struct CheckpointManager {
+            max_checkpoints: usize,
+            checkpoints: BTreeMap<CheckpointKey, Checkpoint>,
+        }
+
+        impl CheckpointManager {
+            pub fn new(config: CheckpointConfig) -> Result<Self, CheckpointError> {
+                if config.max_checkpoints == 0 {
+                    return Err(CheckpointError::ZeroCapacity);
+                }
+                Ok(Self {
+                    max_checkpoints: config.max_checkpoints,
+                    checkpoints: BTreeMap::new(),
+                })
+            }
+
+            /// Record an acknowledgement. Sequence and timestamp may stay equal but
+            /// may never move backwards.
+            pub fn acknowledge(
+                &mut self,
+                key: CheckpointKey,
+                applied_sequence: u64,
+                updated_at_ns: u64,
+            ) -> Result<&Checkpoint, CheckpointError> {
+                if let Some(current) = self.checkpoints.get(&key) {
+                    if applied_sequence < current.applied_sequence {
+                        return Err(CheckpointError::SequenceRegression);
+                    }
+                    if updated_at_ns < current.updated_at_ns {
+                        return Err(CheckpointError::TimestampRegression);
+                    }
+                } else if self.checkpoints.len() >= self.max_checkpoints {
+                    return Err(CheckpointError::CapacityReached);
+                }
+
+                let checkpoint = self.checkpoints.entry(key).or_insert(Checkpoint {
+                    key,
+                    applied_sequence: 0,
+                    updated_at_ns,
+                });
+                checkpoint.applied_sequence = applied_sequence;
+                checkpoint.updated_at_ns = updated_at_ns;
+                Ok(checkpoint)
+            }
+
+            pub fn get(&self, key: CheckpointKey) -> Option<&Checkpoint> {
+                self.checkpoints.get(&key)
+            }
+
+            /// Calculate the next bounded source sequence interval to send.
+            /// Returns `None` when the destination has caught up.
+            pub fn next_batch(
+                &self,
+                key: CheckpointKey,
+                source_latest_sequence: u64,
+                max_batch_size: u64,
+            ) -> Result<Option<(u64, u64)>, CheckpointError> {
+                if max_batch_size == 0 {
+                    return Err(CheckpointError::ZeroBatchSize);
+                }
+                let checkpoint = self
+                    .checkpoints
+                    .get(&key)
+                    .ok_or(CheckpointError::UnknownCheckpoint)?;
+                if checkpoint.applied_sequence >= source_latest_sequence {
+                    return Ok(None);
+                }
+                let start = checkpoint.applied_sequence.saturating_add(1);
+                let end = start
+                    .saturating_add(max_batch_size.saturating_sub(1))
+                    .min(source_latest_sequence);
+                Ok(Some((start, end)))
+            }
+
+            /// Minimum acknowledged sequence across a tenant/source's destinations.
+            /// `None` means no destination checkpoint has been registered.
+            pub fn minimum_acknowledged(
+                &self,
+                tenant_id: TenantId,
+                source_replica: ReplicaId,
+            ) -> Option<u64> {
+                self.checkpoints
+                    .values()
+                    .filter(|checkpoint| {
+                        checkpoint.key.tenant_id == tenant_id
+                            && checkpoint.key.source_replica == source_replica
+                    })
+                    .map(|checkpoint| checkpoint.applied_sequence)
+                    .min()
+            }
+
+            pub fn len(&self) -> usize {
+                self.checkpoints.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.checkpoints.is_empty()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn key(destination: u64) -> CheckpointKey {
+                CheckpointKey {
+                    tenant_id: 7,
+                    source_replica: 1,
+                    destination_replica: destination,
+                }
+            }
+
+            fn manager(max: usize) -> CheckpointManager {
+                CheckpointManager::new(CheckpointConfig {
+                    max_checkpoints: max,
+                })
+                .unwrap_or_else(|_| unreachable!())
+            }
+
+            #[test]
+            fn acknowledgements_advance_and_batch_ranges_are_bounded() {
+                let mut manager = manager(4);
+                assert!(manager.acknowledge(key(2), 10, 100).is_ok());
+                assert_eq!(manager.next_batch(key(2), 30, 5), Ok(Some((11, 15))));
+                assert!(manager.acknowledge(key(2), 30, 200).is_ok());
+                assert_eq!(manager.next_batch(key(2), 30, 5), Ok(None));
+            }
+
+            #[test]
+            fn rejects_regressions_and_calculates_minimum_ack() {
+                let mut manager = manager(4);
+                assert!(manager.acknowledge(key(2), 20, 100).is_ok());
+                assert!(manager.acknowledge(key(3), 12, 100).is_ok());
+                assert_eq!(manager.minimum_acknowledged(7, 1), Some(12));
+                assert_eq!(
+                    manager.acknowledge(key(2), 19, 101).map(|_| ()),
+                    Err(CheckpointError::SequenceRegression)
+                );
+                assert_eq!(
+                    manager.acknowledge(key(2), 20, 99).map(|_| ()),
+                    Err(CheckpointError::TimestampRegression)
+                );
+            }
+
+            #[test]
+            fn enforces_capacity_and_tenant_scoping() {
+                let mut manager = manager(1);
+                assert!(manager.acknowledge(key(2), 5, 10).is_ok());
+                let other_tenant = CheckpointKey {
+                    tenant_id: 8,
+                    ..key(3)
+                };
+                assert_eq!(
+                    manager.acknowledge(other_tenant, 1, 1).map(|_| ()),
+                    Err(CheckpointError::CapacityReached)
+                );
+                assert_eq!(manager.minimum_acknowledged(8, 1), None);
+            }
+        }
+    }
+    pub mod repl_log {
+        //! Bounded per-tenant memory change log for incremental replication.
+        //!
+        //! This module produces ordered change batches and detects cursors that have
+        //! fallen behind retained history. Transport, durable persistence, peer
+        //! authentication, conflict resolution, and applying changes are external.
+
+        use std::collections::{BTreeMap, VecDeque};
+
+        pub type TenantId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum ChangeKind {
+            Upsert,
+            Delete,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct MemoryChange {
+            pub tenant_id: TenantId,
+            pub sequence: u64,
+            pub memory_id: MemoryId,
+            pub kind: ChangeKind,
+            /// Optional opaque payload; callers define its schema and protection.
+            pub payload: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ChangeBatch {
+            pub tenant_id: TenantId,
+            pub requested_after: u64,
+            pub next_cursor: u64,
+            pub has_more: bool,
+            pub changes: Vec<MemoryChange>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum ReplicationError {
+            ZeroCapacity,
+            PayloadTooLarge,
+            SequenceExhausted,
+            CursorExpired { oldest_available: u64 },
+            ZeroBatchLimit,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct ReplicationConfig {
+            pub max_events_per_tenant: usize,
+            pub max_payload_bytes: usize,
+        }
+
+        impl Default for ReplicationConfig {
+            fn default() -> Self {
+                Self {
+                    max_events_per_tenant: 100_000,
+                    max_payload_bytes: 1024 * 1024,
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct TenantLog {
+            events: VecDeque<MemoryChange>,
+            next_sequence: u64,
+        }
+
+        pub struct ReplicationLog {
+            config: ReplicationConfig,
+            tenants: BTreeMap<TenantId, TenantLog>,
+        }
+
+        impl ReplicationLog {
+            pub fn new(config: ReplicationConfig) -> Result<Self, ReplicationError> {
+                if config.max_events_per_tenant == 0 {
+                    return Err(ReplicationError::ZeroCapacity);
+                }
+                Ok(Self {
+                    config,
+                    tenants: BTreeMap::new(),
+                })
+            }
+
+            pub fn append(
+                &mut self,
+                tenant_id: TenantId,
+                memory_id: MemoryId,
+                kind: ChangeKind,
+                payload: Vec<u8>,
+            ) -> Result<u64, ReplicationError> {
+                if payload.len() > self.config.max_payload_bytes {
+                    return Err(ReplicationError::PayloadTooLarge);
+                }
+
+                let log = self.tenants.entry(tenant_id).or_default();
+                let sequence = if log.next_sequence == 0 {
+                    1
+                } else {
+                    log.next_sequence
+                };
+                let next = sequence
+                    .checked_add(1)
+                    .ok_or(ReplicationError::SequenceExhausted)?;
+
+                if log.events.len() == self.config.max_events_per_tenant {
+                    log.events.pop_front();
+                }
+                log.events.push_back(MemoryChange {
+                    tenant_id,
+                    sequence,
+                    memory_id,
+                    kind,
+                    payload,
+                });
+                log.next_sequence = next;
+                Ok(sequence)
+            }
+
+            /// Read at most `limit` events strictly after `cursor`.
+            /// A cursor before the retained history is rejected rather than silently
+            /// returning an incomplete replication stream.
+            pub fn read_after(
+                &self,
+                tenant_id: TenantId,
+                cursor: u64,
+                limit: usize,
+            ) -> Result<ChangeBatch, ReplicationError> {
+                if limit == 0 {
+                    return Err(ReplicationError::ZeroBatchLimit);
+                }
+                let Some(log) = self.tenants.get(&tenant_id) else {
+                    return Ok(ChangeBatch {
+                        tenant_id,
+                        requested_after: cursor,
+                        next_cursor: cursor,
+                        has_more: false,
+                        changes: Vec::new(),
+                    });
+                };
+
+                if let Some(oldest) = log.events.front() {
+                    if cursor.saturating_add(1) < oldest.sequence {
+                        return Err(ReplicationError::CursorExpired {
+                            oldest_available: oldest.sequence,
+                        });
+                    }
+                }
+
+                let mut changes = Vec::new();
+                let mut has_more = false;
+                for event in &log.events {
+                    if event.sequence <= cursor {
+                        continue;
+                    }
+                    if changes.len() == limit {
+                        has_more = true;
+                        break;
+                    }
+                    changes.push(event.clone());
+                }
+
+                let next_cursor = changes.last().map(|event| event.sequence).unwrap_or(cursor);
+
+                Ok(ChangeBatch {
+                    tenant_id,
+                    requested_after: cursor,
+                    next_cursor,
+                    has_more,
+                    changes,
+                })
+            }
+
+            pub fn latest_sequence(&self, tenant_id: TenantId) -> u64 {
+                self.tenants
+                    .get(&tenant_id)
+                    .map(|log| log.next_sequence.saturating_sub(1))
+                    .unwrap_or(0)
+            }
+
+            pub fn retained_count(&self, tenant_id: TenantId) -> usize {
+                self.tenants
+                    .get(&tenant_id)
+                    .map(|log| log.events.len())
+                    .unwrap_or(0)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn log(capacity: usize) -> ReplicationLog {
+                ReplicationLog::new(ReplicationConfig {
+                    max_events_per_tenant: capacity,
+                    max_payload_bytes: 64,
+                })
+                .unwrap_or_else(|_| unreachable!())
+            }
+
+            #[test]
+            fn emits_ordered_incremental_batches() {
+                let mut log = log(8);
+                assert_eq!(log.append(1, 10, ChangeKind::Upsert, vec![1]), Ok(1));
+                assert_eq!(log.append(1, 11, ChangeKind::Delete, Vec::new()), Ok(2));
+                let batch = log.read_after(1, 0, 1);
+                assert!(batch.is_ok());
+                let batch = batch.unwrap_or(ChangeBatch {
+                    tenant_id: 0,
+                    requested_after: 0,
+                    next_cursor: 0,
+                    has_more: false,
+                    changes: Vec::new(),
+                });
+                assert_eq!(batch.next_cursor, 1);
+                assert!(batch.has_more);
+            }
+
+            #[test]
+            fn tenant_logs_are_isolated_and_expired_cursors_are_detected() {
+                let mut log = log(2);
+                assert_eq!(log.append(7, 1, ChangeKind::Upsert, vec![]), Ok(1));
+                assert_eq!(log.append(7, 2, ChangeKind::Upsert, vec![]), Ok(2));
+                assert_eq!(log.append(7, 3, ChangeKind::Upsert, vec![]), Ok(3));
+                assert_eq!(log.latest_sequence(8), 0);
+                assert_eq!(
+                    log.read_after(7, 0, 10),
+                    Err(ReplicationError::CursorExpired {
+                        oldest_available: 2
+                    })
+                );
+                assert_eq!(log.read_after(8, 0, 10).map(|b| b.changes.len()), Ok(0));
+            }
+
+            #[test]
+            fn rejects_oversized_payload_and_zero_batch_limit() {
+                let mut log = log(2);
+                assert_eq!(
+                    log.append(1, 1, ChangeKind::Upsert, vec![0; 65]),
+                    Err(ReplicationError::PayloadTooLarge)
+                );
+                assert_eq!(
+                    log.read_after(1, 0, 0),
+                    Err(ReplicationError::ZeroBatchLimit)
+                );
+            }
+        }
+    }
+    pub mod repl_merge {
+        //! Deterministic, tenant-scoped merge primitives for replicated memory changes.
+        //!
+        //! The engine tracks per-origin sequence watermarks for idempotency and resolves
+        //! concurrent versions using a deterministic last-writer-wins ordering.
+        //! It is a merge policy, not a consensus protocol or durable replication store.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type ReplicaId = u64;
+        pub type MemoryId = u128;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum MutationKind {
+            Upsert,
+            Delete,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ReplicatedMutation {
+            pub tenant_id: TenantId,
+            pub memory_id: MemoryId,
+            pub origin_replica: ReplicaId,
+            pub origin_sequence: u64,
+            pub logical_timestamp_ns: u64,
+            pub kind: MutationKind,
+            pub payload: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct StoredVersion {
+            pub tenant_id: TenantId,
+            pub memory_id: MemoryId,
+            pub origin_replica: ReplicaId,
+            pub origin_sequence: u64,
+            pub logical_timestamp_ns: u64,
+            pub kind: MutationKind,
+            pub payload: Vec<u8>,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum ApplyOutcome {
+            Applied,
+            Replaced,
+            IgnoredStale,
+            Duplicate,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum MergeError {
+            ZeroCapacity,
+            PayloadTooLarge,
+            InvalidSequence,
+            CapacityReached,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct MergeConfig {
+            pub max_records: usize,
+            pub max_payload_bytes: usize,
+            pub max_origins: usize,
+        }
+
+        impl Default for MergeConfig {
+            fn default() -> Self {
+                Self {
+                    max_records: 100_000,
+                    max_payload_bytes: 1024 * 1024,
+                    max_origins: 10_000,
+                }
+            }
+        }
+
+        pub struct ReplicationMerge {
+            config: MergeConfig,
+            records: BTreeMap<(TenantId, MemoryId), StoredVersion>,
+            watermarks: BTreeMap<(TenantId, ReplicaId), u64>,
+        }
+
+        impl ReplicationMerge {
+            pub fn new(config: MergeConfig) -> Result<Self, MergeError> {
+                if config.max_records == 0 || config.max_origins == 0 {
+                    return Err(MergeError::ZeroCapacity);
+                }
+                Ok(Self {
+                    config,
+                    records: BTreeMap::new(),
+                    watermarks: BTreeMap::new(),
+                })
+            }
+
+            /// Apply one mutation. Sequence numbers are monotonic per tenant and origin.
+            /// A repeated or older origin sequence is treated as duplicate.
+            pub fn apply(
+                &mut self,
+                mutation: ReplicatedMutation,
+            ) -> Result<ApplyOutcome, MergeError> {
+                if mutation.origin_sequence == 0 {
+                    return Err(MergeError::InvalidSequence);
+                }
+                if mutation.payload.len() > self.config.max_payload_bytes {
+                    return Err(MergeError::PayloadTooLarge);
+                }
+
+                let watermark_key = (mutation.tenant_id, mutation.origin_replica);
+                let previous_watermark = self.watermarks.get(&watermark_key).copied().unwrap_or(0);
+                if mutation.origin_sequence <= previous_watermark {
+                    return Ok(ApplyOutcome::Duplicate);
+                }
+
+                if !self.watermarks.contains_key(&watermark_key)
+                    && self.watermarks.len() >= self.config.max_origins
+                {
+                    return Err(MergeError::CapacityReached);
+                }
+
+                let record_key = (mutation.tenant_id, mutation.memory_id);
+                let existing = self.records.get(&record_key);
+
+                let outcome = match existing {
+                    None => {
+                        if self.records.len() >= self.config.max_records {
+                            return Err(MergeError::CapacityReached);
+                        }
+                        self.records
+                            .insert(record_key, StoredVersion::from(mutation.clone()));
+                        ApplyOutcome::Applied
+                    }
+                    Some(current) if wins(&mutation, current) => {
+                        self.records
+                            .insert(record_key, StoredVersion::from(mutation.clone()));
+                        ApplyOutcome::Replaced
+                    }
+                    Some(_) => ApplyOutcome::IgnoredStale,
+                };
+
+                // Advance only after the mutation has passed validation and capacity checks.
+                self.watermarks
+                    .insert(watermark_key, mutation.origin_sequence);
+                Ok(outcome)
+            }
+
+            pub fn get(&self, tenant_id: TenantId, memory_id: MemoryId) -> Option<&StoredVersion> {
+                self.records.get(&(tenant_id, memory_id))
+            }
+
+            pub fn watermark(&self, tenant_id: TenantId, replica_id: ReplicaId) -> u64 {
+                self.watermarks
+                    .get(&(tenant_id, replica_id))
+                    .copied()
+                    .unwrap_or(0)
+            }
+
+            pub fn record_count(&self) -> usize {
+                self.records.len()
+            }
+        }
+
+        impl From<ReplicatedMutation> for StoredVersion {
+            fn from(value: ReplicatedMutation) -> Self {
+                Self {
+                    tenant_id: value.tenant_id,
+                    memory_id: value.memory_id,
+                    origin_replica: value.origin_replica,
+                    origin_sequence: value.origin_sequence,
+                    logical_timestamp_ns: value.logical_timestamp_ns,
+                    kind: value.kind,
+                    payload: value.payload,
+                }
+            }
+        }
+
+        /// Order by logical timestamp, then delete-wins, then replica ID and sequence.
+        /// The final tie-breaks ensure every peer chooses the same winner.
+        fn wins(candidate: &ReplicatedMutation, current: &StoredVersion) -> bool {
+            candidate.logical_timestamp_ns > current.logical_timestamp_ns
+                || (candidate.logical_timestamp_ns == current.logical_timestamp_ns
+                    && candidate.kind == MutationKind::Delete
+                    && current.kind != MutationKind::Delete)
+                || (candidate.logical_timestamp_ns == current.logical_timestamp_ns
+                    && candidate.kind == current.kind
+                    && (candidate.origin_replica, candidate.origin_sequence)
+                        > (current.origin_replica, current.origin_sequence))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn merge() -> ReplicationMerge {
+                ReplicationMerge::new(MergeConfig {
+                    max_records: 10,
+                    max_payload_bytes: 32,
+                    max_origins: 4,
+                })
+                .unwrap_or_else(|_| unreachable!())
+            }
+
+            fn mutation(
+                tenant: u64,
+                id: u128,
+                replica: u64,
+                seq: u64,
+                ts: u64,
+                kind: MutationKind,
+                payload: &[u8],
+            ) -> ReplicatedMutation {
+                ReplicatedMutation {
+                    tenant_id: tenant,
+                    memory_id: id,
+                    origin_replica: replica,
+                    origin_sequence: seq,
+                    logical_timestamp_ns: ts,
+                    kind,
+                    payload: payload.to_vec(),
+                }
+            }
+
+            #[test]
+            fn applies_once_and_tracks_per_origin_watermark() {
+                let mut engine = merge();
+                let first = mutation(1, 10, 7, 1, 100, MutationKind::Upsert, b"v1");
+                assert_eq!(engine.apply(first.clone()), Ok(ApplyOutcome::Applied));
+                assert_eq!(engine.apply(first), Ok(ApplyOutcome::Duplicate));
+                assert_eq!(engine.watermark(1, 7), 1);
+            }
+
+            #[test]
+            fn resolves_conflicts_deterministically_with_delete_wins_ties() {
+                let mut engine = merge();
+                assert_eq!(
+                    engine.apply(mutation(1, 10, 1, 1, 50, MutationKind::Upsert, b"value")),
+                    Ok(ApplyOutcome::Applied)
+                );
+                assert_eq!(
+                    engine.apply(mutation(1, 10, 2, 1, 50, MutationKind::Delete, b"")),
+                    Ok(ApplyOutcome::Replaced)
+                );
+                assert_eq!(
+                    engine.get(1, 10).map(|v| v.kind),
+                    Some(MutationKind::Delete)
+                );
+            }
+
+            #[test]
+            fn isolates_tenants_and_rejects_invalid_or_oversized_changes() {
+                let mut engine = merge();
+                assert_eq!(
+                    engine.apply(mutation(1, 10, 1, 1, 1, MutationKind::Upsert, b"x")),
+                    Ok(ApplyOutcome::Applied)
+                );
+                assert!(engine.get(2, 10).is_none());
+                assert_eq!(
+                    engine.apply(mutation(1, 11, 1, 0, 2, MutationKind::Upsert, b"x")),
+                    Err(MergeError::InvalidSequence)
+                );
+                assert_eq!(
+                    engine.apply(mutation(1, 12, 2, 1, 2, MutationKind::Upsert, &[0; 33])),
+                    Err(MergeError::PayloadTooLarge)
+                );
+            }
+        }
+    }
+    pub mod replay_guard {
+        //! Bounded per-tenant/per-peer replay protection for replication sequence numbers.
+        //!
+        //! The guard accepts out-of-order messages within a configurable sliding window,
+        //! rejects duplicates and stale sequence numbers, and bounds the number of tracked
+        //! streams. It is an in-memory primitive; durable replay state and peer authentication
+        //! must be provided by the integrating transport/session layer.
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct StreamKey {
+            pub tenant_id: String,
+            pub peer_id: String,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum ReplayDecision {
+            Accepted,
+            Duplicate,
+            TooOld,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ReplayError {
+            EmptyIdentity,
+            ZeroSequence,
+            InvalidWindow,
+            StreamCapacityReached,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct StreamState {
+            highest_sequence: u64,
+            accepted: BTreeSet<u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayGuard {
+            window_size: u64,
+            max_streams: usize,
+            streams: BTreeMap<StreamKey, StreamState>,
+        }
+
+        impl ReplayGuard {
+            pub fn new(window_size: u64, max_streams: usize) -> Result<Self, ReplayError> {
+                if window_size == 0 || max_streams == 0 {
+                    return Err(ReplayError::InvalidWindow);
+                }
+                Ok(Self {
+                    window_size,
+                    max_streams,
+                    streams: BTreeMap::new(),
+                })
+            }
+
+            pub fn stream_count(&self) -> usize {
+                self.streams.len()
+            }
+
+            pub fn highest_sequence(&self, tenant_id: &str, peer_id: &str) -> Option<u64> {
+                let key = StreamKey {
+                    tenant_id: tenant_id.to_owned(),
+                    peer_id: peer_id.to_owned(),
+                };
+                self.streams.get(&key).map(|state| state.highest_sequence)
+            }
+
+            /// Records a sequence number for one tenant/peer stream.
+            ///
+            /// `Accepted` means this sequence was not previously observed and is inside the
+            /// sliding window. `Duplicate` means it was already accepted. `TooOld` means it
+            /// falls outside the retained window. These decisions do not authenticate sender.
+            pub fn check_and_record(
+                &mut self,
+                tenant_id: &str,
+                peer_id: &str,
+                sequence: u64,
+            ) -> Result<ReplayDecision, ReplayError> {
+                if tenant_id.trim().is_empty() || peer_id.trim().is_empty() {
+                    return Err(ReplayError::EmptyIdentity);
+                }
+                if sequence == 0 {
+                    return Err(ReplayError::ZeroSequence);
+                }
+
+                let key = StreamKey {
+                    tenant_id: tenant_id.to_owned(),
+                    peer_id: peer_id.to_owned(),
+                };
+
+                if !self.streams.contains_key(&key) {
+                    if self.streams.len() >= self.max_streams {
+                        return Err(ReplayError::StreamCapacityReached);
+                    }
+                    let mut accepted = BTreeSet::new();
+                    accepted.insert(sequence);
+                    self.streams.insert(
+                        key,
+                        StreamState {
+                            highest_sequence: sequence,
+                            accepted,
+                        },
+                    );
+                    return Ok(ReplayDecision::Accepted);
+                }
+
+                let state = match self.streams.get_mut(&key) {
+                    Some(value) => value,
+                    None => return Err(ReplayError::StreamCapacityReached),
+                };
+
+                if state.accepted.contains(&sequence) {
+                    return Ok(ReplayDecision::Duplicate);
+                }
+
+                if sequence <= state.highest_sequence {
+                    let oldest_retained = state
+                        .highest_sequence
+                        .saturating_sub(self.window_size.saturating_sub(1));
+                    if sequence < oldest_retained {
+                        return Ok(ReplayDecision::TooOld);
+                    }
+                }
+
+                if sequence > state.highest_sequence {
+                    state.highest_sequence = sequence;
+                    let oldest_retained = state
+                        .highest_sequence
+                        .saturating_sub(self.window_size.saturating_sub(1));
+                    state.accepted.retain(|seen| *seen >= oldest_retained);
+                }
+
+                state.accepted.insert(sequence);
+                Ok(ReplayDecision::Accepted)
+            }
+
+            /// Removes replay history for one stream, for example after authenticated peer
+            /// revocation or an explicit session reset.
+            pub fn remove_stream(&mut self, tenant_id: &str, peer_id: &str) -> bool {
+                let key = StreamKey {
+                    tenant_id: tenant_id.to_owned(),
+                    peer_id: peer_id.to_owned(),
+                };
+                self.streams.remove(&key).is_some()
+            }
+
+            /// Clears all in-memory replay history.
+            pub fn clear(&mut self) {
+                self.streams.clear();
+            }
+
+            /// Returns the number of retained sequence numbers for a stream.
+            pub fn retained_sequence_count(&self, tenant_id: &str, peer_id: &str) -> usize {
+                let key = StreamKey {
+                    tenant_id: tenant_id.to_owned(),
+                    peer_id: peer_id.to_owned(),
+                };
+                self.streams
+                    .get(&key)
+                    .map_or(0, |state| state.accepted.len())
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn accepts_out_of_order_values_inside_window_and_rejects_duplicates() {
+                let mut guard = match ReplayGuard::new(8, 4) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("tenant-a", "peer-1", 10),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("tenant-a", "peer-1", 8),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("tenant-a", "peer-1", 10),
+                    Ok(ReplayDecision::Duplicate)
+                );
+                assert_eq!(guard.highest_sequence("tenant-a", "peer-1"), Some(10));
+            }
+
+            #[test]
+            fn rejects_values_outside_sliding_window() {
+                let mut guard = match ReplayGuard::new(4, 2) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("t", "p", 5),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("t", "p", 9),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("t", "p", 5),
+                    Ok(ReplayDecision::TooOld)
+                );
+                assert_eq!(guard.retained_sequence_count("t", "p"), 1);
+            }
+
+            #[test]
+            fn isolates_tenants_and_peers() {
+                let mut guard = match ReplayGuard::new(16, 4) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("tenant-a", "peer", 1),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("tenant-b", "peer", 1),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("tenant-a", "other-peer", 1),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(guard.stream_count(), 3);
+            }
+
+            #[test]
+            fn enforces_stream_capacity_and_supports_explicit_removal() {
+                let mut guard = match ReplayGuard::new(8, 1) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("t", "p1", 1),
+                    Ok(ReplayDecision::Accepted)
+                );
+                assert_eq!(
+                    guard.check_and_record("t", "p2", 1),
+                    Err(ReplayError::StreamCapacityReached)
+                );
+                assert!(guard.remove_stream("t", "p1"));
+                assert_eq!(
+                    guard.check_and_record("t", "p2", 1),
+                    Ok(ReplayDecision::Accepted)
+                );
+            }
+
+            #[test]
+            fn validates_identity_and_nonzero_sequence() {
+                let mut guard = match ReplayGuard::new(8, 2) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("", "p", 1),
+                    Err(ReplayError::EmptyIdentity)
+                );
+                assert_eq!(
+                    guard.check_and_record("t", "p", 0),
+                    Err(ReplayError::ZeroSequence)
+                );
+                assert_eq!(guard.stream_count(), 0);
+            }
+
+            #[test]
+            fn clear_removes_all_history() {
+                let mut guard = match ReplayGuard::new(8, 4) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid guard configuration rejected"),
+                };
+                assert_eq!(
+                    guard.check_and_record("t", "p", 2),
+                    Ok(ReplayDecision::Accepted)
+                );
+                guard.clear();
+                assert_eq!(guard.stream_count(), 0);
+                assert_eq!(guard.highest_sequence("t", "p"), None);
+            }
+        }
+    }
+    pub mod scheduler {
+        //! Bounded, deterministic scheduling for agent-memory replication repair work.
+        //!
+        //! This crate plans work only. Callers own timers, transport, persistence, and execution.
+
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RepairTask {
+            pub tenant_id: String,
+            pub peer_id: String,
+            pub cursor: u64,
+            pub estimated_bytes: u64,
+            pub priority: u8,
+            pub due_at_ms: u64,
+            pub deadline_ms: Option<u64>,
+            pub attempts: u32,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ScheduleError {
+            EmptyIdentity,
+            DuplicateTask,
+            CapacityReached,
+            InvalidDeadline,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ScheduleLimits {
+            pub max_tasks: usize,
+            pub max_bytes_per_batch: u64,
+            pub max_tasks_per_batch: usize,
+            pub max_attempts: u32,
+            pub base_backoff_ms: u64,
+            pub max_backoff_ms: u64,
+        }
+
+        impl Default for ScheduleLimits {
+            fn default() -> Self {
+                Self {
+                    max_tasks: 4096,
+                    max_bytes_per_batch: 8 * 1024 * 1024,
+                    max_tasks_per_batch: 128,
+                    max_attempts: 12,
+                    base_backoff_ms: 1_000,
+                    max_backoff_ms: 300_000,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ScheduledBatch {
+            pub tasks: Vec<RepairTask>,
+            pub estimated_bytes: u64,
+            pub deferred_count: usize,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Scheduler {
+            limits: ScheduleLimits,
+            tasks: BTreeMap<(String, String), RepairTask>,
+        }
+
+        impl Scheduler {
+            pub fn new(limits: ScheduleLimits) -> Self {
+                Self {
+                    limits,
+                    tasks: BTreeMap::new(),
+                }
+            }
+
+            pub fn len(&self) -> usize {
+                self.tasks.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.tasks.is_empty()
+            }
+
+            pub fn enqueue(&mut self, task: RepairTask) -> Result<(), ScheduleError> {
+                if task.tenant_id.trim().is_empty() || task.peer_id.trim().is_empty() {
+                    return Err(ScheduleError::EmptyIdentity);
+                }
+                if task
+                    .deadline_ms
+                    .is_some_and(|deadline| deadline < task.due_at_ms)
+                {
+                    return Err(ScheduleError::InvalidDeadline);
+                }
+                let key = (task.tenant_id.clone(), task.peer_id.clone());
+                if self.tasks.contains_key(&key) {
+                    return Err(ScheduleError::DuplicateTask);
+                }
+                if self.tasks.len() >= self.limits.max_tasks {
+                    return Err(ScheduleError::CapacityReached);
+                }
+                self.tasks.insert(key, task);
+                Ok(())
+            }
+
+            /// Selects due tasks in priority/deadline/fairness order without removing them.
+            /// The caller acknowledges completed tasks with `complete`.
+            pub fn plan_batch(&self, now_ms: u64) -> ScheduledBatch {
+                let mut due: Vec<&RepairTask> = self
+                    .tasks
+                    .values()
+                    .filter(|task| {
+                        task.due_at_ms <= now_ms && task.attempts < self.limits.max_attempts
+                    })
+                    .collect();
+
+                due.sort_by(|a, b| {
+                    b.priority
+                        .cmp(&a.priority)
+                        .then_with(|| {
+                            a.deadline_ms
+                                .unwrap_or(u64::MAX)
+                                .cmp(&b.deadline_ms.unwrap_or(u64::MAX))
+                        })
+                        .then_with(|| a.tenant_id.cmp(&b.tenant_id))
+                        .then_with(|| a.peer_id.cmp(&b.peer_id))
+                });
+
+                let mut selected = Vec::new();
+                let mut bytes = 0_u64;
+                for task in due.iter() {
+                    if selected.len() >= self.limits.max_tasks_per_batch {
+                        break;
+                    }
+                    let next_bytes = bytes.saturating_add(task.estimated_bytes);
+                    if next_bytes > self.limits.max_bytes_per_batch {
+                        continue;
+                    }
+                    bytes = next_bytes;
+                    selected.push((*task).clone());
+                }
+                let deferred_count = due.len().saturating_sub(selected.len());
+                ScheduledBatch {
+                    tasks: selected,
+                    estimated_bytes: bytes,
+                    deferred_count,
+                }
+            }
+
+            pub fn complete(&mut self, tenant_id: &str, peer_id: &str) -> bool {
+                self.tasks
+                    .remove(&(tenant_id.to_owned(), peer_id.to_owned()))
+                    .is_some()
+            }
+
+            /// Records a failed attempt and computes bounded exponential backoff.
+            pub fn record_failure(
+                &mut self,
+                tenant_id: &str,
+                peer_id: &str,
+                now_ms: u64,
+            ) -> Option<u64> {
+                let key = (tenant_id.to_owned(), peer_id.to_owned());
+                let task = self.tasks.get_mut(&key)?;
+                task.attempts = task.attempts.saturating_add(1);
+                if task.attempts >= self.limits.max_attempts {
+                    return None;
+                }
+                let shift = task.attempts.saturating_sub(1).min(63);
+                let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+                let delay = self
+                    .limits
+                    .base_backoff_ms
+                    .saturating_mul(multiplier)
+                    .min(self.limits.max_backoff_ms);
+                let next_due = now_ms.saturating_add(delay);
+                task.due_at_ms = next_due;
+                Some(next_due)
+            }
+
+            pub fn remove_exhausted(&mut self) -> usize {
+                let before = self.tasks.len();
+                self.tasks
+                    .retain(|_, task| task.attempts < self.limits.max_attempts);
+                before.saturating_sub(self.tasks.len())
+            }
+
+            pub fn task(&self, tenant_id: &str, peer_id: &str) -> Option<&RepairTask> {
+                self.tasks.get(&(tenant_id.to_owned(), peer_id.to_owned()))
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn task(tenant: &str, peer: &str, priority: u8, due: u64, bytes: u64) -> RepairTask {
+                RepairTask {
+                    tenant_id: tenant.to_owned(),
+                    peer_id: peer.to_owned(),
+                    cursor: 10,
+                    estimated_bytes: bytes,
+                    priority,
+                    due_at_ms: due,
+                    deadline_ms: None,
+                    attempts: 0,
+                }
+            }
+
+            #[test]
+            fn batch_respects_priority_and_budgets() {
+                let mut limits = ScheduleLimits::default();
+                limits.max_bytes_per_batch = 10;
+                limits.max_tasks_per_batch = 2;
+                let mut scheduler = Scheduler::new(limits);
+                assert!(scheduler.enqueue(task("t1", "p1", 1, 0, 6)).is_ok());
+                assert!(scheduler.enqueue(task("t2", "p2", 9, 0, 6)).is_ok());
+                assert!(scheduler.enqueue(task("t3", "p3", 5, 0, 4)).is_ok());
+                let batch = scheduler.plan_batch(0);
+                assert_eq!(batch.tasks.len(), 2);
+                assert_eq!(batch.tasks[0].peer_id, "p2");
+                assert_eq!(batch.estimated_bytes, 10);
+            }
+
+            #[test]
+            fn backoff_is_bounded_and_task_is_deferred() {
+                let mut limits = ScheduleLimits::default();
+                limits.base_backoff_ms = 10;
+                limits.max_backoff_ms = 25;
+                let mut scheduler = Scheduler::new(limits);
+                assert!(scheduler.enqueue(task("t", "p", 1, 0, 1)).is_ok());
+                assert_eq!(scheduler.record_failure("t", "p", 100), Some(110));
+                assert!(scheduler.plan_batch(109).tasks.is_empty());
+                assert_eq!(scheduler.plan_batch(110).tasks.len(), 1);
+            }
+
+            #[test]
+            fn tenant_peer_identity_is_unique_and_completion_removes_task() {
+                let mut scheduler = Scheduler::new(ScheduleLimits::default());
+                assert!(scheduler.enqueue(task("tenant", "peer", 1, 0, 1)).is_ok());
+                assert_eq!(
+                    scheduler.enqueue(task("tenant", "peer", 2, 0, 1)),
+                    Err(ScheduleError::DuplicateTask)
+                );
+                assert!(scheduler.complete("tenant", "peer"));
+                assert!(!scheduler.complete("tenant", "peer"));
+            }
+        }
+    }
+    pub mod snapshot {
+        //! Versioned, bounded binary snapshot codec for agent memory records.
+        //!
+        //! The codec is deterministic and dependency-free. Its FNV-1a checksum detects
+        //! accidental corruption only; it is not cryptographic authentication.
+        //! Encryption, signatures, storage, and atomic restore are caller responsibilities.
+
+        const MAGIC: &[u8; 8] = b"AGMEM001";
+        const VERSION: u16 = 1;
+        const CHECKSUM_BYTES: usize = 8;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct SnapshotRecord {
+            pub id: u128,
+            pub agent_id: u64,
+            pub created_at_ns: u64,
+            pub text: String,
+            pub tags: Vec<String>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct MemorySnapshot {
+            pub tenant_id: u64,
+            pub generation: u64,
+            pub records: Vec<SnapshotRecord>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum CodecError {
+            InputTooLarge,
+            Truncated,
+            BadMagic,
+            UnsupportedVersion,
+            ChecksumMismatch,
+            TooManyRecords,
+            TooManyTags,
+            FieldTooLarge,
+            InvalidUtf8,
+            DuplicateRecordId,
+            TrailingBytes,
+            TenantMismatch,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct CodecLimits {
+            pub max_snapshot_bytes: usize,
+            pub max_records: usize,
+            pub max_text_bytes: usize,
+            pub max_tags_per_record: usize,
+            pub max_tag_bytes: usize,
+        }
+
+        impl Default for CodecLimits {
+            fn default() -> Self {
+                Self {
+                    max_snapshot_bytes: 64 * 1024 * 1024,
+                    max_records: 1_000_000,
+                    max_text_bytes: 1024 * 1024,
+                    max_tags_per_record: 128,
+                    max_tag_bytes: 1024,
+                }
+            }
+        }
+
+        pub fn encode(
+            snapshot: &MemorySnapshot,
+            limits: &CodecLimits,
+        ) -> Result<Vec<u8>, CodecError> {
+            validate_snapshot(snapshot, limits)?;
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            put_u16(&mut out, VERSION);
+            put_u64(&mut out, snapshot.tenant_id);
+            put_u64(&mut out, snapshot.generation);
+            put_u32(
+                &mut out,
+                u32::try_from(snapshot.records.len()).map_err(|_| CodecError::TooManyRecords)?,
+            );
+
+            for record in &snapshot.records {
+                put_u128(&mut out, record.id);
+                put_u64(&mut out, record.agent_id);
+                put_u64(&mut out, record.created_at_ns);
+                put_bytes(&mut out, record.text.as_bytes())?;
+                put_u16(
+                    &mut out,
+                    u16::try_from(record.tags.len()).map_err(|_| CodecError::TooManyTags)?,
+                );
+                for tag in &record.tags {
+                    put_bytes(&mut out, tag.as_bytes())?;
+                }
+                if out.len().saturating_add(CHECKSUM_BYTES) > limits.max_snapshot_bytes {
+                    return Err(CodecError::InputTooLarge);
+                }
+            }
+
+            let checksum = fnv1a64(&out);
+            put_u64(&mut out, checksum);
+            if out.len() > limits.max_snapshot_bytes {
+                return Err(CodecError::InputTooLarge);
+            }
+            Ok(out)
+        }
+
+        pub fn decode(
+            bytes: &[u8],
+            expected_tenant: Option<u64>,
+            limits: &CodecLimits,
+        ) -> Result<MemorySnapshot, CodecError> {
+            if bytes.len() > limits.max_snapshot_bytes {
+                return Err(CodecError::InputTooLarge);
+            }
+            if bytes.len() < MAGIC.len() + 2 + 8 + 8 + 4 + CHECKSUM_BYTES {
+                return Err(CodecError::Truncated);
+            }
+
+            let data_end = bytes
+                .len()
+                .checked_sub(CHECKSUM_BYTES)
+                .ok_or(CodecError::Truncated)?;
+            let expected_checksum = read_u64_at(bytes, data_end)?;
+            if fnv1a64(&bytes[..data_end]) != expected_checksum {
+                return Err(CodecError::ChecksumMismatch);
+            }
+
+            let mut reader = Reader::new(&bytes[..data_end]);
+            if reader.take(MAGIC.len())? != MAGIC {
+                return Err(CodecError::BadMagic);
+            }
+            if reader.u16()? != VERSION {
+                return Err(CodecError::UnsupportedVersion);
+            }
+            let tenant_id = reader.u64()?;
+            if expected_tenant.is_some_and(|tenant| tenant != tenant_id) {
+                return Err(CodecError::TenantMismatch);
+            }
+            let generation = reader.u64()?;
+            let count = usize::try_from(reader.u32()?).map_err(|_| CodecError::TooManyRecords)?;
+            if count > limits.max_records {
+                return Err(CodecError::TooManyRecords);
+            }
+
+            let mut records = Vec::with_capacity(count);
+            let mut ids = std::collections::BTreeSet::new();
+            for _ in 0..count {
+                let id = reader.u128()?;
+                if !ids.insert(id) {
+                    return Err(CodecError::DuplicateRecordId);
+                }
+                let agent_id = reader.u64()?;
+                let created_at_ns = reader.u64()?;
+                let text = reader.string(limits.max_text_bytes)?;
+                let tag_count = usize::from(reader.u16()?);
+                if tag_count > limits.max_tags_per_record {
+                    return Err(CodecError::TooManyTags);
+                }
+                let mut tags = Vec::with_capacity(tag_count);
+                for _ in 0..tag_count {
+                    tags.push(reader.string(limits.max_tag_bytes)?);
+                }
+                records.push(SnapshotRecord {
+                    id,
+                    agent_id,
+                    created_at_ns,
+                    text,
+                    tags,
+                });
+            }
+            if !reader.is_empty() {
+                return Err(CodecError::TrailingBytes);
+            }
+            Ok(MemorySnapshot {
+                tenant_id,
+                generation,
+                records,
+            })
+        }
+
+        fn validate_snapshot(
+            snapshot: &MemorySnapshot,
+            limits: &CodecLimits,
+        ) -> Result<(), CodecError> {
+            if snapshot.records.len() > limits.max_records {
+                return Err(CodecError::TooManyRecords);
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            for record in &snapshot.records {
+                if record.text.len() > limits.max_text_bytes {
+                    return Err(CodecError::FieldTooLarge);
+                }
+                if record.tags.len() > limits.max_tags_per_record {
+                    return Err(CodecError::TooManyTags);
+                }
+                if record
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() > limits.max_tag_bytes)
+                {
+                    return Err(CodecError::FieldTooLarge);
+                }
+                if !ids.insert(record.id) {
+                    return Err(CodecError::DuplicateRecordId);
+                }
+            }
+            Ok(())
+        }
+
+        fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), CodecError> {
+            let len = u32::try_from(value.len()).map_err(|_| CodecError::FieldTooLarge)?;
+            put_u32(out, len);
+            out.extend_from_slice(value);
+            Ok(())
+        }
+
+        fn put_u16(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn put_u128(out: &mut Vec<u8>, value: u128) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, CodecError> {
+            let end = offset.checked_add(8).ok_or(CodecError::Truncated)?;
+            let slice = bytes.get(offset..end).ok_or(CodecError::Truncated)?;
+            let array: [u8; 8] = slice.try_into().map_err(|_| CodecError::Truncated)?;
+            Ok(u64::from_le_bytes(array))
+        }
+
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+
+            fn take(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
+                let end = self.offset.checked_add(len).ok_or(CodecError::Truncated)?;
+                let value = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(CodecError::Truncated)?;
+                self.offset = end;
+                Ok(value)
+            }
+
+            fn u16(&mut self) -> Result<u16, CodecError> {
+                let bytes: [u8; 2] = self
+                    .take(2)?
+                    .try_into()
+                    .map_err(|_| CodecError::Truncated)?;
+                Ok(u16::from_le_bytes(bytes))
+            }
+            fn u32(&mut self) -> Result<u32, CodecError> {
+                let bytes: [u8; 4] = self
+                    .take(4)?
+                    .try_into()
+                    .map_err(|_| CodecError::Truncated)?;
+                Ok(u32::from_le_bytes(bytes))
+            }
+            fn u64(&mut self) -> Result<u64, CodecError> {
+                let bytes: [u8; 8] = self
+                    .take(8)?
+                    .try_into()
+                    .map_err(|_| CodecError::Truncated)?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+            fn u128(&mut self) -> Result<u128, CodecError> {
+                let bytes: [u8; 16] = self
+                    .take(16)?
+                    .try_into()
+                    .map_err(|_| CodecError::Truncated)?;
+                Ok(u128::from_le_bytes(bytes))
+            }
+            fn string(&mut self, max_len: usize) -> Result<String, CodecError> {
+                let len = usize::try_from(self.u32()?).map_err(|_| CodecError::FieldTooLarge)?;
+                if len > max_len {
+                    return Err(CodecError::FieldTooLarge);
+                }
+                let bytes = self.take(len)?;
+                String::from_utf8(bytes.to_vec()).map_err(|_| CodecError::InvalidUtf8)
+            }
+            fn is_empty(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn sample() -> MemorySnapshot {
+                MemorySnapshot {
+                    tenant_id: 42,
+                    generation: 7,
+                    records: vec![SnapshotRecord {
+                        id: 9,
+                        agent_id: 3,
+                        created_at_ns: 100,
+                        text: "remember this".to_owned(),
+                        tags: vec!["project".to_owned(), "important".to_owned()],
+                    }],
+                }
+            }
+
+            #[test]
+            fn round_trip_preserves_snapshot() {
+                let limits = CodecLimits::default();
+                let encoded = encode(&sample(), &limits);
+                assert!(encoded.is_ok());
+                let decoded = decode(&encoded.unwrap_or_default(), Some(42), &limits);
+                assert_eq!(decoded, Ok(sample()));
+            }
+
+            #[test]
+            fn rejects_wrong_tenant_and_corruption() {
+                let limits = CodecLimits::default();
+                let mut encoded = encode(&sample(), &limits).unwrap_or_default();
+                assert_eq!(
+                    decode(&encoded, Some(7), &limits),
+                    Err(CodecError::TenantMismatch)
+                );
+                if let Some(byte) = encoded.get_mut(25) {
+                    *byte ^= 1;
+                }
+                assert_eq!(
+                    decode(&encoded, Some(42), &limits),
+                    Err(CodecError::ChecksumMismatch)
+                );
+            }
+
+            #[test]
+            fn rejects_duplicate_ids_and_oversized_fields() {
+                let limits = CodecLimits::default();
+                let mut duplicate = sample();
+                duplicate.records.push(duplicate.records[0].clone());
+                assert_eq!(
+                    encode(&duplicate, &limits),
+                    Err(CodecError::DuplicateRecordId)
+                );
+
+                let mut tiny = CodecLimits::default();
+                tiny.max_text_bytes = 2;
+                assert_eq!(encode(&sample(), &tiny), Err(CodecError::FieldTooLarge));
+            }
+        }
+    }
+    pub mod timeseries {
+        //! M026 — tenant-isolated time-series metrics engine.
+        //!
+        //! Uses block compression with timestamp delta-of-delta varints and XOR
+        //! encoding of IEEE-754 value bits. This is a compact Gorilla-inspired
+        //! encoding, not a byte-for-byte implementation of the original Gorilla
+        //! wire format. The engine is in-memory and exposes a small line protocol.
+        //!
+        //! Tenant identity is part of every series key. A production deployment must
+        //! authenticate tenant identity before calling this library.
+
+        use std::collections::BTreeMap;
+        use std::error::Error;
+        use std::fmt;
+
+        const DEFAULT_BLOCK_SAMPLES: usize = 256;
+        const MAX_BLOCK_SAMPLES: usize = 4096;
+        const DEFAULT_MAX_SERIES: usize = 100_000;
+        const DEFAULT_MAX_SAMPLES_PER_SERIES: usize = 1_000_000;
+        const DEFAULT_MAX_METRIC_BYTES: usize = 128;
+        const MAX_LABELS: usize = 32;
+        const MAX_LABEL_BYTES: usize = 128;
+        const MAX_QUERY_RESULTS: usize = 100_000;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum TsError {
+            InvalidTenant,
+            InvalidMetric,
+            InvalidLabels,
+            InvalidTimestamp,
+            InvalidValue,
+            InvalidConfig(String),
+            CapacityExceeded,
+            CorruptBlock(String),
+            NotFound,
+        }
+
+        impl fmt::Display for TsError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::InvalidTenant => write!(f, "tenant ID must be non-zero"),
+                    Self::InvalidMetric => write!(f, "invalid metric name"),
+                    Self::InvalidLabels => write!(f, "invalid or excessive labels"),
+                    Self::InvalidTimestamp => write!(f, "timestamps must be non-decreasing"),
+                    Self::InvalidValue => write!(f, "metric value must be finite"),
+                    Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
+                    Self::CapacityExceeded => write!(f, "configured time-series capacity exceeded"),
+                    Self::CorruptBlock(message) => write!(f, "corrupt compressed block: {message}"),
+                    Self::NotFound => write!(f, "time series not found"),
+                }
+            }
+        }
+        impl Error for TsError {}
+        type TsResult<T> = Result<T, TsError>;
+
+        #[derive(Clone, Debug)]
+        pub struct TsConfig {
+            pub block_samples: usize,
+            pub max_series: usize,
+            pub max_samples_per_series: usize,
+            pub max_metric_bytes: usize,
+        }
+
+        impl Default for TsConfig {
+            fn default() -> Self {
+                Self {
+                    block_samples: DEFAULT_BLOCK_SAMPLES,
+                    max_series: DEFAULT_MAX_SERIES,
+                    max_samples_per_series: DEFAULT_MAX_SAMPLES_PER_SERIES,
+                    max_metric_bytes: DEFAULT_MAX_METRIC_BYTES,
+                }
+            }
+        }
+
+        impl TsConfig {
+            fn validate(&self) -> TsResult<()> {
+                if self.block_samples == 0 || self.block_samples > MAX_BLOCK_SAMPLES {
+                    return Err(TsError::InvalidConfig(format!(
+                        "block_samples must be 1..={MAX_BLOCK_SAMPLES}"
+                    )));
+                }
+                if self.max_series == 0 || self.max_series > 1_000_000 {
+                    return Err(TsError::InvalidConfig(
+                        "max_series must be 1..=1000000".into(),
+                    ));
+                }
+                if self.max_samples_per_series == 0 {
+                    return Err(TsError::InvalidConfig(
+                        "max_samples_per_series must be non-zero".into(),
+                    ));
+                }
+                if self.max_metric_bytes == 0 || self.max_metric_bytes > 1024 {
+                    return Err(TsError::InvalidConfig(
+                        "max_metric_bytes must be 1..=1024".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct Sample {
+            pub timestamp_ms: u64,
+            pub value: f64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        struct SeriesKey {
+            tenant_id: u64,
+            metric: String,
+            labels: Vec<(String, String)>,
+        }
+
+        #[derive(Clone, Debug)]
+        struct CompressedBlock {
+            first_timestamp_ms: u64,
+            last_timestamp_ms: u64,
+            sample_count: usize,
+            bytes: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, Default)]
+        struct Series {
+            blocks: Vec<CompressedBlock>,
+            pending: Vec<Sample>,
+            sample_count: usize,
+            last_timestamp_ms: Option<u64>,
+        }
+
+        pub struct TimeSeriesDb {
+            config: TsConfig,
+            series: BTreeMap<SeriesKey, Series>,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct QueryResult {
+            pub metric: String,
+            pub labels: Vec<(String, String)>,
+            pub samples: Vec<Sample>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct DbStats {
+            pub series_count: usize,
+            pub sample_count: usize,
+            pub compressed_bytes: usize,
+        }
+
+        fn validate_key(
+            tenant_id: u64,
+            metric: &str,
+            labels: &[(String, String)],
+            config: &TsConfig,
+        ) -> TsResult<SeriesKey> {
+            if tenant_id == 0 {
+                return Err(TsError::InvalidTenant);
+            }
+            if metric.is_empty()
+                || metric.len() > config.max_metric_bytes
+                || !metric
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':')
+            {
+                return Err(TsError::InvalidMetric);
+            }
+            if labels.len() > MAX_LABELS {
+                return Err(TsError::InvalidLabels);
+            }
+            let mut sorted = labels.to_vec();
+            sorted.sort();
+            let mut previous: Option<&str> = None;
+            for (name, value) in &sorted {
+                if name.is_empty()
+                    || name.len() > MAX_LABEL_BYTES
+                    || value.len() > MAX_LABEL_BYTES
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    || name.contains('\0')
+                    || value.contains('\0')
+                {
+                    return Err(TsError::InvalidLabels);
+                }
+                if previous == Some(name.as_str()) {
+                    return Err(TsError::InvalidLabels);
+                }
+                previous = Some(name);
+            }
+            Ok(SeriesKey {
+                tenant_id,
+                metric: metric.to_owned(),
+                labels: sorted,
+            })
+        }
+
+        fn put_varint(mut value: u64, output: &mut Vec<u8>) {
+            while value >= 0x80 {
+                output.push((value as u8) | 0x80);
+                value >>= 7;
+            }
+            output.push(value as u8);
+        }
+
+        fn get_varint(input: &[u8], cursor: &mut usize) -> TsResult<u64> {
+            let mut value = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = *input
+                    .get(*cursor)
+                    .ok_or_else(|| TsError::CorruptBlock("truncated varint".into()))?;
+                *cursor = cursor.checked_add(1).ok_or(TsError::CapacityExceeded)?;
+                let part = u64::from(byte & 0x7f);
+                if shift >= 64 || (shift == 63 && part > 1) {
+                    return Err(TsError::CorruptBlock("varint overflow".into()));
+                }
+                value |= part
+                    .checked_shl(shift)
+                    .ok_or_else(|| TsError::CorruptBlock("varint overflow".into()))?;
+                if byte & 0x80 == 0 {
+                    return Ok(value);
+                }
+                shift = shift.checked_add(7).ok_or(TsError::CapacityExceeded)?;
+            }
+        }
+
+        fn zigzag_encode(value: i64) -> u64 {
+            ((value << 1) ^ (value >> 63)) as u64
+        }
+
+        fn zigzag_decode(value: u64) -> i64 {
+            ((value >> 1) as i64) ^ (-((value & 1) as i64))
+        }
+
+        fn encode_block(samples: &[Sample]) -> TsResult<CompressedBlock> {
+            let first = samples
+                .first()
+                .ok_or_else(|| TsError::InvalidConfig("cannot encode empty block".into()))?;
+            let last = samples
+                .last()
+                .ok_or_else(|| TsError::InvalidConfig("cannot encode empty block".into()))?;
+            let mut bytes = Vec::with_capacity(samples.len().saturating_mul(4).saturating_add(16));
+            bytes.extend_from_slice(&first.timestamp_ms.to_le_bytes());
+            bytes.extend_from_slice(&first.value.to_bits().to_le_bytes());
+
+            let mut previous_timestamp = first.timestamp_ms;
+            let mut previous_delta: i64 = 0;
+            let mut previous_value_bits = first.value.to_bits();
+
+            for sample in samples.iter().skip(1) {
+                let delta_u64 = sample
+                    .timestamp_ms
+                    .checked_sub(previous_timestamp)
+                    .ok_or(TsError::InvalidTimestamp)?;
+                let delta = i64::try_from(delta_u64).map_err(|_| TsError::InvalidTimestamp)?;
+                let delta_of_delta = delta
+                    .checked_sub(previous_delta)
+                    .ok_or(TsError::InvalidTimestamp)?;
+                put_varint(zigzag_encode(delta_of_delta), &mut bytes);
+
+                let value_bits = sample.value.to_bits();
+                let xor = value_bits ^ previous_value_bits;
+                put_varint(xor, &mut bytes);
+
+                previous_timestamp = sample.timestamp_ms;
+                previous_delta = delta;
+                previous_value_bits = value_bits;
+            }
+
+            Ok(CompressedBlock {
+                first_timestamp_ms: first.timestamp_ms,
+                last_timestamp_ms: last.timestamp_ms,
+                sample_count: samples.len(),
+                bytes,
+            })
+        }
+
+        fn decode_block(block: &CompressedBlock) -> TsResult<Vec<Sample>> {
+            if block.sample_count == 0
+                || block.sample_count > MAX_BLOCK_SAMPLES
+                || block.bytes.len() < 16
+            {
+                return Err(TsError::CorruptBlock("invalid block header".into()));
+            }
+            let timestamp_bytes: [u8; 8] = block
+                .bytes
+                .get(0..8)
+                .ok_or_else(|| TsError::CorruptBlock("missing first timestamp".into()))?
+                .try_into()
+                .map_err(|_| TsError::CorruptBlock("invalid first timestamp".into()))?;
+            let value_bytes: [u8; 8] = block
+                .bytes
+                .get(8..16)
+                .ok_or_else(|| TsError::CorruptBlock("missing first value".into()))?
+                .try_into()
+                .map_err(|_| TsError::CorruptBlock("invalid first value".into()))?;
+            let mut timestamp = u64::from_le_bytes(timestamp_bytes);
+            let mut value_bits = u64::from_le_bytes(value_bytes);
+            let first_value = f64::from_bits(value_bits);
+            if !first_value.is_finite() {
+                return Err(TsError::CorruptBlock("non-finite first value".into()));
+            }
+
+            let mut output = Vec::with_capacity(block.sample_count);
+            output.push(Sample {
+                timestamp_ms: timestamp,
+                value: first_value,
+            });
+            let mut previous_delta: i64 = 0;
+            let mut cursor = 16usize;
+
+            for _ in 1..block.sample_count {
+                let encoded_delta = get_varint(&block.bytes, &mut cursor)?;
+                let delta_of_delta = zigzag_decode(encoded_delta);
+                let delta = previous_delta
+                    .checked_add(delta_of_delta)
+                    .ok_or_else(|| TsError::CorruptBlock("timestamp delta overflow".into()))?;
+                if delta < 0 {
+                    return Err(TsError::CorruptBlock("negative timestamp delta".into()));
+                }
+                timestamp = timestamp
+                    .checked_add(delta as u64)
+                    .ok_or_else(|| TsError::CorruptBlock("timestamp overflow".into()))?;
+
+                let xor = get_varint(&block.bytes, &mut cursor)?;
+                value_bits ^= xor;
+                let value = f64::from_bits(value_bits);
+                if !value.is_finite() {
+                    return Err(TsError::CorruptBlock("non-finite value".into()));
+                }
+                output.push(Sample {
+                    timestamp_ms: timestamp,
+                    value,
+                });
+                previous_delta = delta;
+            }
+            if cursor != block.bytes.len() {
+                return Err(TsError::CorruptBlock(
+                    "trailing bytes in compressed block".into(),
+                ));
+            }
+            if output.first().map(|sample| sample.timestamp_ms) != Some(block.first_timestamp_ms)
+                || output.last().map(|sample| sample.timestamp_ms) != Some(block.last_timestamp_ms)
+            {
+                return Err(TsError::CorruptBlock(
+                    "block timestamp bounds mismatch".into(),
+                ));
+            }
+            Ok(output)
+        }
+
+        impl TimeSeriesDb {
+            pub fn new(config: TsConfig) -> TsResult<Self> {
+                config.validate()?;
+                Ok(Self {
+                    config,
+                    series: BTreeMap::new(),
+                })
+            }
+
+            pub fn append(
+                &mut self,
+                tenant_id: u64,
+                metric: &str,
+                labels: &[(String, String)],
+                sample: Sample,
+            ) -> TsResult<()> {
+                let key = validate_key(tenant_id, metric, labels, &self.config)?;
+                if !sample.value.is_finite() {
+                    return Err(TsError::InvalidValue);
+                }
+
+                if !self.series.contains_key(&key) && self.series.len() >= self.config.max_series {
+                    return Err(TsError::CapacityExceeded);
+                }
+                let series = self.series.entry(key).or_default();
+                if series.sample_count >= self.config.max_samples_per_series {
+                    return Err(TsError::CapacityExceeded);
+                }
+                if series
+                    .last_timestamp_ms
+                    .map(|last| sample.timestamp_ms < last)
+                    .unwrap_or(false)
+                {
+                    return Err(TsError::InvalidTimestamp);
+                }
+                series.last_timestamp_ms = Some(sample.timestamp_ms);
+                series.sample_count = series
+                    .sample_count
+                    .checked_add(1)
+                    .ok_or(TsError::CapacityExceeded)?;
+                series.pending.push(sample);
+
+                if series.pending.len() >= self.config.block_samples {
+                    let block = encode_block(&series.pending)?;
+                    series.blocks.push(block);
+                    series.pending.clear();
+                }
+                Ok(())
+            }
+
+            pub fn flush(&mut self) -> TsResult<()> {
+                for series in self.series.values_mut() {
+                    if !series.pending.is_empty() {
+                        let block = encode_block(&series.pending)?;
+                        series.blocks.push(block);
+                        series.pending.clear();
+                    }
+                }
+                Ok(())
+            }
+
+            pub fn query(
+                &self,
+                tenant_id: u64,
+                metric: &str,
+                labels: &[(String, String)],
+                start_ms: u64,
+                end_ms: u64,
+                limit: usize,
+            ) -> TsResult<QueryResult> {
+                if start_ms > end_ms || limit == 0 || limit > MAX_QUERY_RESULTS {
+                    return Err(TsError::InvalidConfig(
+                        "invalid query range or result limit".into(),
+                    ));
+                }
+                let key = validate_key(tenant_id, metric, labels, &self.config)?;
+                let series = self.series.get(&key).ok_or(TsError::NotFound)?;
+                let mut samples = Vec::new();
+
+                for block in &series.blocks {
+                    if block.last_timestamp_ms < start_ms || block.first_timestamp_ms > end_ms {
+                        continue;
+                    }
+                    for sample in decode_block(block)? {
+                        if sample.timestamp_ms >= start_ms && sample.timestamp_ms <= end_ms {
+                            if samples.len() >= limit {
+                                return Err(TsError::CapacityExceeded);
+                            }
+                            samples.push(sample);
+                        }
+                    }
+                }
+                for sample in &series.pending {
+                    if sample.timestamp_ms >= start_ms && sample.timestamp_ms <= end_ms {
+                        if samples.len() >= limit {
+                            return Err(TsError::CapacityExceeded);
+                        }
+                        samples.push(sample.clone());
+                    }
+                }
+                Ok(QueryResult {
+                    metric: key.metric,
+                    labels: key.labels,
+                    samples,
+                })
+            }
+
+            pub fn stats(&self) -> DbStats {
+                let mut sample_count = 0usize;
+                let mut compressed_bytes = 0usize;
+                for series in self.series.values() {
+                    sample_count = sample_count.saturating_add(series.sample_count);
+                    for block in &series.blocks {
+                        compressed_bytes = compressed_bytes.saturating_add(block.bytes.len());
+                    }
+                    compressed_bytes = compressed_bytes.saturating_add(
+                        series
+                            .pending
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Sample>()),
+                    );
+                }
+                DbStats {
+                    series_count: self.series.len(),
+                    sample_count,
+                    compressed_bytes,
+                }
+            }
+
+            pub fn delete_series(
+                &mut self,
+                tenant_id: u64,
+                metric: &str,
+                labels: &[(String, String)],
+            ) -> TsResult<()> {
+                let key = validate_key(tenant_id, metric, labels, &self.config)?;
+                self.series
+                    .remove(&key)
+                    .map(|_| ())
+                    .ok_or(TsError::NotFound)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn config() -> TsConfig {
+                TsConfig {
+                    block_samples: 3,
+                    max_series: 8,
+                    max_samples_per_series: 32,
+                    ..TsConfig::default()
+                }
+            }
+
+            fn labels() -> Vec<(String, String)> {
+                vec![
+                    ("host".into(), "node-a".into()),
+                    ("region".into(), "ap-south".into()),
+                ]
+            }
+
+            #[test]
+            fn block_codec_round_trips_delta_of_delta_and_xor_values() {
+                let samples = vec![
+                    Sample {
+                        timestamp_ms: 1000,
+                        value: 10.25,
+                    },
+                    Sample {
+                        timestamp_ms: 1010,
+                        value: 10.5,
+                    },
+                    Sample {
+                        timestamp_ms: 1025,
+                        value: 10.5,
+                    },
+                    Sample {
+                        timestamp_ms: 1045,
+                        value: -2.75,
+                    },
+                ];
+                let block = encode_block(&samples).expect("encode");
+                assert_eq!(decode_block(&block).expect("decode"), samples);
+            }
+
+            #[test]
+            fn tenant_series_are_isolated() {
+                let mut db = TimeSeriesDb::new(config()).expect("db");
+                let labels = labels();
+                db.append(
+                    1,
+                    "cpu_usage",
+                    &labels,
+                    Sample {
+                        timestamp_ms: 1,
+                        value: 0.5,
+                    },
+                )
+                .expect("append");
+                db.append(
+                    2,
+                    "cpu_usage",
+                    &labels,
+                    Sample {
+                        timestamp_ms: 1,
+                        value: 0.9,
+                    },
+                )
+                .expect("append");
+                let first = db.query(1, "cpu_usage", &labels, 0, 10, 10).expect("query");
+                let second = db.query(2, "cpu_usage", &labels, 0, 10, 10).expect("query");
+                assert_eq!(first.samples.first().map(|sample| sample.value), Some(0.5));
+                assert_eq!(second.samples.first().map(|sample| sample.value), Some(0.9));
+            }
+
+            #[test]
+            fn flush_and_range_query_return_ordered_samples() {
+                let mut db = TimeSeriesDb::new(config()).expect("db");
+                for timestamp in 0..8u64 {
+                    db.append(
+                        7,
+                        "requests_total",
+                        &[],
+                        Sample {
+                            timestamp_ms: timestamp * 1000,
+                            value: timestamp as f64,
+                        },
+                    )
+                    .expect("append");
+                }
+                db.flush().expect("flush");
+                let result = db
+                    .query(7, "requests_total", &[], 2000, 5000, 10)
+                    .expect("query");
+                assert_eq!(result.samples.len(), 4);
+                assert_eq!(
+                    result.samples.first().map(|sample| sample.timestamp_ms),
+                    Some(2000)
+                );
+                assert_eq!(
+                    result.samples.last().map(|sample| sample.timestamp_ms),
+                    Some(5000)
+                );
+            }
+
+            #[test]
+            fn rejects_out_of_order_and_non_finite_samples() {
+                let mut db = TimeSeriesDb::new(config()).expect("db");
+                assert!(db
+                    .append(
+                        1,
+                        "metric",
+                        &[],
+                        Sample {
+                            timestamp_ms: 10,
+                            value: 1.0
+                        }
+                    )
+                    .is_ok());
+                assert_eq!(
+                    db.append(
+                        1,
+                        "metric",
+                        &[],
+                        Sample {
+                            timestamp_ms: 9,
+                            value: 2.0
+                        }
+                    ),
+                    Err(TsError::InvalidTimestamp)
+                );
+                assert_eq!(
+                    db.append(
+                        1,
+                        "metric",
+                        &[],
+                        Sample {
+                            timestamp_ms: 11,
+                            value: f64::NAN
+                        }
+                    ),
+                    Err(TsError::InvalidValue)
+                );
+            }
+
+            #[test]
+            fn validates_labels_and_capacity() {
+                let mut db = TimeSeriesDb::new(config()).expect("db");
+                let duplicate = vec![("host".into(), "a".into()), ("host".into(), "b".into())];
+                assert_eq!(
+                    db.append(
+                        1,
+                        "metric",
+                        &duplicate,
+                        Sample {
+                            timestamp_ms: 1,
+                            value: 1.0
+                        }
+                    ),
+                    Err(TsError::InvalidLabels)
+                );
+                for index in 0..8 {
+                    db.append(
+                        index + 1,
+                        "metric",
+                        &[],
+                        Sample {
+                            timestamp_ms: 1,
+                            value: 1.0,
+                        },
+                    )
+                    .expect("append");
+                }
+                assert_eq!(
+                    db.append(
+                        9,
+                        "metric",
+                        &[],
+                        Sample {
+                            timestamp_ms: 1,
+                            value: 1.0
+                        }
+                    ),
+                    Err(TsError::CapacityExceeded)
+                );
+            }
+        }
+    }
+    pub mod wire {
+        //! Bounded binary wire protocol for AgentOS agent-memory replication.
+        //!
+        //! The codec is deterministic and self-contained. It performs no I/O, authentication,
+        //! encryption, compression, or transport negotiation.
+
+        use std::convert::TryFrom;
+
+        const MAGIC: &[u8; 4] = b"AMRP";
+        const VERSION: u8 = 1;
+        const HEADER_LEN: usize = 10;
+        const CHECKSUM_LEN: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Limits {
+            pub max_frame_bytes: usize,
+            pub max_string_bytes: usize,
+            pub max_records: usize,
+            pub max_record_bytes: usize,
+        }
+
+        impl Default for Limits {
+            fn default() -> Self {
+                Self {
+                    max_frame_bytes: 8 * 1024 * 1024,
+                    max_string_bytes: 4096,
+                    max_records: 4096,
+                    max_record_bytes: 1024 * 1024,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct MemoryRecord {
+            pub memory_id: String,
+            pub version: u64,
+            pub updated_at_ms: u64,
+            pub deleted: bool,
+            pub digest: [u8; 32],
+            pub payload: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum Message {
+            Hello {
+                tenant_id: String,
+                replica_id: String,
+                protocol_min: u8,
+                protocol_max: u8,
+            },
+            Inventory {
+                tenant_id: String,
+                replica_id: String,
+                high_watermark: u64,
+                inventory_digest: [u8; 32],
+            },
+            Fetch {
+                tenant_id: String,
+                request_id: u64,
+                after_sequence: u64,
+                max_records: u32,
+                max_bytes: u64,
+            },
+            Records {
+                tenant_id: String,
+                request_id: u64,
+                first_sequence: u64,
+                records: Vec<MemoryRecord>,
+            },
+            Acknowledge {
+                tenant_id: String,
+                request_id: u64,
+                through_sequence: u64,
+            },
+            Reject {
+                tenant_id: String,
+                request_id: u64,
+                code: u16,
+                message: String,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum CodecError {
+            FrameTooLarge,
+            FrameTooShort,
+            BadMagic,
+            UnsupportedVersion(u8),
+            UnknownMessageType(u8),
+            LengthOverflow,
+            Truncated,
+            TrailingBytes,
+            ChecksumMismatch,
+            InvalidUtf8,
+            EmptyIdentity,
+            StringTooLarge,
+            TooManyRecords,
+            RecordTooLarge,
+            InvalidBoolean,
+            InvalidRange,
+            InvalidLimits,
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+
+            fn take(&mut self, count: usize) -> Result<&'a [u8], CodecError> {
+                let end = self
+                    .offset
+                    .checked_add(count)
+                    .ok_or(CodecError::LengthOverflow)?;
+                let part = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(CodecError::Truncated)?;
+                self.offset = end;
+                Ok(part)
+            }
+
+            fn u8(&mut self) -> Result<u8, CodecError> {
+                self.take(1)?.first().copied().ok_or(CodecError::Truncated)
+            }
+
+            fn u16(&mut self) -> Result<u16, CodecError> {
+                let b = self.take(2)?;
+                let a0 = *b.first().ok_or(CodecError::Truncated)?;
+                let a1 = *b.get(1).ok_or(CodecError::Truncated)?;
+                Ok(u16::from_be_bytes([a0, a1]))
+            }
+
+            fn u32(&mut self) -> Result<u32, CodecError> {
+                let b = self.take(4)?;
+                let a0 = *b.first().ok_or(CodecError::Truncated)?;
+                let a1 = *b.get(1).ok_or(CodecError::Truncated)?;
+                let a2 = *b.get(2).ok_or(CodecError::Truncated)?;
+                let a3 = *b.get(3).ok_or(CodecError::Truncated)?;
+                Ok(u32::from_be_bytes([a0, a1, a2, a3]))
+            }
+
+            fn u64(&mut self) -> Result<u64, CodecError> {
+                let b = self.take(8)?;
+                let mut array = [0_u8; 8];
+                array.copy_from_slice(b);
+                Ok(u64::from_be_bytes(array))
+            }
+
+            fn string(&mut self, limits: &Limits) -> Result<String, CodecError> {
+                let len = usize::try_from(self.u32()?).map_err(|_| CodecError::LengthOverflow)?;
+                if len > limits.max_string_bytes {
+                    return Err(CodecError::StringTooLarge);
+                }
+                let bytes = self.take(len)?;
+                let value = std::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
+                if value.trim().is_empty() {
+                    return Err(CodecError::EmptyIdentity);
+                }
+                Ok(value.to_owned())
+            }
+
+            fn done(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        fn put_u16(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn put_string(out: &mut Vec<u8>, value: &str, limits: &Limits) -> Result<(), CodecError> {
+            if value.trim().is_empty() {
+                return Err(CodecError::EmptyIdentity);
+            }
+            if value.len() > limits.max_string_bytes {
+                return Err(CodecError::StringTooLarge);
+            }
+            let len = u32::try_from(value.len()).map_err(|_| CodecError::LengthOverflow)?;
+            put_u32(out, len);
+            out.extend_from_slice(value.as_bytes());
+            Ok(())
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0_u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        fn validate_limits(limits: &Limits) -> Result<(), CodecError> {
+            if limits.max_frame_bytes < HEADER_LEN + CHECKSUM_LEN
+                || limits.max_string_bytes == 0
+                || limits.max_record_bytes == 0
+            {
+                return Err(CodecError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        pub fn encode(message: &Message, limits: &Limits) -> Result<Vec<u8>, CodecError> {
+            validate_limits(limits)?;
+            let mut body = Vec::new();
+            let message_type = match message {
+                Message::Hello {
+                    tenant_id,
+                    replica_id,
+                    protocol_min,
+                    protocol_max,
+                } => {
+                    if protocol_min > protocol_max {
+                        return Err(CodecError::InvalidRange);
+                    }
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_string(&mut body, replica_id, limits)?;
+                    body.push(*protocol_min);
+                    body.push(*protocol_max);
+                    1_u8
+                }
+                Message::Inventory {
+                    tenant_id,
+                    replica_id,
+                    high_watermark,
+                    inventory_digest,
+                } => {
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_string(&mut body, replica_id, limits)?;
+                    put_u64(&mut body, *high_watermark);
+                    body.extend_from_slice(inventory_digest);
+                    2_u8
+                }
+                Message::Fetch {
+                    tenant_id,
+                    request_id,
+                    after_sequence,
+                    max_records,
+                    max_bytes,
+                } => {
+                    if *max_records == 0 || *max_bytes == 0 {
+                        return Err(CodecError::InvalidRange);
+                    }
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_u64(&mut body, *request_id);
+                    put_u64(&mut body, *after_sequence);
+                    put_u32(&mut body, *max_records);
+                    put_u64(&mut body, *max_bytes);
+                    3_u8
+                }
+                Message::Records {
+                    tenant_id,
+                    request_id,
+                    first_sequence,
+                    records,
+                } => {
+                    if records.len() > limits.max_records {
+                        return Err(CodecError::TooManyRecords);
+                    }
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_u64(&mut body, *request_id);
+                    put_u64(&mut body, *first_sequence);
+                    put_u32(
+                        &mut body,
+                        u32::try_from(records.len()).map_err(|_| CodecError::LengthOverflow)?,
+                    );
+                    for record in records {
+                        put_string(&mut body, &record.memory_id, limits)?;
+                        put_u64(&mut body, record.version);
+                        put_u64(&mut body, record.updated_at_ms);
+                        body.push(u8::from(record.deleted));
+                        body.extend_from_slice(&record.digest);
+                        if record.payload.len() > limits.max_record_bytes {
+                            return Err(CodecError::RecordTooLarge);
+                        }
+                        put_u32(
+                            &mut body,
+                            u32::try_from(record.payload.len())
+                                .map_err(|_| CodecError::LengthOverflow)?,
+                        );
+                        body.extend_from_slice(&record.payload);
+                    }
+                    4_u8
+                }
+                Message::Acknowledge {
+                    tenant_id,
+                    request_id,
+                    through_sequence,
+                } => {
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_u64(&mut body, *request_id);
+                    put_u64(&mut body, *through_sequence);
+                    5_u8
+                }
+                Message::Reject {
+                    tenant_id,
+                    request_id,
+                    code,
+                    message,
+                } => {
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_u64(&mut body, *request_id);
+                    put_u16(&mut body, *code);
+                    put_string(&mut body, message, limits)?;
+                    6_u8
+                }
+            };
+
+            let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthOverflow)?;
+            let total_len = HEADER_LEN
+                .checked_add(body.len())
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(CodecError::LengthOverflow)?;
+            if total_len > limits.max_frame_bytes {
+                return Err(CodecError::FrameTooLarge);
+            }
+
+            let mut frame = Vec::with_capacity(total_len);
+            frame.extend_from_slice(MAGIC);
+            frame.push(VERSION);
+            frame.push(message_type);
+            put_u32(&mut frame, body_len);
+            frame.extend_from_slice(&body);
+            let checksum = crc32(&frame);
+            put_u32(&mut frame, checksum);
+            Ok(frame)
+        }
+
+        pub fn decode(frame: &[u8], limits: &Limits) -> Result<Message, CodecError> {
+            validate_limits(limits)?;
+            if frame.len() > limits.max_frame_bytes {
+                return Err(CodecError::FrameTooLarge);
+            }
+            if frame.len() < HEADER_LEN + CHECKSUM_LEN {
+                return Err(CodecError::FrameTooShort);
+            }
+
+            let mut header = Reader::new(frame);
+            if header.take(4)? != MAGIC {
+                return Err(CodecError::BadMagic);
+            }
+            let version = header.u8()?;
+            if version != VERSION {
+                return Err(CodecError::UnsupportedVersion(version));
+            }
+            let message_type = header.u8()?;
+            let body_len =
+                usize::try_from(header.u32()?).map_err(|_| CodecError::LengthOverflow)?;
+            let expected_len = HEADER_LEN
+                .checked_add(body_len)
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(CodecError::LengthOverflow)?;
+            if expected_len != frame.len() {
+                return Err(CodecError::TrailingBytes);
+            }
+
+            let checksum_offset = frame
+                .len()
+                .checked_sub(CHECKSUM_LEN)
+                .ok_or(CodecError::FrameTooShort)?;
+            let checksum_bytes = frame.get(checksum_offset..).ok_or(CodecError::Truncated)?;
+            let mut checksum_reader = Reader::new(checksum_bytes);
+            let expected_checksum = checksum_reader.u32()?;
+            if crc32(frame.get(..checksum_offset).ok_or(CodecError::Truncated)?)
+                != expected_checksum
+            {
+                return Err(CodecError::ChecksumMismatch);
+            }
+
+            let body_start = HEADER_LEN;
+            let body_end = body_start
+                .checked_add(body_len)
+                .ok_or(CodecError::LengthOverflow)?;
+            let body = frame
+                .get(body_start..body_end)
+                .ok_or(CodecError::Truncated)?;
+            let mut reader = Reader::new(body);
+
+            let message = match message_type {
+                1 => {
+                    let tenant_id = reader.string(limits)?;
+                    let replica_id = reader.string(limits)?;
+                    let protocol_min = reader.u8()?;
+                    let protocol_max = reader.u8()?;
+                    if protocol_min > protocol_max {
+                        return Err(CodecError::InvalidRange);
+                    }
+                    Message::Hello {
+                        tenant_id,
+                        replica_id,
+                        protocol_min,
+                        protocol_max,
+                    }
+                }
+                2 => {
+                    let tenant_id = reader.string(limits)?;
+                    let replica_id = reader.string(limits)?;
+                    let high_watermark = reader.u64()?;
+                    let mut digest = [0_u8; 32];
+                    digest.copy_from_slice(reader.take(32)?);
+                    Message::Inventory {
+                        tenant_id,
+                        replica_id,
+                        high_watermark,
+                        inventory_digest: digest,
+                    }
+                }
+                3 => {
+                    let tenant_id = reader.string(limits)?;
+                    let request_id = reader.u64()?;
+                    let after_sequence = reader.u64()?;
+                    let max_records = reader.u32()?;
+                    let max_bytes = reader.u64()?;
+                    if max_records == 0 || max_bytes == 0 {
+                        return Err(CodecError::InvalidRange);
+                    }
+                    Message::Fetch {
+                        tenant_id,
+                        request_id,
+                        after_sequence,
+                        max_records,
+                        max_bytes,
+                    }
+                }
+                4 => {
+                    let tenant_id = reader.string(limits)?;
+                    let request_id = reader.u64()?;
+                    let first_sequence = reader.u64()?;
+                    let count =
+                        usize::try_from(reader.u32()?).map_err(|_| CodecError::LengthOverflow)?;
+                    if count > limits.max_records {
+                        return Err(CodecError::TooManyRecords);
+                    }
+                    let mut records = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let memory_id = reader.string(limits)?;
+                        let version = reader.u64()?;
+                        let updated_at_ms = reader.u64()?;
+                        let deleted = match reader.u8()? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(CodecError::InvalidBoolean),
+                        };
+                        let mut digest = [0_u8; 32];
+                        digest.copy_from_slice(reader.take(32)?);
+                        let payload_len = usize::try_from(reader.u32()?)
+                            .map_err(|_| CodecError::LengthOverflow)?;
+                        if payload_len > limits.max_record_bytes {
+                            return Err(CodecError::RecordTooLarge);
+                        }
+                        let payload = reader.take(payload_len)?.to_vec();
+                        records.push(MemoryRecord {
+                            memory_id,
+                            version,
+                            updated_at_ms,
+                            deleted,
+                            digest,
+                            payload,
+                        });
+                    }
+                    Message::Records {
+                        tenant_id,
+                        request_id,
+                        first_sequence,
+                        records,
+                    }
+                }
+                5 => {
+                    let tenant_id = reader.string(limits)?;
+                    let request_id = reader.u64()?;
+                    let through_sequence = reader.u64()?;
+                    Message::Acknowledge {
+                        tenant_id,
+                        request_id,
+                        through_sequence,
+                    }
+                }
+                6 => {
+                    let tenant_id = reader.string(limits)?;
+                    let request_id = reader.u64()?;
+                    let code = reader.u16()?;
+                    let message = reader.string(limits)?;
+                    Message::Reject {
+                        tenant_id,
+                        request_id,
+                        code,
+                        message,
+                    }
+                }
+                other => return Err(CodecError::UnknownMessageType(other)),
+            };
+
+            if !reader.done() {
+                return Err(CodecError::TrailingBytes);
+            }
+            Ok(message)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn round_trip(message: Message) {
+                let limits = Limits::default();
+                let encoded = encode(&message, &limits);
+                assert!(encoded.is_ok());
+                let encoded = match encoded {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                assert_eq!(decode(&encoded, &limits), Ok(message));
+            }
+
+            #[test]
+            fn round_trips_every_message_variant() {
+                round_trip(Message::Hello {
+                    tenant_id: "tenant-a".to_owned(),
+                    replica_id: "replica-1".to_owned(),
+                    protocol_min: 1,
+                    protocol_max: 1,
+                });
+                round_trip(Message::Inventory {
+                    tenant_id: "tenant-a".to_owned(),
+                    replica_id: "replica-1".to_owned(),
+                    high_watermark: 99,
+                    inventory_digest: [7_u8; 32],
+                });
+                round_trip(Message::Fetch {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 4,
+                    after_sequence: 8,
+                    max_records: 32,
+                    max_bytes: 65536,
+                });
+                round_trip(Message::Records {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 4,
+                    first_sequence: 9,
+                    records: vec![MemoryRecord {
+                        memory_id: "mem-1".to_owned(),
+                        version: 2,
+                        updated_at_ms: 100,
+                        deleted: false,
+                        digest: [3_u8; 32],
+                        payload: vec![1, 2, 3],
+                    }],
+                });
+                round_trip(Message::Acknowledge {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 4,
+                    through_sequence: 10,
+                });
+                round_trip(Message::Reject {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 4,
+                    code: 409,
+                    message: "conflict".to_owned(),
+                });
+            }
+
+            #[test]
+            fn rejects_corruption_and_truncation() {
+                let limits = Limits::default();
+                let message = Message::Acknowledge {
+                    tenant_id: "tenant".to_owned(),
+                    request_id: 1,
+                    through_sequence: 2,
+                };
+                let encoded = match encode(&message, &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let mut corrupt = encoded.clone();
+                if let Some(byte) = corrupt.get_mut(HEADER_LEN) {
+                    *byte ^= 0x40;
+                }
+                assert_eq!(decode(&corrupt, &limits), Err(CodecError::ChecksumMismatch));
+                assert_eq!(
+                    decode(&encoded[..encoded.len().saturating_sub(1)], &limits),
+                    Err(CodecError::TrailingBytes)
+                );
+            }
+
+            #[test]
+            fn enforces_record_and_frame_limits() {
+                let mut limits = Limits::default();
+                limits.max_record_bytes = 2;
+                let message = Message::Records {
+                    tenant_id: "tenant".to_owned(),
+                    request_id: 1,
+                    first_sequence: 1,
+                    records: vec![MemoryRecord {
+                        memory_id: "m".to_owned(),
+                        version: 1,
+                        updated_at_ms: 1,
+                        deleted: false,
+                        digest: [0; 32],
+                        payload: vec![1, 2, 3],
+                    }],
+                };
+                assert_eq!(encode(&message, &limits), Err(CodecError::RecordTooLarge));
+                limits.max_record_bytes = 10;
+                limits.max_frame_bytes = HEADER_LEN + CHECKSUM_LEN; // smallest valid limit
+                assert_eq!(
+                    encode(
+                        &Message::Hello {
+                            tenant_id: "t".to_owned(),
+                            replica_id: "r".to_owned(),
+                            protocol_min: 1,
+                            protocol_max: 1,
+                        },
+                        &limits
+                    ),
+                    Err(CodecError::FrameTooLarge)
+                );
+            }
+        }
+    }
+    pub mod x045 {
+        //! Replication lag and freshness monitoring for AgentOS memory replicas.
+        //!
+        //! Pure evaluation logic. Callers supply source/destination watermarks and
+        //! timestamps; scheduling, metrics export, alert delivery, and durable history
+        //! are intentionally outside this crate.
+
+        use std::collections::BTreeMap;
+
+        pub type TenantId = u64;
+        pub type ReplicaId = u64;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct ReplicaPair {
+            pub tenant_id: TenantId,
+            pub source_replica: ReplicaId,
+            pub destination_replica: ReplicaId,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ReplicaSample {
+            pub pair: ReplicaPair,
+            pub source_sequence: u64,
+            pub applied_sequence: u64,
+            pub source_updated_at_ns: u64,
+            pub destination_updated_at_ns: u64,
+            pub sampled_at_ns: u64,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum HealthState {
+            Healthy,
+            Lagging,
+            Stale,
+            Invalid,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ReplicaHealth {
+            pub pair: ReplicaPair,
+            pub state: HealthState,
+            pub sequence_lag: u64,
+            pub freshness_lag_ns: u64,
+            pub evaluated_at_ns: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum MonitorError {
+            ZeroCapacity,
+            CapacityReached,
+            FutureTimestamp,
+            AppliedAheadOfSource,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct MonitorConfig {
+            pub max_pairs: usize,
+            pub healthy_sequence_lag: u64,
+            pub stale_after_ns: u64,
+        }
+
+        impl Default for MonitorConfig {
+            fn default() -> Self {
+                Self {
+                    max_pairs: 100_000,
+                    healthy_sequence_lag: 0,
+                    stale_after_ns: 60_000_000_000,
+                }
+            }
+        }
+
+        pub struct ReplicationMonitor {
+            config: MonitorConfig,
+            latest: BTreeMap<ReplicaPair, ReplicaHealth>,
+        }
+
+        impl ReplicationMonitor {
+            pub fn new(config: MonitorConfig) -> Result<Self, MonitorError> {
+                if config.max_pairs == 0 {
+                    return Err(MonitorError::ZeroCapacity);
+                }
+                Ok(Self {
+                    config,
+                    latest: BTreeMap::new(),
+                })
+            }
+
+            pub fn evaluate(
+                &mut self,
+                sample: ReplicaSample,
+            ) -> Result<&ReplicaHealth, MonitorError> {
+                if sample.source_updated_at_ns > sample.sampled_at_ns
+                    || sample.destination_updated_at_ns > sample.sampled_at_ns
+                {
+                    return Err(MonitorError::FutureTimestamp);
+                }
+                if sample.applied_sequence > sample.source_sequence {
+                    return Err(MonitorError::AppliedAheadOfSource);
+                }
+                if !self.latest.contains_key(&sample.pair)
+                    && self.latest.len() >= self.config.max_pairs
+                {
+                    return Err(MonitorError::CapacityReached);
+                }
+
+                let sequence_lag = sample
+                    .source_sequence
+                    .saturating_sub(sample.applied_sequence);
+                let freshness_lag_ns = sample
+                    .sampled_at_ns
+                    .saturating_sub(sample.destination_updated_at_ns);
+
+                let state = if freshness_lag_ns >= self.config.stale_after_ns {
+                    HealthState::Stale
+                } else if sequence_lag > self.config.healthy_sequence_lag {
+                    HealthState::Lagging
+                } else {
+                    HealthState::Healthy
+                };
+
+                let health = ReplicaHealth {
+                    pair: sample.pair,
+                    state,
+                    sequence_lag,
+                    freshness_lag_ns,
+                    evaluated_at_ns: sample.sampled_at_ns,
+                };
+                self.latest.insert(sample.pair, health);
+                // The key was inserted above, so this lookup is guaranteed by construction.
+                match self.latest.get(&sample.pair) {
+                    Some(value) => Ok(value),
+                    None => Err(MonitorError::CapacityReached),
+                }
+            }
+
+            pub fn get(&self, pair: ReplicaPair) -> Option<&ReplicaHealth> {
+                self.latest.get(&pair)
+            }
+
+            pub fn remove(&mut self, pair: ReplicaPair) -> bool {
+                self.latest.remove(&pair).is_some()
+            }
+
+            pub fn counts(&self) -> BTreeMap<HealthState, usize> {
+                let mut counts = BTreeMap::new();
+                for health in self.latest.values() {
+                    let count = counts.entry(health.state).or_insert(0usize);
+                    *count = count.saturating_add(1);
+                }
+                counts
+            }
+
+            pub fn len(&self) -> usize {
+                self.latest.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.latest.is_empty()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn pair(tenant: u64, destination: u64) -> ReplicaPair {
+                ReplicaPair {
+                    tenant_id: tenant,
+                    source_replica: 1,
+                    destination_replica: destination,
+                }
+            }
+
+            fn sample(
+                pair: ReplicaPair,
+                source: u64,
+                applied: u64,
+                destination_time: u64,
+            ) -> ReplicaSample {
+                ReplicaSample {
+                    pair,
+                    source_sequence: source,
+                    applied_sequence: applied,
+                    source_updated_at_ns: 90,
+                    destination_updated_at_ns: destination_time,
+                    sampled_at_ns: 100,
+                }
+            }
+
+            fn monitor() -> ReplicationMonitor {
+                ReplicationMonitor::new(MonitorConfig {
+                    max_pairs: 4,
+                    healthy_sequence_lag: 2,
+                    stale_after_ns: 50,
+                })
+                .unwrap_or_else(|_| unreachable!())
+            }
+
+            #[test]
+            fn classifies_healthy_lagging_and_stale_replicas() {
+                let mut monitor = monitor();
+                assert_eq!(
+                    monitor
+                        .evaluate(sample(pair(1, 2), 10, 9, 99))
+                        .map(|h| h.state),
+                    Ok(HealthState::Healthy)
+                );
+                assert_eq!(
+                    monitor
+                        .evaluate(sample(pair(1, 3), 10, 7, 99))
+                        .map(|h| h.state),
+                    Ok(HealthState::Lagging)
+                );
+                assert_eq!(
+                    monitor
+                        .evaluate(sample(pair(1, 4), 10, 10, 40))
+                        .map(|h| h.state),
+                    Ok(HealthState::Stale)
+                );
+            }
+
+            #[test]
+            fn rejects_impossible_watermarks_and_future_times() {
+                let mut monitor = monitor();
+                assert_eq!(
+                    monitor.evaluate(sample(pair(1, 2), 5, 6, 99)).map(|_| ()),
+                    Err(MonitorError::AppliedAheadOfSource)
+                );
+                let mut future = sample(pair(1, 2), 5, 5, 99);
+                future.sampled_at_ns = 98;
+                assert_eq!(
+                    monitor.evaluate(future).map(|_| ()),
+                    Err(MonitorError::FutureTimestamp)
+                );
+            }
+
+            #[test]
+            fn bounds_pairs_and_reports_state_counts() {
+                let mut monitor = monitor();
+                assert!(monitor.evaluate(sample(pair(1, 2), 1, 1, 99)).is_ok());
+                assert!(monitor.evaluate(sample(pair(1, 3), 5, 1, 99)).is_ok());
+                assert_eq!(monitor.counts().get(&HealthState::Healthy), Some(&1));
+                assert_eq!(monitor.counts().get(&HealthState::Lagging), Some(&1));
+                assert!(monitor.remove(pair(1, 3)));
+                assert_eq!(monitor.len(), 1);
+            }
+        }
+    }
+    pub mod x050 {
+        //! Incremental bounded stream framing for the AgentOS replication wire protocol.
+        //!
+        //! Accepts arbitrary byte fragments, reconstructs complete protocol frames, and
+        //! queues decoded messages. It performs no socket I/O and owns no transport.
+
+        use crate::agentmem::wire::{decode, CodecError, Limits, Message};
+
+        const MAGIC: &[u8; 4] = b"AMRP";
+        const HEADER_LEN: usize = 10;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum StreamError {
+            InvalidLimits,
+            BadMagic,
+            UnsupportedVersion(u8),
+            FrameTooLarge,
+            LengthOverflow,
+            Protocol(CodecError),
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct FeedOutcome {
+            /// Number of input bytes consumed. The caller retains the unconsumed suffix.
+            pub consumed: usize,
+            /// True when the completed-message queue is full.
+            pub backpressured: bool,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct StreamDecoder {
+            limits: Limits,
+            max_ready_messages: usize,
+            frame_buffer: Vec<u8>,
+            expected_frame_len: Option<usize>,
+            ready: Vec<Message>,
+        }
+
+        impl StreamDecoder {
+            pub fn new(limits: Limits, max_ready_messages: usize) -> Result<Self, StreamError> {
+                if limits.max_frame_bytes < HEADER_LEN + 4
+                    || limits.max_frame_bytes > u32::MAX as usize + HEADER_LEN + 4
+                    || max_ready_messages == 0
+                {
+                    return Err(StreamError::InvalidLimits);
+                }
+                Ok(Self {
+                    limits,
+                    max_ready_messages,
+                    frame_buffer: Vec::new(),
+                    expected_frame_len: None,
+                    ready: Vec::new(),
+                })
+            }
+
+            pub fn buffered_bytes(&self) -> usize {
+                self.frame_buffer.len()
+            }
+            pub fn ready_messages(&self) -> usize {
+                self.ready.len()
+            }
+            pub fn has_partial_frame(&self) -> bool {
+                !self.frame_buffer.is_empty()
+            }
+
+            /// Feed as much of `input` as the bounded ready queue permits.
+            ///
+            /// If `backpressured` is true, call `drain_ready` and retry with the
+            /// unconsumed suffix. A malformed frame clears the partial frame buffer.
+            pub fn feed(&mut self, input: &[u8]) -> Result<FeedOutcome, StreamError> {
+                let mut consumed = 0_usize;
+
+                while consumed < input.len() {
+                    if self.ready.len() >= self.max_ready_messages {
+                        return Ok(FeedOutcome {
+                            consumed,
+                            backpressured: true,
+                        });
+                    }
+
+                    let byte = match input.get(consumed) {
+                        Some(value) => *value,
+                        None => {
+                            return Ok(FeedOutcome {
+                                consumed,
+                                backpressured: false,
+                            })
+                        }
+                    };
+                    self.frame_buffer.push(byte);
+                    consumed = consumed.saturating_add(1);
+
+                    if self.frame_buffer.len() == HEADER_LEN {
+                        self.inspect_header()?;
+                    }
+
+                    if let Some(expected) = self.expected_frame_len {
+                        if self.frame_buffer.len() == expected {
+                            let message = match decode(&self.frame_buffer, &self.limits) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    self.reset_partial();
+                                    return Err(StreamError::Protocol(error));
+                                }
+                            };
+                            self.ready.push(message);
+                            self.reset_partial();
+                        } else if self.frame_buffer.len() > expected {
+                            self.reset_partial();
+                            return Err(StreamError::LengthOverflow);
+                        }
+                    }
+                }
+
+                Ok(FeedOutcome {
+                    consumed,
+                    backpressured: false,
+                })
+            }
+
+            /// Removes up to `maximum` completed messages, preserving their wire order.
+            pub fn drain_ready(&mut self, maximum: usize) -> Vec<Message> {
+                let count = maximum.min(self.ready.len());
+                self.ready.drain(..count).collect()
+            }
+
+            /// Discards an incomplete frame, but leaves already decoded messages intact.
+            pub fn discard_partial_frame(&mut self) {
+                self.reset_partial();
+            }
+
+            fn inspect_header(&mut self) -> Result<(), StreamError> {
+                if self.frame_buffer.get(0..4) != Some(MAGIC.as_slice()) {
+                    self.reset_partial();
+                    return Err(StreamError::BadMagic);
+                }
+                let version = self
+                    .frame_buffer
+                    .get(4)
+                    .copied()
+                    .ok_or(StreamError::LengthOverflow)?;
+                if version != 1 {
+                    self.reset_partial();
+                    return Err(StreamError::UnsupportedVersion(version));
+                }
+                let b4 = self
+                    .frame_buffer
+                    .get(6)
+                    .copied()
+                    .ok_or(StreamError::LengthOverflow)?;
+                let b5 = self
+                    .frame_buffer
+                    .get(7)
+                    .copied()
+                    .ok_or(StreamError::LengthOverflow)?;
+                let b6 = self
+                    .frame_buffer
+                    .get(8)
+                    .copied()
+                    .ok_or(StreamError::LengthOverflow)?;
+                let b7 = self
+                    .frame_buffer
+                    .get(9)
+                    .copied()
+                    .ok_or(StreamError::LengthOverflow)?;
+                let body_len_u32 = u32::from_be_bytes([b4, b5, b6, b7]);
+                let body_len =
+                    usize::try_from(body_len_u32).map_err(|_| StreamError::LengthOverflow)?;
+                let total = HEADER_LEN
+                    .checked_add(body_len)
+                    .and_then(|value| value.checked_add(4))
+                    .ok_or(StreamError::LengthOverflow)?;
+                if total > self.limits.max_frame_bytes {
+                    self.reset_partial();
+                    return Err(StreamError::FrameTooLarge);
+                }
+                self.expected_frame_len = Some(total);
+                Ok(())
+            }
+
+            fn reset_partial(&mut self) {
+                self.frame_buffer.clear();
+                self.expected_frame_len = None;
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::wire::encode;
+
+            fn sample(id: u64) -> Message {
+                Message::Acknowledge {
+                    tenant_id: "tenant-x".to_owned(),
+                    request_id: id,
+                    through_sequence: id.saturating_add(10),
+                }
+            }
+
+            fn decoder(queue: usize) -> StreamDecoder {
+                match StreamDecoder::new(Limits::default(), queue) {
+                    Ok(value) => value,
+                    Err(_) => panic!("valid test limits rejected"),
+                }
+            }
+
+            #[test]
+            fn reconstructs_frame_split_across_many_fragments() {
+                let limits = Limits::default();
+                let frame = match encode(&sample(1), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let mut stream = decoder(4);
+                for byte in &frame {
+                    let result = stream.feed(std::slice::from_ref(byte));
+                    assert!(result.is_ok());
+                }
+                assert_eq!(stream.drain_ready(4), vec![sample(1)]);
+                assert!(!stream.has_partial_frame());
+            }
+
+            #[test]
+            fn decodes_multiple_frames_from_one_input_chunk() {
+                let limits = Limits::default();
+                let mut input = match encode(&sample(1), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let second = match encode(&sample(2), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                input.extend_from_slice(&second);
+
+                let mut stream = decoder(4);
+                let outcome = stream.feed(&input);
+                assert_eq!(
+                    outcome,
+                    Ok(FeedOutcome {
+                        consumed: input.len(),
+                        backpressured: false
+                    })
+                );
+                assert_eq!(stream.drain_ready(4), vec![sample(1), sample(2)]);
+            }
+
+            #[test]
+            fn applies_backpressure_without_losing_unconsumed_bytes() {
+                let limits = Limits::default();
+                let mut input = match encode(&sample(1), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let second = match encode(&sample(2), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                input.extend_from_slice(&second);
+
+                let mut stream = decoder(1);
+                let first = stream.feed(&input);
+                assert!(first.is_ok());
+                let first = match first {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                assert!(first.backpressured);
+                assert!(first.consumed < input.len());
+                assert_eq!(stream.drain_ready(1), vec![sample(1)]);
+
+                let remaining = input.get(first.consumed..).unwrap_or(&[]);
+                let second_result = stream.feed(remaining);
+                assert!(second_result.is_ok());
+                assert_eq!(stream.drain_ready(1), vec![sample(2)]);
+            }
+
+            #[test]
+            fn rejects_bad_magic_and_resets_partial_state() {
+                let mut stream = decoder(2);
+                let result = stream.feed(b"NOPE");
+                assert_eq!(
+                    result,
+                    Ok(FeedOutcome {
+                        consumed: 4,
+                        backpressured: false
+                    })
+                );
+                let result = stream.feed(&[0, 1, 0, 0, 0, 0]);
+                assert_eq!(result, Err(StreamError::BadMagic));
+                assert_eq!(stream.buffered_bytes(), 0);
+            }
+
+            #[test]
+            fn explicit_partial_discard_preserves_ready_queue() {
+                let limits = Limits::default();
+                let frame = match encode(&sample(7), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let mut stream = decoder(2);
+                assert!(stream.feed(&frame).is_ok());
+                assert!(stream.feed(b"AMR").is_ok());
+                stream.discard_partial_frame();
+                assert_eq!(stream.drain_ready(2), vec![sample(7)]);
+                assert_eq!(stream.buffered_bytes(), 0);
+            }
+        }
+    }
+    pub mod x051 {
+        //! Stateful, tenant-bound replication protocol session coordinator.
+        //!
+        //! The session validates the M049 message sequence, negotiates protocol compatibility,
+        //! correlates fetch responses, and emits typed events for a transport/application layer.
+        //! It does not perform I/O, authentication, encryption, or durable state management.
+
+        use std::collections::BTreeSet;
+
+        use crate::agentmem::wire::Message;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct SessionConfig {
+            pub tenant_id: String,
+            pub local_replica_id: String,
+            pub protocol_min: u8,
+            pub protocol_max: u8,
+            pub max_pending_requests: usize,
+            pub max_inbound_requests: usize,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum SessionPhase {
+            AwaitingHello,
+            Established,
+            Closed,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum SessionError {
+            InvalidConfig,
+            Closed,
+            HelloRequired,
+            DuplicateHello,
+            TenantMismatch,
+            PeerIdentityMismatch,
+            IncompatibleProtocol,
+            InvalidRequestId,
+            DuplicateRequest,
+            RequestCapacity,
+            UnknownRequest,
+            InvalidSequence,
+            InvalidMessageDirection,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum SessionEvent {
+            Established {
+                peer_replica_id: String,
+                negotiated_version: u8,
+            },
+            InventoryReceived {
+                replica_id: String,
+                high_watermark: u64,
+                digest: [u8; 32],
+            },
+            FetchRequested {
+                request_id: u64,
+                after_sequence: u64,
+                max_records: u32,
+                max_bytes: u64,
+            },
+            RecordsReceived {
+                request_id: u64,
+                first_sequence: u64,
+                records: Vec<crate::agentmem::wire::MemoryRecord>,
+            },
+            Acknowledged {
+                request_id: u64,
+                through_sequence: u64,
+            },
+            Rejected {
+                request_id: u64,
+                code: u16,
+                message: String,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplicationSession {
+            config: SessionConfig,
+            phase: SessionPhase,
+            peer_replica_id: Option<String>,
+            negotiated_version: Option<u8>,
+            pending_outbound: BTreeSet<u64>,
+            pending_inbound: BTreeSet<u64>,
+            last_inventory_watermark: Option<u64>,
+        }
+
+        impl ReplicationSession {
+            pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
+                if config.tenant_id.trim().is_empty()
+                    || config.local_replica_id.trim().is_empty()
+                    || config.protocol_min > config.protocol_max
+                    || config.max_pending_requests == 0
+                    || config.max_inbound_requests == 0
+                {
+                    return Err(SessionError::InvalidConfig);
+                }
+
+                Ok(Self {
+                    config,
+                    phase: SessionPhase::AwaitingHello,
+                    peer_replica_id: None,
+                    negotiated_version: None,
+                    pending_outbound: BTreeSet::new(),
+                    pending_inbound: BTreeSet::new(),
+                    last_inventory_watermark: None,
+                })
+            }
+
+            pub fn phase(&self) -> SessionPhase {
+                self.phase
+            }
+
+            pub fn peer_replica_id(&self) -> Option<&str> {
+                self.peer_replica_id.as_deref()
+            }
+
+            pub fn negotiated_version(&self) -> Option<u8> {
+                self.negotiated_version
+            }
+
+            pub fn pending_outbound_count(&self) -> usize {
+                self.pending_outbound.len()
+            }
+
+            pub fn pending_inbound_count(&self) -> usize {
+                self.pending_inbound.len()
+            }
+
+            /// Produces the local handshake message. The caller sends it over its transport.
+            pub fn hello(&self) -> Result<Message, SessionError> {
+                if self.phase == SessionPhase::Closed {
+                    return Err(SessionError::Closed);
+                }
+                Ok(Message::Hello {
+                    tenant_id: self.config.tenant_id.clone(),
+                    replica_id: self.config.local_replica_id.clone(),
+                    protocol_min: self.config.protocol_min,
+                    protocol_max: self.config.protocol_max,
+                })
+            }
+
+            /// Registers a fetch before sending it, so a response can be correlated safely.
+            pub fn begin_fetch(
+                &mut self,
+                request_id: u64,
+                after_sequence: u64,
+                max_records: u32,
+                max_bytes: u64,
+            ) -> Result<Message, SessionError> {
+                self.ensure_established()?;
+                if request_id == 0 || max_records == 0 || max_bytes == 0 {
+                    return Err(SessionError::InvalidRequestId);
+                }
+                if self.pending_outbound.contains(&request_id)
+                    || self.pending_inbound.contains(&request_id)
+                {
+                    return Err(SessionError::DuplicateRequest);
+                }
+                if self.pending_outbound.len() >= self.config.max_pending_requests {
+                    return Err(SessionError::RequestCapacity);
+                }
+                self.pending_outbound.insert(request_id);
+                Ok(Message::Fetch {
+                    tenant_id: self.config.tenant_id.clone(),
+                    request_id,
+                    after_sequence,
+                    max_records,
+                    max_bytes,
+                })
+            }
+
+            /// Acknowledges a received records batch and clears its inbound request correlation.
+            pub fn acknowledge_records(
+                &mut self,
+                request_id: u64,
+                through_sequence: u64,
+            ) -> Result<Message, SessionError> {
+                self.ensure_established()?;
+                if !self.pending_inbound.remove(&request_id) {
+                    return Err(SessionError::UnknownRequest);
+                }
+                Ok(Message::Acknowledge {
+                    tenant_id: self.config.tenant_id.clone(),
+                    request_id,
+                    through_sequence,
+                })
+            }
+
+            /// Validates an inbound message and returns the application event it represents.
+            pub fn receive(&mut self, message: Message) -> Result<SessionEvent, SessionError> {
+                if self.phase == SessionPhase::Closed {
+                    return Err(SessionError::Closed);
+                }
+
+                match message {
+                    Message::Hello {
+                        tenant_id,
+                        replica_id,
+                        protocol_min,
+                        protocol_max,
+                    } => {
+                        if self.phase != SessionPhase::AwaitingHello {
+                            return Err(SessionError::DuplicateHello);
+                        }
+                        if tenant_id != self.config.tenant_id {
+                            return Err(SessionError::TenantMismatch);
+                        }
+                        if replica_id.trim().is_empty()
+                            || replica_id == self.config.local_replica_id
+                        {
+                            return Err(SessionError::PeerIdentityMismatch);
+                        }
+                        if protocol_min > protocol_max {
+                            return Err(SessionError::IncompatibleProtocol);
+                        }
+                        let low = self.config.protocol_min.max(protocol_min);
+                        let high = self.config.protocol_max.min(protocol_max);
+                        if low > high {
+                            return Err(SessionError::IncompatibleProtocol);
+                        }
+                        let negotiated = high;
+                        self.peer_replica_id = Some(replica_id.clone());
+                        self.negotiated_version = Some(negotiated);
+                        self.phase = SessionPhase::Established;
+                        Ok(SessionEvent::Established {
+                            peer_replica_id: replica_id,
+                            negotiated_version: negotiated,
+                        })
+                    }
+                    other => {
+                        self.ensure_established()?;
+                        match other {
+                            Message::Inventory {
+                                tenant_id,
+                                replica_id,
+                                high_watermark,
+                                inventory_digest,
+                            } => {
+                                self.validate_tenant(&tenant_id)?;
+                                self.validate_peer(&replica_id)?;
+                                if let Some(previous) = self.last_inventory_watermark {
+                                    if high_watermark < previous {
+                                        return Err(SessionError::InvalidSequence);
+                                    }
+                                }
+                                self.last_inventory_watermark = Some(high_watermark);
+                                Ok(SessionEvent::InventoryReceived {
+                                    replica_id,
+                                    high_watermark,
+                                    digest: inventory_digest,
+                                })
+                            }
+                            Message::Fetch {
+                                tenant_id,
+                                request_id,
+                                after_sequence,
+                                max_records,
+                                max_bytes,
+                            } => {
+                                self.validate_tenant(&tenant_id)?;
+                                if request_id == 0 || max_records == 0 || max_bytes == 0 {
+                                    return Err(SessionError::InvalidRequestId);
+                                }
+                                if self.pending_inbound.contains(&request_id)
+                                    || self.pending_outbound.contains(&request_id)
+                                {
+                                    return Err(SessionError::DuplicateRequest);
+                                }
+                                if self.pending_inbound.len() >= self.config.max_inbound_requests {
+                                    return Err(SessionError::RequestCapacity);
+                                }
+                                self.pending_inbound.insert(request_id);
+                                Ok(SessionEvent::FetchRequested {
+                                    request_id,
+                                    after_sequence,
+                                    max_records,
+                                    max_bytes,
+                                })
+                            }
+                            Message::Records {
+                                tenant_id,
+                                request_id,
+                                first_sequence,
+                                records,
+                            } => {
+                                self.validate_tenant(&tenant_id)?;
+                                if !self.pending_outbound.remove(&request_id) {
+                                    return Err(SessionError::UnknownRequest);
+                                }
+                                if !records.is_empty() && first_sequence == 0 {
+                                    return Err(SessionError::InvalidSequence);
+                                }
+                                Ok(SessionEvent::RecordsReceived {
+                                    request_id,
+                                    first_sequence,
+                                    records,
+                                })
+                            }
+                            Message::Acknowledge {
+                                tenant_id,
+                                request_id,
+                                through_sequence,
+                            } => {
+                                self.validate_tenant(&tenant_id)?;
+                                if !self.pending_inbound.remove(&request_id) {
+                                    return Err(SessionError::UnknownRequest);
+                                }
+                                Ok(SessionEvent::Acknowledged {
+                                    request_id,
+                                    through_sequence,
+                                })
+                            }
+                            Message::Reject {
+                                tenant_id,
+                                request_id,
+                                code,
+                                message,
+                            } => {
+                                self.validate_tenant(&tenant_id)?;
+                                let removed_outbound = self.pending_outbound.remove(&request_id);
+                                let removed_inbound = self.pending_inbound.remove(&request_id);
+                                if !removed_outbound && !removed_inbound {
+                                    return Err(SessionError::UnknownRequest);
+                                }
+                                Ok(SessionEvent::Rejected {
+                                    request_id,
+                                    code,
+                                    message,
+                                })
+                            }
+                            Message::Hello { .. } => Err(SessionError::DuplicateHello),
+                        }
+                    }
+                }
+            }
+
+            /// Closes the session and clears all volatile request correlations.
+            pub fn close(&mut self) {
+                self.phase = SessionPhase::Closed;
+                self.pending_outbound.clear();
+                self.pending_inbound.clear();
+            }
+
+            fn ensure_established(&self) -> Result<(), SessionError> {
+                match self.phase {
+                    SessionPhase::AwaitingHello => Err(SessionError::HelloRequired),
+                    SessionPhase::Established => Ok(()),
+                    SessionPhase::Closed => Err(SessionError::Closed),
+                }
+            }
+
+            fn validate_tenant(&self, tenant_id: &str) -> Result<(), SessionError> {
+                if tenant_id == self.config.tenant_id {
+                    Ok(())
+                } else {
+                    Err(SessionError::TenantMismatch)
+                }
+            }
+
+            fn validate_peer(&self, replica_id: &str) -> Result<(), SessionError> {
+                if self.peer_replica_id.as_deref() == Some(replica_id) {
+                    Ok(())
+                } else {
+                    Err(SessionError::PeerIdentityMismatch)
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn config(replica: &str) -> SessionConfig {
+                SessionConfig {
+                    tenant_id: "tenant-a".to_owned(),
+                    local_replica_id: replica.to_owned(),
+                    protocol_min: 1,
+                    protocol_max: 3,
+                    max_pending_requests: 8,
+                    max_inbound_requests: 8,
+                }
+            }
+
+            fn established() -> ReplicationSession {
+                let mut session = match ReplicationSession::new(config("local")) {
+                    Ok(value) => value,
+                    Err(_) => panic!("test config should be valid"),
+                };
+                let event = session.receive(Message::Hello {
+                    tenant_id: "tenant-a".to_owned(),
+                    replica_id: "remote".to_owned(),
+                    protocol_min: 2,
+                    protocol_max: 4,
+                });
+                assert_eq!(
+                    event,
+                    Ok(SessionEvent::Established {
+                        peer_replica_id: "remote".to_owned(),
+                        negotiated_version: 3,
+                    })
+                );
+                session
+            }
+
+            #[test]
+            fn negotiates_highest_common_protocol_version() {
+                let session = established();
+                assert_eq!(session.phase(), SessionPhase::Established);
+                assert_eq!(session.negotiated_version(), Some(3));
+                assert_eq!(session.peer_replica_id(), Some("remote"));
+            }
+
+            #[test]
+            fn correlates_fetch_records_and_acknowledgement() {
+                let mut session = established();
+                let fetch = session.begin_fetch(7, 20, 10, 4096);
+                assert!(matches!(fetch, Ok(Message::Fetch { request_id: 7, .. })));
+                let records = session.receive(Message::Records {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 7,
+                    first_sequence: 21,
+                    records: Vec::new(),
+                });
+                assert!(matches!(
+                    records,
+                    Ok(SessionEvent::RecordsReceived { request_id: 7, .. })
+                ));
+                assert_eq!(session.pending_outbound_count(), 0);
+            }
+
+            #[test]
+            fn rejects_wrong_tenant_and_unknown_response() {
+                let mut session = established();
+                assert_eq!(
+                    session.receive(Message::Inventory {
+                        tenant_id: "tenant-b".to_owned(),
+                        replica_id: "remote".to_owned(),
+                        high_watermark: 1,
+                        inventory_digest: [0; 32],
+                    }),
+                    Err(SessionError::TenantMismatch)
+                );
+                assert_eq!(
+                    session.receive(Message::Acknowledge {
+                        tenant_id: "tenant-a".to_owned(),
+                        request_id: 99,
+                        through_sequence: 1,
+                    }),
+                    Err(SessionError::UnknownRequest)
+                );
+            }
+
+            #[test]
+            fn tracks_inbound_fetch_until_acknowledged() {
+                let mut session = established();
+                let event = session.receive(Message::Fetch {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 4,
+                    after_sequence: 10,
+                    max_records: 5,
+                    max_bytes: 1000,
+                });
+                assert!(matches!(
+                    event,
+                    Ok(SessionEvent::FetchRequested { request_id: 4, .. })
+                ));
+                assert_eq!(session.pending_inbound_count(), 1);
+                let ack = session.acknowledge_records(4, 15);
+                assert!(matches!(
+                    ack,
+                    Ok(Message::Acknowledge {
+                        through_sequence: 15,
+                        ..
+                    })
+                ));
+                assert_eq!(session.pending_inbound_count(), 0);
+            }
+
+            #[test]
+            fn receives_ack_for_records_served_to_peer() {
+                let mut session = established();
+                let request = session.receive(Message::Fetch {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 22,
+                    after_sequence: 3,
+                    max_records: 4,
+                    max_bytes: 2048,
+                });
+                assert!(matches!(
+                    request,
+                    Ok(SessionEvent::FetchRequested { request_id: 22, .. })
+                ));
+                let ack = session.receive(Message::Acknowledge {
+                    tenant_id: "tenant-a".to_owned(),
+                    request_id: 22,
+                    through_sequence: 8,
+                });
+                assert_eq!(
+                    ack,
+                    Ok(SessionEvent::Acknowledged {
+                        request_id: 22,
+                        through_sequence: 8,
+                    })
+                );
+                assert_eq!(session.pending_inbound_count(), 0);
+            }
+
+            #[test]
+            fn rejects_regressing_inventory_and_closes_cleanly() {
+                let mut session = established();
+                let first = Message::Inventory {
+                    tenant_id: "tenant-a".to_owned(),
+                    replica_id: "remote".to_owned(),
+                    high_watermark: 10,
+                    inventory_digest: [1; 32],
+                };
+                assert!(session.receive(first).is_ok());
+                let second = Message::Inventory {
+                    tenant_id: "tenant-a".to_owned(),
+                    replica_id: "remote".to_owned(),
+                    high_watermark: 9,
+                    inventory_digest: [2; 32],
+                };
+                assert_eq!(session.receive(second), Err(SessionError::InvalidSequence));
+                session.close();
+                assert_eq!(session.phase(), SessionPhase::Closed);
+                assert_eq!(session.begin_fetch(1, 0, 1, 1), Err(SessionError::Closed));
+            }
+        }
+    }
+    pub mod x054 {
+        //! Revisioned checkpoint store with validated, atomic in-memory replacement.
+        //!
+        //! The store keeps the canonical encoded checkpoint as its committed representation.
+        //! Candidate snapshots are fully encoded/validated before the committed bytes and
+        //! revision are changed. This is process-local storage, not durable disk persistence.
+
+        use crate::agentmem::checkpoint_codec::{
+            decode, encode, CheckpointError, CodecLimits, ReplayCheckpoint,
+        };
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct StoreSnapshot {
+            pub revision: u64,
+            pub checkpoint: ReplayCheckpoint,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum StoreError {
+            Codec(CheckpointError),
+            RevisionConflict { expected: u64, actual: u64 },
+            RevisionExhausted,
+            EmptyStore,
+        }
+
+        impl From<CheckpointError> for StoreError {
+            fn from(value: CheckpointError) -> Self {
+                Self::Codec(value)
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CheckpointStore {
+            limits: CodecLimits,
+            revision: u64,
+            committed: Option<Vec<u8>>,
+        }
+
+        impl CheckpointStore {
+            pub fn new(limits: CodecLimits) -> Self {
+                Self {
+                    limits,
+                    revision: 0,
+                    committed: None,
+                }
+            }
+
+            pub fn revision(&self) -> u64 {
+                self.revision
+            }
+
+            pub fn is_initialized(&self) -> bool {
+                self.committed.is_some()
+            }
+
+            /// Initializes an empty store. The checkpoint is validated and encoded before
+            /// any state is committed. A second initialization is rejected.
+            pub fn initialize(&mut self, checkpoint: &ReplayCheckpoint) -> Result<u64, StoreError> {
+                if self.committed.is_some() {
+                    return Err(StoreError::RevisionConflict {
+                        expected: 0,
+                        actual: self.revision,
+                    });
+                }
+                let encoded = encode(checkpoint, &self.limits)?;
+                let next_revision = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted)?;
+                self.committed = Some(encoded);
+                self.revision = next_revision;
+                Ok(self.revision)
+            }
+
+            /// Loads and decodes the committed snapshot. No partially decoded state escapes.
+            pub fn load(&self) -> Result<StoreSnapshot, StoreError> {
+                let bytes = self.committed.as_deref().ok_or(StoreError::EmptyStore)?;
+                let checkpoint = decode(bytes, &self.limits)?;
+                Ok(StoreSnapshot {
+                    revision: self.revision,
+                    checkpoint,
+                })
+            }
+
+            /// Exports the exact canonical bytes currently committed in the store.
+            pub fn export_bytes(&self) -> Result<Vec<u8>, StoreError> {
+                self.committed.clone().ok_or(StoreError::EmptyStore)
+            }
+
+            /// Atomically replaces the committed checkpoint if the caller's revision is current.
+            ///
+            /// Validation and encoding happen before mutation. A validation failure, revision
+            /// conflict, or revision overflow leaves both revision and stored bytes unchanged.
+            pub fn compare_and_swap(
+                &mut self,
+                expected_revision: u64,
+                checkpoint: &ReplayCheckpoint,
+            ) -> Result<u64, StoreError> {
+                if self.committed.is_none() {
+                    return Err(StoreError::EmptyStore);
+                }
+                if expected_revision != self.revision {
+                    return Err(StoreError::RevisionConflict {
+                        expected: expected_revision,
+                        actual: self.revision,
+                    });
+                }
+
+                let encoded = encode(checkpoint, &self.limits)?;
+                let next_revision = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted)?;
+
+                self.committed = Some(encoded);
+                self.revision = next_revision;
+                Ok(self.revision)
+            }
+
+            /// Replaces the store from externally supplied bytes after full decode validation.
+            /// The current store is untouched if decoding fails or the expected revision is stale.
+            pub fn import_bytes(
+                &mut self,
+                expected_revision: u64,
+                bytes: &[u8],
+            ) -> Result<u64, StoreError> {
+                if self.committed.is_none() {
+                    return Err(StoreError::EmptyStore);
+                }
+                if expected_revision != self.revision {
+                    return Err(StoreError::RevisionConflict {
+                        expected: expected_revision,
+                        actual: self.revision,
+                    });
+                }
+
+                let checkpoint = decode(bytes, &self.limits)?;
+                let canonical = encode(&checkpoint, &self.limits)?;
+                let next_revision = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted)?;
+
+                self.committed = Some(canonical);
+                self.revision = next_revision;
+                Ok(self.revision)
+            }
+
+            /// Clears the current checkpoint using optimistic revision checking.
+            pub fn clear(&mut self, expected_revision: u64) -> Result<u64, StoreError> {
+                if expected_revision != self.revision {
+                    return Err(StoreError::RevisionConflict {
+                        expected: expected_revision,
+                        actual: self.revision,
+                    });
+                }
+                if self.committed.is_none() {
+                    return Err(StoreError::EmptyStore);
+                }
+                let next_revision = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted)?;
+                self.committed = None;
+                self.revision = next_revision;
+                Ok(self.revision)
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use std::collections::BTreeSet;
+
+            fn checkpoint(highest: u64) -> ReplayCheckpoint {
+                let mut accepted = BTreeSet::new();
+                if highest > 0 {
+                    accepted.insert(highest);
+                }
+                ReplayCheckpoint {
+                    window_size: 16,
+                    streams: vec![crate::agentmem::checkpoint_codec::StreamCheckpoint {
+                        tenant_id: "tenant-a".to_owned(),
+                        peer_id: "peer-a".to_owned(),
+                        highest_sequence: highest,
+                        accepted_sequences: accepted,
+                    }],
+                }
+            }
+
+            fn store() -> CheckpointStore {
+                CheckpointStore::new(CodecLimits::default())
+            }
+
+            #[test]
+            fn initializes_and_loads_committed_checkpoint() {
+                let mut store = store();
+                assert_eq!(store.initialize(&checkpoint(8)), Ok(1));
+                assert_eq!(
+                    store.load(),
+                    Ok(StoreSnapshot {
+                        revision: 1,
+                        checkpoint: checkpoint(8)
+                    })
+                );
+            }
+
+            #[test]
+            fn compare_and_swap_updates_only_matching_revision() {
+                let mut store = store();
+                assert_eq!(store.initialize(&checkpoint(8)), Ok(1));
+                assert_eq!(store.compare_and_swap(1, &checkpoint(9)), Ok(2));
+                assert_eq!(
+                    store.compare_and_swap(1, &checkpoint(10)),
+                    Err(StoreError::RevisionConflict {
+                        expected: 1,
+                        actual: 2
+                    })
+                );
+                assert_eq!(
+                    store.load().map(|snapshot| snapshot.checkpoint),
+                    Ok(checkpoint(9))
+                );
+            }
+
+            #[test]
+            fn invalid_candidate_leaves_committed_state_unchanged() {
+                let mut store = store();
+                assert_eq!(store.initialize(&checkpoint(8)), Ok(1));
+                let invalid = ReplayCheckpoint {
+                    window_size: 0,
+                    streams: Vec::new(),
+                };
+                assert!(matches!(
+                    store.compare_and_swap(1, &invalid),
+                    Err(StoreError::Codec(_))
+                ));
+                assert_eq!(store.revision(), 1);
+                assert_eq!(
+                    store.load().map(|snapshot| snapshot.checkpoint),
+                    Ok(checkpoint(8))
+                );
+            }
+
+            #[test]
+            fn imports_validated_bytes_and_rejects_corruption_without_mutation() {
+                let limits = CodecLimits::default();
+                let external = match encode(&checkpoint(12), &limits) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                };
+                let mut store = store();
+                assert_eq!(store.initialize(&checkpoint(8)), Ok(1));
+                assert_eq!(store.import_bytes(1, &external), Ok(2));
+                let before = store.export_bytes();
+                let mut damaged = external.clone();
+                if let Some(byte) = damaged.get_mut(10) {
+                    *byte ^= 0x20;
+                }
+                assert!(matches!(
+                    store.import_bytes(2, &damaged),
+                    Err(StoreError::Codec(_))
+                ));
+                assert_eq!(store.revision(), 2);
+                assert_eq!(store.export_bytes(), before);
+            }
+
+            #[test]
+            fn export_import_round_trip_and_clear_are_revisioned() {
+                let mut source = store();
+                assert_eq!(source.initialize(&checkpoint(20)), Ok(1));
+                let bytes = match source.export_bytes() {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+
+                let mut target = store();
+                assert_eq!(target.initialize(&checkpoint(1)), Ok(1));
+                assert_eq!(target.import_bytes(1, &bytes), Ok(2));
+                assert_eq!(
+                    target.load().map(|value| value.checkpoint),
+                    Ok(checkpoint(20))
+                );
+                assert_eq!(target.clear(2), Ok(3));
+                assert_eq!(target.load(), Err(StoreError::EmptyStore));
+            }
+        }
+    }
+    pub mod x055 {
+        //! Deterministic diff and application for replay checkpoint snapshots.
+        //!
+        //! Deltas operate at tenant/peer stream granularity. A delta is bound to the exact
+        //! base checkpoint through a stable digest; applying it validates the complete result
+        //! with the M053 codec before returning it. The digest detects accidental mismatch,
+        //! not malicious tampering or authenticated origin.
+
+        use std::collections::BTreeMap;
+
+        use crate::agentmem::checkpoint_codec::{
+            encode, CodecLimits, ReplayCheckpoint, StreamCheckpoint,
+        };
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct StreamKey {
+            pub tenant_id: String,
+            pub peer_id: String,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum StreamChange {
+            Remove { key: StreamKey },
+            Replace { stream: StreamCheckpoint },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CheckpointDelta {
+            pub base_digest: u64,
+            pub target_window_size: u64,
+            pub changes: Vec<StreamChange>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum DeltaError {
+            InvalidBase,
+            BaseMismatch { expected: u64, actual: u64 },
+            DuplicateChange(StreamKey),
+            ConflictingChange(StreamKey),
+            InvalidIdentity,
+            InvalidTargetWindow,
+            Codec(String),
+        }
+
+        fn key_for(stream: &StreamCheckpoint) -> StreamKey {
+            StreamKey {
+                tenant_id: stream.tenant_id.clone(),
+                peer_id: stream.peer_id.clone(),
+            }
+        }
+
+        /// Stable FNV-1a digest of the canonical M053 checkpoint encoding.
+        pub fn checkpoint_digest(
+            checkpoint: &ReplayCheckpoint,
+            limits: &CodecLimits,
+        ) -> Result<u64, DeltaError> {
+            let bytes = encode(checkpoint, limits)
+                .map_err(|error| DeltaError::Codec(format!("{error:?}")))?;
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(hash)
+        }
+
+        /// Produces a deterministic stream-level delta from `base` to `target`.
+        pub fn diff(
+            base: &ReplayCheckpoint,
+            target: &ReplayCheckpoint,
+            limits: &CodecLimits,
+        ) -> Result<CheckpointDelta, DeltaError> {
+            let base_digest = checkpoint_digest(base, limits)?;
+            // Validate target before constructing a delta.
+            let _ =
+                encode(target, limits).map_err(|error| DeltaError::Codec(format!("{error:?}")))?;
+
+            let base_map: BTreeMap<StreamKey, &StreamCheckpoint> = base
+                .streams
+                .iter()
+                .map(|stream| (key_for(stream), stream))
+                .collect();
+            let target_map: BTreeMap<StreamKey, &StreamCheckpoint> = target
+                .streams
+                .iter()
+                .map(|stream| (key_for(stream), stream))
+                .collect();
+
+            let mut changes = Vec::new();
+
+            for key in base_map.keys() {
+                if !target_map.contains_key(key) {
+                    changes.push(StreamChange::Remove { key: key.clone() });
+                }
+            }
+
+            for (key, target_stream) in &target_map {
+                let needs_replace = match base_map.get(key) {
+                    Some(base_stream) => *base_stream != *target_stream,
+                    None => true,
+                };
+                if needs_replace {
+                    changes.push(StreamChange::Replace {
+                        stream: (*target_stream).clone(),
+                    });
+                }
+            }
+
+            changes.sort_by_key(change_key);
+
+            Ok(CheckpointDelta {
+                base_digest,
+                target_window_size: target.window_size,
+                changes,
+            })
+        }
+
+        fn change_key(change: &StreamChange) -> StreamKey {
+            match change {
+                StreamChange::Remove { key } => key.clone(),
+                StreamChange::Replace { stream } => key_for(stream),
+            }
+        }
+
+        /// Applies a delta only when its base digest matches. The entire resulting checkpoint
+        /// is validated by M053 before it is returned.
+        pub fn apply(
+            base: &ReplayCheckpoint,
+            delta: &CheckpointDelta,
+            limits: &CodecLimits,
+        ) -> Result<ReplayCheckpoint, DeltaError> {
+            let actual_digest = checkpoint_digest(base, limits)?;
+            if actual_digest != delta.base_digest {
+                return Err(DeltaError::BaseMismatch {
+                    expected: delta.base_digest,
+                    actual: actual_digest,
+                });
+            }
+            if delta.target_window_size == 0 {
+                return Err(DeltaError::InvalidTargetWindow);
+            }
+
+            let mut streams: BTreeMap<StreamKey, StreamCheckpoint> = base
+                .streams
+                .iter()
+                .cloned()
+                .map(|stream| (key_for(&stream), stream))
+                .collect();
+
+            let mut seen = BTreeMap::<StreamKey, u8>::new();
+            for change in &delta.changes {
+                let key = change_key(change);
+                if key.tenant_id.trim().is_empty() || key.peer_id.trim().is_empty() {
+                    return Err(DeltaError::InvalidIdentity);
+                }
+                let current_kind = match change {
+                    StreamChange::Remove { .. } => 1,
+                    StreamChange::Replace { .. } => 2,
+                };
+                if let Some(previous_kind) = seen.insert(key.clone(), current_kind) {
+                    return Err(if previous_kind == current_kind {
+                        DeltaError::DuplicateChange(key)
+                    } else {
+                        DeltaError::ConflictingChange(key)
+                    });
+                }
+
+                match change {
+                    StreamChange::Remove { .. } => {
+                        streams.remove(&key);
+                    }
+                    StreamChange::Replace { stream } => {
+                        streams.insert(key, stream.clone());
+                    }
+                }
+            }
+
+            let result = ReplayCheckpoint {
+                window_size: delta.target_window_size,
+                streams: streams.into_values().collect(),
+            };
+            encode(&result, limits).map_err(|error| DeltaError::Codec(format!("{error:?}")))?;
+            Ok(result)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use std::collections::BTreeSet;
+
+            fn stream(tenant: &str, peer: &str, highest: u64) -> StreamCheckpoint {
+                let mut accepted = BTreeSet::new();
+                if highest > 0 {
+                    accepted.insert(highest);
+                }
+                StreamCheckpoint {
+                    tenant_id: tenant.to_owned(),
+                    peer_id: peer.to_owned(),
+                    highest_sequence: highest,
+                    accepted_sequences: accepted,
+                }
+            }
+
+            fn limits() -> CodecLimits {
+                CodecLimits::default()
+            }
+
+            #[test]
+            fn diff_and_apply_reconstruct_target_exactly() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("t1", "p1", 4), stream("t1", "p2", 9)],
+                };
+                let target = ReplayCheckpoint {
+                    window_size: 16,
+                    streams: vec![stream("t1", "p1", 7), stream("t2", "p3", 2)],
+                };
+                let delta = diff(&base, &target, &limits());
+                assert!(delta.is_ok());
+                let result = match delta {
+                    Ok(value) => apply(&base, &value, &limits()),
+                    Err(error) => Err(error),
+                };
+                assert_eq!(result, Ok(target));
+            }
+
+            #[test]
+            fn rejects_delta_for_wrong_base() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("t", "p", 4)],
+                };
+                let other = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("t", "p", 5)],
+                };
+                let target = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("t", "p", 6)],
+                };
+                let delta = match diff(&base, &target, &limits()) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                assert!(matches!(
+                    apply(&other, &delta, &limits()),
+                    Err(DeltaError::BaseMismatch { .. })
+                ));
+            }
+
+            #[test]
+            fn empty_delta_preserves_base_when_window_is_unchanged() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("t", "p", 4)],
+                };
+                let delta = diff(&base, &base, &limits());
+                assert!(
+                    matches!(delta, Ok(CheckpointDelta { ref changes, .. }) if changes.is_empty()),
+                    "expected an empty delta"
+                );
+                let result = match delta {
+                    Ok(value) => apply(&base, &value, &limits()),
+                    Err(error) => Err(error),
+                };
+                assert_eq!(result, Ok(base));
+            }
+
+            #[test]
+            fn rejects_duplicate_stream_changes() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: Vec::new(),
+                };
+                let digest = match checkpoint_digest(&base, &limits()) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let replacement = stream("t", "p", 1);
+                let delta = CheckpointDelta {
+                    base_digest: digest,
+                    target_window_size: 8,
+                    changes: vec![
+                        StreamChange::Replace {
+                            stream: replacement.clone(),
+                        },
+                        StreamChange::Replace {
+                            stream: replacement,
+                        },
+                    ],
+                };
+                assert!(matches!(
+                    apply(&base, &delta, &limits()),
+                    Err(DeltaError::DuplicateChange(_))
+                ));
+            }
+
+            #[test]
+            fn distinguishes_conflicting_remove_and_replace() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: Vec::new(),
+                };
+                let digest = match checkpoint_digest(&base, &limits()) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let delta = CheckpointDelta {
+                    base_digest: digest,
+                    target_window_size: 8,
+                    changes: vec![
+                        StreamChange::Remove {
+                            key: StreamKey {
+                                tenant_id: "t".to_owned(),
+                                peer_id: "p".to_owned(),
+                            },
+                        },
+                        StreamChange::Replace {
+                            stream: stream("t", "p", 1),
+                        },
+                    ],
+                };
+                assert!(matches!(
+                    apply(&base, &delta, &limits()),
+                    Err(DeltaError::ConflictingChange(_))
+                ));
+            }
+
+            #[test]
+            fn rejects_invalid_result_window_or_stream_state() {
+                let base = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: Vec::new(),
+                };
+                let digest = match checkpoint_digest(&base, &limits()) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let invalid_window = CheckpointDelta {
+                    base_digest: digest,
+                    target_window_size: 0,
+                    changes: Vec::new(),
+                };
+                assert_eq!(
+                    apply(&base, &invalid_window, &limits()),
+                    Err(DeltaError::InvalidTargetWindow)
+                );
+
+                let invalid_stream = CheckpointDelta {
+                    base_digest: digest,
+                    target_window_size: 8,
+                    changes: vec![StreamChange::Replace {
+                        stream: stream("", "p", 1),
+                    }],
+                };
+                assert_eq!(
+                    apply(&base, &invalid_stream, &limits()),
+                    Err(DeltaError::InvalidIdentity)
+                );
+            }
+        }
+    }
+    pub mod x056 {
+        //! Deterministic bounded binary codec for M055 replay checkpoint deltas.
+        //!
+        //! The codec serializes base digest, target window, and ordered remove/replace changes.
+        //! It validates replacement streams against M053 checkpoint invariants before encoding
+        //! or returning decoded data. CRC-32 detects accidental corruption; it is not a MAC.
+
+        use std::collections::BTreeSet;
+        use std::convert::TryFrom;
+
+        use crate::agentmem::checkpoint_codec::{
+            encode as encode_checkpoint, CodecLimits, ReplayCheckpoint,
+        };
+        use crate::agentmem::x055::{CheckpointDelta, StreamChange, StreamKey};
+
+        const MAGIC: &[u8; 4] = b"ARDL";
+        const VERSION: u8 = 1;
+        const HEADER_LEN: usize = 10;
+        const CHECKSUM_LEN: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeltaCodecLimits {
+            pub max_frame_bytes: usize,
+            pub max_changes: usize,
+            pub max_identity_bytes: usize,
+            pub max_sequences_per_stream: usize,
+        }
+
+        impl Default for DeltaCodecLimits {
+            fn default() -> Self {
+                Self {
+                    max_frame_bytes: 16 * 1024 * 1024,
+                    max_changes: 65_536,
+                    max_identity_bytes: 4096,
+                    max_sequences_per_stream: 4096,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum DeltaCodecError {
+            InvalidLimits,
+            FrameTooLarge,
+            FrameTooShort,
+            BadMagic,
+            UnsupportedVersion(u8),
+            InvalidFlags,
+            LengthOverflow,
+            Truncated,
+            TrailingBytes,
+            ChecksumMismatch,
+            InvalidUtf8,
+            EmptyIdentity,
+            IdentityTooLarge,
+            TooManyChanges,
+            TooManySequences,
+            InvalidWindow,
+            InvalidSequence,
+            DuplicateChange,
+            InvalidChangeKind,
+            Codec(String),
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+
+            fn take(&mut self, count: usize) -> Result<&'a [u8], DeltaCodecError> {
+                let end = self
+                    .offset
+                    .checked_add(count)
+                    .ok_or(DeltaCodecError::LengthOverflow)?;
+                let part = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(DeltaCodecError::Truncated)?;
+                self.offset = end;
+                Ok(part)
+            }
+
+            fn u8(&mut self) -> Result<u8, DeltaCodecError> {
+                self.take(1)?
+                    .first()
+                    .copied()
+                    .ok_or(DeltaCodecError::Truncated)
+            }
+
+            fn u32(&mut self) -> Result<u32, DeltaCodecError> {
+                let b = self.take(4)?;
+                let mut a = [0_u8; 4];
+                a.copy_from_slice(b);
+                Ok(u32::from_be_bytes(a))
+            }
+
+            fn u64(&mut self) -> Result<u64, DeltaCodecError> {
+                let b = self.take(8)?;
+                let mut a = [0_u8; 8];
+                a.copy_from_slice(b);
+                Ok(u64::from_be_bytes(a))
+            }
+
+            fn string(&mut self, limits: &DeltaCodecLimits) -> Result<String, DeltaCodecError> {
+                let len =
+                    usize::try_from(self.u32()?).map_err(|_| DeltaCodecError::LengthOverflow)?;
+                if len > limits.max_identity_bytes {
+                    return Err(DeltaCodecError::IdentityTooLarge);
+                }
+                let bytes = self.take(len)?;
+                let value = std::str::from_utf8(bytes).map_err(|_| DeltaCodecError::InvalidUtf8)?;
+                if value.trim().is_empty() {
+                    return Err(DeltaCodecError::EmptyIdentity);
+                }
+                Ok(value.to_owned())
+            }
+
+            fn done(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn put_string(
+            out: &mut Vec<u8>,
+            value: &str,
+            limits: &DeltaCodecLimits,
+        ) -> Result<(), DeltaCodecError> {
+            if value.trim().is_empty() {
+                return Err(DeltaCodecError::EmptyIdentity);
+            }
+            if value.len() > limits.max_identity_bytes {
+                return Err(DeltaCodecError::IdentityTooLarge);
+            }
+            put_u32(
+                out,
+                u32::try_from(value.len()).map_err(|_| DeltaCodecError::LengthOverflow)?,
+            );
+            out.extend_from_slice(value.as_bytes());
+            Ok(())
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0_u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        fn validate_limits(limits: &DeltaCodecLimits) -> Result<(), DeltaCodecError> {
+            if limits.max_frame_bytes < HEADER_LEN + CHECKSUM_LEN
+                || limits.max_identity_bytes == 0
+                || limits.max_changes == 0
+                || limits.max_sequences_per_stream == 0
+            {
+                return Err(DeltaCodecError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn validate_delta(
+            delta: &CheckpointDelta,
+            limits: &DeltaCodecLimits,
+        ) -> Result<(), DeltaCodecError> {
+            if delta.target_window_size == 0 {
+                return Err(DeltaCodecError::InvalidWindow);
+            }
+            if delta.changes.len() > limits.max_changes {
+                return Err(DeltaCodecError::TooManyChanges);
+            }
+
+            let mut keys = BTreeSet::new();
+            for change in &delta.changes {
+                let key = match change {
+                    StreamChange::Remove { key } => key,
+                    StreamChange::Replace { stream } => {
+                        if stream.accepted_sequences.len() > limits.max_sequences_per_stream {
+                            return Err(DeltaCodecError::TooManySequences);
+                        }
+                        let checkpoint = ReplayCheckpoint {
+                            window_size: delta.target_window_size,
+                            streams: vec![stream.clone()],
+                        };
+                        let codec_limits = CodecLimits {
+                            max_snapshot_bytes: limits.max_frame_bytes,
+                            max_streams: 1,
+                            max_identity_bytes: limits.max_identity_bytes,
+                            max_sequences_per_stream: limits.max_sequences_per_stream,
+                        };
+                        encode_checkpoint(&checkpoint, &codec_limits).map_err(|error| {
+                            DeltaCodecError::Codec(format!("invalid replacement stream: {error:?}"))
+                        })?;
+                        // The key reference is not needed after the validation call.
+                        continue;
+                    }
+                };
+                if key.tenant_id.trim().is_empty() || key.peer_id.trim().is_empty() {
+                    return Err(DeltaCodecError::EmptyIdentity);
+                }
+                if key.tenant_id.len() > limits.max_identity_bytes
+                    || key.peer_id.len() > limits.max_identity_bytes
+                {
+                    return Err(DeltaCodecError::IdentityTooLarge);
+                }
+                if !keys.insert((key.tenant_id.as_str(), key.peer_id.as_str())) {
+                    return Err(DeltaCodecError::DuplicateChange);
+                }
+            }
+
+            // Validate uniqueness across both Remove and Replace entries.
+            let mut all_keys = BTreeSet::new();
+            for change in &delta.changes {
+                let (tenant, peer) = match change {
+                    StreamChange::Remove { key } => (key.tenant_id.as_str(), key.peer_id.as_str()),
+                    StreamChange::Replace { stream } => {
+                        (stream.tenant_id.as_str(), stream.peer_id.as_str())
+                    }
+                };
+                if !all_keys.insert((tenant, peer)) {
+                    return Err(DeltaCodecError::DuplicateChange);
+                }
+            }
+            Ok(())
+        }
+
+        /// Encodes a deterministic M055 delta frame.
+        pub fn encode(
+            delta: &CheckpointDelta,
+            limits: &DeltaCodecLimits,
+        ) -> Result<Vec<u8>, DeltaCodecError> {
+            validate_limits(limits)?;
+            validate_delta(delta, limits)?;
+
+            let mut changes = delta.changes.clone();
+            changes.sort_by_key(change_key);
+
+            let mut body = Vec::new();
+            put_u64(&mut body, delta.base_digest);
+            put_u64(&mut body, delta.target_window_size);
+            put_u32(
+                &mut body,
+                u32::try_from(changes.len()).map_err(|_| DeltaCodecError::LengthOverflow)?,
+            );
+
+            for change in changes {
+                match change {
+                    StreamChange::Remove { key } => {
+                        body.push(1);
+                        put_string(&mut body, &key.tenant_id, limits)?;
+                        put_string(&mut body, &key.peer_id, limits)?;
+                    }
+                    StreamChange::Replace { stream } => {
+                        body.push(2);
+                        put_string(&mut body, &stream.tenant_id, limits)?;
+                        put_string(&mut body, &stream.peer_id, limits)?;
+                        put_u64(&mut body, stream.highest_sequence);
+                        put_u32(
+                            &mut body,
+                            u32::try_from(stream.accepted_sequences.len())
+                                .map_err(|_| DeltaCodecError::LengthOverflow)?,
+                        );
+                        for sequence in stream.accepted_sequences {
+                            put_u64(&mut body, sequence);
+                        }
+                    }
+                }
+            }
+
+            let total = HEADER_LEN
+                .checked_add(body.len())
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(DeltaCodecError::LengthOverflow)?;
+            if total > limits.max_frame_bytes {
+                return Err(DeltaCodecError::FrameTooLarge);
+            }
+
+            let mut frame = Vec::with_capacity(total);
+            frame.extend_from_slice(MAGIC);
+            frame.push(VERSION);
+            frame.push(0);
+            put_u32(
+                &mut frame,
+                u32::try_from(body.len()).map_err(|_| DeltaCodecError::LengthOverflow)?,
+            );
+            frame.extend_from_slice(&body);
+            let checksum = crc32(&frame);
+            put_u32(&mut frame, checksum);
+            Ok(frame)
+        }
+
+        fn change_key(change: &StreamChange) -> StreamKey {
+            match change {
+                StreamChange::Remove { key } => key.clone(),
+                StreamChange::Replace { stream } => StreamKey {
+                    tenant_id: stream.tenant_id.clone(),
+                    peer_id: stream.peer_id.clone(),
+                },
+            }
+        }
+
+        /// Decodes a frame and validates every replacement stream before returning the delta.
+        pub fn decode(
+            frame: &[u8],
+            limits: &DeltaCodecLimits,
+        ) -> Result<CheckpointDelta, DeltaCodecError> {
+            validate_limits(limits)?;
+            if frame.len() > limits.max_frame_bytes {
+                return Err(DeltaCodecError::FrameTooLarge);
+            }
+            if frame.len() < HEADER_LEN + CHECKSUM_LEN {
+                return Err(DeltaCodecError::FrameTooShort);
+            }
+
+            let mut header = Reader::new(frame);
+            if header.take(4)? != MAGIC {
+                return Err(DeltaCodecError::BadMagic);
+            }
+            let version = header.u8()?;
+            if version != VERSION {
+                return Err(DeltaCodecError::UnsupportedVersion(version));
+            }
+            if header.u8()? != 0 {
+                return Err(DeltaCodecError::InvalidFlags);
+            }
+            let body_len =
+                usize::try_from(header.u32()?).map_err(|_| DeltaCodecError::LengthOverflow)?;
+            let expected = HEADER_LEN
+                .checked_add(body_len)
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(DeltaCodecError::LengthOverflow)?;
+            if expected != frame.len() {
+                return Err(DeltaCodecError::TrailingBytes);
+            }
+
+            let checksum_offset = frame
+                .len()
+                .checked_sub(CHECKSUM_LEN)
+                .ok_or(DeltaCodecError::FrameTooShort)?;
+            let mut checksum_reader = Reader::new(
+                frame
+                    .get(checksum_offset..)
+                    .ok_or(DeltaCodecError::Truncated)?,
+            );
+            let expected_checksum = checksum_reader.u32()?;
+            if crc32(
+                frame
+                    .get(..checksum_offset)
+                    .ok_or(DeltaCodecError::Truncated)?,
+            ) != expected_checksum
+            {
+                return Err(DeltaCodecError::ChecksumMismatch);
+            }
+
+            let body_start = HEADER_LEN;
+            let body_end = body_start
+                .checked_add(body_len)
+                .ok_or(DeltaCodecError::LengthOverflow)?;
+            let mut reader = Reader::new(
+                frame
+                    .get(body_start..body_end)
+                    .ok_or(DeltaCodecError::Truncated)?,
+            );
+
+            let base_digest = reader.u64()?;
+            let target_window_size = reader.u64()?;
+            if target_window_size == 0 {
+                return Err(DeltaCodecError::InvalidWindow);
+            }
+            let count =
+                usize::try_from(reader.u32()?).map_err(|_| DeltaCodecError::LengthOverflow)?;
+            if count > limits.max_changes {
+                return Err(DeltaCodecError::TooManyChanges);
+            }
+
+            let mut changes = Vec::with_capacity(count);
+            for _ in 0..count {
+                let kind = reader.u8()?;
+                let tenant_id = reader.string(limits)?;
+                let peer_id = reader.string(limits)?;
+                match kind {
+                    1 => changes.push(StreamChange::Remove {
+                        key: StreamKey { tenant_id, peer_id },
+                    }),
+                    2 => {
+                        let highest_sequence = reader.u64()?;
+                        let sequence_count = usize::try_from(reader.u32()?)
+                            .map_err(|_| DeltaCodecError::LengthOverflow)?;
+                        if sequence_count > limits.max_sequences_per_stream {
+                            return Err(DeltaCodecError::TooManySequences);
+                        }
+                        let mut accepted_sequences = BTreeSet::new();
+                        for _ in 0..sequence_count {
+                            let sequence = reader.u64()?;
+                            if !accepted_sequences.insert(sequence) {
+                                return Err(DeltaCodecError::InvalidSequence);
+                            }
+                        }
+                        changes.push(StreamChange::Replace {
+                            stream: crate::agentmem::checkpoint_codec::StreamCheckpoint {
+                                tenant_id,
+                                peer_id,
+                                highest_sequence,
+                                accepted_sequences,
+                            },
+                        });
+                    }
+                    _ => return Err(DeltaCodecError::InvalidChangeKind),
+                }
+            }
+
+            if !reader.done() {
+                return Err(DeltaCodecError::TrailingBytes);
+            }
+            let delta = CheckpointDelta {
+                base_digest,
+                target_window_size,
+                changes,
+            };
+            validate_delta(&delta, limits)?;
+            Ok(delta)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::checkpoint_codec::StreamCheckpoint;
+            use std::collections::BTreeSet;
+
+            fn sample() -> CheckpointDelta {
+                let mut accepted = BTreeSet::new();
+                accepted.insert(5);
+                accepted.insert(7);
+                CheckpointDelta {
+                    base_digest: 0x1234_5678,
+                    target_window_size: 16,
+                    changes: vec![
+                        StreamChange::Remove {
+                            key: StreamKey {
+                                tenant_id: "tenant-a".to_owned(),
+                                peer_id: "peer-old".to_owned(),
+                            },
+                        },
+                        StreamChange::Replace {
+                            stream: StreamCheckpoint {
+                                tenant_id: "tenant-b".to_owned(),
+                                peer_id: "peer-new".to_owned(),
+                                highest_sequence: 7,
+                                accepted_sequences: accepted,
+                            },
+                        },
+                    ],
+                }
+            }
+
+            #[test]
+            fn round_trips_remove_and_replace_changes() {
+                let limits = DeltaCodecLimits::default();
+                let bytes = encode(&sample(), &limits);
+                assert!(bytes.is_ok());
+                let decoded = match bytes {
+                    Ok(value) => decode(&value, &limits),
+                    Err(error) => Err(error),
+                };
+                assert_eq!(decoded, Ok(sample()));
+            }
+
+            #[test]
+            fn encoding_is_deterministic_independent_of_change_order() {
+                let limits = DeltaCodecLimits::default();
+                let a = sample();
+                let mut b = sample();
+                b.changes.reverse();
+                assert_eq!(encode(&a, &limits), encode(&b, &limits));
+            }
+
+            #[test]
+            fn rejects_corrupt_frames_and_bad_magic() {
+                let limits = DeltaCodecLimits::default();
+                let mut bytes = match encode(&sample(), &limits) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                if let Some(byte) = bytes.get_mut(HEADER_LEN) {
+                    *byte ^= 1;
+                }
+                assert_eq!(
+                    decode(&bytes, &limits),
+                    Err(DeltaCodecError::ChecksumMismatch)
+                );
+                // A frame of valid length whose magic is wrong is rejected as BadMagic.
+                let mut wrong_magic = bytes.clone();
+                wrong_magic[..4].copy_from_slice(b"NOPE");
+                assert_eq!(
+                    decode(&wrong_magic, &limits),
+                    Err(DeltaCodecError::BadMagic)
+                );
+                // A frame shorter than header + checksum is rejected as too short.
+                assert_eq!(
+                    decode(b"NOPE000000", &limits),
+                    Err(DeltaCodecError::FrameTooShort)
+                );
+            }
+
+            #[test]
+            fn rejects_duplicate_changes_and_invalid_replacement_sequences() {
+                let limits = DeltaCodecLimits::default();
+                let duplicate = CheckpointDelta {
+                    base_digest: 1,
+                    target_window_size: 8,
+                    changes: vec![
+                        StreamChange::Remove {
+                            key: StreamKey {
+                                tenant_id: "t".to_owned(),
+                                peer_id: "p".to_owned(),
+                            },
+                        },
+                        StreamChange::Remove {
+                            key: StreamKey {
+                                tenant_id: "t".to_owned(),
+                                peer_id: "p".to_owned(),
+                            },
+                        },
+                    ],
+                };
+                assert_eq!(
+                    encode(&duplicate, &limits),
+                    Err(DeltaCodecError::DuplicateChange)
+                );
+
+                let invalid = CheckpointDelta {
+                    base_digest: 1,
+                    target_window_size: 8,
+                    changes: vec![StreamChange::Replace {
+                        stream: StreamCheckpoint {
+                            tenant_id: "t".to_owned(),
+                            peer_id: "p".to_owned(),
+                            highest_sequence: 3,
+                            accepted_sequences: [3, 4].into_iter().collect(),
+                        },
+                    }],
+                };
+                assert!(matches!(
+                    encode(&invalid, &limits),
+                    Err(DeltaCodecError::Codec(_))
+                ));
+            }
+
+            #[test]
+            fn enforces_frame_and_change_limits() {
+                let mut limits = DeltaCodecLimits::default();
+                limits.max_changes = 1;
+                let mut value = sample();
+                assert_eq!(
+                    encode(&value, &limits),
+                    Err(DeltaCodecError::TooManyChanges)
+                );
+                limits.max_changes = 10;
+                // One byte below the real frame size must be rejected as too large.
+                limits.max_frame_bytes = 10_000;
+                let full = encode(&value, &limits).expect("fits in 10k").len();
+                limits.max_frame_bytes = full - 1;
+                assert_eq!(encode(&value, &limits), Err(DeltaCodecError::FrameTooLarge));
+                // A limit at the smallest valid size is rejected too (with whichever size error fires first).
+                limits.max_frame_bytes = HEADER_LEN + CHECKSUM_LEN;
+                assert!(encode(&value, &limits).is_err());
+                value.changes.clear();
+            }
+        }
+    }
+    pub mod x057 {
+        //! End-to-end replay checkpoint delta exchange over the M053–M056 primitives.
+        //!
+        //! This module creates portable delta frames and applies received frames to a
+        //! revisioned M054 store. Applying is transactional at the store boundary:
+        //! frame decoding, base matching, delta application, and checkpoint validation
+        //! all complete before the store is changed.
+
+        use crate::agentmem::checkpoint_codec::{CodecLimits, ReplayCheckpoint};
+        use crate::agentmem::x054::{CheckpointStore, StoreError};
+        use crate::agentmem::x055::{apply, diff, DeltaError};
+        use crate::agentmem::x056::{decode, encode, DeltaCodecError, DeltaCodecLimits};
+
+        #[derive(Clone, Debug, Eq, PartialEq, Default)]
+        pub struct ExchangeLimits {
+            pub checkpoint: CodecLimits,
+            pub delta_frame: DeltaCodecLimits,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ExchangeError {
+            Delta(DeltaError),
+            Frame(DeltaCodecError),
+            Store(StoreError),
+            RevisionMismatch { expected: u64, actual: u64 },
+        }
+
+        impl From<DeltaError> for ExchangeError {
+            fn from(value: DeltaError) -> Self {
+                Self::Delta(value)
+            }
+        }
+
+        impl From<DeltaCodecError> for ExchangeError {
+            fn from(value: DeltaCodecError) -> Self {
+                Self::Frame(value)
+            }
+        }
+
+        impl From<StoreError> for ExchangeError {
+            fn from(value: StoreError) -> Self {
+                Self::Store(value)
+            }
+        }
+
+        /// Builds a deterministic encoded delta from `base` to `target`.
+        ///
+        /// Both checkpoints are validated by the M055 diff path, and the resulting
+        /// frame is bounded and checksummed by the M056 codec.
+        pub fn create_delta_frame(
+            base: &ReplayCheckpoint,
+            target: &ReplayCheckpoint,
+            limits: &ExchangeLimits,
+        ) -> Result<Vec<u8>, ExchangeError> {
+            let delta = diff(base, target, &limits.checkpoint)?;
+            Ok(encode(&delta, &limits.delta_frame)?)
+        }
+
+        /// Decodes and applies a delta without mutating a store.
+        ///
+        /// Useful for validation, inspection, or staging before an explicit commit.
+        pub fn preview_delta_frame(
+            base: &ReplayCheckpoint,
+            frame: &[u8],
+            limits: &ExchangeLimits,
+        ) -> Result<ReplayCheckpoint, ExchangeError> {
+            let delta = decode(frame, &limits.delta_frame)?;
+            Ok(apply(base, &delta, &limits.checkpoint)?)
+        }
+
+        /// Applies a received delta to a revisioned checkpoint store.
+        ///
+        /// The expected revision is checked before processing. The M055 base digest
+        /// then binds the delta to the exact checkpoint currently stored. The final
+        /// checkpoint is committed with M054 compare-and-swap, so every error leaves
+        /// the store unchanged.
+        pub fn apply_delta_frame(
+            store: &mut CheckpointStore,
+            expected_revision: u64,
+            frame: &[u8],
+            limits: &ExchangeLimits,
+        ) -> Result<u64, ExchangeError> {
+            let current = store.load()?;
+            if current.revision != expected_revision {
+                return Err(ExchangeError::RevisionMismatch {
+                    expected: expected_revision,
+                    actual: current.revision,
+                });
+            }
+
+            let candidate = preview_delta_frame(&current.checkpoint, frame, limits)?;
+            Ok(store.compare_and_swap(expected_revision, &candidate)?)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::checkpoint_codec::StreamCheckpoint;
+            use std::collections::BTreeSet;
+
+            fn checkpoint(highest: u64) -> ReplayCheckpoint {
+                let mut accepted_sequences = BTreeSet::new();
+                if highest > 0 {
+                    accepted_sequences.insert(highest);
+                }
+                ReplayCheckpoint {
+                    window_size: 16,
+                    streams: vec![StreamCheckpoint {
+                        tenant_id: "tenant-a".to_owned(),
+                        peer_id: "peer-a".to_owned(),
+                        highest_sequence: highest,
+                        accepted_sequences,
+                    }],
+                }
+            }
+
+            fn limits() -> ExchangeLimits {
+                ExchangeLimits::default()
+            }
+
+            fn initialized_store(value: &ReplayCheckpoint) -> CheckpointStore {
+                let mut store = CheckpointStore::new(CodecLimits::default());
+                let result = store.initialize(value);
+                assert!(result.is_ok());
+                store
+            }
+
+            #[test]
+            fn creates_frame_and_applies_it_to_revisioned_store() {
+                let base = checkpoint(4);
+                let target = checkpoint(9);
+                let frame = create_delta_frame(&base, &target, &limits());
+                assert!(frame.is_ok());
+                let mut store = initialized_store(&base);
+                let revision =
+                    apply_delta_frame(&mut store, 1, &frame.unwrap_or_default(), &limits());
+                assert_eq!(revision, Ok(2));
+                assert_eq!(store.load().map(|snapshot| snapshot.checkpoint), Ok(target));
+            }
+
+            #[test]
+            fn preview_does_not_mutate_any_store() {
+                let base = checkpoint(4);
+                let target = checkpoint(7);
+                let frame = create_delta_frame(&base, &target, &limits());
+                assert!(frame.is_ok());
+                assert_eq!(
+                    preview_delta_frame(&base, &frame.unwrap_or_default(), &limits()),
+                    Ok(target)
+                );
+            }
+
+            #[test]
+            fn rejects_stale_revision_without_mutation() {
+                let base = checkpoint(4);
+                let target = checkpoint(7);
+                let frame = create_delta_frame(&base, &target, &limits());
+                assert!(frame.is_ok());
+                let mut store = initialized_store(&base);
+                let before = store.export_bytes();
+                assert_eq!(
+                    apply_delta_frame(&mut store, 8, &frame.unwrap_or_default(), &limits()),
+                    Err(ExchangeError::RevisionMismatch {
+                        expected: 8,
+                        actual: 1
+                    })
+                );
+                assert_eq!(store.export_bytes(), before);
+                assert_eq!(store.revision(), 1);
+            }
+
+            #[test]
+            fn rejects_wrong_base_and_preserves_store() {
+                let base = checkpoint(4);
+                let target = checkpoint(7);
+                let unrelated = checkpoint(5);
+                let frame = create_delta_frame(&base, &target, &limits());
+                assert!(frame.is_ok());
+                let mut store = initialized_store(&unrelated);
+                let before = store.export_bytes();
+                let result =
+                    apply_delta_frame(&mut store, 1, &frame.unwrap_or_default(), &limits());
+                assert!(matches!(
+                    result,
+                    Err(ExchangeError::Delta(DeltaError::BaseMismatch { .. }))
+                ));
+                assert_eq!(store.export_bytes(), before);
+                assert_eq!(store.revision(), 1);
+            }
+
+            #[test]
+            fn rejects_corrupt_frame_without_committing() {
+                let base = checkpoint(4);
+                let target = checkpoint(7);
+                let frame = create_delta_frame(&base, &target, &limits());
+                assert!(frame.is_ok());
+                let mut damaged = frame.unwrap_or_default();
+                if let Some(byte) = damaged.get_mut(12) {
+                    *byte ^= 0x40;
+                }
+                let mut store = initialized_store(&base);
+                let before = store.export_bytes();
+                assert!(apply_delta_frame(&mut store, 1, &damaged, &limits()).is_err());
+                assert_eq!(store.export_bytes(), before);
+                assert_eq!(store.revision(), 1);
+            }
+
+            #[test]
+            fn empty_change_frame_advances_revision_without_changing_checkpoint() {
+                let base = checkpoint(4);
+                let frame = create_delta_frame(&base, &base, &limits());
+                assert!(frame.is_ok());
+                let mut store = initialized_store(&base);
+                assert_eq!(
+                    apply_delta_frame(&mut store, 1, &frame.unwrap_or_default(), &limits()),
+                    Ok(2)
+                );
+                assert_eq!(store.load().map(|snapshot| snapshot.checkpoint), Ok(base));
+            }
+        }
+    }
+    pub mod x058 {
+        //! Bounded, lease-based delivery tracking for replay checkpoint delta frames.
+        //!
+        //! The outbox provides deterministic claiming, acknowledgement, retry scheduling,
+        //! and terminal failure after a configured attempt limit. The inbound ledger
+        //! provides bounded idempotency keys per authenticated sender identity.
+        //! Authentication, durable persistence, and transport are caller responsibilities.
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct PeerKey {
+            pub tenant_id: String,
+            pub peer_id: String,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeliveryConfig {
+            pub max_pending: usize,
+            pub max_frame_bytes: usize,
+            pub max_attempts: u32,
+            pub lease_ms: u64,
+            pub retry_base_ms: u64,
+            pub retry_max_ms: u64,
+            pub max_inbound_keys_per_peer: usize,
+        }
+
+        impl Default for DeliveryConfig {
+            fn default() -> Self {
+                Self {
+                    max_pending: 4096,
+                    max_frame_bytes: 4 * 1024 * 1024,
+                    max_attempts: 8,
+                    lease_ms: 30_000,
+                    retry_base_ms: 1_000,
+                    retry_max_ms: 60_000,
+                    max_inbound_keys_per_peer: 8192,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum DeliveryError {
+            InvalidConfig,
+            InvalidIdentity,
+            EmptyFrame,
+            FrameTooLarge,
+            QueueFull,
+            SequenceExhausted,
+            UnknownDelivery,
+            LeaseNotActive,
+            LeaseExpired,
+            AttemptLimitReached,
+            InboundCapacity,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum DeliveryState {
+            Pending { available_at_ms: u64 },
+            Leased { lease_until_ms: u64 },
+            Delivered,
+            Failed,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeliveryRecord {
+            pub delivery_id: u64,
+            pub peer: PeerKey,
+            pub frame: Vec<u8>,
+            pub attempts: u32,
+            pub state: DeliveryState,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeliveryLease {
+            pub delivery_id: u64,
+            pub peer: PeerKey,
+            pub frame: Vec<u8>,
+            pub attempt: u32,
+            pub lease_until_ms: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeliveryStats {
+            pub pending: usize,
+            pub leased: usize,
+            pub delivered: usize,
+            pub failed: usize,
+            pub next_delivery_id: u64,
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct DeltaDelivery {
+            config: DeliveryConfig,
+            next_delivery_id: u64,
+            records: BTreeMap<u64, DeliveryRecord>,
+            inbound: BTreeMap<PeerKey, BTreeSet<u64>>,
+        }
+
+        impl DeltaDelivery {
+            pub fn new(config: DeliveryConfig) -> Result<Self, DeliveryError> {
+                if config.max_pending == 0
+                    || config.max_frame_bytes == 0
+                    || config.max_attempts == 0
+                    || config.lease_ms == 0
+                    || config.retry_base_ms == 0
+                    || config.retry_max_ms < config.retry_base_ms
+                    || config.max_inbound_keys_per_peer == 0
+                {
+                    return Err(DeliveryError::InvalidConfig);
+                }
+                Ok(Self {
+                    config,
+                    next_delivery_id: 1,
+                    records: BTreeMap::new(),
+                    inbound: BTreeMap::new(),
+                })
+            }
+
+            fn validate_peer(peer: &PeerKey) -> Result<(), DeliveryError> {
+                if peer.tenant_id.trim().is_empty() || peer.peer_id.trim().is_empty() {
+                    return Err(DeliveryError::InvalidIdentity);
+                }
+                Ok(())
+            }
+
+            /// Enqueues an opaque encoded delta frame for a tenant/peer destination.
+            pub fn enqueue(
+                &mut self,
+                peer: PeerKey,
+                frame: Vec<u8>,
+                now_ms: u64,
+            ) -> Result<u64, DeliveryError> {
+                Self::validate_peer(&peer)?;
+                if frame.is_empty() {
+                    return Err(DeliveryError::EmptyFrame);
+                }
+                if frame.len() > self.config.max_frame_bytes {
+                    return Err(DeliveryError::FrameTooLarge);
+                }
+                if self
+                    .records
+                    .values()
+                    .filter(|record| {
+                        matches!(
+                            record.state,
+                            DeliveryState::Pending { .. } | DeliveryState::Leased { .. }
+                        )
+                    })
+                    .count()
+                    >= self.config.max_pending
+                {
+                    return Err(DeliveryError::QueueFull);
+                }
+
+                let id = self.next_delivery_id;
+                let next = id.checked_add(1).ok_or(DeliveryError::SequenceExhausted)?;
+                self.records.insert(
+                    id,
+                    DeliveryRecord {
+                        delivery_id: id,
+                        peer,
+                        frame,
+                        attempts: 0,
+                        state: DeliveryState::Pending {
+                            available_at_ms: now_ms,
+                        },
+                    },
+                );
+                self.next_delivery_id = next;
+                Ok(id)
+            }
+
+            /// Claims the lowest-ID eligible delivery and establishes a bounded lease.
+            /// Expired leases become retryable; deliveries at their attempt limit fail.
+            pub fn claim(&mut self, now_ms: u64) -> Option<DeliveryLease> {
+                let ids: Vec<u64> = self.records.keys().copied().collect();
+                for id in ids {
+                    let Some(record) = self.records.get_mut(&id) else {
+                        continue;
+                    };
+                    if let DeliveryState::Leased { lease_until_ms } = record.state {
+                        if lease_until_ms > now_ms {
+                            continue;
+                        }
+                        if record.attempts >= self.config.max_attempts {
+                            record.state = DeliveryState::Failed;
+                            continue;
+                        }
+                        let delay = retry_delay(
+                            self.config.retry_base_ms,
+                            self.config.retry_max_ms,
+                            record.attempts,
+                        );
+                        let available = lease_until_ms.saturating_add(delay);
+                        record.state = DeliveryState::Pending {
+                            available_at_ms: available,
+                        };
+                    }
+
+                    let available_at_ms = match record.state {
+                        DeliveryState::Pending { available_at_ms } => available_at_ms,
+                        _ => continue,
+                    };
+                    if available_at_ms > now_ms {
+                        continue;
+                    }
+                    if record.attempts >= self.config.max_attempts {
+                        record.state = DeliveryState::Failed;
+                        continue;
+                    }
+                    let attempt = match record.attempts.checked_add(1) {
+                        Some(value) => value,
+                        None => {
+                            record.state = DeliveryState::Failed;
+                            continue;
+                        }
+                    };
+                    let lease_until_ms = now_ms.saturating_add(self.config.lease_ms);
+                    record.attempts = attempt;
+                    record.state = DeliveryState::Leased { lease_until_ms };
+                    return Some(DeliveryLease {
+                        delivery_id: id,
+                        peer: record.peer.clone(),
+                        frame: record.frame.clone(),
+                        attempt,
+                        lease_until_ms,
+                    });
+                }
+                None
+            }
+
+            /// Acknowledges a currently active, unexpired lease.
+            pub fn acknowledge(
+                &mut self,
+                delivery_id: u64,
+                now_ms: u64,
+            ) -> Result<(), DeliveryError> {
+                let record = self
+                    .records
+                    .get_mut(&delivery_id)
+                    .ok_or(DeliveryError::UnknownDelivery)?;
+                match record.state {
+                    DeliveryState::Leased { lease_until_ms } if lease_until_ms > now_ms => {
+                        record.state = DeliveryState::Delivered;
+                        Ok(())
+                    }
+                    DeliveryState::Leased { .. } => Err(DeliveryError::LeaseExpired),
+                    _ => Err(DeliveryError::LeaseNotActive),
+                }
+            }
+
+            /// Releases a lease for retry, using capped exponential backoff.
+            pub fn retry(&mut self, delivery_id: u64, now_ms: u64) -> Result<u64, DeliveryError> {
+                let record = self
+                    .records
+                    .get_mut(&delivery_id)
+                    .ok_or(DeliveryError::UnknownDelivery)?;
+                match record.state {
+                    DeliveryState::Leased { lease_until_ms } if lease_until_ms > now_ms => {}
+                    DeliveryState::Leased { .. } => return Err(DeliveryError::LeaseExpired),
+                    _ => return Err(DeliveryError::LeaseNotActive),
+                }
+                if record.attempts >= self.config.max_attempts {
+                    record.state = DeliveryState::Failed;
+                    return Err(DeliveryError::AttemptLimitReached);
+                }
+                let delay = retry_delay(
+                    self.config.retry_base_ms,
+                    self.config.retry_max_ms,
+                    record.attempts.saturating_sub(1),
+                );
+                let available_at_ms = now_ms.saturating_add(delay);
+                record.state = DeliveryState::Pending { available_at_ms };
+                Ok(available_at_ms)
+            }
+
+            /// Records an inbound frame identity once per tenant/peer. Returns false for
+            /// a duplicate. Caller should invoke only after authenticating the peer.
+            pub fn record_inbound(
+                &mut self,
+                peer: PeerKey,
+                frame_id: u64,
+            ) -> Result<bool, DeliveryError> {
+                Self::validate_peer(&peer)?;
+                let keys = self.inbound.entry(peer).or_default();
+                if keys.contains(&frame_id) {
+                    return Ok(false);
+                }
+                if keys.len() >= self.config.max_inbound_keys_per_peer {
+                    return Err(DeliveryError::InboundCapacity);
+                }
+                keys.insert(frame_id);
+                Ok(true)
+            }
+
+            /// Removes an inbound deduplication entry, for explicit retention management.
+            pub fn forget_inbound(&mut self, peer: &PeerKey, frame_id: u64) -> bool {
+                let removed = self
+                    .inbound
+                    .get_mut(peer)
+                    .map(|keys| keys.remove(&frame_id))
+                    .unwrap_or(false);
+                if self.inbound.get(peer).is_some_and(BTreeSet::is_empty) {
+                    self.inbound.remove(peer);
+                }
+                removed
+            }
+
+            pub fn get(&self, delivery_id: u64) -> Option<&DeliveryRecord> {
+                self.records.get(&delivery_id)
+            }
+
+            /// Removes terminal records and returns the number removed.
+            pub fn prune_terminal(&mut self) -> usize {
+                let before = self.records.len();
+                self.records.retain(|_, record| {
+                    !matches!(
+                        record.state,
+                        DeliveryState::Delivered | DeliveryState::Failed
+                    )
+                });
+                before.saturating_sub(self.records.len())
+            }
+
+            pub fn stats(&self) -> DeliveryStats {
+                let mut stats = DeliveryStats {
+                    pending: 0,
+                    leased: 0,
+                    delivered: 0,
+                    failed: 0,
+                    next_delivery_id: self.next_delivery_id,
+                };
+                for record in self.records.values() {
+                    match record.state {
+                        DeliveryState::Pending { .. } => stats.pending += 1,
+                        DeliveryState::Leased { .. } => stats.leased += 1,
+                        DeliveryState::Delivered => stats.delivered += 1,
+                        DeliveryState::Failed => stats.failed += 1,
+                    }
+                }
+                stats
+            }
+        }
+
+        fn retry_delay(base: u64, maximum: u64, prior_attempts: u32) -> u64 {
+            let shift = prior_attempts.min(63);
+            let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+            base.saturating_mul(multiplier).min(maximum)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn peer() -> PeerKey {
+                PeerKey {
+                    tenant_id: "tenant-1".to_owned(),
+                    peer_id: "peer-1".to_owned(),
+                }
+            }
+
+            fn config() -> DeliveryConfig {
+                DeliveryConfig {
+                    max_pending: 2,
+                    max_frame_bytes: 32,
+                    max_attempts: 3,
+                    lease_ms: 10,
+                    retry_base_ms: 5,
+                    retry_max_ms: 20,
+                    max_inbound_keys_per_peer: 2,
+                }
+            }
+
+            #[test]
+            fn enqueues_claims_and_acknowledges() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                let id = queue.enqueue(peer(), vec![1, 2, 3], 100).expect("enqueue");
+                let lease = queue.claim(100).expect("claim");
+                assert_eq!(lease.delivery_id, id);
+                assert_eq!(lease.attempt, 1);
+                assert_eq!(queue.acknowledge(id, 105), Ok(()));
+                assert_eq!(
+                    queue.get(id).map(|r| r.state.clone()),
+                    Some(DeliveryState::Delivered)
+                );
+            }
+
+            #[test]
+            fn retry_uses_backoff_and_reclaims() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                let id = queue.enqueue(peer(), vec![9], 0).expect("enqueue");
+                assert!(queue.claim(0).is_some());
+                assert_eq!(queue.retry(id, 1), Ok(6));
+                assert!(queue.claim(5).is_none());
+                assert_eq!(queue.claim(6).map(|lease| lease.attempt), Some(2));
+            }
+
+            #[test]
+            fn expired_lease_is_not_acknowledged_and_is_retried_later() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                let id = queue.enqueue(peer(), vec![9], 0).expect("enqueue");
+                assert!(queue.claim(0).is_some());
+                assert_eq!(queue.acknowledge(id, 10), Err(DeliveryError::LeaseExpired));
+                assert!(queue.claim(10).is_none());
+                assert!(queue.claim(20).is_some());
+            }
+
+            #[test]
+            fn attempt_limit_transitions_to_failed() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                let id = queue.enqueue(peer(), vec![9], 0).expect("enqueue");
+                assert!(queue.claim(0).is_some());
+                assert_eq!(queue.retry(id, 1), Ok(6));
+                assert!(queue.claim(6).is_some());
+                assert_eq!(queue.retry(id, 7), Ok(17));
+                assert!(queue.claim(17).is_some());
+                assert_eq!(queue.retry(id, 18), Err(DeliveryError::AttemptLimitReached));
+                assert_eq!(
+                    queue.get(id).map(|r| r.state.clone()),
+                    Some(DeliveryState::Failed)
+                );
+            }
+
+            #[test]
+            fn inbound_keys_are_idempotent_and_peer_scoped() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                assert_eq!(queue.record_inbound(peer(), 42), Ok(true));
+                assert_eq!(queue.record_inbound(peer(), 42), Ok(false));
+                let other = PeerKey {
+                    tenant_id: "tenant-2".to_owned(),
+                    peer_id: "peer-1".to_owned(),
+                };
+                assert_eq!(queue.record_inbound(other, 42), Ok(true));
+            }
+
+            #[test]
+            fn capacities_and_terminal_pruning_are_enforced() {
+                let mut queue = DeltaDelivery::new(config()).expect("valid config");
+                let first = queue.enqueue(peer(), vec![1], 0).expect("first");
+                queue.enqueue(peer(), vec![2], 0).expect("second");
+                assert_eq!(
+                    queue.enqueue(peer(), vec![3], 0),
+                    Err(DeliveryError::QueueFull)
+                );
+                assert!(queue.claim(0).is_some());
+                assert_eq!(queue.acknowledge(first, 1), Ok(()));
+                assert_eq!(queue.prune_terminal(), 1);
+                assert_eq!(queue.stats().pending, 1);
+            }
+        }
+    }
+    pub mod x059 {
+        //! Durable append-only journal for replay delta delivery state transitions.
+        //!
+        //! Each event is independently framed and checksummed. Recovery replays complete
+        //! events in order and truncates only an incomplete final frame (a normal torn-write
+        //! case). A complete frame with invalid magic, version, length, or checksum is an
+        //! error; it is never silently discarded. Callers own semantic state reconstruction.
+
+        use std::fs::{File, OpenOptions};
+        use std::io::{self, Read, Seek, SeekFrom, Write};
+        use std::path::Path;
+
+        const MAGIC: &[u8; 4] = b"ADJ1";
+        const VERSION: u8 = 1;
+        const HEADER_LEN: usize = 10;
+        const CHECKSUM_LEN: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct JournalLimits {
+            pub max_frame_bytes: usize,
+            pub max_identity_bytes: usize,
+            pub max_payload_bytes: usize,
+            pub max_events: usize,
+        }
+
+        impl Default for JournalLimits {
+            fn default() -> Self {
+                Self {
+                    max_frame_bytes: 4 * 1024 * 1024,
+                    max_identity_bytes: 1024,
+                    max_payload_bytes: 4 * 1024 * 1024 - 128,
+                    max_events: 1_000_000,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum JournalEvent {
+            Enqueued {
+                delivery_id: u64,
+                tenant_id: String,
+                peer_id: String,
+                frame: Vec<u8>,
+            },
+            Leased {
+                delivery_id: u64,
+                attempt: u32,
+                lease_until_ms: u64,
+            },
+            Acknowledged {
+                delivery_id: u64,
+            },
+            RetryScheduled {
+                delivery_id: u64,
+                available_at_ms: u64,
+            },
+            Failed {
+                delivery_id: u64,
+            },
+            InboundAccepted {
+                tenant_id: String,
+                peer_id: String,
+                frame_id: u64,
+            },
+            InboundForgotten {
+                tenant_id: String,
+                peer_id: String,
+                frame_id: u64,
+            },
+            TerminalPruned {
+                delivery_id: u64,
+            },
+            /// Preserves IDs already allocated before a journal compaction.
+            /// Must be the first event in a compacted journal.
+            DeliveryIdHighWatermark {
+                last_delivery_id: u64,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum JournalError {
+            Io(String),
+            InvalidLimits,
+            FrameTooLarge,
+            InvalidIdentity,
+            InvalidPayload,
+            BadMagic,
+            UnsupportedVersion(u8),
+            InvalidFlags,
+            Truncated,
+            LengthMismatch,
+            ChecksumMismatch,
+            UnknownEvent(u8),
+            LengthOverflow,
+        }
+
+        impl From<io::Error> for JournalError {
+            fn from(value: io::Error) -> Self {
+                Self::Io(value.to_string())
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Recovery {
+            pub events: Vec<JournalEvent>,
+            pub valid_bytes: u64,
+            pub truncated_bytes: u64,
+        }
+
+        pub struct DeliveryJournal {
+            file: File,
+            limits: JournalLimits,
+            end: u64,
+        }
+
+        impl DeliveryJournal {
+            /// Opens or creates a journal, validates its complete frames, and truncates
+            /// an incomplete final frame before accepting new appends.
+            pub fn open(
+                path: impl AsRef<Path>,
+                limits: JournalLimits,
+            ) -> Result<(Self, Recovery), JournalError> {
+                validate_limits(&limits)?;
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false) // keep existing records: they are recovered below
+                    .open(path)?;
+                let recovery = recover_file(&mut file, &limits)?;
+                let end = recovery.valid_bytes;
+                file.seek(SeekFrom::Start(end))?;
+                Ok((Self { file, limits, end }, recovery))
+            }
+
+            /// Appends one event and calls sync_data before reporting success.
+            pub fn append(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
+                let frame = encode_event(event, &self.limits)?;
+                let next_end = self
+                    .end
+                    .checked_add(
+                        u64::try_from(frame.len()).map_err(|_| JournalError::LengthOverflow)?,
+                    )
+                    .ok_or(JournalError::LengthOverflow)?;
+                self.file.seek(SeekFrom::Start(self.end))?;
+                self.file.write_all(&frame)?;
+                self.file.sync_data()?;
+                self.end = next_end;
+                Ok(self.end)
+            }
+
+            pub fn len_bytes(&self) -> u64 {
+                self.end
+            }
+
+            /// Forces journal data and metadata to stable storage where supported.
+            pub fn sync(&mut self) -> Result<(), JournalError> {
+                self.file.sync_all()?;
+                Ok(())
+            }
+        }
+
+        fn validate_limits(limits: &JournalLimits) -> Result<(), JournalError> {
+            if limits.max_frame_bytes < HEADER_LEN + CHECKSUM_LEN + 1
+                || limits.max_identity_bytes == 0
+                || limits.max_payload_bytes == 0
+                || limits.max_events == 0
+            {
+                return Err(JournalError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0_u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+
+            fn take(&mut self, n: usize) -> Result<&'a [u8], JournalError> {
+                let end = self
+                    .offset
+                    .checked_add(n)
+                    .ok_or(JournalError::LengthOverflow)?;
+                let value = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(JournalError::Truncated)?;
+                self.offset = end;
+                Ok(value)
+            }
+
+            fn u8(&mut self) -> Result<u8, JournalError> {
+                self.take(1)?
+                    .first()
+                    .copied()
+                    .ok_or(JournalError::Truncated)
+            }
+
+            fn u32(&mut self) -> Result<u32, JournalError> {
+                let bytes = self.take(4)?;
+                let mut value = [0_u8; 4];
+                value.copy_from_slice(bytes);
+                Ok(u32::from_be_bytes(value))
+            }
+
+            fn u64(&mut self) -> Result<u64, JournalError> {
+                let bytes = self.take(8)?;
+                let mut value = [0_u8; 8];
+                value.copy_from_slice(bytes);
+                Ok(u64::from_be_bytes(value))
+            }
+
+            fn string(&mut self, limits: &JournalLimits) -> Result<String, JournalError> {
+                let len = usize::try_from(self.u32()?).map_err(|_| JournalError::LengthOverflow)?;
+                if len == 0 || len > limits.max_identity_bytes {
+                    return Err(JournalError::InvalidIdentity);
+                }
+                let bytes = self.take(len)?;
+                let value =
+                    std::str::from_utf8(bytes).map_err(|_| JournalError::InvalidIdentity)?;
+                if value.trim().is_empty() {
+                    return Err(JournalError::InvalidIdentity);
+                }
+                Ok(value.to_owned())
+            }
+
+            fn bytes(&mut self, limits: &JournalLimits) -> Result<Vec<u8>, JournalError> {
+                let len = usize::try_from(self.u32()?).map_err(|_| JournalError::LengthOverflow)?;
+                if len == 0 || len > limits.max_payload_bytes {
+                    return Err(JournalError::InvalidPayload);
+                }
+                Ok(self.take(len)?.to_vec())
+            }
+
+            fn done(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        fn put_string(
+            out: &mut Vec<u8>,
+            value: &str,
+            limits: &JournalLimits,
+        ) -> Result<(), JournalError> {
+            if value.trim().is_empty() || value.len() > limits.max_identity_bytes {
+                return Err(JournalError::InvalidIdentity);
+            }
+            put_u32(
+                out,
+                u32::try_from(value.len()).map_err(|_| JournalError::LengthOverflow)?,
+            );
+            out.extend_from_slice(value.as_bytes());
+            Ok(())
+        }
+
+        fn encode_event(
+            event: &JournalEvent,
+            limits: &JournalLimits,
+        ) -> Result<Vec<u8>, JournalError> {
+            let mut body = Vec::new();
+            match event {
+                JournalEvent::Enqueued {
+                    delivery_id,
+                    tenant_id,
+                    peer_id,
+                    frame,
+                } => {
+                    if frame.is_empty() || frame.len() > limits.max_payload_bytes {
+                        return Err(JournalError::InvalidPayload);
+                    }
+                    body.push(1);
+                    put_u64(&mut body, *delivery_id);
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_string(&mut body, peer_id, limits)?;
+                    put_u32(
+                        &mut body,
+                        u32::try_from(frame.len()).map_err(|_| JournalError::LengthOverflow)?,
+                    );
+                    body.extend_from_slice(frame);
+                }
+                JournalEvent::Leased {
+                    delivery_id,
+                    attempt,
+                    lease_until_ms,
+                } => {
+                    body.push(2);
+                    put_u64(&mut body, *delivery_id);
+                    put_u32(&mut body, *attempt);
+                    put_u64(&mut body, *lease_until_ms);
+                }
+                JournalEvent::Acknowledged { delivery_id } => {
+                    body.push(3);
+                    put_u64(&mut body, *delivery_id);
+                }
+                JournalEvent::RetryScheduled {
+                    delivery_id,
+                    available_at_ms,
+                } => {
+                    body.push(4);
+                    put_u64(&mut body, *delivery_id);
+                    put_u64(&mut body, *available_at_ms);
+                }
+                JournalEvent::Failed { delivery_id } => {
+                    body.push(5);
+                    put_u64(&mut body, *delivery_id);
+                }
+                JournalEvent::InboundAccepted {
+                    tenant_id,
+                    peer_id,
+                    frame_id,
+                } => {
+                    body.push(6);
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_string(&mut body, peer_id, limits)?;
+                    put_u64(&mut body, *frame_id);
+                }
+                JournalEvent::InboundForgotten {
+                    tenant_id,
+                    peer_id,
+                    frame_id,
+                } => {
+                    body.push(7);
+                    put_string(&mut body, tenant_id, limits)?;
+                    put_string(&mut body, peer_id, limits)?;
+                    put_u64(&mut body, *frame_id);
+                }
+                JournalEvent::TerminalPruned { delivery_id } => {
+                    body.push(8);
+                    put_u64(&mut body, *delivery_id);
+                }
+                JournalEvent::DeliveryIdHighWatermark { last_delivery_id } => {
+                    body.push(9);
+                    put_u64(&mut body, *last_delivery_id);
+                }
+            }
+
+            let total = HEADER_LEN
+                .checked_add(body.len())
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(JournalError::LengthOverflow)?;
+            if total > limits.max_frame_bytes {
+                return Err(JournalError::FrameTooLarge);
+            }
+
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(MAGIC);
+            out.push(VERSION);
+            out.push(0);
+            put_u32(
+                &mut out,
+                u32::try_from(body.len()).map_err(|_| JournalError::LengthOverflow)?,
+            );
+            out.extend_from_slice(&body);
+            let checksum = crc32(&out);
+            put_u32(&mut out, checksum);
+            Ok(out)
+        }
+
+        fn decode_event(body: &[u8], limits: &JournalLimits) -> Result<JournalEvent, JournalError> {
+            let mut reader = Reader::new(body);
+            let event = match reader.u8()? {
+                1 => {
+                    let delivery_id = reader.u64()?;
+                    let tenant_id = reader.string(limits)?;
+                    let peer_id = reader.string(limits)?;
+                    let frame = reader.bytes(limits)?;
+                    JournalEvent::Enqueued {
+                        delivery_id,
+                        tenant_id,
+                        peer_id,
+                        frame,
+                    }
+                }
+                2 => JournalEvent::Leased {
+                    delivery_id: reader.u64()?,
+                    attempt: reader.u32()?,
+                    lease_until_ms: reader.u64()?,
+                },
+                3 => JournalEvent::Acknowledged {
+                    delivery_id: reader.u64()?,
+                },
+                4 => JournalEvent::RetryScheduled {
+                    delivery_id: reader.u64()?,
+                    available_at_ms: reader.u64()?,
+                },
+                5 => JournalEvent::Failed {
+                    delivery_id: reader.u64()?,
+                },
+                6 => JournalEvent::InboundAccepted {
+                    tenant_id: reader.string(limits)?,
+                    peer_id: reader.string(limits)?,
+                    frame_id: reader.u64()?,
+                },
+                7 => JournalEvent::InboundForgotten {
+                    tenant_id: reader.string(limits)?,
+                    peer_id: reader.string(limits)?,
+                    frame_id: reader.u64()?,
+                },
+                8 => JournalEvent::TerminalPruned {
+                    delivery_id: reader.u64()?,
+                },
+                9 => JournalEvent::DeliveryIdHighWatermark {
+                    last_delivery_id: reader.u64()?,
+                },
+                kind => return Err(JournalError::UnknownEvent(kind)),
+            };
+            if !reader.done() {
+                return Err(JournalError::LengthMismatch);
+            }
+            Ok(event)
+        }
+
+        /// Recovers all complete events. An incomplete suffix is truncated; corruption
+        /// in a complete frame is returned as an error and leaves the file untouched.
+        pub fn recover_file(
+            file: &mut File,
+            limits: &JournalLimits,
+        ) -> Result<Recovery, JournalError> {
+            validate_limits(limits)?;
+            let file_len = file.metadata()?.len();
+            file.seek(SeekFrom::Start(0))?;
+            let mut events = Vec::new();
+            let mut offset = 0_u64;
+
+            while offset < file_len {
+                let remaining = file_len.saturating_sub(offset);
+                if remaining < HEADER_LEN as u64 {
+                    break;
+                }
+                let mut header = [0_u8; HEADER_LEN];
+                file.read_exact(&mut header)?;
+                if header.get(0..4) != Some(MAGIC.as_slice()) {
+                    return Err(JournalError::BadMagic);
+                }
+                let version = header.get(4).copied().ok_or(JournalError::Truncated)?;
+                if version != VERSION {
+                    return Err(JournalError::UnsupportedVersion(version));
+                }
+                if header.get(5).copied().ok_or(JournalError::Truncated)? != 0 {
+                    return Err(JournalError::InvalidFlags);
+                }
+                let length_slice = header.get(6..10).ok_or(JournalError::Truncated)?;
+                let mut length_bytes = [0_u8; 4];
+                length_bytes.copy_from_slice(length_slice);
+                let body_len_u32 = u32::from_be_bytes(length_bytes);
+                let body_len =
+                    usize::try_from(body_len_u32).map_err(|_| JournalError::LengthOverflow)?;
+                let total = HEADER_LEN
+                    .checked_add(body_len)
+                    .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                    .ok_or(JournalError::LengthOverflow)?;
+                if total > limits.max_frame_bytes {
+                    return Err(JournalError::FrameTooLarge);
+                }
+                if remaining < u64::try_from(total).map_err(|_| JournalError::LengthOverflow)? {
+                    break;
+                }
+                let mut rest = vec![0_u8; body_len + CHECKSUM_LEN];
+                file.read_exact(&mut rest)?;
+                let mut complete = header.to_vec();
+                complete.extend_from_slice(&rest);
+                let checksum_start = complete
+                    .len()
+                    .checked_sub(CHECKSUM_LEN)
+                    .ok_or(JournalError::Truncated)?;
+                let checksum_bytes = complete
+                    .get(checksum_start..)
+                    .ok_or(JournalError::Truncated)?;
+                let mut checksum_array = [0_u8; 4];
+                checksum_array.copy_from_slice(checksum_bytes);
+                let expected_checksum = u32::from_be_bytes(checksum_array);
+                if crc32(&complete[..checksum_start]) != expected_checksum {
+                    return Err(JournalError::ChecksumMismatch);
+                }
+                if events.len() >= limits.max_events {
+                    return Err(JournalError::FrameTooLarge);
+                }
+                let body = complete
+                    .get(HEADER_LEN..checksum_start)
+                    .ok_or(JournalError::Truncated)?;
+                let event = decode_event(body, limits)?;
+                events.push(event);
+                offset = offset
+                    .checked_add(u64::try_from(total).map_err(|_| JournalError::LengthOverflow)?)
+                    .ok_or(JournalError::LengthOverflow)?;
+            }
+
+            let truncated_bytes = file_len.saturating_sub(offset);
+            if truncated_bytes > 0 {
+                file.set_len(offset)?;
+                file.sync_all()?;
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            Ok(Recovery {
+                events,
+                valid_bytes: offset,
+                truncated_bytes,
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use std::fs;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            fn path(label: &str) -> std::path::PathBuf {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                std::env::temp_dir().join(format!("agentos-{label}-{nonce}.journal"))
+            }
+
+            fn sample() -> Vec<JournalEvent> {
+                vec![
+                    JournalEvent::Enqueued {
+                        delivery_id: 7,
+                        tenant_id: "tenant-a".into(),
+                        peer_id: "peer-b".into(),
+                        frame: vec![1, 2, 3, 4],
+                    },
+                    JournalEvent::Leased {
+                        delivery_id: 7,
+                        attempt: 1,
+                        lease_until_ms: 500,
+                    },
+                    JournalEvent::RetryScheduled {
+                        delivery_id: 7,
+                        available_at_ms: 600,
+                    },
+                    JournalEvent::Acknowledged { delivery_id: 7 },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "tenant-a".into(),
+                        peer_id: "peer-b".into(),
+                        frame_id: 99,
+                    },
+                ]
+            }
+
+            #[test]
+            fn append_and_reopen_replays_events_in_order() {
+                let path = path("roundtrip");
+                let expected = sample();
+                {
+                    let opened = DeliveryJournal::open(&path, JournalLimits::default());
+                    assert!(opened.is_ok());
+                    let (mut journal, recovery) = match opened {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    assert!(recovery.events.is_empty());
+                    for event in &expected {
+                        assert!(journal.append(event).is_ok());
+                    }
+                    assert!(journal.sync().is_ok());
+                }
+                let reopened = DeliveryJournal::open(&path, JournalLimits::default());
+                assert!(reopened.is_ok());
+                if let Ok((_journal, recovery)) = reopened {
+                    assert_eq!(recovery.events, expected);
+                    assert_eq!(recovery.truncated_bytes, 0);
+                }
+                let _ = fs::remove_file(path);
+            }
+
+            #[test]
+            fn incomplete_tail_is_truncated_but_prior_events_survive() {
+                let path = path("torn");
+                let expected = sample();
+                {
+                    let opened = DeliveryJournal::open(&path, JournalLimits::default());
+                    if let Ok((mut journal, _)) = opened {
+                        assert!(journal.append(&expected[0]).is_ok());
+                    }
+                }
+                if let Ok(mut file) = OpenOptions::new().append(true).open(&path) {
+                    let _ = file.write_all(b"ADJ");
+                }
+                let reopened = DeliveryJournal::open(&path, JournalLimits::default());
+                assert!(reopened.is_ok());
+                if let Ok((_journal, recovery)) = reopened {
+                    assert_eq!(recovery.events, vec![expected[0].clone()]);
+                    assert_eq!(recovery.truncated_bytes, 3);
+                }
+                let _ = fs::remove_file(path);
+            }
+
+            #[test]
+            fn complete_corrupt_frame_is_not_silently_truncated() {
+                let path = path("corrupt");
+                {
+                    let opened = DeliveryJournal::open(&path, JournalLimits::default());
+                    if let Ok((mut journal, _)) = opened {
+                        assert!(journal.append(&sample()[0]).is_ok());
+                    }
+                }
+                if let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) {
+                    if file.seek(SeekFrom::Start(12)).is_ok() {
+                        let _ = file.write_all(&[0xff]);
+                    }
+                }
+                assert_eq!(
+                    DeliveryJournal::open(&path, JournalLimits::default()).err(),
+                    Some(JournalError::ChecksumMismatch)
+                );
+                let _ = fs::remove_file(path);
+            }
+
+            #[test]
+            fn rejects_oversized_payload_and_invalid_identity() {
+                let limits = JournalLimits {
+                    max_payload_bytes: 2,
+                    ..JournalLimits::default()
+                };
+                let event = JournalEvent::Enqueued {
+                    delivery_id: 1,
+                    tenant_id: "t".into(),
+                    peer_id: "p".into(),
+                    frame: vec![1, 2, 3],
+                };
+                assert_eq!(
+                    encode_event(&event, &limits),
+                    Err(JournalError::InvalidPayload)
+                );
+                let bad = JournalEvent::InboundAccepted {
+                    tenant_id: " ".into(),
+                    peer_id: "p".into(),
+                    frame_id: 1,
+                };
+                assert_eq!(
+                    encode_event(&bad, &JournalLimits::default()),
+                    Err(JournalError::InvalidIdentity)
+                );
+            }
+        }
+    }
+    pub mod x060 {
+        //! Deterministic semantic recovery for the M059 replay-delta delivery journal.
+        //!
+        //! M059 verifies and decodes the journal's physical frames. This module validates
+        //! the event history and reconstructs the logical outbox and inbound deduplication
+        //! ledger. A semantically invalid history is rejected as a whole; no partial
+        //! recovered state is returned.
+
+        use crate::agentmem::x059::{DeliveryJournal, JournalError, JournalEvent, JournalLimits};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::Path;
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct PeerKey {
+            pub tenant_id: String,
+            pub peer_id: String,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RecoveredState {
+            Pending { available_at_ms: u64 },
+            Leased { attempt: u32, lease_until_ms: u64 },
+            Delivered,
+            Failed,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RecoveredDelivery {
+            pub delivery_id: u64,
+            pub peer: PeerKey,
+            pub frame: Vec<u8>,
+            pub attempts: u32,
+            pub state: RecoveredState,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RecoveryLimits {
+            pub max_deliveries: usize,
+            pub max_frame_bytes: usize,
+            pub max_inbound_keys_per_peer: usize,
+            pub max_events: usize,
+        }
+
+        impl Default for RecoveryLimits {
+            fn default() -> Self {
+                Self {
+                    max_deliveries: 4096,
+                    max_frame_bytes: 4 * 1024 * 1024,
+                    max_inbound_keys_per_peer: 8192,
+                    max_events: 1_000_000,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RecoveryError {
+            InvalidLimits,
+            Journal(JournalError),
+            TooManyEvents,
+            TooManyDeliveries,
+            FrameTooLarge,
+            InvalidIdentity,
+            EmptyFrame,
+            DuplicateDelivery(u64),
+            UnknownDelivery(u64),
+            InvalidTransition {
+                delivery_id: u64,
+                event: &'static str,
+            },
+            InvalidAttempt {
+                delivery_id: u64,
+                expected: u32,
+                actual: u32,
+            },
+            DuplicateInbound {
+                tenant_id: String,
+                peer_id: String,
+                frame_id: u64,
+            },
+            UnknownInbound {
+                tenant_id: String,
+                peer_id: String,
+                frame_id: u64,
+            },
+            InboundCapacity {
+                tenant_id: String,
+                peer_id: String,
+            },
+            DuplicatePrune(u64),
+            DeliveryIdRegression {
+                previous: u64,
+                next: u64,
+            },
+            SequenceExhausted,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct JournalRecoverySnapshot {
+            pub state: RecoverySnapshot,
+            pub valid_bytes: u64,
+            pub truncated_bytes: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RecoverySnapshot {
+            pub deliveries: BTreeMap<u64, RecoveredDelivery>,
+            pub inbound: BTreeMap<PeerKey, BTreeSet<u64>>,
+            pub last_delivery_id: u64,
+            pub event_count: usize,
+        }
+
+        impl RecoverySnapshot {
+            pub fn pending_count(&self) -> usize {
+                self.deliveries
+                    .values()
+                    .filter(|d| matches!(d.state, RecoveredState::Pending { .. }))
+                    .count()
+            }
+
+            pub fn leased_count(&self) -> usize {
+                self.deliveries
+                    .values()
+                    .filter(|d| matches!(d.state, RecoveredState::Leased { .. }))
+                    .count()
+            }
+
+            pub fn delivered_count(&self) -> usize {
+                self.deliveries
+                    .values()
+                    .filter(|d| matches!(d.state, RecoveredState::Delivered))
+                    .count()
+            }
+
+            pub fn failed_count(&self) -> usize {
+                self.deliveries
+                    .values()
+                    .filter(|d| matches!(d.state, RecoveredState::Failed))
+                    .count()
+            }
+
+            /// The next ID is strictly greater than every ID observed in the journal.
+            pub fn next_delivery_id(&self) -> Result<u64, RecoveryError> {
+                self.last_delivery_id
+                    .checked_add(1)
+                    .ok_or(RecoveryError::SequenceExhausted)
+            }
+        }
+
+        /// Opens a physical M059 journal, repairs only an incomplete trailing frame,
+        /// then validates and reconstructs the complete semantic delivery history.
+        pub fn recover_journal(
+            path: impl AsRef<Path>,
+            journal_limits: JournalLimits,
+            recovery_limits: &RecoveryLimits,
+        ) -> Result<JournalRecoverySnapshot, RecoveryError> {
+            let opened =
+                DeliveryJournal::open(path, journal_limits).map_err(RecoveryError::Journal)?;
+            let (_journal, physical) = opened;
+            let state = recover_events(&physical.events, recovery_limits)?;
+            Ok(JournalRecoverySnapshot {
+                state,
+                valid_bytes: physical.valid_bytes,
+                truncated_bytes: physical.truncated_bytes,
+            })
+        }
+
+        pub fn recover_events(
+            events: &[JournalEvent],
+            limits: &RecoveryLimits,
+        ) -> Result<RecoverySnapshot, RecoveryError> {
+            if limits.max_deliveries == 0
+                || limits.max_frame_bytes == 0
+                || limits.max_inbound_keys_per_peer == 0
+                || limits.max_events == 0
+            {
+                return Err(RecoveryError::InvalidLimits);
+            }
+            if events.len() > limits.max_events {
+                return Err(RecoveryError::TooManyEvents);
+            }
+
+            let mut deliveries: BTreeMap<u64, RecoveredDelivery> = BTreeMap::new();
+            let mut inbound: BTreeMap<PeerKey, BTreeSet<u64>> = BTreeMap::new();
+            let mut last_delivery_id = 0_u64;
+            let mut last_enqueued_id = 0_u64;
+            let mut saw_high_watermark = false;
+            let mut pruned = BTreeSet::new();
+
+            for (event_index, event) in events.iter().enumerate() {
+                match event {
+                    JournalEvent::Enqueued {
+                        delivery_id,
+                        tenant_id,
+                        peer_id,
+                        frame,
+                    } => {
+                        validate_identity(tenant_id, peer_id)?;
+                        if frame.is_empty() {
+                            return Err(RecoveryError::EmptyFrame);
+                        }
+                        if frame.len() > limits.max_frame_bytes {
+                            return Err(RecoveryError::FrameTooLarge);
+                        }
+                        if deliveries.contains_key(delivery_id) || pruned.contains(delivery_id) {
+                            return Err(RecoveryError::DuplicateDelivery(*delivery_id));
+                        }
+                        if *delivery_id <= last_enqueued_id {
+                            return Err(RecoveryError::DeliveryIdRegression {
+                                previous: last_enqueued_id,
+                                next: *delivery_id,
+                            });
+                        }
+                        if deliveries.len() >= limits.max_deliveries {
+                            return Err(RecoveryError::TooManyDeliveries);
+                        }
+                        last_enqueued_id = *delivery_id;
+                        last_delivery_id = last_delivery_id.max(*delivery_id);
+                        deliveries.insert(
+                            *delivery_id,
+                            RecoveredDelivery {
+                                delivery_id: *delivery_id,
+                                peer: PeerKey {
+                                    tenant_id: tenant_id.clone(),
+                                    peer_id: peer_id.clone(),
+                                },
+                                frame: frame.clone(),
+                                attempts: 0,
+                                state: RecoveredState::Pending { available_at_ms: 0 },
+                            },
+                        );
+                    }
+                    JournalEvent::Leased {
+                        delivery_id,
+                        attempt,
+                        lease_until_ms,
+                    } => {
+                        let record = delivery_mut(&mut deliveries, *delivery_id)?;
+                        if !matches!(record.state, RecoveredState::Pending { .. }) {
+                            return Err(transition(*delivery_id, "Leased"));
+                        }
+                        let expected = record
+                            .attempts
+                            .checked_add(1)
+                            .ok_or(RecoveryError::SequenceExhausted)?;
+                        if *attempt != expected {
+                            return Err(RecoveryError::InvalidAttempt {
+                                delivery_id: *delivery_id,
+                                expected,
+                                actual: *attempt,
+                            });
+                        }
+                        record.attempts = *attempt;
+                        record.state = RecoveredState::Leased {
+                            attempt: *attempt,
+                            lease_until_ms: *lease_until_ms,
+                        };
+                    }
+                    JournalEvent::Acknowledged { delivery_id } => {
+                        let record = delivery_mut(&mut deliveries, *delivery_id)?;
+                        if !matches!(record.state, RecoveredState::Leased { .. }) {
+                            return Err(transition(*delivery_id, "Acknowledged"));
+                        }
+                        record.state = RecoveredState::Delivered;
+                    }
+                    JournalEvent::RetryScheduled {
+                        delivery_id,
+                        available_at_ms,
+                    } => {
+                        let record = delivery_mut(&mut deliveries, *delivery_id)?;
+                        if !matches!(record.state, RecoveredState::Leased { .. }) {
+                            return Err(transition(*delivery_id, "RetryScheduled"));
+                        }
+                        record.state = RecoveredState::Pending {
+                            available_at_ms: *available_at_ms,
+                        };
+                    }
+                    JournalEvent::Failed { delivery_id } => {
+                        let record = delivery_mut(&mut deliveries, *delivery_id)?;
+                        if !matches!(
+                            record.state,
+                            RecoveredState::Leased { .. } | RecoveredState::Pending { .. }
+                        ) {
+                            return Err(transition(*delivery_id, "Failed"));
+                        }
+                        record.state = RecoveredState::Failed;
+                    }
+                    JournalEvent::InboundAccepted {
+                        tenant_id,
+                        peer_id,
+                        frame_id,
+                    } => {
+                        validate_identity(tenant_id, peer_id)?;
+                        let key = PeerKey {
+                            tenant_id: tenant_id.clone(),
+                            peer_id: peer_id.clone(),
+                        };
+                        let entries = inbound.entry(key.clone()).or_default();
+                        if entries.contains(frame_id) {
+                            return Err(RecoveryError::DuplicateInbound {
+                                tenant_id: key.tenant_id,
+                                peer_id: key.peer_id,
+                                frame_id: *frame_id,
+                            });
+                        }
+                        if entries.len() >= limits.max_inbound_keys_per_peer {
+                            return Err(RecoveryError::InboundCapacity {
+                                tenant_id: key.tenant_id,
+                                peer_id: key.peer_id,
+                            });
+                        }
+                        entries.insert(*frame_id);
+                    }
+                    JournalEvent::InboundForgotten {
+                        tenant_id,
+                        peer_id,
+                        frame_id,
+                    } => {
+                        validate_identity(tenant_id, peer_id)?;
+                        let key = PeerKey {
+                            tenant_id: tenant_id.clone(),
+                            peer_id: peer_id.clone(),
+                        };
+                        let entries =
+                            inbound
+                                .get_mut(&key)
+                                .ok_or_else(|| RecoveryError::UnknownInbound {
+                                    tenant_id: key.tenant_id.clone(),
+                                    peer_id: key.peer_id.clone(),
+                                    frame_id: *frame_id,
+                                })?;
+                        if !entries.remove(frame_id) {
+                            return Err(RecoveryError::UnknownInbound {
+                                tenant_id: key.tenant_id,
+                                peer_id: key.peer_id,
+                                frame_id: *frame_id,
+                            });
+                        }
+                        if entries.is_empty() {
+                            inbound.remove(&key);
+                        }
+                    }
+                    JournalEvent::TerminalPruned { delivery_id } => {
+                        let record = deliveries
+                            .get(delivery_id)
+                            .ok_or(RecoveryError::UnknownDelivery(*delivery_id))?;
+                        if !matches!(
+                            record.state,
+                            RecoveredState::Delivered | RecoveredState::Failed
+                        ) {
+                            return Err(transition(*delivery_id, "TerminalPruned"));
+                        }
+                        deliveries.remove(delivery_id);
+                        pruned.insert(*delivery_id);
+                    }
+                    JournalEvent::DeliveryIdHighWatermark {
+                        last_delivery_id: watermark,
+                    } => {
+                        if event_index != 0 || saw_high_watermark {
+                            return Err(transition(0, "DeliveryIdHighWatermark"));
+                        }
+                        saw_high_watermark = true;
+                        last_delivery_id = last_delivery_id.max(*watermark);
+                    }
+                }
+            }
+
+            Ok(RecoverySnapshot {
+                deliveries,
+                inbound,
+                last_delivery_id,
+                event_count: events.len(),
+            })
+        }
+
+        fn validate_identity(tenant_id: &str, peer_id: &str) -> Result<(), RecoveryError> {
+            if tenant_id.trim().is_empty() || peer_id.trim().is_empty() {
+                return Err(RecoveryError::InvalidIdentity);
+            }
+            Ok(())
+        }
+
+        fn delivery_mut(
+            deliveries: &mut BTreeMap<u64, RecoveredDelivery>,
+            id: u64,
+        ) -> Result<&mut RecoveredDelivery, RecoveryError> {
+            deliveries
+                .get_mut(&id)
+                .ok_or(RecoveryError::UnknownDelivery(id))
+        }
+
+        fn transition(id: u64, event: &'static str) -> RecoveryError {
+            RecoveryError::InvalidTransition {
+                delivery_id: id,
+                event,
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn enqueue(id: u64) -> JournalEvent {
+                JournalEvent::Enqueued {
+                    delivery_id: id,
+                    tenant_id: "tenant-a".into(),
+                    peer_id: "peer-b".into(),
+                    frame: vec![1, 2, 3],
+                }
+            }
+
+            fn limits() -> RecoveryLimits {
+                RecoveryLimits {
+                    max_deliveries: 8,
+                    max_frame_bytes: 64,
+                    max_inbound_keys_per_peer: 4,
+                    max_events: 32,
+                }
+            }
+
+            #[test]
+            fn reconstructs_delivery_states_and_attempt_counts() {
+                let events = vec![
+                    enqueue(1),
+                    JournalEvent::Leased {
+                        delivery_id: 1,
+                        attempt: 1,
+                        lease_until_ms: 50,
+                    },
+                    JournalEvent::RetryScheduled {
+                        delivery_id: 1,
+                        available_at_ms: 60,
+                    },
+                    JournalEvent::Leased {
+                        delivery_id: 1,
+                        attempt: 2,
+                        lease_until_ms: 90,
+                    },
+                    JournalEvent::Acknowledged { delivery_id: 1 },
+                    enqueue(2),
+                    JournalEvent::Leased {
+                        delivery_id: 2,
+                        attempt: 1,
+                        lease_until_ms: 80,
+                    },
+                    JournalEvent::Failed { delivery_id: 2 },
+                ];
+                let snapshot = recover_events(&events, &limits());
+                assert!(snapshot.is_ok());
+                if let Ok(snapshot) = snapshot {
+                    assert_eq!(snapshot.delivered_count(), 1);
+                    assert_eq!(snapshot.failed_count(), 1);
+                    assert_eq!(snapshot.deliveries.get(&1).map(|d| d.attempts), Some(2));
+                    assert_eq!(snapshot.next_delivery_id(), Ok(3));
+                }
+            }
+
+            #[test]
+            fn rejects_invalid_transition_and_attempt_jump() {
+                assert_eq!(
+                    recover_events(
+                        &[enqueue(1), JournalEvent::Acknowledged { delivery_id: 1 }],
+                        &limits()
+                    ),
+                    Err(RecoveryError::InvalidTransition {
+                        delivery_id: 1,
+                        event: "Acknowledged"
+                    })
+                );
+                assert_eq!(
+                    recover_events(
+                        &[
+                            enqueue(1),
+                            JournalEvent::Leased {
+                                delivery_id: 1,
+                                attempt: 3,
+                                lease_until_ms: 20
+                            },
+                        ],
+                        &limits()
+                    ),
+                    Err(RecoveryError::InvalidAttempt {
+                        delivery_id: 1,
+                        expected: 1,
+                        actual: 3
+                    })
+                );
+            }
+
+            #[test]
+            fn rebuilds_inbound_deduplication_and_forgotten_entries() {
+                let events = vec![
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 5,
+                    },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 6,
+                    },
+                    JournalEvent::InboundForgotten {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 5,
+                    },
+                ];
+                let snapshot = recover_events(&events, &limits());
+                assert!(snapshot.is_ok());
+                if let Ok(snapshot) = snapshot {
+                    let key = PeerKey {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                    };
+                    assert_eq!(
+                        snapshot.inbound.get(&key).cloned(),
+                        Some(BTreeSet::from([6]))
+                    );
+                }
+            }
+
+            #[test]
+            fn prunes_only_terminal_deliveries_and_preserves_id_high_watermark() {
+                let events = vec![
+                    enqueue(1),
+                    JournalEvent::Leased {
+                        delivery_id: 1,
+                        attempt: 1,
+                        lease_until_ms: 5,
+                    },
+                    JournalEvent::Acknowledged { delivery_id: 1 },
+                    JournalEvent::TerminalPruned { delivery_id: 1 },
+                ];
+                let snapshot = recover_events(&events, &limits());
+                assert!(snapshot.is_ok());
+                if let Ok(snapshot) = snapshot {
+                    assert!(snapshot.deliveries.is_empty());
+                    assert_eq!(snapshot.last_delivery_id, 1);
+                    assert_eq!(snapshot.next_delivery_id(), Ok(2));
+                }
+            }
+
+            #[test]
+            fn enforces_history_and_resource_limits() {
+                let small = RecoveryLimits {
+                    max_events: 1,
+                    ..limits()
+                };
+                assert_eq!(
+                    recover_events(&[enqueue(1), enqueue(2)], &small),
+                    Err(RecoveryError::TooManyEvents)
+                );
+                let small_frames = RecoveryLimits {
+                    max_frame_bytes: 2,
+                    ..limits()
+                };
+                assert_eq!(
+                    recover_events(&[enqueue(1)], &small_frames),
+                    Err(RecoveryError::FrameTooLarge)
+                );
+            }
+        }
+    }
+    pub mod x061 {
+        //! Canonical compaction for replay delta delivery journals.
+        //!
+        //! Compaction first performs physical and semantic recovery, then writes a
+        //! canonical event stream to a new file and atomically publishes it with rename.
+        //! Complete source records are retained; M060 may truncate an incomplete final
+        //! frame during recovery. A high-watermark event preserves IDs allocated by
+        //! records that have already been pruned.
+
+        use crate::agentmem::x059::{DeliveryJournal, JournalError, JournalEvent, JournalLimits};
+        use crate::agentmem::x060::{
+            recover_journal, RecoveredState, RecoveryError, RecoveryLimits,
+        };
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CompactionReport {
+            pub source_valid_bytes: u64,
+            pub source_truncated_bytes: u64,
+            pub destination_bytes: u64,
+            pub source_event_count: usize,
+            pub compacted_event_count: usize,
+            pub retained_deliveries: usize,
+            pub retained_inbound_keys: usize,
+            pub last_delivery_id: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum CompactionError {
+            Recovery(RecoveryError),
+            Journal(JournalError),
+            DestinationExists,
+            SameSourceAndDestination,
+            InvalidDestination,
+            EventCountExceeded,
+            Io(String),
+        }
+
+        impl From<RecoveryError> for CompactionError {
+            fn from(value: RecoveryError) -> Self {
+                Self::Recovery(value)
+            }
+        }
+
+        impl From<JournalError> for CompactionError {
+            fn from(value: JournalError) -> Self {
+                Self::Journal(value)
+            }
+        }
+
+        impl From<std::io::Error> for CompactionError {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value.to_string())
+            }
+        }
+
+        /// Produces a deterministic minimal event history representing the recovered state.
+        pub fn canonical_events(
+            snapshot: &crate::agentmem::x060::RecoverySnapshot,
+        ) -> Result<Vec<JournalEvent>, CompactionError> {
+            let mut events = Vec::new();
+            events.push(JournalEvent::DeliveryIdHighWatermark {
+                last_delivery_id: snapshot.last_delivery_id,
+            });
+
+            for delivery in snapshot.deliveries.values() {
+                events.push(JournalEvent::Enqueued {
+                    delivery_id: delivery.delivery_id,
+                    tenant_id: delivery.peer.tenant_id.clone(),
+                    peer_id: delivery.peer.peer_id.clone(),
+                    frame: delivery.frame.clone(),
+                });
+
+                match delivery.state {
+                    RecoveredState::Pending { available_at_ms } => {
+                        append_prior_attempts(
+                            &mut events,
+                            delivery.delivery_id,
+                            delivery.attempts,
+                            Some(available_at_ms),
+                            None,
+                        );
+                    }
+                    RecoveredState::Leased {
+                        attempt,
+                        lease_until_ms,
+                    } => {
+                        if attempt != delivery.attempts {
+                            return Err(CompactionError::Recovery(RecoveryError::InvalidAttempt {
+                                delivery_id: delivery.delivery_id,
+                                expected: delivery.attempts,
+                                actual: attempt,
+                            }));
+                        }
+                        append_prior_attempts(
+                            &mut events,
+                            delivery.delivery_id,
+                            delivery.attempts,
+                            None,
+                            Some(lease_until_ms),
+                        );
+                    }
+                    RecoveredState::Delivered => {
+                        if delivery.attempts == 0 {
+                            return Err(CompactionError::InvalidDestination);
+                        }
+                        append_prior_attempts(
+                            &mut events,
+                            delivery.delivery_id,
+                            delivery.attempts,
+                            None,
+                            Some(0),
+                        );
+                        events.push(JournalEvent::Acknowledged {
+                            delivery_id: delivery.delivery_id,
+                        });
+                    }
+                    RecoveredState::Failed => {
+                        if delivery.attempts == 0 {
+                            events.push(JournalEvent::Failed {
+                                delivery_id: delivery.delivery_id,
+                            });
+                        } else {
+                            append_prior_attempts(
+                                &mut events,
+                                delivery.delivery_id,
+                                delivery.attempts,
+                                None,
+                                Some(0),
+                            );
+                            events.push(JournalEvent::Failed {
+                                delivery_id: delivery.delivery_id,
+                            });
+                        }
+                    }
+                }
+            }
+
+            for (peer, frame_ids) in &snapshot.inbound {
+                for frame_id in frame_ids {
+                    events.push(JournalEvent::InboundAccepted {
+                        tenant_id: peer.tenant_id.clone(),
+                        peer_id: peer.peer_id.clone(),
+                        frame_id: *frame_id,
+                    });
+                }
+            }
+            Ok(events)
+        }
+
+        /// Adds the historical attempts needed to reconstruct a current delivery state.
+        /// `pending_at` selects a final RetryScheduled; `leased_until` selects a final
+        /// Leased event. Earlier attempts are represented as lease/retry pairs.
+        fn append_prior_attempts(
+            events: &mut Vec<JournalEvent>,
+            delivery_id: u64,
+            attempts: u32,
+            pending_at: Option<u64>,
+            leased_until: Option<u64>,
+        ) {
+            if attempts == 0 {
+                return;
+            }
+            for attempt in 1..=attempts {
+                let is_last = attempt == attempts;
+                let lease_until_ms = if is_last {
+                    leased_until.unwrap_or(0)
+                } else {
+                    0
+                };
+                events.push(JournalEvent::Leased {
+                    delivery_id,
+                    attempt,
+                    lease_until_ms,
+                });
+                if !is_last || pending_at.is_some() {
+                    events.push(JournalEvent::RetryScheduled {
+                        delivery_id,
+                        available_at_ms: if is_last { pending_at.unwrap_or(0) } else { 0 },
+                    });
+                }
+            }
+        }
+
+        /// Compacts `source` into a new `destination`.
+        ///
+        /// Destination must not already exist. A temporary sibling is fully written
+        /// and synced before an atomic hard-link publication, which will not overwrite
+        /// an existing destination. The source's valid prefix is preserved; recovery
+        /// may truncate an incomplete final frame. Do not use the same path for both.
+        pub fn compact_journal(
+            source: impl AsRef<Path>,
+            destination: impl AsRef<Path>,
+            journal_limits: JournalLimits,
+            recovery_limits: &RecoveryLimits,
+        ) -> Result<CompactionReport, CompactionError> {
+            let source = source.as_ref();
+            let destination = destination.as_ref();
+            if source == destination {
+                return Err(CompactionError::SameSourceAndDestination);
+            }
+            if destination.exists() {
+                return Err(CompactionError::DestinationExists);
+            }
+            let parent = destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !parent.is_dir() {
+                return Err(CompactionError::InvalidDestination);
+            }
+
+            let recovered = recover_journal(source, journal_limits.clone(), recovery_limits)?;
+            let events = canonical_events(&recovered.state)?;
+            if events.len() > journal_limits.max_events {
+                return Err(CompactionError::EventCountExceeded);
+            }
+
+            let temp = temporary_sibling(destination);
+            if temp.exists() {
+                fs::remove_file(&temp)?;
+            }
+
+            let write_result = (|| -> Result<u64, CompactionError> {
+                let opened = DeliveryJournal::open(&temp, journal_limits)?;
+                let (mut journal, recovery) = opened;
+                if !recovery.events.is_empty() {
+                    return Err(CompactionError::InvalidDestination);
+                }
+                for event in &events {
+                    journal.append(event)?;
+                }
+                journal.sync()?;
+                Ok(journal.len_bytes())
+            })();
+
+            let destination_bytes = match write_result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(error);
+                }
+            };
+
+            if destination.exists() {
+                let _ = fs::remove_file(&temp);
+                return Err(CompactionError::DestinationExists);
+            }
+            if let Err(error) = fs::hard_link(&temp, destination) {
+                let _ = fs::remove_file(&temp);
+                return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    CompactionError::DestinationExists
+                } else {
+                    CompactionError::Io(error.to_string())
+                });
+            }
+            fs::remove_file(&temp)?;
+
+            Ok(CompactionReport {
+                source_valid_bytes: recovered.valid_bytes,
+                source_truncated_bytes: recovered.truncated_bytes,
+                destination_bytes,
+                source_event_count: recovered.state.event_count,
+                compacted_event_count: events.len(),
+                retained_deliveries: recovered.state.deliveries.len(),
+                retained_inbound_keys: recovered.state.inbound.values().map(|set| set.len()).sum(),
+                last_delivery_id: recovered.state.last_delivery_id,
+            })
+        }
+
+        fn temporary_sibling(destination: &Path) -> PathBuf {
+            let mut name = destination.as_os_str().to_os_string();
+            name.push(".agentos-compacting");
+            PathBuf::from(name)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::x060::{recover_events, PeerKey, RecoveryLimits};
+            use std::collections::{BTreeMap, BTreeSet};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            fn temp_path(label: &str) -> PathBuf {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|v| v.as_nanos())
+                    .unwrap_or(0);
+                std::env::temp_dir().join(format!("agentos-m061-{label}-{nonce}.journal"))
+            }
+
+            fn recovery_limits() -> RecoveryLimits {
+                RecoveryLimits {
+                    max_deliveries: 16,
+                    max_frame_bytes: 1024,
+                    max_inbound_keys_per_peer: 16,
+                    max_events: 256,
+                }
+            }
+
+            fn populated_snapshot() -> crate::agentmem::x060::RecoverySnapshot {
+                let events = vec![
+                    JournalEvent::DeliveryIdHighWatermark {
+                        last_delivery_id: 12,
+                    },
+                    JournalEvent::Enqueued {
+                        delivery_id: 4,
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame: vec![1, 2],
+                    },
+                    JournalEvent::Leased {
+                        delivery_id: 4,
+                        attempt: 1,
+                        lease_until_ms: 50,
+                    },
+                    JournalEvent::RetryScheduled {
+                        delivery_id: 4,
+                        available_at_ms: 60,
+                    },
+                    JournalEvent::Leased {
+                        delivery_id: 4,
+                        attempt: 2,
+                        lease_until_ms: 90,
+                    },
+                    JournalEvent::Enqueued {
+                        delivery_id: 9,
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame: vec![3, 4],
+                    },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 20,
+                    },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 21,
+                    },
+                ];
+                match recover_events(&events, &recovery_limits()) {
+                    Ok(value) => value,
+                    Err(_) => crate::agentmem::x060::RecoverySnapshot {
+                        deliveries: BTreeMap::new(),
+                        inbound: BTreeMap::<PeerKey, BTreeSet<u64>>::new(),
+                        last_delivery_id: 0,
+                        event_count: 0,
+                    },
+                }
+            }
+
+            #[test]
+            fn canonical_events_round_trip_to_same_logical_state() {
+                let snapshot = populated_snapshot();
+                let canonical = canonical_events(&snapshot);
+                assert!(canonical.is_ok());
+                if let Ok(events) = canonical {
+                    let recovered = recover_events(&events, &recovery_limits());
+                    assert!(recovered.is_ok());
+                    if let Ok(recovered) = recovered {
+                        assert_eq!(recovered.deliveries, snapshot.deliveries);
+                        assert_eq!(recovered.inbound, snapshot.inbound);
+                        assert_eq!(recovered.last_delivery_id, snapshot.last_delivery_id);
+                    }
+                }
+            }
+
+            #[test]
+            fn compaction_writes_new_file_and_preserves_source() {
+                let source = temp_path("source");
+                let destination = temp_path("destination");
+                let limits = JournalLimits::default();
+                {
+                    let opened = DeliveryJournal::open(&source, limits.clone());
+                    assert!(opened.is_ok());
+                    if let Ok((mut journal, _)) = opened {
+                        let event = JournalEvent::Enqueued {
+                            delivery_id: 5,
+                            tenant_id: "tenant".into(),
+                            peer_id: "peer".into(),
+                            frame: vec![7, 8, 9],
+                        };
+                        assert!(journal.append(&event).is_ok());
+                    }
+                }
+                let before = fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
+                let result = compact_journal(&source, &destination, limits, &recovery_limits());
+                assert!(result.is_ok());
+                if let Ok(report) = result {
+                    assert_eq!(report.source_event_count, 1);
+                    assert!(report.compacted_event_count >= 2);
+                    assert_eq!(fs::metadata(&source).map(|m| m.len()).unwrap_or(0), before);
+                    let reopened =
+                        recover_journal(&destination, JournalLimits::default(), &recovery_limits());
+                    assert!(reopened.is_ok());
+                }
+                let _ = fs::remove_file(source);
+                let _ = fs::remove_file(destination);
+            }
+
+            #[test]
+            fn rejects_existing_destination_and_same_path() {
+                let source = temp_path("same");
+                let _ = fs::write(&source, []);
+                assert_eq!(
+                    compact_journal(
+                        &source,
+                        &source,
+                        JournalLimits::default(),
+                        &recovery_limits()
+                    ),
+                    Err(CompactionError::SameSourceAndDestination)
+                );
+                let destination = temp_path("exists");
+                let _ = fs::write(&destination, [1]);
+                assert_eq!(
+                    compact_journal(
+                        &source,
+                        &destination,
+                        JournalLimits::default(),
+                        &recovery_limits()
+                    ),
+                    Err(CompactionError::DestinationExists)
+                );
+                let _ = fs::remove_file(source);
+                let _ = fs::remove_file(destination);
+            }
+        }
+    }
+    pub mod x062 {
+        //! Retention planning and safe event selection for replay delta delivery journals.
+        //!
+        //! This module separates policy from mutation: it computes a deterministic plan
+        //! from a recovered snapshot and a caller-supplied time. It never deletes journal
+        //! records itself. The plan can be reviewed and then applied by producing a new
+        //! canonical journal using M061 compaction.
+
+        use crate::agentmem::x059::JournalEvent;
+        use crate::agentmem::x060::{PeerKey, RecoveredDelivery, RecoveredState, RecoverySnapshot};
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RetentionPolicy {
+            /// Terminal deliveries older than this age are eligible for pruning.
+            pub terminal_retention_ms: u64,
+            /// Inbound replay IDs older than this age are eligible for forgetting.
+            pub inbound_retention_ms: u64,
+            /// Maximum number of retained terminal deliveries, newest first.
+            pub max_terminal_deliveries: usize,
+            /// Maximum number of retained inbound IDs per tenant/peer.
+            pub max_inbound_ids_per_peer: usize,
+        }
+
+        impl Default for RetentionPolicy {
+            fn default() -> Self {
+                Self {
+                    terminal_retention_ms: 7 * 24 * 60 * 60 * 1000,
+                    inbound_retention_ms: 24 * 60 * 60 * 1000,
+                    max_terminal_deliveries: 4096,
+                    max_inbound_ids_per_peer: 8192,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct DeliveryAge {
+            pub delivery_id: u64,
+            pub terminal_at_ms: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct InboundAge {
+            pub peer: PeerKey,
+            pub frame_id: u64,
+            pub accepted_at_ms: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RetentionInput {
+            pub now_ms: u64,
+            pub terminal_times: BTreeMap<u64, u64>,
+            pub inbound_times: BTreeMap<(PeerKey, u64), u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RetentionPlan {
+            pub generated_at_ms: u64,
+            pub prune_delivery_ids: Vec<u64>,
+            pub forget_inbound: Vec<(PeerKey, u64)>,
+            pub retained_terminal_count: usize,
+            pub retained_inbound_counts: BTreeMap<PeerKey, usize>,
+            pub missing_terminal_timestamps: Vec<u64>,
+            pub missing_inbound_timestamps: Vec<(PeerKey, u64)>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RetentionError {
+            InvalidPolicy,
+            FutureTimestamp { timestamp_ms: u64, now_ms: u64 },
+            UnknownDelivery(u64),
+            NonTerminalDelivery(u64),
+            UnknownInbound { peer: PeerKey, frame_id: u64 },
+        }
+
+        /// Builds a deterministic retention plan.
+        ///
+        /// Missing timestamps are conservatively retained and reported. Age-based
+        /// eligibility uses `now_ms.saturating_sub(timestamp)`. Count limits are applied
+        /// after age limits, retaining the newest terminal records and newest inbound IDs.
+        pub fn plan_retention(
+            snapshot: &RecoverySnapshot,
+            policy: &RetentionPolicy,
+            input: &RetentionInput,
+        ) -> Result<RetentionPlan, RetentionError> {
+            if policy.max_terminal_deliveries == 0 || policy.max_inbound_ids_per_peer == 0 {
+                return Err(RetentionError::InvalidPolicy);
+            }
+
+            let mut terminal = Vec::<(u64, u64)>::new();
+            let mut missing_terminal_timestamps = Vec::new();
+
+            for (id, timestamp) in &input.terminal_times {
+                let delivery = snapshot
+                    .deliveries
+                    .get(id)
+                    .ok_or(RetentionError::UnknownDelivery(*id))?;
+                if !matches!(
+                    delivery.state,
+                    RecoveredState::Delivered | RecoveredState::Failed
+                ) {
+                    return Err(RetentionError::NonTerminalDelivery(*id));
+                }
+                if *timestamp > input.now_ms {
+                    return Err(RetentionError::FutureTimestamp {
+                        timestamp_ms: *timestamp,
+                        now_ms: input.now_ms,
+                    });
+                }
+                terminal.push((*timestamp, *id));
+            }
+
+            for (id, delivery) in &snapshot.deliveries {
+                if matches!(
+                    delivery.state,
+                    RecoveredState::Delivered | RecoveredState::Failed
+                ) && !input.terminal_times.contains_key(id)
+                {
+                    missing_terminal_timestamps.push(*id);
+                }
+            }
+
+            // Oldest first for pruning; deterministic tie-break by ID.
+            terminal.sort_by_key(|(timestamp, id)| (*timestamp, *id));
+            let mut prune_delivery_ids = Vec::new();
+            let mut retained_terminal = Vec::<(u64, u64)>::new();
+
+            for (timestamp, id) in terminal {
+                let age = input.now_ms.saturating_sub(timestamp);
+                if age >= policy.terminal_retention_ms {
+                    prune_delivery_ids.push(id);
+                } else {
+                    retained_terminal.push((timestamp, id));
+                }
+            }
+
+            // Retain newest by timestamp, then larger delivery ID on ties.
+            retained_terminal.sort_by_key(|(timestamp, id)| {
+                (std::cmp::Reverse(*timestamp), std::cmp::Reverse(*id))
+            });
+            if retained_terminal.len() > policy.max_terminal_deliveries {
+                for (_, id) in retained_terminal.drain(policy.max_terminal_deliveries..) {
+                    prune_delivery_ids.push(id);
+                }
+            }
+            prune_delivery_ids.sort_unstable();
+
+            let mut inbound_candidates = BTreeMap::<PeerKey, Vec<(u64, u64)>>::new();
+            let mut missing_inbound_timestamps = Vec::new();
+
+            for (peer, ids) in &snapshot.inbound {
+                for frame_id in ids {
+                    let key = (peer.clone(), *frame_id);
+                    match input.inbound_times.get(&key) {
+                        Some(timestamp) => {
+                            if *timestamp > input.now_ms {
+                                return Err(RetentionError::FutureTimestamp {
+                                    timestamp_ms: *timestamp,
+                                    now_ms: input.now_ms,
+                                });
+                            }
+                            inbound_candidates
+                                .entry(peer.clone())
+                                .or_default()
+                                .push((*timestamp, *frame_id));
+                        }
+                        None => missing_inbound_timestamps.push(key),
+                    }
+                }
+            }
+
+            let mut forget_inbound = Vec::new();
+            let mut retained_inbound_counts = BTreeMap::new();
+
+            for (peer, mut candidates) in inbound_candidates {
+                candidates.sort_by_key(|(timestamp, id)| (*timestamp, *id));
+                let mut retained = Vec::new();
+                for (timestamp, id) in candidates {
+                    if input.now_ms.saturating_sub(timestamp) >= policy.inbound_retention_ms {
+                        forget_inbound.push((peer.clone(), id));
+                    } else {
+                        retained.push((timestamp, id));
+                    }
+                }
+                retained.sort_by_key(|(timestamp, id)| {
+                    (std::cmp::Reverse(*timestamp), std::cmp::Reverse(*id))
+                });
+                if retained.len() > policy.max_inbound_ids_per_peer {
+                    for (_, id) in retained.drain(policy.max_inbound_ids_per_peer..) {
+                        forget_inbound.push((peer.clone(), id));
+                    }
+                }
+                let retained_count = snapshot
+                    .inbound
+                    .get(&peer)
+                    .map(|ids| ids.len())
+                    .unwrap_or(0)
+                    .saturating_sub(forget_inbound.iter().filter(|(p, _)| p == &peer).count());
+                retained_inbound_counts.insert(peer, retained_count);
+            }
+
+            // Peers whose every timestamp is missing are conservatively retained too.
+            // Include them in the summary rather than silently omitting their counts.
+            for (peer, ids) in &snapshot.inbound {
+                retained_inbound_counts
+                    .entry(peer.clone())
+                    .or_insert(ids.len());
+            }
+
+            forget_inbound.sort();
+            missing_terminal_timestamps.sort_unstable();
+            missing_inbound_timestamps.sort();
+
+            let pruned_count = prune_delivery_ids.len();
+            Ok(RetentionPlan {
+                generated_at_ms: input.now_ms,
+                prune_delivery_ids,
+                forget_inbound,
+                retained_terminal_count: snapshot
+                    .deliveries
+                    .values()
+                    .filter(|delivery| {
+                        matches!(
+                            delivery.state,
+                            RecoveredState::Delivered | RecoveredState::Failed
+                        )
+                    })
+                    .count()
+                    .saturating_sub(pruned_count),
+                retained_inbound_counts,
+                missing_terminal_timestamps,
+                missing_inbound_timestamps,
+            })
+        }
+
+        /// Converts a retention plan into explicit journal events. The caller must
+        /// append these events to a new journal or otherwise apply them transactionally.
+        pub fn retention_events(plan: &RetentionPlan) -> Vec<JournalEvent> {
+            let mut events = Vec::new();
+            for delivery_id in &plan.prune_delivery_ids {
+                events.push(JournalEvent::TerminalPruned {
+                    delivery_id: *delivery_id,
+                });
+            }
+            for (peer, frame_id) in &plan.forget_inbound {
+                events.push(JournalEvent::InboundForgotten {
+                    tenant_id: peer.tenant_id.clone(),
+                    peer_id: peer.peer_id.clone(),
+                    frame_id: *frame_id,
+                });
+            }
+            events
+        }
+
+        /// Returns the state class for a delivery; useful to keep active deliveries
+        /// excluded from retention workflows even when the caller supplies timestamps.
+        pub fn is_active(delivery: &RecoveredDelivery) -> bool {
+            matches!(
+                delivery.state,
+                RecoveredState::Pending { .. } | RecoveredState::Leased { .. }
+            )
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use std::collections::{BTreeMap, BTreeSet};
+
+            fn snapshot() -> RecoverySnapshot {
+                let peer = PeerKey {
+                    tenant_id: "t".into(),
+                    peer_id: "p".into(),
+                };
+                let mut deliveries = BTreeMap::new();
+                deliveries.insert(
+                    1,
+                    RecoveredDelivery {
+                        delivery_id: 1,
+                        peer: peer.clone(),
+                        frame: vec![1],
+                        attempts: 1,
+                        state: RecoveredState::Delivered,
+                    },
+                );
+                deliveries.insert(
+                    2,
+                    RecoveredDelivery {
+                        delivery_id: 2,
+                        peer: peer.clone(),
+                        frame: vec![2],
+                        attempts: 0,
+                        state: RecoveredState::Pending {
+                            available_at_ms: 100,
+                        },
+                    },
+                );
+                let mut inbound = BTreeMap::new();
+                inbound.insert(peer, BTreeSet::from([10, 11, 12]));
+                RecoverySnapshot {
+                    deliveries,
+                    inbound,
+                    last_delivery_id: 2,
+                    event_count: 4,
+                }
+            }
+
+            #[test]
+            fn prunes_old_terminal_and_inbound_entries() {
+                let state = snapshot();
+                let peer = state.inbound.keys().next().cloned().unwrap_or(PeerKey {
+                    tenant_id: "t".into(),
+                    peer_id: "p".into(),
+                });
+                let policy = RetentionPolicy {
+                    terminal_retention_ms: 100,
+                    inbound_retention_ms: 50,
+                    ..RetentionPolicy::default()
+                };
+                let input = RetentionInput {
+                    now_ms: 1000,
+                    terminal_times: BTreeMap::from([(1, 800)]),
+                    inbound_times: BTreeMap::from([
+                        ((peer.clone(), 10), 900),
+                        ((peer.clone(), 11), 980),
+                        ((peer, 12), 990),
+                    ]),
+                };
+                let plan = plan_retention(&state, &policy, &input);
+                assert!(plan.is_ok());
+                if let Ok(plan) = plan {
+                    assert_eq!(plan.prune_delivery_ids, vec![1]);
+                    assert_eq!(
+                        plan.forget_inbound,
+                        vec![(
+                            PeerKey {
+                                tenant_id: "t".into(),
+                                peer_id: "p".into()
+                            },
+                            10
+                        )]
+                    );
+                }
+            }
+
+            #[test]
+            fn count_limits_retain_newest_and_preserve_unknown_age() {
+                let state = snapshot();
+                let peer = state.inbound.keys().next().cloned().unwrap_or(PeerKey {
+                    tenant_id: "t".into(),
+                    peer_id: "p".into(),
+                });
+                let policy = RetentionPolicy {
+                    terminal_retention_ms: 10_000,
+                    inbound_retention_ms: 10_000,
+                    max_inbound_ids_per_peer: 1,
+                    ..RetentionPolicy::default()
+                };
+                let input = RetentionInput {
+                    now_ms: 1000,
+                    terminal_times: BTreeMap::from([(1, 999)]),
+                    inbound_times: BTreeMap::from([
+                        ((peer.clone(), 10), 900),
+                        ((peer.clone(), 11), 950),
+                    ]),
+                };
+                let plan = plan_retention(&state, &policy, &input);
+                assert!(plan.is_ok());
+                if let Ok(plan) = plan {
+                    assert_eq!(
+                        plan.forget_inbound,
+                        vec![(
+                            PeerKey {
+                                tenant_id: "t".into(),
+                                peer_id: "p".into()
+                            },
+                            10
+                        )]
+                    );
+                    assert_eq!(
+                        plan.missing_inbound_timestamps,
+                        vec![(
+                            PeerKey {
+                                tenant_id: "t".into(),
+                                peer_id: "p".into()
+                            },
+                            12
+                        )]
+                    );
+                }
+            }
+
+            #[test]
+            fn rejects_future_and_nonterminal_timestamps() {
+                let state = snapshot();
+                let future = RetentionInput {
+                    now_ms: 10,
+                    terminal_times: BTreeMap::from([(1, 11)]),
+                    inbound_times: BTreeMap::new(),
+                };
+                assert!(matches!(
+                    plan_retention(&state, &RetentionPolicy::default(), &future),
+                    Err(RetentionError::FutureTimestamp { .. })
+                ));
+                let nonterminal = RetentionInput {
+                    now_ms: 10,
+                    terminal_times: BTreeMap::from([(2, 1)]),
+                    inbound_times: BTreeMap::new(),
+                };
+                assert_eq!(
+                    plan_retention(&state, &RetentionPolicy::default(), &nonterminal),
+                    Err(RetentionError::NonTerminalDelivery(2))
+                );
+            }
+        }
+    }
+    pub mod x063 {
+        //! Applies a reviewed M062 retention plan by producing a compacted journal.
+        //!
+        //! The source journal is never rewritten. The retained semantic snapshot is
+        //! canonicalized with M061, written and synced to a unique sibling temporary
+        //! file, then published with a no-overwrite hard link.
+
+        use crate::agentmem::x059::{DeliveryJournal, JournalError, JournalLimits};
+        use crate::agentmem::x060::{
+            recover_journal, RecoveryError, RecoveryLimits, RecoverySnapshot,
+        };
+        use crate::agentmem::x061::{canonical_events, CompactionError};
+        use crate::agentmem::x062::{
+            plan_retention, RetentionError, RetentionInput, RetentionPlan, RetentionPolicy,
+        };
+        use std::fs::{self, OpenOptions};
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RetentionCompactionReport {
+            pub source_valid_bytes: u64,
+            pub source_truncated_bytes: u64,
+            pub destination_bytes: u64,
+            pub source_events: usize,
+            pub destination_events: usize,
+            pub removed_deliveries: usize,
+            pub removed_inbound_ids: usize,
+            pub retained_deliveries: usize,
+            pub retained_inbound_ids: usize,
+            pub last_delivery_id: u64,
+            pub plan: RetentionPlan,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ApplyError {
+            Recovery(RecoveryError),
+            Retention(RetentionError),
+            Compaction(CompactionError),
+            Journal(JournalError),
+            SameSourceAndDestination,
+            DestinationExists,
+            InvalidDestination,
+            EventCountExceeded,
+            TemporaryFileCollision,
+            Io(String),
+        }
+
+        impl From<RecoveryError> for ApplyError {
+            fn from(value: RecoveryError) -> Self {
+                Self::Recovery(value)
+            }
+        }
+        impl From<RetentionError> for ApplyError {
+            fn from(value: RetentionError) -> Self {
+                Self::Retention(value)
+            }
+        }
+        impl From<JournalError> for ApplyError {
+            fn from(value: JournalError) -> Self {
+                Self::Journal(value)
+            }
+        }
+        impl From<CompactionError> for ApplyError {
+            fn from(value: CompactionError) -> Self {
+                Self::Compaction(value)
+            }
+        }
+        impl From<std::io::Error> for ApplyError {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value.to_string())
+            }
+        }
+
+        /// Recovers `source`, computes a retention plan, applies it to a cloned
+        /// snapshot, and atomically publishes a new compacted journal at `destination`.
+        ///
+        /// `destination` must not exist and must be on a filesystem supporting hard
+        /// links. The source remains intact (apart from M059/M060's permitted truncation
+        /// of an incomplete trailing frame). Missing retention timestamps are retained.
+        pub fn retain_and_compact(
+            source: impl AsRef<Path>,
+            destination: impl AsRef<Path>,
+            policy: &RetentionPolicy,
+            input: &RetentionInput,
+            journal_limits: JournalLimits,
+            recovery_limits: &RecoveryLimits,
+        ) -> Result<RetentionCompactionReport, ApplyError> {
+            let source = source.as_ref();
+            let destination = destination.as_ref();
+            if source == destination {
+                return Err(ApplyError::SameSourceAndDestination);
+            }
+            if destination.exists() {
+                return Err(ApplyError::DestinationExists);
+            }
+            let parent = destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !parent.is_dir() {
+                return Err(ApplyError::InvalidDestination);
+            }
+
+            let recovered = recover_journal(source, journal_limits.clone(), recovery_limits)?;
+            let plan = plan_retention(&recovered.state, policy, input)?;
+            let mut retained = recovered.state.clone();
+            apply_plan(&mut retained, &plan)?;
+
+            let events = canonical_events(&retained)?;
+            if events.len() > journal_limits.max_events {
+                return Err(ApplyError::EventCountExceeded);
+            }
+
+            let temp = reserve_temporary_sibling(destination)?;
+            let write_result = (|| -> Result<u64, ApplyError> {
+                let (mut journal, recovery) = DeliveryJournal::open(&temp, journal_limits)?;
+                if !recovery.events.is_empty() {
+                    return Err(ApplyError::TemporaryFileCollision);
+                }
+                for event in &events {
+                    journal.append(event)?;
+                }
+                journal.sync()?;
+                Ok(journal.len_bytes())
+            })();
+
+            let destination_bytes = match write_result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(error);
+                }
+            };
+
+            if destination.exists() {
+                let _ = fs::remove_file(&temp);
+                return Err(ApplyError::DestinationExists);
+            }
+            if let Err(error) = fs::hard_link(&temp, destination) {
+                let _ = fs::remove_file(&temp);
+                return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ApplyError::DestinationExists
+                } else {
+                    ApplyError::Io(error.to_string())
+                });
+            }
+            fs::remove_file(&temp)?;
+
+            let removed_deliveries = plan.prune_delivery_ids.len();
+            let removed_inbound_ids = plan.forget_inbound.len();
+            let retained_deliveries = retained.deliveries.len();
+            let retained_inbound_ids = retained.inbound.values().map(|ids| ids.len()).sum();
+
+            Ok(RetentionCompactionReport {
+                source_valid_bytes: recovered.valid_bytes,
+                source_truncated_bytes: recovered.truncated_bytes,
+                destination_bytes,
+                source_events: recovered.state.event_count,
+                destination_events: events.len(),
+                removed_deliveries,
+                removed_inbound_ids,
+                retained_deliveries,
+                retained_inbound_ids,
+                last_delivery_id: retained.last_delivery_id,
+                plan,
+            })
+        }
+
+        fn apply_plan(
+            snapshot: &mut RecoverySnapshot,
+            plan: &RetentionPlan,
+        ) -> Result<(), ApplyError> {
+            for id in &plan.prune_delivery_ids {
+                let delivery = snapshot
+                    .deliveries
+                    .get(id)
+                    .ok_or(ApplyError::Retention(RetentionError::UnknownDelivery(*id)))?;
+                if !matches!(
+                    delivery.state,
+                    crate::agentmem::x060::RecoveredState::Delivered
+                        | crate::agentmem::x060::RecoveredState::Failed
+                ) {
+                    return Err(ApplyError::Retention(RetentionError::NonTerminalDelivery(
+                        *id,
+                    )));
+                }
+            }
+            for (peer, frame_id) in &plan.forget_inbound {
+                if !snapshot
+                    .inbound
+                    .get(peer)
+                    .map(|ids| ids.contains(frame_id))
+                    .unwrap_or(false)
+                {
+                    return Err(ApplyError::Retention(RetentionError::UnknownInbound {
+                        peer: peer.clone(),
+                        frame_id: *frame_id,
+                    }));
+                }
+            }
+
+            for id in &plan.prune_delivery_ids {
+                snapshot.deliveries.remove(id);
+            }
+            for (peer, frame_id) in &plan.forget_inbound {
+                let remove_peer = if let Some(ids) = snapshot.inbound.get_mut(peer) {
+                    ids.remove(frame_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_peer {
+                    snapshot.inbound.remove(peer);
+                }
+            }
+            Ok(())
+        }
+
+        fn reserve_temporary_sibling(destination: &Path) -> Result<PathBuf, ApplyError> {
+            for _ in 0..32 {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let mut name = destination.as_os_str().to_os_string();
+                name.push(format!(
+                    ".agentos-retention-{}-{sequence}.tmp",
+                    std::process::id()
+                ));
+                let candidate = PathBuf::from(name);
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(file) => {
+                        drop(file);
+                        return Ok(candidate);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(ApplyError::Io(error.to_string())),
+                }
+            }
+            Err(ApplyError::TemporaryFileCollision)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::x059::JournalEvent;
+            use crate::agentmem::x060::{
+                recover_events, PeerKey, RecoveredState, RecoverySnapshot,
+            };
+            use std::collections::{BTreeMap, BTreeSet};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            fn limits() -> RecoveryLimits {
+                RecoveryLimits {
+                    max_deliveries: 16,
+                    max_frame_bytes: 1024,
+                    max_inbound_keys_per_peer: 16,
+                    max_events: 256,
+                }
+            }
+
+            fn snapshot() -> RecoverySnapshot {
+                let events = vec![
+                    JournalEvent::DeliveryIdHighWatermark {
+                        last_delivery_id: 8,
+                    },
+                    JournalEvent::Enqueued {
+                        delivery_id: 2,
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame: vec![1],
+                    },
+                    JournalEvent::Leased {
+                        delivery_id: 2,
+                        attempt: 1,
+                        lease_until_ms: 5,
+                    },
+                    JournalEvent::Acknowledged { delivery_id: 2 },
+                    JournalEvent::Enqueued {
+                        delivery_id: 7,
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame: vec![7],
+                    },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 10,
+                    },
+                    JournalEvent::InboundAccepted {
+                        tenant_id: "t".into(),
+                        peer_id: "p".into(),
+                        frame_id: 11,
+                    },
+                ];
+                recover_events(&events, &limits()).unwrap_or(RecoverySnapshot {
+                    deliveries: BTreeMap::new(),
+                    inbound: BTreeMap::<PeerKey, BTreeSet<u64>>::new(),
+                    last_delivery_id: 0,
+                    event_count: 0,
+                })
+            }
+
+            #[test]
+            fn applying_plan_preserves_active_state_and_high_watermark() {
+                let mut state = snapshot();
+                let peer = PeerKey {
+                    tenant_id: "t".into(),
+                    peer_id: "p".into(),
+                };
+                let plan = RetentionPlan {
+                    generated_at_ms: 100,
+                    prune_delivery_ids: vec![2],
+                    forget_inbound: vec![(peer.clone(), 10)],
+                    retained_terminal_count: 0,
+                    retained_inbound_counts: BTreeMap::from([(peer.clone(), 1)]),
+                    missing_terminal_timestamps: Vec::new(),
+                    missing_inbound_timestamps: Vec::new(),
+                };
+                assert!(apply_plan(&mut state, &plan).is_ok());
+                assert!(!state.deliveries.contains_key(&2));
+                assert!(matches!(
+                    state.deliveries.get(&7).map(|d| &d.state),
+                    Some(RecoveredState::Pending { .. })
+                ));
+                assert_eq!(
+                    state.inbound.get(&peer).cloned(),
+                    Some(BTreeSet::from([11]))
+                );
+                assert_eq!(state.last_delivery_id, 8);
+            }
+
+            #[test]
+            fn rejects_attempt_to_prune_active_delivery() {
+                let mut state = snapshot();
+                let plan = RetentionPlan {
+                    generated_at_ms: 100,
+                    prune_delivery_ids: vec![7],
+                    forget_inbound: Vec::new(),
+                    retained_terminal_count: 1,
+                    retained_inbound_counts: BTreeMap::new(),
+                    missing_terminal_timestamps: Vec::new(),
+                    missing_inbound_timestamps: Vec::new(),
+                };
+                assert!(matches!(
+                    apply_plan(&mut state, &plan),
+                    Err(ApplyError::Retention(RetentionError::NonTerminalDelivery(
+                        7
+                    )))
+                ));
+            }
+
+            #[test]
+            fn source_and_destination_must_differ() {
+                let path = std::env::temp_dir().join(format!(
+                    "agentos-m063-same-{}.journal",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|v| v.as_nanos())
+                        .unwrap_or(0)
+                ));
+                let result = retain_and_compact(
+                    &path,
+                    &path,
+                    &RetentionPolicy::default(),
+                    &RetentionInput {
+                        now_ms: 1,
+                        terminal_times: BTreeMap::new(),
+                        inbound_times: BTreeMap::new(),
+                    },
+                    JournalLimits::default(),
+                    &limits(),
+                );
+                assert_eq!(result, Err(ApplyError::SameSourceAndDestination));
+            }
+        }
+    }
+    pub mod x064 {
+        //! Independent validation of M062 delivery-retention plans.
+        //!
+        //! The verifier is deliberately read-only. It checks that requested removals
+        //! refer to existing terminal deliveries and inbound replay IDs, that lists are
+        //! canonical and duplicate-free, and that reported retained counts agree with
+        //! the recovered snapshot.
+
+        use crate::agentmem::x060::{PeerKey, RecoveredState, RecoverySnapshot};
+        use crate::agentmem::x062::RetentionPlan;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum VerificationIssue {
+            DeliveryRemovalNotStrictlySorted,
+            DuplicateDeliveryRemoval(u64),
+            UnknownDelivery(u64),
+            NonTerminalDelivery(u64),
+            InboundRemovalNotStrictlySorted,
+            DuplicateInboundRemoval {
+                peer: PeerKey,
+                frame_id: u64,
+            },
+            UnknownInbound {
+                peer: PeerKey,
+                frame_id: u64,
+            },
+            RetainedTerminalCountMismatch {
+                reported: usize,
+                calculated: usize,
+            },
+            RetainedInboundCountMismatch {
+                peer: PeerKey,
+                reported: usize,
+                calculated: usize,
+            },
+            MissingInboundPeerCount(PeerKey),
+            UnexpectedInboundPeerCount(PeerKey),
+            MissingTimestampListNotCanonical,
+            MissingTerminalTimestampUnknown(u64),
+            MissingTerminalTimestampNotTerminal(u64),
+            MissingInboundTimestampUnknown {
+                peer: PeerKey,
+                frame_id: u64,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct VerificationReport {
+            pub valid: bool,
+            pub issue_count: usize,
+            pub issues: Vec<VerificationIssue>,
+            pub deliveries_before: usize,
+            pub deliveries_after: usize,
+            pub inbound_ids_before: usize,
+            pub inbound_ids_after: usize,
+        }
+
+        /// Checks a retention plan against the exact recovered state it was derived from.
+        /// A valid result means the plan is internally consistent; it does not prove the
+        /// retention policy itself is appropriate or that timestamps are authentic.
+        pub fn verify_retention_plan(
+            snapshot: &RecoverySnapshot,
+            plan: &RetentionPlan,
+        ) -> VerificationReport {
+            let mut issues = Vec::new();
+
+            if !strictly_increasing(&plan.prune_delivery_ids) {
+                issues.push(VerificationIssue::DeliveryRemovalNotStrictlySorted);
+            }
+            let mut seen_delivery = BTreeSet::new();
+            for id in &plan.prune_delivery_ids {
+                if !seen_delivery.insert(*id) {
+                    issues.push(VerificationIssue::DuplicateDeliveryRemoval(*id));
+                    continue;
+                }
+                match snapshot.deliveries.get(id) {
+                    None => issues.push(VerificationIssue::UnknownDelivery(*id)),
+                    Some(delivery)
+                        if !matches!(
+                            delivery.state,
+                            RecoveredState::Delivered | RecoveredState::Failed
+                        ) =>
+                    {
+                        issues.push(VerificationIssue::NonTerminalDelivery(*id))
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            if !strictly_increasing(&plan.forget_inbound) {
+                issues.push(VerificationIssue::InboundRemovalNotStrictlySorted);
+            }
+            let mut seen_inbound = BTreeSet::new();
+            for (peer, frame_id) in &plan.forget_inbound {
+                let key = (peer.clone(), *frame_id);
+                if !seen_inbound.insert(key) {
+                    issues.push(VerificationIssue::DuplicateInboundRemoval {
+                        peer: peer.clone(),
+                        frame_id: *frame_id,
+                    });
+                    continue;
+                }
+                if !snapshot
+                    .inbound
+                    .get(peer)
+                    .map(|ids| ids.contains(frame_id))
+                    .unwrap_or(false)
+                {
+                    issues.push(VerificationIssue::UnknownInbound {
+                        peer: peer.clone(),
+                        frame_id: *frame_id,
+                    });
+                }
+            }
+
+            let removed_delivery_ids: BTreeSet<u64> =
+                plan.prune_delivery_ids.iter().copied().collect();
+            let terminal_before = snapshot
+                .deliveries
+                .values()
+                .filter(|delivery| {
+                    matches!(
+                        delivery.state,
+                        RecoveredState::Delivered | RecoveredState::Failed
+                    )
+                })
+                .count();
+            let terminal_removed = removed_delivery_ids
+                .iter()
+                .filter(|id| {
+                    snapshot
+                        .deliveries
+                        .get(id)
+                        .map(|d| {
+                            matches!(d.state, RecoveredState::Delivered | RecoveredState::Failed)
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            let terminal_after = terminal_before.saturating_sub(terminal_removed);
+            if plan.retained_terminal_count != terminal_after {
+                issues.push(VerificationIssue::RetainedTerminalCountMismatch {
+                    reported: plan.retained_terminal_count,
+                    calculated: terminal_after,
+                });
+            }
+
+            let removed_by_peer = count_removed_by_peer(&plan.forget_inbound);
+            let mut expected_peers = BTreeSet::new();
+            for peer in snapshot.inbound.keys() {
+                expected_peers.insert(peer.clone());
+            }
+            for peer in plan.retained_inbound_counts.keys() {
+                expected_peers.insert(peer.clone());
+            }
+
+            for peer in &expected_peers {
+                let before = snapshot.inbound.get(peer).map(|ids| ids.len()).unwrap_or(0);
+                let removed = removed_by_peer.get(peer).copied().unwrap_or(0);
+                let calculated = before.saturating_sub(removed);
+                match plan.retained_inbound_counts.get(peer) {
+                    Some(reported) if *reported != calculated => {
+                        issues.push(VerificationIssue::RetainedInboundCountMismatch {
+                            peer: peer.clone(),
+                            reported: *reported,
+                            calculated,
+                        });
+                    }
+                    None if before > 0 => {
+                        issues.push(VerificationIssue::MissingInboundPeerCount(peer.clone()))
+                    }
+                    None => {}
+                    Some(_) => {}
+                }
+            }
+            for peer in plan.retained_inbound_counts.keys() {
+                if !snapshot.inbound.contains_key(peer) {
+                    issues.push(VerificationIssue::UnexpectedInboundPeerCount(peer.clone()));
+                }
+            }
+
+            if !strictly_increasing(&plan.missing_terminal_timestamps) {
+                issues.push(VerificationIssue::MissingTimestampListNotCanonical);
+            }
+            for id in &plan.missing_terminal_timestamps {
+                match snapshot.deliveries.get(id) {
+                    None => issues.push(VerificationIssue::MissingTerminalTimestampUnknown(*id)),
+                    Some(delivery)
+                        if !matches!(
+                            delivery.state,
+                            RecoveredState::Delivered | RecoveredState::Failed
+                        ) =>
+                    {
+                        issues.push(VerificationIssue::MissingTerminalTimestampNotTerminal(*id))
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            if !strictly_increasing(&plan.missing_inbound_timestamps) {
+                issues.push(VerificationIssue::MissingTimestampListNotCanonical);
+            }
+            for (peer, frame_id) in &plan.missing_inbound_timestamps {
+                if !snapshot
+                    .inbound
+                    .get(peer)
+                    .map(|ids| ids.contains(frame_id))
+                    .unwrap_or(false)
+                {
+                    issues.push(VerificationIssue::MissingInboundTimestampUnknown {
+                        peer: peer.clone(),
+                        frame_id: *frame_id,
+                    });
+                }
+            }
+
+            let deliveries_before = snapshot.deliveries.len();
+            let deliveries_after = deliveries_before.saturating_sub(
+                removed_delivery_ids
+                    .iter()
+                    .filter(|id| snapshot.deliveries.contains_key(id))
+                    .count(),
+            );
+            let inbound_ids_before = snapshot
+                .inbound
+                .values()
+                .map(|ids| ids.len())
+                .sum::<usize>();
+            let inbound_ids_after = inbound_ids_before.saturating_sub(
+                seen_inbound
+                    .iter()
+                    .filter(|(peer, id)| {
+                        snapshot
+                            .inbound
+                            .get(peer)
+                            .map(|ids| ids.contains(id))
+                            .unwrap_or(false)
+                    })
+                    .count(),
+            );
+
+            VerificationReport {
+                valid: issues.is_empty(),
+                issue_count: issues.len(),
+                issues,
+                deliveries_before,
+                deliveries_after,
+                inbound_ids_before,
+                inbound_ids_after,
+            }
+        }
+
+        fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
+            values.windows(2).all(|pair| pair[0] < pair[1])
+        }
+
+        fn count_removed_by_peer(removals: &[(PeerKey, u64)]) -> BTreeMap<PeerKey, usize> {
+            let mut counts = BTreeMap::new();
+            for (peer, _) in removals {
+                let current = counts.get(peer).copied().unwrap_or(0_usize);
+                counts.insert(peer.clone(), current.saturating_add(1));
+            }
+            counts
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::x062::RetentionPlan;
+            use std::collections::{BTreeMap, BTreeSet};
+
+            fn fixture() -> (RecoverySnapshot, RetentionPlan) {
+                let peer = PeerKey {
+                    tenant_id: "tenant-a".into(),
+                    peer_id: "peer-a".into(),
+                };
+                let mut deliveries = BTreeMap::new();
+                deliveries.insert(
+                    1,
+                    crate::agentmem::x060::RecoveredDelivery {
+                        delivery_id: 1,
+                        peer: peer.clone(),
+                        frame: vec![1],
+                        attempts: 1,
+                        state: RecoveredState::Delivered,
+                    },
+                );
+                deliveries.insert(
+                    2,
+                    crate::agentmem::x060::RecoveredDelivery {
+                        delivery_id: 2,
+                        peer: peer.clone(),
+                        frame: vec![2],
+                        attempts: 0,
+                        state: RecoveredState::Pending {
+                            available_at_ms: 50,
+                        },
+                    },
+                );
+                let inbound = BTreeMap::from([(peer.clone(), BTreeSet::from([10, 11]))]);
+                let snapshot = RecoverySnapshot {
+                    deliveries,
+                    inbound,
+                    last_delivery_id: 2,
+                    event_count: 5,
+                };
+                let plan = RetentionPlan {
+                    generated_at_ms: 100,
+                    prune_delivery_ids: vec![1],
+                    forget_inbound: vec![(peer.clone(), 10)],
+                    retained_terminal_count: 0,
+                    retained_inbound_counts: BTreeMap::from([(peer, 1)]),
+                    missing_terminal_timestamps: Vec::new(),
+                    missing_inbound_timestamps: Vec::new(),
+                };
+                (snapshot, plan)
+            }
+
+            #[test]
+            fn accepts_consistent_plan() {
+                let (snapshot, plan) = fixture();
+                let report = verify_retention_plan(&snapshot, &plan);
+                assert!(report.valid);
+                assert_eq!(report.deliveries_after, 1);
+                assert_eq!(report.inbound_ids_after, 1);
+            }
+
+            #[test]
+            fn detects_active_delivery_prune_and_bad_counts() {
+                let (snapshot, mut plan) = fixture();
+                plan.prune_delivery_ids = vec![2];
+                plan.retained_terminal_count = 1;
+                let report = verify_retention_plan(&snapshot, &plan);
+                assert!(!report.valid);
+                assert!(report
+                    .issues
+                    .contains(&VerificationIssue::NonTerminalDelivery(2)));
+            }
+
+            #[test]
+            fn detects_duplicate_and_unknown_inbound_removals() {
+                let (snapshot, mut plan) = fixture();
+                let peer = snapshot.inbound.keys().next().cloned().unwrap_or(PeerKey {
+                    tenant_id: "tenant-a".into(),
+                    peer_id: "peer-a".into(),
+                });
+                plan.forget_inbound = vec![(peer.clone(), 10), (peer.clone(), 10), (peer, 99)];
+                let report = verify_retention_plan(&snapshot, &plan);
+                assert!(!report.valid);
+                assert!(report.issues.iter().any(|issue| matches!(
+                    issue,
+                    VerificationIssue::DuplicateInboundRemoval { frame_id: 10, .. }
+                )));
+                assert!(report.issues.iter().any(|issue| matches!(
+                    issue,
+                    VerificationIssue::UnknownInbound { frame_id: 99, .. }
+                )));
+            }
+        }
+    }
+    pub mod x065 {
+        //! Deterministic bounded binary codec for M062 delivery-retention plans.
+        //!
+        //! The codec provides integrity against accidental corruption using CRC-32.
+        //! It does not authenticate the producer, encrypt content, or prevent deliberate
+        //! modification by an attacker.
+
+        use crate::agentmem::x060::PeerKey;
+        use crate::agentmem::x062::RetentionPlan;
+        use std::collections::BTreeMap;
+
+        const MAGIC: &[u8; 4] = b"ARPL";
+        const VERSION: u8 = 1;
+        const CHECKSUM_LEN: usize = 4;
+        const FIXED_HEADER_LEN: usize = 5;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CodecLimits {
+            pub max_encoded_bytes: usize,
+            pub max_entries_per_list: usize,
+            pub max_peers: usize,
+            pub max_identity_bytes: usize,
+        }
+
+        impl Default for CodecLimits {
+            fn default() -> Self {
+                Self {
+                    max_encoded_bytes: 8 * 1024 * 1024,
+                    max_entries_per_list: 100_000,
+                    max_peers: 16_384,
+                    max_identity_bytes: 1024,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum CodecError {
+            InvalidLimits,
+            TooLarge,
+            TooManyEntries,
+            TooManyPeers,
+            InvalidIdentity,
+            InvalidMagic,
+            UnsupportedVersion(u8),
+            Truncated,
+            TrailingBytes,
+            ChecksumMismatch,
+            LengthOverflow,
+            NonCanonicalOrder,
+            DuplicateEntry,
+            DuplicatePeer,
+        }
+
+        pub fn encode(plan: &RetentionPlan, limits: &CodecLimits) -> Result<Vec<u8>, CodecError> {
+            validate_limits(limits)?;
+            validate_plan(plan, limits)?;
+
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.push(VERSION);
+            put_u64(&mut out, plan.generated_at_ms);
+            put_u32(&mut out, count32(plan.prune_delivery_ids.len())?);
+            for id in &plan.prune_delivery_ids {
+                put_u64(&mut out, *id);
+            }
+
+            put_u32(&mut out, count32(plan.forget_inbound.len())?);
+            for (peer, frame_id) in &plan.forget_inbound {
+                put_peer(&mut out, peer, limits)?;
+                put_u64(&mut out, *frame_id);
+            }
+
+            put_u64(
+                &mut out,
+                u64::try_from(plan.retained_terminal_count)
+                    .map_err(|_| CodecError::LengthOverflow)?,
+            );
+            put_u32(&mut out, count32(plan.retained_inbound_counts.len())?);
+            for (peer, count) in &plan.retained_inbound_counts {
+                put_peer(&mut out, peer, limits)?;
+                put_u64(
+                    &mut out,
+                    u64::try_from(*count).map_err(|_| CodecError::LengthOverflow)?,
+                );
+            }
+
+            put_u32(&mut out, count32(plan.missing_terminal_timestamps.len())?);
+            for id in &plan.missing_terminal_timestamps {
+                put_u64(&mut out, *id);
+            }
+
+            put_u32(&mut out, count32(plan.missing_inbound_timestamps.len())?);
+            for (peer, frame_id) in &plan.missing_inbound_timestamps {
+                put_peer(&mut out, peer, limits)?;
+                put_u64(&mut out, *frame_id);
+            }
+
+            let total = out
+                .len()
+                .checked_add(CHECKSUM_LEN)
+                .ok_or(CodecError::LengthOverflow)?;
+            if total > limits.max_encoded_bytes {
+                return Err(CodecError::TooLarge);
+            }
+            let checksum = crc32(&out);
+            put_u32(&mut out, checksum);
+            Ok(out)
+        }
+
+        pub fn decode(bytes: &[u8], limits: &CodecLimits) -> Result<RetentionPlan, CodecError> {
+            validate_limits(limits)?;
+            if bytes.len() > limits.max_encoded_bytes {
+                return Err(CodecError::TooLarge);
+            }
+            if bytes.len() < FIXED_HEADER_LEN + 8 + CHECKSUM_LEN {
+                return Err(CodecError::Truncated);
+            }
+
+            let content_len = bytes
+                .len()
+                .checked_sub(CHECKSUM_LEN)
+                .ok_or(CodecError::Truncated)?;
+            let (content, checksum_bytes) = bytes.split_at(content_len);
+            let expected = read_u32_exact(checksum_bytes)?;
+            if crc32(content) != expected {
+                return Err(CodecError::ChecksumMismatch);
+            }
+
+            let mut reader = Reader::new(content);
+            if reader.take(4)? != MAGIC {
+                return Err(CodecError::InvalidMagic);
+            }
+            let version = reader.u8()?;
+            if version != VERSION {
+                return Err(CodecError::UnsupportedVersion(version));
+            }
+            let generated_at_ms = reader.u64()?;
+
+            let prune_count = reader.count(limits.max_entries_per_list)?;
+            let mut prune_delivery_ids = Vec::with_capacity(prune_count);
+            for _ in 0..prune_count {
+                prune_delivery_ids.push(reader.u64()?);
+            }
+
+            let forget_count = reader.count(limits.max_entries_per_list)?;
+            let mut forget_inbound = Vec::with_capacity(forget_count);
+            for _ in 0..forget_count {
+                forget_inbound.push((reader.peer(limits)?, reader.u64()?));
+            }
+
+            let retained_terminal_count =
+                usize::try_from(reader.u64()?).map_err(|_| CodecError::LengthOverflow)?;
+            let peer_count = reader.count(limits.max_peers)?;
+            let mut retained_inbound_counts = BTreeMap::new();
+            for _ in 0..peer_count {
+                let peer = reader.peer(limits)?;
+                let count =
+                    usize::try_from(reader.u64()?).map_err(|_| CodecError::LengthOverflow)?;
+                if retained_inbound_counts.insert(peer, count).is_some() {
+                    return Err(CodecError::DuplicatePeer);
+                }
+            }
+
+            let missing_terminal_count = reader.count(limits.max_entries_per_list)?;
+            let mut missing_terminal_timestamps = Vec::with_capacity(missing_terminal_count);
+            for _ in 0..missing_terminal_count {
+                missing_terminal_timestamps.push(reader.u64()?);
+            }
+
+            let missing_inbound_count = reader.count(limits.max_entries_per_list)?;
+            let mut missing_inbound_timestamps = Vec::with_capacity(missing_inbound_count);
+            for _ in 0..missing_inbound_count {
+                missing_inbound_timestamps.push((reader.peer(limits)?, reader.u64()?));
+            }
+
+            if !reader.done() {
+                return Err(CodecError::TrailingBytes);
+            }
+            let plan = RetentionPlan {
+                generated_at_ms,
+                prune_delivery_ids,
+                forget_inbound,
+                retained_terminal_count,
+                retained_inbound_counts,
+                missing_terminal_timestamps,
+                missing_inbound_timestamps,
+            };
+            validate_plan(&plan, limits)?;
+            Ok(plan)
+        }
+
+        fn validate_plan(plan: &RetentionPlan, limits: &CodecLimits) -> Result<(), CodecError> {
+            if plan.prune_delivery_ids.len() > limits.max_entries_per_list
+                || plan.forget_inbound.len() > limits.max_entries_per_list
+                || plan.missing_terminal_timestamps.len() > limits.max_entries_per_list
+                || plan.missing_inbound_timestamps.len() > limits.max_entries_per_list
+            {
+                return Err(CodecError::TooManyEntries);
+            }
+            if plan.retained_inbound_counts.len() > limits.max_peers {
+                return Err(CodecError::TooManyPeers);
+            }
+            if !strictly_increasing(&plan.prune_delivery_ids)
+                || !strictly_increasing(&plan.forget_inbound)
+                || !strictly_increasing(&plan.missing_terminal_timestamps)
+                || !strictly_increasing(&plan.missing_inbound_timestamps)
+            {
+                return Err(CodecError::NonCanonicalOrder);
+            }
+            for peer in plan.retained_inbound_counts.keys() {
+                validate_peer(peer, limits)?;
+            }
+            for (peer, _) in &plan.forget_inbound {
+                validate_peer(peer, limits)?;
+            }
+            for (peer, _) in &plan.missing_inbound_timestamps {
+                validate_peer(peer, limits)?;
+            }
+            Ok(())
+        }
+
+        fn validate_peer(peer: &PeerKey, limits: &CodecLimits) -> Result<(), CodecError> {
+            for value in [&peer.tenant_id, &peer.peer_id] {
+                if value.trim().is_empty() || value.len() > limits.max_identity_bytes {
+                    return Err(CodecError::InvalidIdentity);
+                }
+            }
+            Ok(())
+        }
+
+        fn validate_limits(limits: &CodecLimits) -> Result<(), CodecError> {
+            if limits.max_encoded_bytes < FIXED_HEADER_LEN + 8 + CHECKSUM_LEN
+                || limits.max_entries_per_list == 0
+                || limits.max_peers == 0
+                || limits.max_identity_bytes == 0
+            {
+                return Err(CodecError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
+            values.windows(2).all(|pair| pair[0] < pair[1])
+        }
+
+        fn count32(value: usize) -> Result<u32, CodecError> {
+            u32::try_from(value).map_err(|_| CodecError::LengthOverflow)
+        }
+        fn put_u16(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, value: u64) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn put_peer(
+            out: &mut Vec<u8>,
+            peer: &PeerKey,
+            limits: &CodecLimits,
+        ) -> Result<(), CodecError> {
+            validate_peer(peer, limits)?;
+            let tenant =
+                u16::try_from(peer.tenant_id.len()).map_err(|_| CodecError::LengthOverflow)?;
+            let id = u16::try_from(peer.peer_id.len()).map_err(|_| CodecError::LengthOverflow)?;
+            put_u16(out, tenant);
+            out.extend_from_slice(peer.tenant_id.as_bytes());
+            put_u16(out, id);
+            out.extend_from_slice(peer.peer_id.as_bytes());
+            Ok(())
+        }
+
+        fn read_u32_exact(bytes: &[u8]) -> Result<u32, CodecError> {
+            let slice = bytes.get(0..4).ok_or(CodecError::Truncated)?;
+            let mut value = [0_u8; 4];
+            value.copy_from_slice(slice);
+            Ok(u32::from_be_bytes(value))
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+        impl<'a> Reader<'a> {
+            fn new(bytes: &'a [u8]) -> Self {
+                Self { bytes, offset: 0 }
+            }
+            fn take(&mut self, count: usize) -> Result<&'a [u8], CodecError> {
+                let end = self
+                    .offset
+                    .checked_add(count)
+                    .ok_or(CodecError::LengthOverflow)?;
+                let value = self
+                    .bytes
+                    .get(self.offset..end)
+                    .ok_or(CodecError::Truncated)?;
+                self.offset = end;
+                Ok(value)
+            }
+            fn u8(&mut self) -> Result<u8, CodecError> {
+                self.take(1)?.first().copied().ok_or(CodecError::Truncated)
+            }
+            fn u16(&mut self) -> Result<u16, CodecError> {
+                let bytes = self.take(2)?;
+                let mut value = [0_u8; 2];
+                value.copy_from_slice(bytes);
+                Ok(u16::from_be_bytes(value))
+            }
+            fn u32(&mut self) -> Result<u32, CodecError> {
+                let bytes = self.take(4)?;
+                let mut value = [0_u8; 4];
+                value.copy_from_slice(bytes);
+                Ok(u32::from_be_bytes(value))
+            }
+            fn u64(&mut self) -> Result<u64, CodecError> {
+                let bytes = self.take(8)?;
+                let mut value = [0_u8; 8];
+                value.copy_from_slice(bytes);
+                Ok(u64::from_be_bytes(value))
+            }
+            fn count(&mut self, max: usize) -> Result<usize, CodecError> {
+                let count = usize::try_from(self.u32()?).map_err(|_| CodecError::LengthOverflow)?;
+                if count > max {
+                    return Err(CodecError::TooManyEntries);
+                }
+                Ok(count)
+            }
+            fn peer(&mut self, limits: &CodecLimits) -> Result<PeerKey, CodecError> {
+                let tenant_len = usize::from(self.u16()?);
+                if tenant_len == 0 || tenant_len > limits.max_identity_bytes {
+                    return Err(CodecError::InvalidIdentity);
+                }
+                let tenant = std::str::from_utf8(self.take(tenant_len)?)
+                    .map_err(|_| CodecError::InvalidIdentity)?
+                    .to_owned();
+                let peer_len = usize::from(self.u16()?);
+                if peer_len == 0 || peer_len > limits.max_identity_bytes {
+                    return Err(CodecError::InvalidIdentity);
+                }
+                let peer = std::str::from_utf8(self.take(peer_len)?)
+                    .map_err(|_| CodecError::InvalidIdentity)?
+                    .to_owned();
+                let value = PeerKey {
+                    tenant_id: tenant,
+                    peer_id: peer,
+                };
+                validate_peer(&value, limits)?;
+                Ok(value)
+            }
+            fn done(&self) -> bool {
+                self.offset == self.bytes.len()
+            }
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0_u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn plan() -> RetentionPlan {
+                let peer = PeerKey {
+                    tenant_id: "tenant".into(),
+                    peer_id: "peer".into(),
+                };
+                RetentionPlan {
+                    generated_at_ms: 1234,
+                    prune_delivery_ids: vec![2, 5],
+                    forget_inbound: vec![(peer.clone(), 7), (peer.clone(), 9)],
+                    retained_terminal_count: 3,
+                    retained_inbound_counts: BTreeMap::from([(peer.clone(), 4)]),
+                    missing_terminal_timestamps: vec![8, 11],
+                    missing_inbound_timestamps: vec![(peer, 12)],
+                }
+            }
+
+            #[test]
+            fn round_trip_is_deterministic() {
+                let value = plan();
+                let first = encode(&value, &CodecLimits::default());
+                let second = encode(&value, &CodecLimits::default());
+                assert_eq!(first, second);
+                assert_eq!(
+                    first.and_then(|bytes| decode(&bytes, &CodecLimits::default())),
+                    Ok(value)
+                );
+            }
+
+            #[test]
+            fn rejects_corruption_and_trailing_data() {
+                let encoded = encode(&plan(), &CodecLimits::default());
+                assert!(encoded.is_ok());
+                if let Ok(mut bytes) = encoded {
+                    let last = bytes.len().saturating_sub(1);
+                    if let Some(byte) = bytes.get_mut(last) {
+                        *byte ^= 0x40;
+                    }
+                    assert_eq!(
+                        decode(&bytes, &CodecLimits::default()),
+                        Err(CodecError::ChecksumMismatch)
+                    );
+                }
+            }
+
+            #[test]
+            fn rejects_noncanonical_plan() {
+                let mut value = plan();
+                value.prune_delivery_ids = vec![5, 2];
+                assert_eq!(
+                    encode(&value, &CodecLimits::default()),
+                    Err(CodecError::NonCanonicalOrder)
+                );
+            }
+
+            #[test]
+            fn enforces_size_and_entry_bounds() {
+                let value = plan();
+                let limits = CodecLimits {
+                    max_entries_per_list: 1,
+                    ..CodecLimits::default()
+                };
+                assert_eq!(encode(&value, &limits), Err(CodecError::TooManyEntries));
+            }
+        }
+    }
+    pub mod x080 {
+        //! Deterministic bounded checkpoint codec for M079 audit-report replay watermarks.
+        //!
+        //! The checkpoint preserves the highest accepted sequence for each
+        //! `(consumer_id, key_id)` principal. Canonical ordering and CRC-32 provide
+        //! deterministic encoding and accidental-corruption detection; they do not
+        //! authenticate the checkpoint.
+        use std::collections::BTreeMap;
+
+        const MAGIC: &[u8; 4] = b"IARC";
+        const VERSION: u8 = 1;
+        const HEADER_BYTES: usize = 4 + 1 + 4;
+        const ENTRY_FIXED_BYTES: usize = 2 + 2 + 8;
+        const CHECKSUM_BYTES: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        pub struct ReplayPrincipal {
+            pub consumer_id: String,
+            pub key_id: String,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpoint {
+            pub generation: u64,
+            pub watermarks: BTreeMap<ReplayPrincipal, u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpointLimits {
+            pub max_encoded_bytes: usize,
+            pub max_principals: usize,
+            pub max_consumer_id_bytes: usize,
+            pub max_key_id_bytes: usize,
+            pub require_nonzero_generation: bool,
+        }
+        impl Default for ReplayCheckpointLimits {
+            fn default() -> Self {
+                Self {
+                    max_encoded_bytes: 4 * 1024 * 1024,
+                    max_principals: 16_384,
+                    max_consumer_id_bytes: 256,
+                    max_key_id_bytes: 128,
+                    require_nonzero_generation: true,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ReplayCheckpointError {
+            InvalidLimits,
+            TooLarge,
+            Truncated,
+            InvalidMagic,
+            UnsupportedVersion(u8),
+            ChecksumMismatch,
+            InvalidCheckpoint,
+            InvalidUtf8,
+            NonCanonicalOrder,
+            DuplicatePrincipal,
+            ZeroSequence,
+            GenerationMismatch,
+        }
+
+        impl ReplayCheckpoint {
+            pub fn new(generation: u64, watermarks: BTreeMap<ReplayPrincipal, u64>) -> Self {
+                Self {
+                    generation,
+                    watermarks,
+                }
+            }
+
+            pub fn principal_count(&self) -> usize {
+                self.watermarks.len()
+            }
+
+            pub fn maximum_sequence(&self) -> u64 {
+                self.watermarks.values().copied().max().unwrap_or(0)
+            }
+        }
+
+        pub fn encode(
+            checkpoint: &ReplayCheckpoint,
+            limits: &ReplayCheckpointLimits,
+        ) -> Result<Vec<u8>, ReplayCheckpointError> {
+            validate_limits(limits)?;
+            validate_checkpoint(checkpoint, limits)?;
+            let count = u32::try_from(checkpoint.watermarks.len())
+                .map_err(|_| ReplayCheckpointError::TooLarge)?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(MAGIC);
+            bytes.push(VERSION);
+            bytes.extend_from_slice(&checkpoint.generation.to_be_bytes());
+            bytes.extend_from_slice(&count.to_be_bytes());
+            for (principal, sequence) in &checkpoint.watermarks {
+                let consumer_len = u16::try_from(principal.consumer_id.len())
+                    .map_err(|_| ReplayCheckpointError::TooLarge)?;
+                let key_len = u16::try_from(principal.key_id.len())
+                    .map_err(|_| ReplayCheckpointError::TooLarge)?;
+                bytes.extend_from_slice(&consumer_len.to_be_bytes());
+                bytes.extend_from_slice(&key_len.to_be_bytes());
+                bytes.extend_from_slice(&sequence.to_be_bytes());
+                bytes.extend_from_slice(principal.consumer_id.as_bytes());
+                bytes.extend_from_slice(principal.key_id.as_bytes());
+                if bytes
+                    .len()
+                    .checked_add(CHECKSUM_BYTES)
+                    .ok_or(ReplayCheckpointError::TooLarge)?
+                    > limits.max_encoded_bytes
+                {
+                    return Err(ReplayCheckpointError::TooLarge);
+                }
+            }
+            let checksum = crc32(&bytes);
+            bytes.extend_from_slice(&checksum.to_be_bytes());
+            if bytes.len() > limits.max_encoded_bytes {
+                return Err(ReplayCheckpointError::TooLarge);
+            }
+            Ok(bytes)
+        }
+
+        pub fn decode(
+            bytes: &[u8],
+            expected_generation: Option<u64>,
+            limits: &ReplayCheckpointLimits,
+        ) -> Result<ReplayCheckpoint, ReplayCheckpointError> {
+            validate_limits(limits)?;
+            if bytes.len() > limits.max_encoded_bytes {
+                return Err(ReplayCheckpointError::TooLarge);
+            }
+            if bytes.len() < HEADER_BYTES + 8 + CHECKSUM_BYTES {
+                return Err(ReplayCheckpointError::Truncated);
+            }
+            if bytes.get(0..4) != Some(MAGIC.as_slice()) {
+                return Err(ReplayCheckpointError::InvalidMagic);
+            }
+            let version = bytes
+                .get(4)
+                .copied()
+                .ok_or(ReplayCheckpointError::Truncated)?;
+            if version != VERSION {
+                return Err(ReplayCheckpointError::UnsupportedVersion(version));
+            }
+            let checksum_at = bytes
+                .len()
+                .checked_sub(CHECKSUM_BYTES)
+                .ok_or(ReplayCheckpointError::Truncated)?;
+            let supplied = read_u32(
+                bytes
+                    .get(checksum_at..)
+                    .ok_or(ReplayCheckpointError::Truncated)?,
+            )?;
+            if crc32(
+                bytes
+                    .get(..checksum_at)
+                    .ok_or(ReplayCheckpointError::Truncated)?,
+            ) != supplied
+            {
+                return Err(ReplayCheckpointError::ChecksumMismatch);
+            }
+            let generation = read_u64_at(bytes, 5)?;
+            if expected_generation.is_some_and(|expected| expected != generation) {
+                return Err(ReplayCheckpointError::GenerationMismatch);
+            }
+            let count = usize::try_from(read_u32_at(bytes, 13)?)
+                .map_err(|_| ReplayCheckpointError::TooLarge)?;
+            if count > limits.max_principals {
+                return Err(ReplayCheckpointError::InvalidCheckpoint);
+            }
+            let mut offset = 17usize;
+            let mut watermarks = BTreeMap::new();
+            let mut previous: Option<ReplayPrincipal> = None;
+            for _ in 0..count {
+                let fixed_end = offset
+                    .checked_add(ENTRY_FIXED_BYTES)
+                    .ok_or(ReplayCheckpointError::Truncated)?;
+                let fixed = bytes
+                    .get(offset..fixed_end)
+                    .filter(|_| fixed_end <= checksum_at)
+                    .ok_or(ReplayCheckpointError::Truncated)?;
+                let consumer_len = usize::from(read_u16(
+                    fixed.get(0..2).ok_or(ReplayCheckpointError::Truncated)?,
+                )?);
+                let key_len = usize::from(read_u16(
+                    fixed.get(2..4).ok_or(ReplayCheckpointError::Truncated)?,
+                )?);
+                let sequence = read_u64(fixed.get(4..12).ok_or(ReplayCheckpointError::Truncated)?)?;
+                if consumer_len == 0 || key_len == 0 || sequence == 0 {
+                    return Err(ReplayCheckpointError::ZeroSequence);
+                }
+                if consumer_len > limits.max_consumer_id_bytes || key_len > limits.max_key_id_bytes
+                {
+                    return Err(ReplayCheckpointError::InvalidCheckpoint);
+                }
+                let consumer_start = fixed_end;
+                let consumer_end = consumer_start
+                    .checked_add(consumer_len)
+                    .ok_or(ReplayCheckpointError::Truncated)?;
+                let key_end = consumer_end
+                    .checked_add(key_len)
+                    .ok_or(ReplayCheckpointError::Truncated)?;
+                if key_end > checksum_at {
+                    return Err(ReplayCheckpointError::Truncated);
+                }
+                let consumer_id = std::str::from_utf8(
+                    bytes
+                        .get(consumer_start..consumer_end)
+                        .ok_or(ReplayCheckpointError::Truncated)?,
+                )
+                .map_err(|_| ReplayCheckpointError::InvalidUtf8)?
+                .to_owned();
+                let key_id = std::str::from_utf8(
+                    bytes
+                        .get(consumer_end..key_end)
+                        .ok_or(ReplayCheckpointError::Truncated)?,
+                )
+                .map_err(|_| ReplayCheckpointError::InvalidUtf8)?
+                .to_owned();
+                if consumer_id.trim().is_empty() || key_id.trim().is_empty() {
+                    return Err(ReplayCheckpointError::InvalidCheckpoint);
+                }
+                let principal = ReplayPrincipal {
+                    consumer_id,
+                    key_id,
+                };
+                if let Some(prior) = previous.as_ref() {
+                    if &principal == prior {
+                        return Err(ReplayCheckpointError::DuplicatePrincipal);
+                    }
+                    if &principal < prior {
+                        return Err(ReplayCheckpointError::NonCanonicalOrder);
+                    }
+                }
+                previous = Some(principal.clone());
+                if watermarks.insert(principal, sequence).is_some() {
+                    return Err(ReplayCheckpointError::DuplicatePrincipal);
+                }
+                offset = key_end;
+            }
+            if offset != checksum_at {
+                return Err(ReplayCheckpointError::InvalidCheckpoint);
+            }
+            let checkpoint = ReplayCheckpoint {
+                generation,
+                watermarks,
+            };
+            validate_checkpoint(&checkpoint, limits)?;
+            Ok(checkpoint)
+        }
+
+        fn validate_limits(limits: &ReplayCheckpointLimits) -> Result<(), ReplayCheckpointError> {
+            if limits.max_encoded_bytes < HEADER_BYTES + 8 + CHECKSUM_BYTES
+                || limits.max_encoded_bytes > 64 * 1024 * 1024
+                || limits.max_principals == 0
+                || limits.max_principals > u32::MAX as usize
+                || limits.max_consumer_id_bytes == 0
+                || limits.max_key_id_bytes == 0
+                || limits.max_consumer_id_bytes > usize::from(u16::MAX)
+                || limits.max_key_id_bytes > usize::from(u16::MAX)
+            {
+                return Err(ReplayCheckpointError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn validate_checkpoint(
+            checkpoint: &ReplayCheckpoint,
+            limits: &ReplayCheckpointLimits,
+        ) -> Result<(), ReplayCheckpointError> {
+            if (limits.require_nonzero_generation && checkpoint.generation == 0)
+                || checkpoint.watermarks.len() > limits.max_principals
+            {
+                return Err(ReplayCheckpointError::InvalidCheckpoint);
+            }
+            for (principal, sequence) in &checkpoint.watermarks {
+                if principal.consumer_id.trim().is_empty()
+                    || principal.key_id.trim().is_empty()
+                    || principal.consumer_id.len() > limits.max_consumer_id_bytes
+                    || principal.key_id.len() > limits.max_key_id_bytes
+                {
+                    return Err(ReplayCheckpointError::InvalidCheckpoint);
+                }
+                if *sequence == 0 {
+                    return Err(ReplayCheckpointError::ZeroSequence);
+                }
+            }
+            Ok(())
+        }
+        fn read_u16(bytes: &[u8]) -> Result<u16, ReplayCheckpointError> {
+            let part = bytes.get(0..2).ok_or(ReplayCheckpointError::Truncated)?;
+            let mut out = [0u8; 2];
+            out.copy_from_slice(part);
+            Ok(u16::from_be_bytes(out))
+        }
+        fn read_u32(bytes: &[u8]) -> Result<u32, ReplayCheckpointError> {
+            let part = bytes.get(0..4).ok_or(ReplayCheckpointError::Truncated)?;
+            let mut out = [0u8; 4];
+            out.copy_from_slice(part);
+            Ok(u32::from_be_bytes(out))
+        }
+        fn read_u64(bytes: &[u8]) -> Result<u64, ReplayCheckpointError> {
+            let part = bytes.get(0..8).ok_or(ReplayCheckpointError::Truncated)?;
+            let mut out = [0u8; 8];
+            out.copy_from_slice(part);
+            Ok(u64::from_be_bytes(out))
+        }
+        fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, ReplayCheckpointError> {
+            let end = offset
+                .checked_add(4)
+                .ok_or(ReplayCheckpointError::Truncated)?;
+            read_u32(
+                bytes
+                    .get(offset..end)
+                    .ok_or(ReplayCheckpointError::Truncated)?,
+            )
+        }
+        fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, ReplayCheckpointError> {
+            let end = offset
+                .checked_add(8)
+                .ok_or(ReplayCheckpointError::Truncated)?;
+            read_u64(
+                bytes
+                    .get(offset..end)
+                    .ok_or(ReplayCheckpointError::Truncated)?,
+            )
+        }
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = 0u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn fixture() -> ReplayCheckpoint {
+                let mut map = BTreeMap::new();
+                map.insert(
+                    ReplayPrincipal {
+                        consumer_id: "consumer-a".into(),
+                        key_id: "key-1".into(),
+                    },
+                    8,
+                );
+                map.insert(
+                    ReplayPrincipal {
+                        consumer_id: "consumer-b".into(),
+                        key_id: "key-2".into(),
+                    },
+                    19,
+                );
+                ReplayCheckpoint::new(4, map)
+            }
+            #[test]
+            fn deterministic_round_trip_and_generation_guard() {
+                let checkpoint = fixture();
+                let a = encode(&checkpoint, &ReplayCheckpointLimits::default());
+                let b = encode(&checkpoint, &ReplayCheckpointLimits::default());
+                assert_eq!(a, b);
+                assert_eq!(
+                    a.and_then(|v| decode(&v, Some(4), &ReplayCheckpointLimits::default())),
+                    Ok(checkpoint)
+                );
+            }
+            #[test]
+            fn rejects_wrong_generation() {
+                let bytes =
+                    encode(&fixture(), &ReplayCheckpointLimits::default()).unwrap_or_default();
+                assert_eq!(
+                    decode(&bytes, Some(5), &ReplayCheckpointLimits::default()),
+                    Err(ReplayCheckpointError::GenerationMismatch)
+                );
+            }
+            #[test]
+            fn rejects_checksum_corruption() {
+                let mut bytes =
+                    encode(&fixture(), &ReplayCheckpointLimits::default()).unwrap_or_default();
+                if let Some(value) = bytes.get_mut(20) {
+                    *value ^= 1;
+                }
+                assert_eq!(
+                    decode(&bytes, None, &ReplayCheckpointLimits::default()),
+                    Err(ReplayCheckpointError::ChecksumMismatch)
+                );
+            }
+            #[test]
+            fn rejects_zero_watermark() {
+                let mut checkpoint = fixture();
+                if let Some(value) = checkpoint.watermarks.values_mut().next() {
+                    *value = 0;
+                }
+                assert_eq!(
+                    encode(&checkpoint, &ReplayCheckpointLimits::default()),
+                    Err(ReplayCheckpointError::ZeroSequence)
+                );
+            }
+            #[test]
+            fn rejects_trailing_bytes() {
+                let mut bytes =
+                    encode(&fixture(), &ReplayCheckpointLimits::default()).unwrap_or_default();
+                bytes.push(0);
+                assert_eq!(
+                    decode(&bytes, None, &ReplayCheckpointLimits::default()),
+                    Err(ReplayCheckpointError::ChecksumMismatch)
+                );
+            }
+        }
+    }
+    pub mod x081 {
+        //! Durable atomic file storage for M080 audit-report replay checkpoints.
+        //!
+        //! The store validates complete checkpoint bytes before returning them. Saves
+        //! use optimistic generation checks, a synced sibling staging file, atomic
+        //! rename, and parent-directory sync. Writers must be externally serialized:
+        //! the generation precondition is not a cross-process lock or CAS primitive.
+
+        use crate::agentmem::x080::{
+            decode, encode, ReplayCheckpoint, ReplayCheckpointError, ReplayCheckpointLimits,
+        };
+        use std::fs::{self, File, OpenOptions};
+        use std::io::{Read, Write};
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpointStoreLimits {
+            pub codec: ReplayCheckpointLimits,
+            pub max_file_bytes: usize,
+        }
+
+        impl Default for ReplayCheckpointStoreLimits {
+            fn default() -> Self {
+                Self {
+                    codec: ReplayCheckpointLimits::default(),
+                    max_file_bytes: 4 * 1024 * 1024,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpointMetadata {
+            pub generation: u64,
+            pub principal_count: usize,
+            pub maximum_sequence: u64,
+            pub encoded_bytes: usize,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum StoreError {
+            InvalidLimits,
+            NotFound,
+            AlreadyExists,
+            GenerationConflict {
+                expected: Option<u64>,
+                actual: Option<u64>,
+            },
+            GenerationNotIncreasing {
+                current: u64,
+                proposed: u64,
+            },
+            TooLarge,
+            InvalidPath,
+            TemporaryFileCollision,
+            Codec(ReplayCheckpointError),
+            Io(String),
+        }
+
+        impl From<ReplayCheckpointError> for StoreError {
+            fn from(value: ReplayCheckpointError) -> Self {
+                Self::Codec(value)
+            }
+        }
+
+        impl From<std::io::Error> for StoreError {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value.to_string())
+            }
+        }
+
+        /// Loads a checkpoint, rejecting oversized, truncated, or invalid files.
+        pub fn load(
+            path: impl AsRef<Path>,
+            limits: &ReplayCheckpointStoreLimits,
+        ) -> Result<(ReplayCheckpoint, ReplayCheckpointMetadata), StoreError> {
+            validate_limits(limits)?;
+            let path = path.as_ref();
+            let metadata = fs::metadata(path).map_err(map_not_found)?;
+            if !metadata.is_file() {
+                return Err(StoreError::InvalidPath);
+            }
+            let file_len = usize::try_from(metadata.len()).map_err(|_| StoreError::TooLarge)?;
+            if file_len > limits.max_file_bytes {
+                return Err(StoreError::TooLarge);
+            }
+
+            let file = File::open(path)?;
+            let mut bytes = Vec::with_capacity(file_len);
+            file.take(
+                u64::try_from(limits.max_file_bytes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut bytes)?;
+            if bytes.len() > limits.max_file_bytes {
+                return Err(StoreError::TooLarge);
+            }
+            let checkpoint = decode(&bytes, None, &limits.codec)?;
+            let result = metadata_for(&checkpoint, bytes.len());
+            Ok((checkpoint, result))
+        }
+
+        /// Publishes a checkpoint after checking its generation against the current file.
+        ///
+        /// `expected_generation = None` requires an absent destination. `Some(g)`
+        /// requires a readable checkpoint at generation `g`. New generations must be
+        /// strictly increasing. The staging file is synced before atomic rename, then
+        /// the containing directory is synced to confirm publication durability.
+        pub fn save(
+            path: impl AsRef<Path>,
+            checkpoint: &ReplayCheckpoint,
+            expected_generation: Option<u64>,
+            limits: &ReplayCheckpointStoreLimits,
+        ) -> Result<ReplayCheckpointMetadata, StoreError> {
+            validate_limits(limits)?;
+            let path = path.as_ref();
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !parent.is_dir() || path.file_name().is_none() {
+                return Err(StoreError::InvalidPath);
+            }
+
+            let current = match load(path, limits) {
+                Ok((existing, _)) => Some(existing.generation),
+                Err(StoreError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            if current != expected_generation {
+                return Err(StoreError::GenerationConflict {
+                    expected: expected_generation,
+                    actual: current,
+                });
+            }
+            if let Some(generation) = current {
+                if checkpoint.generation <= generation {
+                    return Err(StoreError::GenerationNotIncreasing {
+                        current: generation,
+                        proposed: checkpoint.generation,
+                    });
+                }
+            }
+
+            let bytes = encode(checkpoint, &limits.codec)?;
+            if bytes.len() > limits.max_file_bytes {
+                return Err(StoreError::TooLarge);
+            }
+            let temporary = reserve_temp_sibling(path)?;
+            if let Err(error) = write_synced(&temporary, &bytes) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+            if let Err(error) = fs::rename(&temporary, path) {
+                let _ = fs::remove_file(&temporary);
+                return Err(StoreError::Io(error.to_string()));
+            }
+            File::open(parent)?.sync_all()?;
+            Ok(metadata_for(checkpoint, bytes.len()))
+        }
+
+        /// Creates a checkpoint only when the destination does not already exist.
+        /// Unlike `save`, this operation never replaces a pre-existing destination.
+        pub fn create_new(
+            path: impl AsRef<Path>,
+            checkpoint: &ReplayCheckpoint,
+            limits: &ReplayCheckpointStoreLimits,
+        ) -> Result<ReplayCheckpointMetadata, StoreError> {
+            validate_limits(limits)?;
+            let path = path.as_ref();
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !parent.is_dir() || path.file_name().is_none() {
+                return Err(StoreError::InvalidPath);
+            }
+            match fs::symlink_metadata(path) {
+                Ok(_) => return Err(StoreError::AlreadyExists),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StoreError::Io(error.to_string())),
+            }
+            let bytes = encode(checkpoint, &limits.codec)?;
+            if bytes.len() > limits.max_file_bytes {
+                return Err(StoreError::TooLarge);
+            }
+            let temporary = reserve_temp_sibling(path)?;
+            if let Err(error) = write_synced(&temporary, &bytes) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+            // A hard link provides no-overwrite publication; it must remain on the same filesystem.
+            if let Err(error) = fs::hard_link(&temporary, path) {
+                let _ = fs::remove_file(&temporary);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(StoreError::AlreadyExists);
+                }
+                return Err(StoreError::Io(error.to_string()));
+            }
+            fs::remove_file(&temporary)?;
+            File::open(parent)?.sync_all()?;
+            Ok(metadata_for(checkpoint, bytes.len()))
+        }
+
+        fn metadata_for(
+            checkpoint: &ReplayCheckpoint,
+            encoded_bytes: usize,
+        ) -> ReplayCheckpointMetadata {
+            ReplayCheckpointMetadata {
+                generation: checkpoint.generation,
+                principal_count: checkpoint.principal_count(),
+                maximum_sequence: checkpoint.maximum_sequence(),
+                encoded_bytes,
+            }
+        }
+
+        fn validate_limits(limits: &ReplayCheckpointStoreLimits) -> Result<(), StoreError> {
+            if limits.max_file_bytes == 0 || limits.max_file_bytes > limits.codec.max_encoded_bytes
+            {
+                return Err(StoreError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn map_not_found(error: std::io::Error) -> StoreError {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound
+            } else {
+                StoreError::Io(error.to_string())
+            }
+        }
+
+        fn reserve_temp_sibling(destination: &Path) -> Result<PathBuf, StoreError> {
+            for _ in 0..64 {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let mut name = destination.as_os_str().to_os_string();
+                name.push(format!(
+                    ".agentos-audit-replay-checkpoint-{}-{sequence}.tmp",
+                    std::process::id()
+                ));
+                let candidate = PathBuf::from(name);
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(file) => {
+                        drop(file);
+                        return Ok(candidate);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(StoreError::Io(error.to_string())),
+                }
+            }
+            Err(StoreError::TemporaryFileCollision)
+        }
+
+        fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+            let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::x080::ReplayPrincipal;
+            use std::collections::BTreeMap;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            fn path(label: &str) -> PathBuf {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|v| v.as_nanos())
+                    .unwrap_or(0);
+                std::env::temp_dir().join(format!(
+                    "agentos-m081-{label}-{}-{nonce}.checkpoint",
+                    std::process::id()
+                ))
+            }
+            fn checkpoint(generation: u64, sequence: u64) -> ReplayCheckpoint {
+                ReplayCheckpoint::new(
+                    generation,
+                    BTreeMap::from([(
+                        ReplayPrincipal {
+                            consumer_id: "consumer-a".into(),
+                            key_id: "key-a".into(),
+                        },
+                        sequence,
+                    )]),
+                )
+            }
+
+            #[test]
+            fn create_load_and_cas_update() {
+                let file = path("cas");
+                let limits = ReplayCheckpointStoreLimits::default();
+                let first = checkpoint(1, 12);
+                assert!(create_new(&file, &first, &limits).is_ok());
+                let loaded = load(&file, &limits);
+                assert_eq!(loaded.map(|v| v.0), Ok(first));
+                let second = checkpoint(2, 17);
+                assert!(save(&file, &second, Some(1), &limits).is_ok());
+                assert_eq!(load(&file, &limits).map(|v| v.0), Ok(second));
+                let _ = fs::remove_file(file);
+            }
+
+            #[test]
+            fn rejects_stale_generation_and_existing_create() {
+                let file = path("stale");
+                let limits = ReplayCheckpointStoreLimits::default();
+                assert!(create_new(&file, &checkpoint(3, 8), &limits).is_ok());
+                assert_eq!(
+                    create_new(&file, &checkpoint(4, 9), &limits),
+                    Err(StoreError::AlreadyExists)
+                );
+                assert!(matches!(
+                    save(&file, &checkpoint(4, 9), Some(2), &limits),
+                    Err(StoreError::GenerationConflict { .. })
+                ));
+                assert!(matches!(
+                    save(&file, &checkpoint(3, 10), Some(3), &limits),
+                    Err(StoreError::GenerationNotIncreasing { .. })
+                ));
+                let _ = fs::remove_file(file);
+            }
+
+            #[test]
+            fn rejects_corruption_without_rewriting_file() {
+                let file = path("corrupt");
+                let limits = ReplayCheckpointStoreLimits::default();
+                assert!(create_new(&file, &checkpoint(1, 2), &limits).is_ok());
+                let mut bytes = fs::read(&file).unwrap_or_default();
+                if let Some(byte) = bytes.get_mut(6) {
+                    *byte ^= 0x40;
+                }
+                assert!(fs::write(&file, &bytes).is_ok());
+                let before = fs::read(&file).unwrap_or_default();
+                assert!(matches!(load(&file, &limits), Err(StoreError::Codec(_))));
+                assert_eq!(fs::read(&file).unwrap_or_default(), before);
+                let _ = fs::remove_file(file);
+            }
+
+            #[test]
+            fn enforces_file_limit() {
+                let file = path("limit");
+                let limits = ReplayCheckpointStoreLimits {
+                    max_file_bytes: 20,
+                    ..ReplayCheckpointStoreLimits::default()
+                };
+                assert_eq!(
+                    create_new(&file, &checkpoint(1, 2), &limits),
+                    Err(StoreError::TooLarge)
+                );
+                assert!(!file.exists());
+            }
+        }
+    }
+    pub mod x082 {
+        //! Restore policy validation for audit-report replay checkpoints.
+        //!
+        //! This module validates a decoded M080 checkpoint against generation,
+        //! cardinality, sequence-ceiling, and live-watermark continuity policies.
+        //! It performs no I/O and never mutates the supplied live state.
+
+        use crate::agentmem::x080::{
+            encode, ReplayCheckpoint, ReplayCheckpointError, ReplayCheckpointLimits,
+            ReplayPrincipal,
+        };
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpointRestorePolicy {
+            pub minimum_generation: u64,
+            pub maximum_generation: Option<u64>,
+            pub current_generation: Option<u64>,
+            pub maximum_principals: usize,
+            pub maximum_sequence: Option<u64>,
+            pub preserve_existing_principals: bool,
+            pub current_watermarks: BTreeMap<ReplayPrincipal, u64>,
+        }
+
+        impl Default for ReplayCheckpointRestorePolicy {
+            fn default() -> Self {
+                Self {
+                    minimum_generation: 1,
+                    maximum_generation: None,
+                    current_generation: None,
+                    maximum_principals: 16_384,
+                    maximum_sequence: None,
+                    preserve_existing_principals: true,
+                    current_watermarks: BTreeMap::new(),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReplayCheckpointRestoreReport {
+            pub generation: u64,
+            pub principal_count: usize,
+            pub added_principals: usize,
+            pub retained_principals: usize,
+            pub removed_principals: usize,
+            pub maximum_sequence: u64,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RestorePolicyError {
+            InvalidPolicy,
+            Checkpoint(ReplayCheckpointError),
+            GenerationBelowMinimum {
+                actual: u64,
+                minimum: u64,
+            },
+            GenerationAboveMaximum {
+                actual: u64,
+                maximum: u64,
+            },
+            GenerationNotIncreasing {
+                current: u64,
+                proposed: u64,
+            },
+            TooManyPrincipals {
+                actual: usize,
+                maximum: usize,
+            },
+            SequenceAboveMaximum {
+                principal: ReplayPrincipal,
+                actual: u64,
+                maximum: u64,
+            },
+            WatermarkRegression {
+                principal: ReplayPrincipal,
+                current: u64,
+                proposed: Option<u64>,
+            },
+        }
+
+        impl From<ReplayCheckpointError> for RestorePolicyError {
+            fn from(value: ReplayCheckpointError) -> Self {
+                Self::Checkpoint(value)
+            }
+        }
+
+        /// Validates a checkpoint before installation. Existing principals may not
+        /// regress; by default they may not disappear either. A successful report is
+        /// evidence of policy validation only, not authentication of checkpoint bytes.
+        pub fn validate_restore(
+            checkpoint: &ReplayCheckpoint,
+            policy: &ReplayCheckpointRestorePolicy,
+            codec_limits: &ReplayCheckpointLimits,
+        ) -> Result<ReplayCheckpointRestoreReport, RestorePolicyError> {
+            if policy.maximum_principals == 0
+                || policy.minimum_generation == 0
+                || policy
+                    .maximum_generation
+                    .is_some_and(|maximum| maximum < policy.minimum_generation)
+                || policy
+                    .current_generation
+                    .is_some_and(|current| current == u64::MAX)
+                || policy
+                    .current_watermarks
+                    .values()
+                    .any(|sequence| *sequence == 0)
+            {
+                return Err(RestorePolicyError::InvalidPolicy);
+            }
+
+            // Reuse the canonical codec validator so in-memory values obey the same
+            // identity, sequence, generation, and encoded-size constraints as wire data.
+            let _encoded = encode(checkpoint, codec_limits)?;
+
+            if checkpoint.generation < policy.minimum_generation {
+                return Err(RestorePolicyError::GenerationBelowMinimum {
+                    actual: checkpoint.generation,
+                    minimum: policy.minimum_generation,
+                });
+            }
+            if let Some(maximum) = policy.maximum_generation {
+                if checkpoint.generation > maximum {
+                    return Err(RestorePolicyError::GenerationAboveMaximum {
+                        actual: checkpoint.generation,
+                        maximum,
+                    });
+                }
+            }
+            if let Some(current) = policy.current_generation {
+                if checkpoint.generation <= current {
+                    return Err(RestorePolicyError::GenerationNotIncreasing {
+                        current,
+                        proposed: checkpoint.generation,
+                    });
+                }
+            }
+            if checkpoint.watermarks.len() > policy.maximum_principals {
+                return Err(RestorePolicyError::TooManyPrincipals {
+                    actual: checkpoint.watermarks.len(),
+                    maximum: policy.maximum_principals,
+                });
+            }
+
+            for (principal, proposed) in &checkpoint.watermarks {
+                if let Some(maximum) = policy.maximum_sequence {
+                    if *proposed > maximum {
+                        return Err(RestorePolicyError::SequenceAboveMaximum {
+                            principal: principal.clone(),
+                            actual: *proposed,
+                            maximum,
+                        });
+                    }
+                }
+            }
+
+            let mut retained = 0usize;
+            let mut added = 0usize;
+            let mut removed = 0usize;
+            for (principal, current) in &policy.current_watermarks {
+                match checkpoint.watermarks.get(principal).copied() {
+                    Some(proposed) if proposed >= *current => retained = retained.saturating_add(1),
+                    Some(proposed) => {
+                        return Err(RestorePolicyError::WatermarkRegression {
+                            principal: principal.clone(),
+                            current: *current,
+                            proposed: Some(proposed),
+                        })
+                    }
+                    None if policy.preserve_existing_principals => {
+                        return Err(RestorePolicyError::WatermarkRegression {
+                            principal: principal.clone(),
+                            current: *current,
+                            proposed: None,
+                        });
+                    }
+                    None => removed = removed.saturating_add(1),
+                }
+            }
+            for principal in checkpoint.watermarks.keys() {
+                if !policy.current_watermarks.contains_key(principal) {
+                    added = added.saturating_add(1);
+                }
+            }
+
+            Ok(ReplayCheckpointRestoreReport {
+                generation: checkpoint.generation,
+                principal_count: checkpoint.watermarks.len(),
+                added_principals: added,
+                retained_principals: retained,
+                removed_principals: removed,
+                maximum_sequence: checkpoint.maximum_sequence(),
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn principal(consumer: &str, key: &str) -> ReplayPrincipal {
+                ReplayPrincipal {
+                    consumer_id: consumer.to_owned(),
+                    key_id: key.to_owned(),
+                }
+            }
+
+            fn checkpoint(generation: u64, entries: &[(&str, &str, u64)]) -> ReplayCheckpoint {
+                let watermarks = entries
+                    .iter()
+                    .map(|(consumer, key, sequence)| (principal(consumer, key), *sequence))
+                    .collect();
+                ReplayCheckpoint::new(generation, watermarks)
+            }
+
+            #[test]
+            fn accepts_monotonic_checkpoint_and_reports_delta() {
+                let current = BTreeMap::from([(principal("consumer-a", "key-a"), 7)]);
+                let policy = ReplayCheckpointRestorePolicy {
+                    current_generation: Some(3),
+                    current_watermarks: current,
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                let report = validate_restore(
+                    &checkpoint(4, &[("consumer-a", "key-a", 8), ("consumer-b", "key-b", 2)]),
+                    &policy,
+                    &ReplayCheckpointLimits::default(),
+                )
+                .expect("valid checkpoint");
+                assert_eq!(report.added_principals, 1);
+                assert_eq!(report.retained_principals, 1);
+                assert_eq!(report.removed_principals, 0);
+                assert_eq!(report.maximum_sequence, 8);
+            }
+
+            #[test]
+            fn rejects_generation_regression_and_watermark_regression() {
+                let policy = ReplayCheckpointRestorePolicy {
+                    current_generation: Some(4),
+                    current_watermarks: BTreeMap::from([(principal("c", "k"), 9)]),
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                assert!(matches!(
+                    validate_restore(
+                        &checkpoint(4, &[("c", "k", 10)]),
+                        &policy,
+                        &ReplayCheckpointLimits::default()
+                    ),
+                    Err(RestorePolicyError::GenerationNotIncreasing { .. })
+                ));
+                assert!(matches!(
+                    validate_restore(
+                        &checkpoint(5, &[("c", "k", 8)]),
+                        &policy,
+                        &ReplayCheckpointLimits::default()
+                    ),
+                    Err(RestorePolicyError::WatermarkRegression { .. })
+                ));
+            }
+
+            #[test]
+            fn rejects_removal_by_default_and_allows_explicit_pruning() {
+                let current = BTreeMap::from([(principal("c", "k"), 9)]);
+                let strict = ReplayCheckpointRestorePolicy {
+                    current_watermarks: current.clone(),
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                let candidate = checkpoint(2, &[]);
+                assert!(matches!(
+                    validate_restore(&candidate, &strict, &ReplayCheckpointLimits::default()),
+                    Err(RestorePolicyError::WatermarkRegression { proposed: None, .. })
+                ));
+                let pruning = ReplayCheckpointRestorePolicy {
+                    preserve_existing_principals: false,
+                    current_watermarks: current,
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                let report =
+                    validate_restore(&candidate, &pruning, &ReplayCheckpointLimits::default())
+                        .expect("explicit pruning");
+                assert_eq!(report.removed_principals, 1);
+            }
+
+            #[test]
+            fn enforces_principal_and_sequence_ceilings() {
+                let policy = ReplayCheckpointRestorePolicy {
+                    maximum_principals: 1,
+                    maximum_sequence: Some(10),
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                assert!(matches!(
+                    validate_restore(
+                        &checkpoint(2, &[("a", "k", 1), ("b", "k", 2)]),
+                        &policy,
+                        &ReplayCheckpointLimits::default()
+                    ),
+                    Err(RestorePolicyError::TooManyPrincipals { .. })
+                ));
+                let sequence_policy = ReplayCheckpointRestorePolicy {
+                    maximum_sequence: Some(5),
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                assert!(matches!(
+                    validate_restore(
+                        &checkpoint(2, &[("a", "k", 6)]),
+                        &sequence_policy,
+                        &ReplayCheckpointLimits::default()
+                    ),
+                    Err(RestorePolicyError::SequenceAboveMaximum { .. })
+                ));
+            }
+        }
+    }
+    pub mod x083 {
+        //! Policy-checked, atomic in-memory restoration from a durable replay checkpoint.
+        //!
+        //! The coordinator loads and decodes the M080 checkpoint through M081, binds
+        //! M082 policy validation to the exact live runtime state, and only then swaps
+        //! the complete watermark map and generation. Any failure leaves live state
+        //! untouched. Authentication of checkpoint bytes and exclusive ownership of
+        //! the checkpoint file remain caller responsibilities.
+
+        use crate::agentmem::x080::{ReplayCheckpointLimits, ReplayPrincipal};
+        use crate::agentmem::x081::{
+            self, ReplayCheckpointMetadata, ReplayCheckpointStoreLimits, StoreError,
+        };
+        use crate::agentmem::x082::{
+            validate_restore, ReplayCheckpointRestorePolicy, ReplayCheckpointRestoreReport,
+            RestorePolicyError,
+        };
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        /// The mutable replay state owned by one runtime instance.
+        #[derive(Clone, Debug, Default, Eq, PartialEq)]
+        pub struct ReplayRuntimeState {
+            pub generation: Option<u64>,
+            pub watermarks: BTreeMap<ReplayPrincipal, u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RestoreOutcome {
+            pub previous_generation: Option<u64>,
+            pub installed_generation: u64,
+            pub store_metadata: ReplayCheckpointMetadata,
+            pub policy_report: ReplayCheckpointRestoreReport,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RestoreError {
+            Store(StoreError),
+            Policy(RestorePolicyError),
+            LiveStateTooLarge { actual: usize, maximum: usize },
+            InvalidLiveWatermark,
+        }
+        impl From<StoreError> for RestoreError {
+            fn from(value: StoreError) -> Self {
+                Self::Store(value)
+            }
+        }
+        impl From<RestorePolicyError> for RestoreError {
+            fn from(value: RestorePolicyError) -> Self {
+                Self::Policy(value)
+            }
+        }
+
+        /// Restores a checkpoint as one in-memory state transition.
+        ///
+        /// The policy's generation and watermark baselines are replaced with values
+        /// read from `live`, preventing callers from accidentally validating against
+        /// stale baselines. All file I/O, decoding, and policy checks complete before
+        /// either live field is modified. The caller must serialize access to `live`
+        /// and prevent concurrent replacement of the checkpoint file during this call.
+        pub fn restore_into(
+            checkpoint_path: impl AsRef<Path>,
+            live: &mut ReplayRuntimeState,
+            policy: &ReplayCheckpointRestorePolicy,
+            limits: &ReplayCheckpointStoreLimits,
+        ) -> Result<RestoreOutcome, RestoreError> {
+            if live.watermarks.len() > policy.maximum_principals {
+                return Err(RestoreError::LiveStateTooLarge {
+                    actual: live.watermarks.len(),
+                    maximum: policy.maximum_principals,
+                });
+            }
+            if live.watermarks.values().any(|sequence| *sequence == 0) {
+                return Err(RestoreError::InvalidLiveWatermark);
+            }
+
+            let (candidate, metadata) = x081::load(checkpoint_path, limits)?;
+            let mut bound_policy = policy.clone();
+            bound_policy.current_generation = live.generation;
+            bound_policy.current_watermarks = live.watermarks.clone();
+            let codec_limits: &ReplayCheckpointLimits = &limits.codec;
+            let report = validate_restore(&candidate, &bound_policy, codec_limits)?;
+
+            // No fallible operation occurs after this point: the transition is atomic
+            // with respect to this function and its exclusively borrowed state value.
+            let previous_generation = live.generation;
+            let installed_generation = candidate.generation;
+            let next_watermarks = candidate.watermarks;
+            live.watermarks = next_watermarks;
+            live.generation = Some(installed_generation);
+
+            Ok(RestoreOutcome {
+                previous_generation,
+                installed_generation,
+                store_metadata: metadata,
+                policy_report: report,
+            })
+        }
+
+        /// Exposes the checkpoint codec limits used by the coordinator without
+        /// requiring callers to construct a second, potentially inconsistent policy.
+        pub fn default_codec_limits() -> ReplayCheckpointLimits {
+            ReplayCheckpointLimits::default()
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::agentmem::x080::ReplayCheckpoint;
+            use std::fs;
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+
+            fn temp_path(label: &str) -> std::path::PathBuf {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                std::env::temp_dir().join(format!(
+                    "agentos-m083-{label}-{}-{id}.bin",
+                    std::process::id()
+                ))
+            }
+            fn principal(consumer: &str, key: &str) -> ReplayPrincipal {
+                ReplayPrincipal {
+                    consumer_id: consumer.to_owned(),
+                    key_id: key.to_owned(),
+                }
+            }
+            fn write_checkpoint(path: &Path, generation: u64, entries: &[(&str, &str, u64)]) {
+                let watermarks = entries
+                    .iter()
+                    .map(|(consumer, key, sequence)| (principal(consumer, key), *sequence))
+                    .collect();
+                let checkpoint = ReplayCheckpoint::new(generation, watermarks);
+                x081::create_new(path, &checkpoint, &ReplayCheckpointStoreLimits::default())
+                    .expect("checkpoint creation");
+            }
+
+            #[test]
+            fn restores_only_after_policy_validation_and_reports_transition() {
+                let path = temp_path("success");
+                write_checkpoint(
+                    &path,
+                    5,
+                    &[("consumer-a", "key-a", 12), ("consumer-b", "key-b", 3)],
+                );
+                let mut live = ReplayRuntimeState {
+                    generation: Some(4),
+                    watermarks: BTreeMap::from([(principal("consumer-a", "key-a"), 10)]),
+                };
+                let outcome = restore_into(
+                    &path,
+                    &mut live,
+                    &ReplayCheckpointRestorePolicy::default(),
+                    &ReplayCheckpointStoreLimits::default(),
+                )
+                .expect("restore");
+                assert_eq!(live.generation, Some(5));
+                assert_eq!(
+                    live.watermarks.get(&principal("consumer-a", "key-a")),
+                    Some(&12)
+                );
+                assert_eq!(outcome.previous_generation, Some(4));
+                assert_eq!(outcome.policy_report.added_principals, 1);
+                let _ = fs::remove_file(path);
+            }
+
+            #[test]
+            fn failed_policy_validation_leaves_live_state_unchanged() {
+                let path = temp_path("regression");
+                write_checkpoint(&path, 5, &[("consumer-a", "key-a", 8)]);
+                let original = ReplayRuntimeState {
+                    generation: Some(4),
+                    watermarks: BTreeMap::from([(principal("consumer-a", "key-a"), 9)]),
+                };
+                let mut live = original.clone();
+                let result = restore_into(
+                    &path,
+                    &mut live,
+                    &ReplayCheckpointRestorePolicy::default(),
+                    &ReplayCheckpointStoreLimits::default(),
+                );
+                assert!(matches!(
+                    result,
+                    Err(RestoreError::Policy(
+                        RestorePolicyError::WatermarkRegression { .. }
+                    ))
+                ));
+                assert_eq!(live, original);
+                let _ = fs::remove_file(path);
+            }
+
+            #[test]
+            fn missing_checkpoint_does_not_change_runtime() {
+                let path = temp_path("missing");
+                let original = ReplayRuntimeState::default();
+                let mut live = original.clone();
+                let result = restore_into(
+                    &path,
+                    &mut live,
+                    &ReplayCheckpointRestorePolicy::default(),
+                    &ReplayCheckpointStoreLimits::default(),
+                );
+                assert!(matches!(
+                    result,
+                    Err(RestoreError::Store(StoreError::NotFound))
+                ));
+                assert_eq!(live, original);
+            }
+
+            #[test]
+            fn rejects_live_state_over_policy_capacity_before_io() {
+                let path = temp_path("capacity");
+                let mut live = ReplayRuntimeState {
+                    generation: Some(1),
+                    watermarks: BTreeMap::from([
+                        (principal("a", "k"), 1),
+                        (principal("b", "k"), 2),
+                    ]),
+                };
+                let policy = ReplayCheckpointRestorePolicy {
+                    maximum_principals: 1,
+                    ..ReplayCheckpointRestorePolicy::default()
+                };
+                let original = live.clone();
+                let result = restore_into(
+                    &path,
+                    &mut live,
+                    &policy,
+                    &ReplayCheckpointStoreLimits::default(),
+                );
+                assert!(matches!(
+                    result,
+                    Err(RestoreError::LiveStateTooLarge { .. })
+                ));
+                assert_eq!(live, original);
+            }
+        }
+    }
+    pub mod x088 {
+        //! Deterministic, bounded codec for non-secret checkpoint-keyring audit events.
+        //!
+        //! The format records lifecycle metadata only. Secret key bytes are never accepted,
+        //! encoded, decoded, or exposed by this crate. CRC-32 detects accidental corruption;
+        //! it is not an authenticity mechanism.
+
+        use std::fmt;
+
+        const MAGIC: &[u8; 4] = b"KRAU";
+        const VERSION: u16 = 1;
+        const HEADER_LEN: usize = 4 + 2 + 4;
+        const CHECKSUM_LEN: usize = 4;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum KeyStatus {
+            Active,
+            VerifyOnly,
+            Revoked,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum AuditAction {
+            Initialized,
+            Rotated,
+            Revoked,
+            Purged,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct KeyMetadata {
+            pub key_id: String,
+            pub status: KeyStatus,
+            pub activated_at_ms: u64,
+            pub verify_until_ms: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct KeyringAuditEvent {
+            pub sequence: u64,
+            pub at_ms: u64,
+            pub action: AuditAction,
+            /// For rotation, this is the former active key; otherwise the affected key.
+            pub key: KeyMetadata,
+            /// Present only for rotation, and identifies the newly active key.
+            pub related: Option<KeyMetadata>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CodecLimits {
+            pub max_events: usize,
+            pub max_key_id_bytes: usize,
+            pub max_total_bytes: usize,
+        }
+        impl Default for CodecLimits {
+            fn default() -> Self {
+                Self {
+                    max_events: 4096,
+                    max_key_id_bytes: 128,
+                    max_total_bytes: 1_048_576,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum CodecError {
+            InvalidLimits,
+            TooManyEvents,
+            TooLarge,
+            Truncated,
+            BadMagic,
+            UnsupportedVersion(u16),
+            LengthMismatch,
+            ChecksumMismatch,
+            InvalidUtf8,
+            InvalidKeyId,
+            InvalidStatus(u8),
+            InvalidAction(u8),
+            InvalidOption(u8),
+            InvalidEvent,
+            NonIncreasingSequence,
+            TrailingBytes,
+            IntegerOverflow,
+        }
+        impl fmt::Display for CodecError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for CodecError {}
+
+        pub fn encode(
+            events: &[KeyringAuditEvent],
+            limits: &CodecLimits,
+        ) -> Result<Vec<u8>, CodecError> {
+            validate_limits(limits)?;
+            if events.len() > limits.max_events {
+                return Err(CodecError::TooManyEvents);
+            }
+            let mut body = Vec::new();
+            put_u32(
+                &mut body,
+                u32::try_from(events.len()).map_err(|_| CodecError::IntegerOverflow)?,
+            );
+            let mut previous = None;
+            for event in events {
+                validate_event(event, limits)?;
+                if previous.map(|p| event.sequence <= p).unwrap_or(false) {
+                    return Err(CodecError::NonIncreasingSequence);
+                }
+                previous = Some(event.sequence);
+                put_u64(&mut body, event.sequence);
+                put_u64(&mut body, event.at_ms);
+                body.push(action_byte(event.action));
+                put_metadata(&mut body, &event.key, limits)?;
+                match &event.related {
+                    Some(metadata) => {
+                        body.push(1);
+                        put_metadata(&mut body, metadata, limits)?;
+                    }
+                    None => body.push(0),
+                }
+                if HEADER_LEN
+                    .checked_add(body.len())
+                    .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                    .ok_or(CodecError::IntegerOverflow)?
+                    > limits.max_total_bytes
+                {
+                    return Err(CodecError::TooLarge);
+                }
+            }
+            let body_len = u32::try_from(body.len()).map_err(|_| CodecError::IntegerOverflow)?;
+            let mut out = Vec::with_capacity(HEADER_LEN + body.len() + CHECKSUM_LEN);
+            out.extend_from_slice(MAGIC);
+            put_u16(&mut out, VERSION);
+            put_u32(&mut out, body_len);
+            out.extend_from_slice(&body);
+            let checksum = crc32(&out);
+            put_u32(&mut out, checksum);
+            if out.len() > limits.max_total_bytes {
+                return Err(CodecError::TooLarge);
+            }
+            Ok(out)
+        }
+
+        pub fn decode(
+            bytes: &[u8],
+            limits: &CodecLimits,
+        ) -> Result<Vec<KeyringAuditEvent>, CodecError> {
+            validate_limits(limits)?;
+            if bytes.len() > limits.max_total_bytes {
+                return Err(CodecError::TooLarge);
+            }
+            if bytes.len() < HEADER_LEN + CHECKSUM_LEN {
+                return Err(CodecError::Truncated);
+            }
+            if &bytes[..4] != MAGIC {
+                return Err(CodecError::BadMagic);
+            }
+            let version = read_u16_at(bytes, 4)?;
+            if version != VERSION {
+                return Err(CodecError::UnsupportedVersion(version));
+            }
+            let body_len = read_u32_at(bytes, 6)? as usize;
+            let expected = HEADER_LEN
+                .checked_add(body_len)
+                .and_then(|n| n.checked_add(CHECKSUM_LEN))
+                .ok_or(CodecError::IntegerOverflow)?;
+            if expected != bytes.len() {
+                return Err(CodecError::LengthMismatch);
+            }
+            let stored_crc = read_u32_at(bytes, bytes.len() - CHECKSUM_LEN)?;
+            if crc32(&bytes[..bytes.len() - CHECKSUM_LEN]) != stored_crc {
+                return Err(CodecError::ChecksumMismatch);
+            }
+            let mut r = Reader {
+                bytes: &bytes[HEADER_LEN..bytes.len() - CHECKSUM_LEN],
+                pos: 0,
+            };
+            let count = r.u32()? as usize;
+            if count > limits.max_events {
+                return Err(CodecError::TooManyEvents);
+            }
+            let mut events = Vec::with_capacity(count);
+            let mut previous = None;
+            for _ in 0..count {
+                let sequence = r.u64()?;
+                let at_ms = r.u64()?;
+                let action = parse_action(r.byte()?)?;
+                let key = r.metadata(limits)?;
+                let related = match r.byte()? {
+                    0 => None,
+                    1 => Some(r.metadata(limits)?),
+                    n => return Err(CodecError::InvalidOption(n)),
+                };
+                let event = KeyringAuditEvent {
+                    sequence,
+                    at_ms,
+                    action,
+                    key,
+                    related,
+                };
+                validate_event(&event, limits)?;
+                if previous.map(|p| sequence <= p).unwrap_or(false) {
+                    return Err(CodecError::NonIncreasingSequence);
+                }
+                previous = Some(sequence);
+                events.push(event);
+            }
+            if r.pos != r.bytes.len() {
+                return Err(CodecError::TrailingBytes);
+            }
+            Ok(events)
+        }
+
+        fn validate_limits(l: &CodecLimits) -> Result<(), CodecError> {
+            if l.max_events == 0
+                || l.max_key_id_bytes == 0
+                || l.max_total_bytes < HEADER_LEN + CHECKSUM_LEN + 4
+            {
+                return Err(CodecError::InvalidLimits);
+            }
+            Ok(())
+        }
+        fn validate_event(e: &KeyringAuditEvent, l: &CodecLimits) -> Result<(), CodecError> {
+            if e.sequence == 0 {
+                return Err(CodecError::InvalidEvent);
+            }
+            validate_metadata(&e.key, l)?;
+            if let Some(other) = &e.related {
+                validate_metadata(other, l)?;
+                if other.key_id == e.key.key_id {
+                    return Err(CodecError::InvalidEvent);
+                }
+            }
+            let valid = match e.action {
+                AuditAction::Initialized => {
+                    e.key.status == KeyStatus::Active
+                        && e.key.verify_until_ms.is_none()
+                        && e.related.is_none()
+                }
+                AuditAction::Rotated => {
+                    e.key.status == KeyStatus::VerifyOnly
+                        && e.key.verify_until_ms.is_some()
+                        && e.related
+                            .as_ref()
+                            .map(|m| {
+                                m.status == KeyStatus::Active
+                                    && m.verify_until_ms.is_none()
+                                    && m.activated_at_ms == e.at_ms
+                            })
+                            .unwrap_or(false)
+                }
+                AuditAction::Revoked => {
+                    e.key.status == KeyStatus::Revoked
+                        && e.key.verify_until_ms == Some(e.at_ms)
+                        && e.related.is_none()
+                }
+                AuditAction::Purged => {
+                    matches!(e.key.status, KeyStatus::Revoked | KeyStatus::VerifyOnly)
+                        && e.related.is_none()
+                }
+            };
+            if !valid {
+                return Err(CodecError::InvalidEvent);
+            }
+            Ok(())
+        }
+        fn validate_metadata(m: &KeyMetadata, l: &CodecLimits) -> Result<(), CodecError> {
+            if m.key_id.trim().is_empty()
+                || m.key_id.len() > l.max_key_id_bytes
+                || m.key_id.as_bytes().contains(&0)
+            {
+                return Err(CodecError::InvalidKeyId);
+            }
+            if let Some(until) = m.verify_until_ms {
+                if until < m.activated_at_ms {
+                    return Err(CodecError::InvalidEvent);
+                }
+            }
+            if m.status == KeyStatus::Active && m.verify_until_ms.is_some() {
+                return Err(CodecError::InvalidEvent);
+            }
+            if m.status == KeyStatus::Revoked && m.verify_until_ms.is_none() {
+                return Err(CodecError::InvalidEvent);
+            }
+            Ok(())
+        }
+        fn put_metadata(
+            out: &mut Vec<u8>,
+            m: &KeyMetadata,
+            l: &CodecLimits,
+        ) -> Result<(), CodecError> {
+            validate_metadata(m, l)?;
+            let n = u16::try_from(m.key_id.len()).map_err(|_| CodecError::IntegerOverflow)?;
+            put_u16(out, n);
+            out.extend_from_slice(m.key_id.as_bytes());
+            out.push(match m.status {
+                KeyStatus::Active => 1,
+                KeyStatus::VerifyOnly => 2,
+                KeyStatus::Revoked => 3,
+            });
+            put_u64(out, m.activated_at_ms);
+            match m.verify_until_ms {
+                Some(v) => {
+                    out.push(1);
+                    put_u64(out, v)
+                }
+                None => out.push(0),
+            }
+            Ok(())
+        }
+        fn action_byte(a: AuditAction) -> u8 {
+            match a {
+                AuditAction::Initialized => 1,
+                AuditAction::Rotated => 2,
+                AuditAction::Revoked => 3,
+                AuditAction::Purged => 4,
+            }
+        }
+        fn parse_action(n: u8) -> Result<AuditAction, CodecError> {
+            match n {
+                1 => Ok(AuditAction::Initialized),
+                2 => Ok(AuditAction::Rotated),
+                3 => Ok(AuditAction::Revoked),
+                4 => Ok(AuditAction::Purged),
+                _ => Err(CodecError::InvalidAction(n)),
+            }
+        }
+        fn put_u16(v: &mut Vec<u8>, n: u16) {
+            v.extend_from_slice(&n.to_be_bytes())
+        }
+        fn put_u32(v: &mut Vec<u8>, n: u32) {
+            v.extend_from_slice(&n.to_be_bytes())
+        }
+        fn put_u64(v: &mut Vec<u8>, n: u64) {
+            v.extend_from_slice(&n.to_be_bytes())
+        }
+        fn read_u16_at(b: &[u8], p: usize) -> Result<u16, CodecError> {
+            let s = b.get(p..p + 2).ok_or(CodecError::Truncated)?;
+            Ok(u16::from_be_bytes([s[0], s[1]]))
+        }
+        fn read_u32_at(b: &[u8], p: usize) -> Result<u32, CodecError> {
+            let s = b.get(p..p + 4).ok_or(CodecError::Truncated)?;
+            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+        }
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            pos: usize,
+        }
+        impl<'a> Reader<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], CodecError> {
+                let end = self.pos.checked_add(n).ok_or(CodecError::IntegerOverflow)?;
+                let s = self.bytes.get(self.pos..end).ok_or(CodecError::Truncated)?;
+                self.pos = end;
+                Ok(s)
+            }
+            fn byte(&mut self) -> Result<u8, CodecError> {
+                Ok(self.take(1)?[0])
+            }
+            fn u16(&mut self) -> Result<u16, CodecError> {
+                let s = self.take(2)?;
+                Ok(u16::from_be_bytes([s[0], s[1]]))
+            }
+            fn u32(&mut self) -> Result<u32, CodecError> {
+                let s = self.take(4)?;
+                Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+            }
+            fn u64(&mut self) -> Result<u64, CodecError> {
+                let s = self.take(8)?;
+                Ok(u64::from_be_bytes([
+                    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                ]))
+            }
+            fn metadata(&mut self, l: &CodecLimits) -> Result<KeyMetadata, CodecError> {
+                let n = self.u16()? as usize;
+                if n == 0 || n > l.max_key_id_bytes {
+                    return Err(CodecError::InvalidKeyId);
+                }
+                let id = std::str::from_utf8(self.take(n)?)
+                    .map_err(|_| CodecError::InvalidUtf8)?
+                    .to_owned();
+                let status = match self.byte()? {
+                    1 => KeyStatus::Active,
+                    2 => KeyStatus::VerifyOnly,
+                    3 => KeyStatus::Revoked,
+                    x => return Err(CodecError::InvalidStatus(x)),
+                };
+                let activated_at_ms = self.u64()?;
+                let verify_until_ms = match self.byte()? {
+                    0 => None,
+                    1 => Some(self.u64()?),
+                    x => return Err(CodecError::InvalidOption(x)),
+                };
+                let m = KeyMetadata {
+                    key_id: id,
+                    status,
+                    activated_at_ms,
+                    verify_until_ms,
+                };
+                validate_metadata(&m, l)?;
+                Ok(m)
+            }
+        }
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &b in bytes {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb88320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn limits() -> CodecLimits {
+                CodecLimits::default()
+            }
+            fn meta(id: &str, status: KeyStatus, at: u64, until: Option<u64>) -> KeyMetadata {
+                KeyMetadata {
+                    key_id: id.into(),
+                    status,
+                    activated_at_ms: at,
+                    verify_until_ms: until,
+                }
+            }
+            #[test]
+            fn round_trip_lifecycle_events() {
+                let events = vec![
+                    KeyringAuditEvent {
+                        sequence: 1,
+                        at_ms: 10,
+                        action: AuditAction::Initialized,
+                        key: meta("k1", KeyStatus::Active, 10, None),
+                        related: None,
+                    },
+                    KeyringAuditEvent {
+                        sequence: 2,
+                        at_ms: 20,
+                        action: AuditAction::Rotated,
+                        key: meta("k1", KeyStatus::VerifyOnly, 10, Some(100)),
+                        related: Some(meta("k2", KeyStatus::Active, 20, None)),
+                    },
+                    KeyringAuditEvent {
+                        sequence: 3,
+                        at_ms: 30,
+                        action: AuditAction::Revoked,
+                        key: meta("k2", KeyStatus::Revoked, 20, Some(30)),
+                        related: None,
+                    },
+                    KeyringAuditEvent {
+                        sequence: 4,
+                        at_ms: 31,
+                        action: AuditAction::Purged,
+                        key: meta("k1", KeyStatus::VerifyOnly, 10, Some(100)),
+                        related: None,
+                    },
+                ];
+                let bytes = encode(&events, &limits()).unwrap();
+                assert_eq!(decode(&bytes, &limits()).unwrap(), events);
+            }
+            #[test]
+            fn detects_corruption() {
+                let e = KeyringAuditEvent {
+                    sequence: 1,
+                    at_ms: 1,
+                    action: AuditAction::Initialized,
+                    key: meta("k", KeyStatus::Active, 1, None),
+                    related: None,
+                };
+                let mut b = encode(&[e], &limits()).unwrap();
+                b[12] ^= 1;
+                assert_eq!(decode(&b, &limits()), Err(CodecError::ChecksumMismatch));
+            }
+            #[test]
+            fn rejects_sequence_regression() {
+                let e = |s| KeyringAuditEvent {
+                    sequence: s,
+                    at_ms: s,
+                    action: AuditAction::Initialized,
+                    key: meta(&format!("k{s}"), KeyStatus::Active, s, None),
+                    related: None,
+                };
+                assert_eq!(
+                    encode(&[e(2), e(1)], &limits()),
+                    Err(CodecError::NonIncreasingSequence)
+                );
+            }
+            #[test]
+            fn rejects_invalid_rotation_shape() {
+                let e = KeyringAuditEvent {
+                    sequence: 1,
+                    at_ms: 2,
+                    action: AuditAction::Rotated,
+                    key: meta("old", KeyStatus::Active, 1, None),
+                    related: Some(meta("new", KeyStatus::Active, 2, None)),
+                };
+                assert_eq!(encode(&[e], &limits()), Err(CodecError::InvalidEvent));
+            }
+        }
+    }
+    pub mod x089 {
+        //! Durable append-only journal for M088 checkpoint-keyring lifecycle audit events.
+        //!
+        //! Each record is a length-prefixed, independently checksummed M088 event envelope.
+        //! Appends are synced before the in-memory sequence watermark advances. Recovery
+        //! truncates only an incomplete final frame; complete malformed records fail closed.
+        //! This journal is single-process/single-writer and does not authenticate its history.
+
+        use crate::agentmem::x088 as codec;
+        use codec::{CodecError, CodecLimits, KeyringAuditEvent};
+        use std::fmt;
+        use std::fs::{File, OpenOptions};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::path::{Path, PathBuf};
+
+        const FRAME_PREFIX: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct JournalLimits {
+            pub max_record_bytes: usize,
+            pub max_total_bytes: u64,
+            pub codec: CodecLimits,
+        }
+        impl Default for JournalLimits {
+            fn default() -> Self {
+                Self {
+                    max_record_bytes: 16_384,
+                    max_total_bytes: 16 * 1024 * 1024,
+                    codec: CodecLimits::default(),
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        pub enum JournalError {
+            InvalidLimits,
+            RecordTooLarge,
+            JournalFull,
+            SequenceNotIncreasing { previous: u64, proposed: u64 },
+            CorruptRecord { offset: u64, source: CodecError },
+            InvalidRecordCount,
+            IntegerOverflow,
+            Io(std::io::Error),
+        }
+        impl fmt::Display for JournalError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for JournalError {}
+        impl From<std::io::Error> for JournalError {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value)
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RecoveryReport {
+            pub events: Vec<KeyringAuditEvent>,
+            pub truncated_tail_bytes: u64,
+            pub journal_bytes: u64,
+            pub last_sequence: Option<u64>,
+        }
+
+        pub struct KeyringAuditJournal {
+            path: PathBuf,
+            file: File,
+            limits: JournalLimits,
+            events: Vec<KeyringAuditEvent>,
+            last_sequence: Option<u64>,
+            bytes: u64,
+        }
+
+        impl KeyringAuditJournal {
+            /// Opens or creates a journal and performs recovery before returning it.
+            /// The caller must ensure exclusive process ownership of `path`.
+            pub fn open(
+                path: impl AsRef<Path>,
+                limits: JournalLimits,
+            ) -> Result<(Self, RecoveryReport), JournalError> {
+                validate_limits(&limits)?;
+                let path = path.as_ref().to_path_buf();
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false) // keep existing records: they are recovered below
+                    .open(&path)?;
+                let report = recover_file(&mut file, &limits)?;
+                let bytes = report.journal_bytes;
+                let last_sequence = report.last_sequence;
+                let events = report.events.clone();
+                file.seek(SeekFrom::End(0))?;
+                let journal = Self {
+                    path,
+                    file,
+                    limits,
+                    events,
+                    last_sequence,
+                    bytes,
+                };
+                Ok((journal, report))
+            }
+
+            /// Durably appends one event. Memory state advances only after `sync_data` succeeds.
+            pub fn append(&mut self, event: KeyringAuditEvent) -> Result<(), JournalError> {
+                if let Some(previous) = self.last_sequence {
+                    if event.sequence <= previous {
+                        return Err(JournalError::SequenceNotIncreasing {
+                            previous,
+                            proposed: event.sequence,
+                        });
+                    }
+                }
+                let encoded = codec::encode(std::slice::from_ref(&event), &self.limits.codec)
+                    .map_err(|source| JournalError::CorruptRecord {
+                        offset: self.bytes,
+                        source,
+                    })?;
+                if encoded.len() > self.limits.max_record_bytes {
+                    return Err(JournalError::RecordTooLarge);
+                }
+                let frame_len = FRAME_PREFIX
+                    .checked_add(encoded.len())
+                    .ok_or(JournalError::IntegerOverflow)?;
+                let next_bytes = self
+                    .bytes
+                    .checked_add(
+                        u64::try_from(frame_len).map_err(|_| JournalError::IntegerOverflow)?,
+                    )
+                    .ok_or(JournalError::IntegerOverflow)?;
+                if next_bytes > self.limits.max_total_bytes {
+                    return Err(JournalError::JournalFull);
+                }
+                let length =
+                    u32::try_from(encoded.len()).map_err(|_| JournalError::IntegerOverflow)?;
+                let start = self.file.seek(SeekFrom::End(0))?;
+                let result = (|| -> Result<(), std::io::Error> {
+                    self.file.write_all(&length.to_be_bytes())?;
+                    self.file.write_all(&encoded)?;
+                    self.file.sync_data()?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    // Best-effort rollback prevents a failed append from leaving bytes that a
+                    // subsequent append could mistake for a complete record.
+                    let rollback = self.file.set_len(start).and_then(|_| self.file.sync_data());
+                    if rollback.is_err() {
+                        return Err(JournalError::Io(error));
+                    }
+                    return Err(JournalError::Io(error));
+                }
+                self.bytes = next_bytes;
+                self.last_sequence = Some(event.sequence);
+                self.events.push(event);
+                Ok(())
+            }
+
+            pub fn events(&self) -> &[KeyringAuditEvent] {
+                &self.events
+            }
+            pub fn last_sequence(&self) -> Option<u64> {
+                self.last_sequence
+            }
+            pub fn journal_bytes(&self) -> u64 {
+                self.bytes
+            }
+            pub fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        fn validate_limits(l: &JournalLimits) -> Result<(), JournalError> {
+            if l.max_record_bytes < 18
+                || l.max_total_bytes < 4
+                || l.max_record_bytes > u32::MAX as usize
+                || l.codec.max_total_bytes < 18
+                || l.codec.max_events == 0
+            {
+                return Err(JournalError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn recover_file(
+            file: &mut File,
+            limits: &JournalLimits,
+        ) -> Result<RecoveryReport, JournalError> {
+            let file_len = file.metadata()?.len();
+            if file_len > limits.max_total_bytes {
+                return Err(JournalError::JournalFull);
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut events = Vec::new();
+            let mut offset = 0u64;
+            let mut truncated = 0u64;
+            let mut last_sequence = None;
+            loop {
+                if offset == file_len {
+                    break;
+                }
+                let remaining = file_len
+                    .checked_sub(offset)
+                    .ok_or(JournalError::IntegerOverflow)?;
+                if remaining < FRAME_PREFIX as u64 {
+                    truncated = remaining;
+                    file.set_len(offset)?;
+                    file.sync_data()?;
+                    break;
+                }
+                let mut prefix = [0u8; 4];
+                file.read_exact(&mut prefix)?;
+                let record_len = u32::from_be_bytes(prefix) as usize;
+                if record_len == 0 || record_len > limits.max_record_bytes {
+                    return Err(JournalError::CorruptRecord {
+                        offset,
+                        source: CodecError::TooLarge,
+                    });
+                }
+                let frame_size = FRAME_PREFIX
+                    .checked_add(record_len)
+                    .ok_or(JournalError::IntegerOverflow)?;
+                if remaining < frame_size as u64 {
+                    truncated = remaining;
+                    file.set_len(offset)?;
+                    file.sync_data()?;
+                    break;
+                }
+                let mut encoded = vec![0u8; record_len];
+                file.read_exact(&mut encoded)?;
+                let decoded = codec::decode(&encoded, &limits.codec)
+                    .map_err(|source| JournalError::CorruptRecord { offset, source })?;
+                if decoded.len() != 1 {
+                    return Err(JournalError::InvalidRecordCount);
+                }
+                let event = decoded
+                    .into_iter()
+                    .next()
+                    .ok_or(JournalError::InvalidRecordCount)?;
+                if let Some(previous) = last_sequence {
+                    if event.sequence <= previous {
+                        return Err(JournalError::SequenceNotIncreasing {
+                            previous,
+                            proposed: event.sequence,
+                        });
+                    }
+                }
+                last_sequence = Some(event.sequence);
+                events.push(event);
+                offset = offset
+                    .checked_add(frame_size as u64)
+                    .ok_or(JournalError::IntegerOverflow)?;
+            }
+            file.seek(SeekFrom::End(0))?;
+            Ok(RecoveryReport {
+                events,
+                truncated_tail_bytes: truncated,
+                journal_bytes: offset,
+                last_sequence,
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use codec::{AuditAction, KeyMetadata, KeyStatus};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+
+            fn path() -> PathBuf {
+                let n = NEXT.fetch_add(1, Ordering::Relaxed);
+                std::env::temp_dir()
+                    .join(format!("agentos-m089-{}-{n}.journal", std::process::id()))
+            }
+            fn event(sequence: u64, key_id: &str) -> KeyringAuditEvent {
+                KeyringAuditEvent {
+                    sequence,
+                    at_ms: sequence * 10,
+                    action: AuditAction::Initialized,
+                    key: KeyMetadata {
+                        key_id: key_id.to_owned(),
+                        status: KeyStatus::Active,
+                        activated_at_ms: sequence * 10,
+                        verify_until_ms: None,
+                    },
+                    related: None,
+                }
+            }
+
+            #[test]
+            fn append_and_reopen_restores_watermark() {
+                let p = path();
+                {
+                    let (mut j, _) =
+                        KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                    j.append(event(1, "key-a")).unwrap();
+                    j.append(event(2, "key-b")).unwrap();
+                }
+                let (j, report) = KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                assert_eq!(j.last_sequence(), Some(2));
+                assert_eq!(report.events.len(), 2);
+                let _ = std::fs::remove_file(p);
+            }
+
+            #[test]
+            fn incomplete_final_frame_is_truncated() {
+                let p = path();
+                {
+                    let (mut j, _) =
+                        KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                    j.append(event(1, "key-a")).unwrap();
+                }
+                let good = std::fs::metadata(&p).unwrap().len();
+                {
+                    let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+                    f.write_all(&[0, 0, 0, 20, 1, 2]).unwrap();
+                }
+                let (_, report) = KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                assert_eq!(report.truncated_tail_bytes, 6);
+                assert_eq!(std::fs::metadata(&p).unwrap().len(), good);
+                let _ = std::fs::remove_file(p);
+            }
+
+            #[test]
+            fn duplicate_or_regressing_sequence_is_rejected() {
+                let p = path();
+                let (mut j, _) = KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                j.append(event(4, "key-a")).unwrap();
+                assert!(matches!(
+                    j.append(event(4, "key-b")),
+                    Err(JournalError::SequenceNotIncreasing { .. })
+                ));
+                assert!(matches!(
+                    j.append(event(3, "key-c")),
+                    Err(JournalError::SequenceNotIncreasing { .. })
+                ));
+                drop(j);
+                let _ = std::fs::remove_file(p);
+            }
+
+            #[test]
+            fn complete_corruption_fails_closed() {
+                let p = path();
+                {
+                    let (mut j, _) =
+                        KeyringAuditJournal::open(&p, JournalLimits::default()).unwrap();
+                    j.append(event(1, "key-a")).unwrap();
+                }
+                let mut bytes = std::fs::read(&p).unwrap();
+                let last = bytes.len().saturating_sub(1);
+                if let Some(b) = bytes.get_mut(last) {
+                    *b ^= 0x80;
+                }
+                std::fs::write(&p, bytes).unwrap();
+                assert!(matches!(
+                    KeyringAuditJournal::open(&p, JournalLimits::default()),
+                    Err(JournalError::CorruptRecord { .. })
+                ));
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    pub mod x090 {
+        //! Read-only structural and semantic verifier for the authenticated-checkpoint
+        //! keyring audit journal. The verifier never truncates or repairs the source.
+        //!
+        //! M088 CRC-32 framing detects accidental corruption only. This crate validates
+        //! lifecycle consistency, not cryptographic authenticity of the journal history.
+
+        use crate::agentmem::x088 as codec;
+        use codec::{
+            AuditAction, CodecError, CodecLimits, KeyMetadata, KeyStatus, KeyringAuditEvent,
+        };
+        use std::collections::BTreeMap;
+        use std::fmt;
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::Path;
+
+        const PREFIX_LEN: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct VerifyLimits {
+            pub max_record_bytes: usize,
+            pub max_total_bytes: u64,
+            pub max_events: usize,
+            pub codec: CodecLimits,
+        }
+        impl Default for VerifyLimits {
+            fn default() -> Self {
+                Self {
+                    max_record_bytes: 16_384,
+                    max_total_bytes: 16 * 1024 * 1024,
+                    max_events: 100_000,
+                    codec: CodecLimits::default(),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct KeySummary {
+            pub key_id: String,
+            pub final_status: KeyStatus,
+            pub activated_at_ms: u64,
+            pub verify_until_ms: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct VerificationReport {
+            pub events_verified: usize,
+            pub journal_bytes: u64,
+            pub first_sequence: Option<u64>,
+            pub last_sequence: Option<u64>,
+            pub active_key_id: Option<String>,
+            pub key_summaries: Vec<KeySummary>,
+        }
+
+        #[derive(Debug)]
+        pub enum VerifyError {
+            InvalidLimits,
+            JournalTooLarge,
+            TruncatedFrame {
+                offset: u64,
+            },
+            InvalidFrameLength {
+                offset: u64,
+                length: usize,
+            },
+            CorruptRecord {
+                offset: u64,
+                source: CodecError,
+            },
+            RecordEventCount {
+                offset: u64,
+                count: usize,
+            },
+            TooManyEvents,
+            SequenceNotIncreasing {
+                previous: u64,
+                proposed: u64,
+            },
+            InvalidLifecycle {
+                sequence: u64,
+                reason: LifecycleError,
+            },
+            IntegerOverflow,
+            Io(std::io::Error),
+        }
+        impl fmt::Display for VerifyError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for VerifyError {}
+        impl From<std::io::Error> for VerifyError {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value)
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum LifecycleError {
+            InitializationNotFirst,
+            DuplicateKeyId,
+            NoActiveKey,
+            ActiveKeyMismatch,
+            UnknownKey,
+            KeyAlreadyTerminal,
+            MetadataMismatch,
+            RotationDeadlineBeforeEvent,
+            PurgeBeforeExpiry,
+            InvalidActionShape,
+        }
+
+        #[derive(Clone)]
+        struct KeyState {
+            status: KeyStatus,
+            activated_at_ms: u64,
+            verify_until_ms: Option<u64>,
+        }
+
+        /// Verify an existing journal file without changing its bytes or metadata.
+        /// The caller must prevent concurrent writers while verification is running.
+        pub fn verify_file(
+            path: impl AsRef<Path>,
+            limits: VerifyLimits,
+        ) -> Result<VerificationReport, VerifyError> {
+            validate_limits(&limits)?;
+            let mut file = File::open(path)?;
+            let file_len = file.metadata()?.len();
+            if file_len > limits.max_total_bytes {
+                return Err(VerifyError::JournalTooLarge);
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut offset = 0u64;
+            let mut events = Vec::new();
+            let mut previous_sequence = None;
+            while offset < file_len {
+                let remaining = file_len
+                    .checked_sub(offset)
+                    .ok_or(VerifyError::IntegerOverflow)?;
+                if remaining < PREFIX_LEN as u64 {
+                    return Err(VerifyError::TruncatedFrame { offset });
+                }
+                let mut prefix = [0u8; PREFIX_LEN];
+                file.read_exact(&mut prefix)?;
+                let record_len = u32::from_be_bytes(prefix) as usize;
+                if record_len == 0 || record_len > limits.max_record_bytes {
+                    return Err(VerifyError::InvalidFrameLength {
+                        offset,
+                        length: record_len,
+                    });
+                }
+                let frame_len = PREFIX_LEN
+                    .checked_add(record_len)
+                    .ok_or(VerifyError::IntegerOverflow)?;
+                if remaining < u64::try_from(frame_len).map_err(|_| VerifyError::IntegerOverflow)? {
+                    return Err(VerifyError::TruncatedFrame { offset });
+                }
+                let mut encoded = vec![0u8; record_len];
+                file.read_exact(&mut encoded)?;
+                let decoded = codec::decode(&encoded, &limits.codec)
+                    .map_err(|source| VerifyError::CorruptRecord { offset, source })?;
+                if decoded.len() != 1 {
+                    return Err(VerifyError::RecordEventCount {
+                        offset,
+                        count: decoded.len(),
+                    });
+                }
+                let event = decoded
+                    .into_iter()
+                    .next()
+                    .ok_or(VerifyError::RecordEventCount { offset, count: 0 })?;
+                if let Some(previous) = previous_sequence {
+                    if event.sequence <= previous {
+                        return Err(VerifyError::SequenceNotIncreasing {
+                            previous,
+                            proposed: event.sequence,
+                        });
+                    }
+                }
+                previous_sequence = Some(event.sequence);
+                events.push(event);
+                if events.len() > limits.max_events {
+                    return Err(VerifyError::TooManyEvents);
+                }
+                offset = offset
+                    .checked_add(
+                        u64::try_from(frame_len).map_err(|_| VerifyError::IntegerOverflow)?,
+                    )
+                    .ok_or(VerifyError::IntegerOverflow)?;
+            }
+            replay_lifecycle(&events, file_len)
+        }
+
+        /// Validate a decoded event sequence when the caller already owns the events.
+        pub fn verify_events(
+            events: &[KeyringAuditEvent],
+        ) -> Result<VerificationReport, VerifyError> {
+            replay_lifecycle(events, 0)
+        }
+
+        fn validate_limits(l: &VerifyLimits) -> Result<(), VerifyError> {
+            if l.max_record_bytes < 18
+                || l.max_record_bytes > u32::MAX as usize
+                || l.max_total_bytes < 4
+                || l.max_events == 0
+                || l.codec.max_events == 0
+                || l.codec.max_total_bytes < 18
+            {
+                return Err(VerifyError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn replay_lifecycle(
+            events: &[KeyringAuditEvent],
+            journal_bytes: u64,
+        ) -> Result<VerificationReport, VerifyError> {
+            let mut states: BTreeMap<String, KeyState> = BTreeMap::new();
+            let mut active: Option<String> = None;
+            let mut previous_sequence = None;
+            for event in events {
+                if let Some(previous) = previous_sequence {
+                    if event.sequence <= previous {
+                        return Err(VerifyError::SequenceNotIncreasing {
+                            previous,
+                            proposed: event.sequence,
+                        });
+                    }
+                }
+                previous_sequence = Some(event.sequence);
+                apply_event(event, &mut states, &mut active).map_err(|reason| {
+                    VerifyError::InvalidLifecycle {
+                        sequence: event.sequence,
+                        reason,
+                    }
+                })?;
+            }
+            let key_summaries = states
+                .into_iter()
+                .map(|(key_id, state)| KeySummary {
+                    key_id,
+                    final_status: state.status,
+                    activated_at_ms: state.activated_at_ms,
+                    verify_until_ms: state.verify_until_ms,
+                })
+                .collect();
+            Ok(VerificationReport {
+                events_verified: events.len(),
+                journal_bytes,
+                first_sequence: events.first().map(|e| e.sequence),
+                last_sequence: events.last().map(|e| e.sequence),
+                active_key_id: active,
+                key_summaries,
+            })
+        }
+
+        fn apply_event(
+            event: &KeyringAuditEvent,
+            states: &mut BTreeMap<String, KeyState>,
+            active: &mut Option<String>,
+        ) -> Result<(), LifecycleError> {
+            match event.action {
+                AuditAction::Initialized => {
+                    if !states.is_empty() {
+                        return Err(LifecycleError::InitializationNotFirst);
+                    }
+                    if event.key.status != KeyStatus::Active || event.related.is_some() {
+                        return Err(LifecycleError::InvalidActionShape);
+                    }
+                    if states.contains_key(&event.key.key_id) {
+                        return Err(LifecycleError::DuplicateKeyId);
+                    }
+                    states.insert(event.key.key_id.clone(), state_from(&event.key));
+                    *active = Some(event.key.key_id.clone());
+                }
+                AuditAction::Rotated => {
+                    let old_id = event.key.key_id.as_str();
+                    let new = event
+                        .related
+                        .as_ref()
+                        .ok_or(LifecycleError::InvalidActionShape)?;
+                    if active.as_deref() != Some(old_id) {
+                        return Err(LifecycleError::ActiveKeyMismatch);
+                    }
+                    let old_state = states.get(old_id).ok_or(LifecycleError::UnknownKey)?;
+                    if old_state.status != KeyStatus::Active {
+                        return Err(LifecycleError::KeyAlreadyTerminal);
+                    }
+                    if old_state.activated_at_ms != event.key.activated_at_ms {
+                        return Err(LifecycleError::MetadataMismatch);
+                    }
+                    if event.key.status != KeyStatus::VerifyOnly
+                        || event
+                            .key
+                            .verify_until_ms
+                            .map(|v| v < event.at_ms)
+                            .unwrap_or(true)
+                    {
+                        return Err(LifecycleError::RotationDeadlineBeforeEvent);
+                    }
+                    if states.contains_key(&new.key_id) {
+                        return Err(LifecycleError::DuplicateKeyId);
+                    }
+                    if new.status != KeyStatus::Active
+                        || new.activated_at_ms != event.at_ms
+                        || new.verify_until_ms.is_some()
+                    {
+                        return Err(LifecycleError::InvalidActionShape);
+                    }
+                    states.insert(old_id.to_owned(), state_from(&event.key));
+                    states.insert(new.key_id.clone(), state_from(new));
+                    *active = Some(new.key_id.clone());
+                }
+                AuditAction::Revoked => {
+                    let id = event.key.key_id.as_str();
+                    let previous = states.get(id).ok_or(LifecycleError::UnknownKey)?;
+                    if !matches!(previous.status, KeyStatus::Active | KeyStatus::VerifyOnly) {
+                        return Err(LifecycleError::KeyAlreadyTerminal);
+                    }
+                    if previous.activated_at_ms != event.key.activated_at_ms {
+                        return Err(LifecycleError::MetadataMismatch);
+                    }
+                    if event.key.status != KeyStatus::Revoked
+                        || event.key.verify_until_ms != Some(event.at_ms)
+                    {
+                        return Err(LifecycleError::InvalidActionShape);
+                    }
+                    states.insert(id.to_owned(), state_from(&event.key));
+                    if active.as_deref() == Some(id) {
+                        *active = None;
+                    }
+                }
+                AuditAction::Purged => {
+                    let id = event.key.key_id.as_str();
+                    let previous = states.get(id).ok_or(LifecycleError::UnknownKey)?;
+                    if !matches!(previous.status, KeyStatus::Revoked | KeyStatus::VerifyOnly) {
+                        return Err(LifecycleError::KeyAlreadyTerminal);
+                    }
+                    if previous.status != event.key.status
+                        || previous.activated_at_ms != event.key.activated_at_ms
+                        || previous.verify_until_ms != event.key.verify_until_ms
+                    {
+                        return Err(LifecycleError::MetadataMismatch);
+                    }
+                    if previous.status == KeyStatus::VerifyOnly
+                        && event.at_ms < previous.verify_until_ms.unwrap_or(u64::MAX)
+                    {
+                        return Err(LifecycleError::PurgeBeforeExpiry);
+                    }
+                    if previous.status == KeyStatus::Revoked
+                        && event.at_ms < previous.verify_until_ms.unwrap_or(u64::MAX)
+                    {
+                        return Err(LifecycleError::PurgeBeforeExpiry);
+                    }
+                    states.remove(id);
+                }
+            }
+            Ok(())
+        }
+
+        fn state_from(metadata: &KeyMetadata) -> KeyState {
+            KeyState {
+                status: metadata.status,
+                activated_at_ms: metadata.activated_at_ms,
+                verify_until_ms: metadata.verify_until_ms,
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use codec::{AuditAction, KeyMetadata};
+
+            fn meta(
+                id: &str,
+                status: KeyStatus,
+                activated: u64,
+                until: Option<u64>,
+            ) -> KeyMetadata {
+                KeyMetadata {
+                    key_id: id.to_owned(),
+                    status,
+                    activated_at_ms: activated,
+                    verify_until_ms: until,
+                }
+            }
+            fn initialized() -> KeyringAuditEvent {
+                KeyringAuditEvent {
+                    sequence: 1,
+                    at_ms: 10,
+                    action: AuditAction::Initialized,
+                    key: meta("k1", KeyStatus::Active, 10, None),
+                    related: None,
+                }
+            }
+            fn rotated() -> KeyringAuditEvent {
+                KeyringAuditEvent {
+                    sequence: 2,
+                    at_ms: 20,
+                    action: AuditAction::Rotated,
+                    key: meta("k1", KeyStatus::VerifyOnly, 10, Some(50)),
+                    related: Some(meta("k2", KeyStatus::Active, 20, None)),
+                }
+            }
+
+            #[test]
+            fn accepts_valid_initialization_and_rotation() {
+                let report = verify_events(&[initialized(), rotated()]).unwrap();
+                assert_eq!(report.events_verified, 2);
+                assert_eq!(report.active_key_id.as_deref(), Some("k2"));
+                assert_eq!(report.key_summaries.len(), 2);
+            }
+
+            #[test]
+            fn rejects_rotation_of_non_active_key() {
+                let mut event = rotated();
+                event.key.key_id = "unknown".to_owned();
+                assert!(matches!(
+                    verify_events(&[initialized(), event]),
+                    Err(VerifyError::InvalidLifecycle {
+                        reason: LifecycleError::ActiveKeyMismatch,
+                        ..
+                    })
+                ));
+            }
+
+            #[test]
+            fn rejects_reused_key_identifier() {
+                let mut event = rotated();
+                event.related = Some(meta("k1", KeyStatus::Active, 20, None));
+                assert!(matches!(
+                    verify_events(&[initialized(), event]),
+                    Err(VerifyError::InvalidLifecycle {
+                        reason: LifecycleError::DuplicateKeyId,
+                        ..
+                    })
+                ));
+            }
+
+            #[test]
+            fn rejects_purge_before_verification_deadline() {
+                let mut purge = rotated();
+                purge.sequence = 3;
+                purge.at_ms = 49;
+                purge.action = AuditAction::Purged;
+                purge.key = meta("k1", KeyStatus::VerifyOnly, 10, Some(50));
+                purge.related = None;
+                assert!(matches!(
+                    verify_events(&[initialized(), rotated(), purge]),
+                    Err(VerifyError::InvalidLifecycle {
+                        reason: LifecycleError::PurgeBeforeExpiry,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+    pub mod x091 {
+        //! Deterministic bounded codec for M090 keyring-audit verification reports.
+        //!
+        //! Reports contain non-secret metadata only. CRC-32 detects accidental
+        //! corruption; it does not authenticate a report or its source journal.
+
+        use crate::agentmem::x088::KeyStatus;
+        use crate::agentmem::x090::{KeySummary, VerificationReport};
+        use std::fmt;
+
+        const MAGIC: &[u8; 4] = b"KVRP";
+        const VERSION: u16 = 1;
+        const HEADER: usize = 10;
+        const CHECKSUM: usize = 4;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ReportLimits {
+            pub max_key_id_bytes: usize,
+            pub max_summaries: usize,
+            pub max_total_bytes: usize,
+        }
+        impl Default for ReportLimits {
+            fn default() -> Self {
+                Self {
+                    max_key_id_bytes: 128,
+                    max_summaries: 4096,
+                    max_total_bytes: 1_048_576,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum ReportCodecError {
+            InvalidLimits,
+            TooLarge,
+            TooManySummaries,
+            Truncated,
+            BadMagic,
+            UnsupportedVersion(u16),
+            LengthMismatch,
+            ChecksumMismatch,
+            InvalidUtf8,
+            InvalidKeyId,
+            InvalidStatus(u8),
+            InvalidOption(u8),
+            InvalidReport,
+            NonCanonicalOrder,
+            IntegerOverflow,
+            TrailingBytes,
+        }
+        impl fmt::Display for ReportCodecError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        impl std::error::Error for ReportCodecError {}
+
+        pub fn encode(
+            report: &VerificationReport,
+            limits: &ReportLimits,
+        ) -> Result<Vec<u8>, ReportCodecError> {
+            validate_limits(limits)?;
+            validate_report(report, limits)?;
+            if report.key_summaries.len() > limits.max_summaries {
+                return Err(ReportCodecError::TooManySummaries);
+            }
+            let mut body = Vec::new();
+            put_u64(
+                &mut body,
+                u64::try_from(report.events_verified)
+                    .map_err(|_| ReportCodecError::IntegerOverflow)?,
+            );
+            put_u64(&mut body, report.journal_bytes);
+            put_optional_u64(&mut body, report.first_sequence);
+            put_optional_u64(&mut body, report.last_sequence);
+            put_optional_string(&mut body, report.active_key_id.as_deref(), limits)?;
+            put_u32(
+                &mut body,
+                u32::try_from(report.key_summaries.len())
+                    .map_err(|_| ReportCodecError::IntegerOverflow)?,
+            );
+            for summary in &report.key_summaries {
+                put_string(&mut body, &summary.key_id, limits)?;
+                body.push(status_byte(summary.final_status));
+                put_u64(&mut body, summary.activated_at_ms);
+                put_optional_u64(&mut body, summary.verify_until_ms);
+                if HEADER
+                    .checked_add(body.len())
+                    .and_then(|v| v.checked_add(CHECKSUM))
+                    .ok_or(ReportCodecError::IntegerOverflow)?
+                    > limits.max_total_bytes
+                {
+                    return Err(ReportCodecError::TooLarge);
+                }
+            }
+            let body_len =
+                u32::try_from(body.len()).map_err(|_| ReportCodecError::IntegerOverflow)?;
+            let mut out = Vec::with_capacity(HEADER + body.len() + CHECKSUM);
+            out.extend_from_slice(MAGIC);
+            put_u16(&mut out, VERSION);
+            put_u32(&mut out, body_len);
+            out.extend_from_slice(&body);
+            let sum = crc32(&out);
+            put_u32(&mut out, sum);
+            if out.len() > limits.max_total_bytes {
+                return Err(ReportCodecError::TooLarge);
+            }
+            Ok(out)
+        }
+
+        pub fn decode(
+            bytes: &[u8],
+            limits: &ReportLimits,
+        ) -> Result<VerificationReport, ReportCodecError> {
+            validate_limits(limits)?;
+            if bytes.len() > limits.max_total_bytes {
+                return Err(ReportCodecError::TooLarge);
+            }
+            if bytes.len() < HEADER + CHECKSUM {
+                return Err(ReportCodecError::Truncated);
+            }
+            if bytes.get(0..4) != Some(MAGIC.as_slice()) {
+                return Err(ReportCodecError::BadMagic);
+            }
+            let version = read_u16(bytes, 4)?;
+            if version != VERSION {
+                return Err(ReportCodecError::UnsupportedVersion(version));
+            }
+            let body_len = usize::try_from(read_u32(bytes, 6)?)
+                .map_err(|_| ReportCodecError::IntegerOverflow)?;
+            let expected = HEADER
+                .checked_add(body_len)
+                .and_then(|v| v.checked_add(CHECKSUM))
+                .ok_or(ReportCodecError::IntegerOverflow)?;
+            if expected != bytes.len() {
+                return Err(ReportCodecError::LengthMismatch);
+            }
+            let checksum_offset = bytes
+                .len()
+                .checked_sub(CHECKSUM)
+                .ok_or(ReportCodecError::Truncated)?;
+            let stored = read_u32(bytes, checksum_offset)?;
+            if crc32(&bytes[..checksum_offset]) != stored {
+                return Err(ReportCodecError::ChecksumMismatch);
+            }
+            let mut r = Reader {
+                bytes: &bytes[HEADER..checksum_offset],
+                pos: 0,
+            };
+            let events_verified =
+                usize::try_from(r.u64()?).map_err(|_| ReportCodecError::IntegerOverflow)?;
+            let journal_bytes = r.u64()?;
+            let first_sequence = r.opt_u64()?;
+            let last_sequence = r.opt_u64()?;
+            let active_key_id = r.opt_string(limits)?;
+            let count = usize::try_from(r.u32()?).map_err(|_| ReportCodecError::IntegerOverflow)?;
+            if count > limits.max_summaries {
+                return Err(ReportCodecError::TooManySummaries);
+            }
+            let mut key_summaries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key_id = r.string(limits)?;
+                let raw_status = r.byte()?;
+                let final_status = parse_status(raw_status)?;
+                let activated_at_ms = r.u64()?;
+                let verify_until_ms = r.opt_u64()?;
+                key_summaries.push(KeySummary {
+                    key_id,
+                    final_status,
+                    activated_at_ms,
+                    verify_until_ms,
+                });
+            }
+            if r.pos != r.bytes.len() {
+                return Err(ReportCodecError::TrailingBytes);
+            }
+            let report = VerificationReport {
+                events_verified,
+                journal_bytes,
+                first_sequence,
+                last_sequence,
+                active_key_id,
+                key_summaries,
+            };
+            validate_report(&report, limits)?;
+            Ok(report)
+        }
+
+        fn validate_limits(l: &ReportLimits) -> Result<(), ReportCodecError> {
+            if l.max_key_id_bytes == 0
+                || l.max_key_id_bytes > u16::MAX as usize
+                || l.max_summaries == 0
+                || l.max_summaries > u32::MAX as usize
+                || l.max_total_bytes < HEADER + CHECKSUM + 8
+            {
+                return Err(ReportCodecError::InvalidLimits);
+            }
+            Ok(())
+        }
+
+        fn validate_report(
+            report: &VerificationReport,
+            limits: &ReportLimits,
+        ) -> Result<(), ReportCodecError> {
+            match (
+                report.events_verified,
+                report.first_sequence,
+                report.last_sequence,
+            ) {
+                (0, None, None) => {}
+                (0, _, _) | (_, None, _) | (_, _, None) => {
+                    return Err(ReportCodecError::InvalidReport)
+                }
+                (_, Some(first), Some(last)) if first != 0 && last >= first => {}
+                _ => return Err(ReportCodecError::InvalidReport),
+            }
+            if report.key_summaries.len() > limits.max_summaries {
+                return Err(ReportCodecError::TooManySummaries);
+            }
+            let mut previous: Option<&str> = None;
+            let mut active_count = 0usize;
+            for summary in &report.key_summaries {
+                validate_key_id(&summary.key_id, limits)?;
+                if let Some(p) = previous {
+                    if summary.key_id.as_str() <= p {
+                        return Err(ReportCodecError::NonCanonicalOrder);
+                    }
+                }
+                previous = Some(&summary.key_id);
+                match summary.final_status {
+                    KeyStatus::Active => {
+                        active_count = active_count
+                            .checked_add(1)
+                            .ok_or(ReportCodecError::IntegerOverflow)?;
+                        if summary.verify_until_ms.is_some() {
+                            return Err(ReportCodecError::InvalidReport);
+                        }
+                    }
+                    KeyStatus::VerifyOnly | KeyStatus::Revoked => {
+                        if summary.verify_until_ms.is_none() {
+                            return Err(ReportCodecError::InvalidReport);
+                        }
+                    }
+                }
+            }
+            match report.active_key_id.as_deref() {
+                Some(id) => {
+                    validate_key_id(id, limits)?;
+                    if active_count != 1
+                        || !report
+                            .key_summaries
+                            .iter()
+                            .any(|s| s.key_id == id && s.final_status == KeyStatus::Active)
+                    {
+                        return Err(ReportCodecError::InvalidReport);
+                    }
+                }
+                None if active_count == 0 => {}
+                None => return Err(ReportCodecError::InvalidReport),
+            }
+            Ok(())
+        }
+
+        fn validate_key_id(id: &str, limits: &ReportLimits) -> Result<(), ReportCodecError> {
+            if id.is_empty()
+                || id.len() > limits.max_key_id_bytes
+                || id.trim() != id
+                || id.chars().any(char::is_control)
+            {
+                return Err(ReportCodecError::InvalidKeyId);
+            }
+            Ok(())
+        }
+        fn status_byte(s: KeyStatus) -> u8 {
+            match s {
+                KeyStatus::Active => 1,
+                KeyStatus::VerifyOnly => 2,
+                KeyStatus::Revoked => 3,
+            }
+        }
+        fn parse_status(v: u8) -> Result<KeyStatus, ReportCodecError> {
+            match v {
+                1 => Ok(KeyStatus::Active),
+                2 => Ok(KeyStatus::VerifyOnly),
+                3 => Ok(KeyStatus::Revoked),
+                n => Err(ReportCodecError::InvalidStatus(n)),
+            }
+        }
+        fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+            match value {
+                Some(v) => {
+                    out.push(1);
+                    put_u64(out, v);
+                }
+                None => out.push(0),
+            }
+        }
+        fn put_optional_string(
+            out: &mut Vec<u8>,
+            value: Option<&str>,
+            limits: &ReportLimits,
+        ) -> Result<(), ReportCodecError> {
+            match value {
+                Some(v) => {
+                    out.push(1);
+                    put_string(out, v, limits)?;
+                }
+                None => out.push(0),
+            };
+            Ok(())
+        }
+        fn put_string(
+            out: &mut Vec<u8>,
+            value: &str,
+            limits: &ReportLimits,
+        ) -> Result<(), ReportCodecError> {
+            validate_key_id(value, limits)?;
+            let n = u16::try_from(value.len()).map_err(|_| ReportCodecError::IntegerOverflow)?;
+            put_u16(out, n);
+            out.extend_from_slice(value.as_bytes());
+            Ok(())
+        }
+        fn put_u16(out: &mut Vec<u8>, v: u16) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn put_u32(out: &mut Vec<u8>, v: u32) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, v: u64) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn read_u16(b: &[u8], p: usize) -> Result<u16, ReportCodecError> {
+            let s = b
+                .get(p..p.checked_add(2).ok_or(ReportCodecError::IntegerOverflow)?)
+                .ok_or(ReportCodecError::Truncated)?;
+            let a: [u8; 2] = s.try_into().map_err(|_| ReportCodecError::Truncated)?;
+            Ok(u16::from_be_bytes(a))
+        }
+        fn read_u32(b: &[u8], p: usize) -> Result<u32, ReportCodecError> {
+            let s = b
+                .get(p..p.checked_add(4).ok_or(ReportCodecError::IntegerOverflow)?)
+                .ok_or(ReportCodecError::Truncated)?;
+            let a: [u8; 4] = s.try_into().map_err(|_| ReportCodecError::Truncated)?;
+            Ok(u32::from_be_bytes(a))
+        }
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320u32 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            !crc
+        }
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            pos: usize,
+        }
+        impl<'a> Reader<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], ReportCodecError> {
+                let end = self
+                    .pos
+                    .checked_add(n)
+                    .ok_or(ReportCodecError::IntegerOverflow)?;
+                let s = self
+                    .bytes
+                    .get(self.pos..end)
+                    .ok_or(ReportCodecError::Truncated)?;
+                self.pos = end;
+                Ok(s)
+            }
+            fn byte(&mut self) -> Result<u8, ReportCodecError> {
+                self.take(1)?
+                    .first()
+                    .copied()
+                    .ok_or(ReportCodecError::Truncated)
+            }
+            fn u16(&mut self) -> Result<u16, ReportCodecError> {
+                let s = self.take(2)?;
+                let a: [u8; 2] = s.try_into().map_err(|_| ReportCodecError::Truncated)?;
+                Ok(u16::from_be_bytes(a))
+            }
+            fn u32(&mut self) -> Result<u32, ReportCodecError> {
+                let s = self.take(4)?;
+                let a: [u8; 4] = s.try_into().map_err(|_| ReportCodecError::Truncated)?;
+                Ok(u32::from_be_bytes(a))
+            }
+            fn u64(&mut self) -> Result<u64, ReportCodecError> {
+                let s = self.take(8)?;
+                let a: [u8; 8] = s.try_into().map_err(|_| ReportCodecError::Truncated)?;
+                Ok(u64::from_be_bytes(a))
+            }
+            fn opt_u64(&mut self) -> Result<Option<u64>, ReportCodecError> {
+                match self.byte()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(self.u64()?)),
+                    n => Err(ReportCodecError::InvalidOption(n)),
+                }
+            }
+            fn string(&mut self, l: &ReportLimits) -> Result<String, ReportCodecError> {
+                let n = usize::from(self.u16()?);
+                if n == 0 || n > l.max_key_id_bytes {
+                    return Err(ReportCodecError::InvalidKeyId);
+                }
+                let value = std::str::from_utf8(self.take(n)?)
+                    .map_err(|_| ReportCodecError::InvalidUtf8)?
+                    .to_owned();
+                validate_key_id(&value, l)?;
+                Ok(value)
+            }
+            fn opt_string(&mut self, l: &ReportLimits) -> Result<Option<String>, ReportCodecError> {
+                match self.byte()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(self.string(l)?)),
+                    n => Err(ReportCodecError::InvalidOption(n)),
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn sample() -> VerificationReport {
+                VerificationReport {
+                    events_verified: 2,
+                    journal_bytes: 96,
+                    first_sequence: Some(1),
+                    last_sequence: Some(2),
+                    active_key_id: Some("k2".to_owned()),
+                    key_summaries: vec![
+                        KeySummary {
+                            key_id: "k1".to_owned(),
+                            final_status: KeyStatus::VerifyOnly,
+                            activated_at_ms: 10,
+                            verify_until_ms: Some(50),
+                        },
+                        KeySummary {
+                            key_id: "k2".to_owned(),
+                            final_status: KeyStatus::Active,
+                            activated_at_ms: 20,
+                            verify_until_ms: None,
+                        },
+                    ],
+                }
+            }
+            #[test]
+            fn round_trip_is_exact() {
+                let value = sample();
+                let bytes = encode(&value, &ReportLimits::default()).unwrap();
+                assert_eq!(decode(&bytes, &ReportLimits::default()).unwrap(), value);
+            }
+            #[test]
+            fn rejects_checksum_corruption() {
+                let mut bytes = encode(&sample(), &ReportLimits::default()).unwrap();
+                let n = bytes.len();
+                bytes[n - 5] ^= 1;
+                assert_eq!(
+                    decode(&bytes, &ReportLimits::default()),
+                    Err(ReportCodecError::ChecksumMismatch)
+                );
+            }
+            #[test]
+            fn rejects_noncanonical_summary_order() {
+                let mut value = sample();
+                value.key_summaries.reverse();
+                assert_eq!(
+                    encode(&value, &ReportLimits::default()),
+                    Err(ReportCodecError::NonCanonicalOrder)
+                );
+            }
+            #[test]
+            fn rejects_active_key_mismatch() {
+                let mut value = sample();
+                value.active_key_id = Some("k1".to_owned());
+                assert_eq!(
+                    encode(&value, &ReportLimits::default()),
+                    Err(ReportCodecError::InvalidReport)
+                );
+            }
+        }
+    }
+}
