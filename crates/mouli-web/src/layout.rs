@@ -2,19 +2,21 @@
 //!
 //! What is laid out: block flow with margin collapsing, inline text with line breaking,
 //! alignment and mixed font sizes, inline-blocks and replaced elements, flexbox (rows, columns,
-//! wrapping, grow and shrink, alignment), tables (auto widths, colspan), lists with markers,
-//! floats, relative, absolute and fixed positioning, percentage and `calc()` sizes, min and max
-//! sizes, `box-sizing`, and `overflow: hidden`.
+//! wrapping, grow and shrink, alignment), grid (fixed, `fr`, `auto` and `minmax` tracks,
+//! `repeat` with counts and `auto-fill`, gaps, spans and explicit placement, alignment), tables
+//! (auto widths, colspan), lists with markers, relative, absolute and fixed positioning,
+//! percentage and `calc()` sizes, min and max sizes, `box-sizing`, and `overflow: hidden`.
 //!
-//! What is not: CSS grid (a grid container is laid out as a block), `rowspan`, multi-column
-//! layout, `writing-mode`, transforms, and sticky positioning (treated as relative). Layout
+//! What is not: floats (a floated box is laid out as a normal block), grid template areas and
+//! dense packing, `rowspan`, multi-column layout, `writing-mode`, transforms, and sticky
+//! positioning (treated as relative). Layout
 //! approximates a browser's; it is deterministic and uses only the [`Fonts`] it is given.
 
 use crate::dom::{Dom, NodeId};
 use crate::style::{
-    Align, BorderStyle, Dim, Display, FlexDir, FlexWrap, Float, Justify, LineHeight, ListStyle,
-    Overflow, Position, Size, Style, Styles, TextAlign, TextTransform, VAlign, Viewport,
-    WhiteSpace,
+    Align, BorderStyle, Dim, Display, FlexDir, FlexWrap, Float, GridLine, GridTemplate, Justify,
+    LineHeight, ListStyle, Overflow, Position, Size, Style, Styles, TextAlign, TextTransform,
+    Track, TrackSize, VAlign, Viewport, WhiteSpace,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -536,7 +538,10 @@ impl Ctx<'_> {
                 matches!(s.position, Position::Static | Position::Relative)
                     && matches!(
                         s.display,
-                        Display::Inline | Display::InlineBlock | Display::InlineFlex
+                        Display::Inline
+                            | Display::InlineBlock
+                            | Display::InlineFlex
+                            | Display::InlineGrid
                     )
                     && s.float == Float::None
             }
@@ -732,6 +737,7 @@ impl Ctx<'_> {
         }
         let (mut min, mut max) = match style.display {
             Display::Flex | Display::InlineFlex => self.flex_intrinsic(n, &style),
+            Display::Grid | Display::InlineGrid => self.grid_intrinsic(n),
             Display::Table => self.table_intrinsic(n),
             _ => self.flow_intrinsic(n, &style),
         };
@@ -832,7 +838,10 @@ impl Ctx<'_> {
         }
         let replaced = self.replaced(n, &style);
         let atomic = replaced.is_some()
-            || matches!(style.display, Display::InlineBlock | Display::InlineFlex);
+            || matches!(
+                style.display,
+                Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+            );
         if atomic {
             let (min_w, w, b) = match avail {
                 Some(a) => {
@@ -1593,6 +1602,8 @@ impl Ctx<'_> {
                 style.display,
                 Display::Flex
                     | Display::InlineFlex
+                    | Display::Grid
+                    | Display::InlineGrid
                     | Display::Table
                     | Display::TableCell
                     | Display::InlineBlock
@@ -1642,6 +1653,9 @@ impl Ctx<'_> {
             match style.display {
                 Display::Flex | Display::InlineFlex => {
                     self.layout_flex(node, style, content_w, own_h)
+                }
+                Display::Grid | Display::InlineGrid => {
+                    self.layout_grid(node, style, content_w, own_h)
                 }
                 Display::Table => self.layout_table(node, style, content_w),
                 _ => self.layout_flow(node, style, content_w, own_h, top_c, bot_c),
@@ -2776,6 +2790,430 @@ impl Ctx<'_> {
         flow
     }
 
+    fn grid_intrinsic(&self, n: NodeId) -> (f32, f32) {
+        // Widest minimum of any child, and every child side by side as the most it could want.
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        for c in self.visible_children(n) {
+            if self.dom.tag(c).is_some() {
+                let (a, b) = self.intrinsic(c);
+                lo = lo.max(a);
+                hi += b;
+            }
+        }
+        (lo, hi)
+    }
+
+    // -------------------------------------------------------------- grid
+
+    /// Expands a template into its tracks for a container `avail` pixels long.
+    fn grid_tracks(&self, t: &GridTemplate, avail: f32, gap: f32) -> Vec<Track> {
+        let mut tracks = t.tracks.clone();
+        if let Some((at, tr, _)) = t.repeat {
+            let base = match (tr.min, tr.max) {
+                (TrackSize::Px(p), _) | (_, TrackSize::Px(p)) => p,
+                (TrackSize::Pct(f), _) | (_, TrackSize::Pct(f)) => f * avail,
+                _ => 0.0,
+            };
+            let fixed: f32 = t
+                .tracks
+                .iter()
+                .map(|k| match k.min {
+                    TrackSize::Px(p) => p,
+                    TrackSize::Pct(f) => f * avail,
+                    _ => 0.0,
+                })
+                .sum();
+            let n = if base > 0.0 {
+                (((avail - fixed + gap) / (base + gap)).floor().max(1.0) as usize).min(200)
+            } else {
+                1
+            };
+            let at = at.min(tracks.len());
+            for _ in 0..n {
+                tracks.insert(at, tr);
+            }
+        }
+        tracks
+    }
+
+    /// Reads where an item sits along one axis: the first track (if given) and how many it spans.
+    fn grid_axis(line: GridLine, explicit: usize) -> (Option<usize>, usize) {
+        let idx = |v: i32| -> usize {
+            if v > 0 {
+                (v - 1) as usize
+            } else {
+                (explicit as i32 + 1 + v).max(0) as usize
+            }
+        };
+        match (line.start, line.end, line.span) {
+            (Some(a), Some(b), _) => {
+                let (a, b) = (idx(a), idx(b));
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                (Some(lo), (hi - lo).max(1))
+            }
+            (Some(a), None, sp) => (Some(idx(a)), sp.map_or(1, |n| n as usize)),
+            (None, Some(b), sp) => {
+                let end = idx(b);
+                let span = sp.map_or(1, |n| n as usize);
+                (Some(end.saturating_sub(span)), span)
+            }
+            (None, None, sp) => (None, sp.map_or(1, |n| n as usize)),
+        }
+    }
+
+    fn layout_grid(
+        &self,
+        node: NodeId,
+        style: &Rc<Style>,
+        content_w: f32,
+        def_h: Option<f32>,
+    ) -> Flow {
+        let (mut items, pending) = self.flex_items(node, style, content_w, true, def_h);
+        items.sort_by_key(|i| i.order);
+        let mut flow = Flow {
+            pending,
+            ..Flow::default()
+        };
+        if items.is_empty() || !self.room() {
+            flow.empty = true;
+            if let Some(h) = def_h {
+                flow.height = h;
+            }
+            return flow;
+        }
+        let gap_c = dim_px(style.column_gap, content_w).max(0.0);
+        let gap_r = dim_px(style.row_gap, def_h.unwrap_or(0.0)).max(0.0);
+        let mut col_tracks = self.grid_tracks(&style.grid_columns, content_w, gap_c);
+        let explicit_cols = col_tracks.len();
+        let row_template = self.grid_tracks(&style.grid_rows, def_h.unwrap_or(0.0), gap_r);
+        let explicit_rows = row_template.len();
+        // Place every item in a cell range.
+        struct Cell {
+            c: usize,
+            r: usize,
+            cs: usize,
+            rs: usize,
+        }
+        let mut ncols = explicit_cols.max(1);
+        type Axis = (Option<usize>, usize);
+        let axes: Vec<(Axis, Axis)> = items
+            .iter()
+            .map(|it| {
+                (
+                    Self::grid_axis(it.style.grid_column, explicit_cols.max(1)),
+                    Self::grid_axis(it.style.grid_row, explicit_rows),
+                )
+            })
+            .collect();
+        for ((cs, csp), _) in &axes {
+            ncols = ncols.max(cs.map_or(0, |c| c + csp)).max(*csp);
+        }
+        ncols = ncols.min(1000);
+        while col_tracks.len() < ncols {
+            col_tracks.push(style.grid_auto_columns);
+        }
+        let mut occ: Vec<Vec<bool>> = Vec::new();
+        let free = |occ: &Vec<Vec<bool>>, r: usize, c: usize, rs: usize, cs: usize| -> bool {
+            (r..r + rs).all(|y| {
+                occ.get(y)
+                    .is_none_or(|row| (c..c + cs).all(|x| !row.get(x).copied().unwrap_or(false)))
+            })
+        };
+        let mark = |occ: &mut Vec<Vec<bool>>, r: usize, c: usize, rs: usize, cs: usize| {
+            while occ.len() < r + rs {
+                occ.push(vec![false; ncols]);
+            }
+            for row in occ.iter_mut().skip(r).take(rs) {
+                for cell in row.iter_mut().take((c + cs).min(ncols)).skip(c) {
+                    *cell = true;
+                }
+            }
+        };
+        let mut cells: Vec<Option<Cell>> = Vec::new();
+        let (mut cur_r, mut cur_c) = (0usize, 0usize);
+        for ((cstart, cspan), (rstart, rspan)) in &axes {
+            let cs = (*cspan).clamp(1, ncols);
+            let rs = (*rspan).clamp(1, 1000);
+            let placed = match (cstart, rstart) {
+                (Some(c), Some(r)) => Some((*r, (*c).min(ncols - cs))),
+                (Some(c), None) => {
+                    let c = (*c).min(ncols - cs);
+                    let mut r = cur_r;
+                    while r < 1000 && !free(&occ, r, c, rs, cs) {
+                        r += 1;
+                    }
+                    (r < 1000).then_some((r, c))
+                }
+                (None, Some(r)) => {
+                    let mut c = 0;
+                    while c + cs <= ncols && !free(&occ, *r, c, rs, cs) {
+                        c += 1;
+                    }
+                    (c + cs <= ncols).then_some((*r, c))
+                }
+                (None, None) => {
+                    let (mut r, mut c) = (cur_r, cur_c);
+                    loop {
+                        if c + cs > ncols {
+                            r += 1;
+                            c = 0;
+                        }
+                        if r >= 1000 {
+                            break None;
+                        }
+                        if free(&occ, r, c, rs, cs) {
+                            break Some((r, c));
+                        }
+                        c += 1;
+                    }
+                }
+            };
+            match placed {
+                Some((r, c)) => {
+                    mark(&mut occ, r, c, rs, cs);
+                    if cstart.is_none() || rstart.is_none() {
+                        cur_r = r;
+                        cur_c = c + cs;
+                    }
+                    cells.push(Some(Cell { c, r, cs, rs }));
+                }
+                None => cells.push(None),
+            }
+        }
+        let nrows = occ.len().max(explicit_rows).max(1);
+        // Column widths.
+        let content_extra = |it: &FItem| it.extras(true) + it.margin[1] + it.margin[3];
+        let item_range = |it: &FItem| -> (f32, f32) {
+            let (lo, hi) = match it.elem {
+                Some(e) => self.intrinsic(e),
+                None => {
+                    let (lo, hi) = atoms_intrinsic(&self.collect_atoms(
+                        &[it.text.unwrap_or(0)],
+                        &it.style,
+                        None,
+                    ));
+                    (lo, hi)
+                }
+            };
+            let extra = content_extra(it);
+            (lo + extra, hi + extra)
+        };
+        let total_gap_c = gap_c * (ncols - 1) as f32;
+        let avail_c = (content_w - total_gap_c).max(0.0);
+        let mut width = vec![0.0f32; ncols];
+        let mut floor = vec![0.0f32; ncols];
+        let mut fr = vec![0.0f32; ncols];
+        let mut auto = vec![false; ncols];
+        for (k, t) in col_tracks.iter().enumerate().take(ncols) {
+            let px = |s: TrackSize| match s {
+                TrackSize::Px(p) => Some(p),
+                TrackSize::Pct(f) => Some(f * content_w),
+                _ => None,
+            };
+            let content_fit = |want_hi: bool| -> f32 {
+                items
+                    .iter()
+                    .zip(&cells)
+                    .filter_map(|(it, c)| c.as_ref().filter(|c| c.c == k && c.cs == 1).map(|_| it))
+                    .map(|it| {
+                        let (lo, hi) = item_range(it);
+                        if want_hi {
+                            hi
+                        } else {
+                            lo
+                        }
+                    })
+                    .fold(0.0f32, f32::max)
+            };
+            match t.max {
+                TrackSize::Fr(f) => {
+                    fr[k] = f.max(0.0);
+                    floor[k] = px(t.min).unwrap_or_else(|| content_fit(false));
+                }
+                TrackSize::Auto => {
+                    auto[k] = true;
+                    width[k] = px(t.min).unwrap_or(0.0).max(content_fit(true).min(avail_c));
+                }
+                other => {
+                    let max = px(other).unwrap_or(0.0);
+                    let min = px(t.min).unwrap_or(max);
+                    width[k] = max.max(min);
+                }
+            }
+        }
+        let fixed_sum: f32 = width.iter().sum();
+        let total_fr: f32 = fr.iter().sum();
+        if total_fr > 0.0 {
+            let mut frozen = vec![false; ncols];
+            let mut leftover = (avail_c - fixed_sum).max(0.0);
+            for _ in 0..ncols {
+                let denom: f32 = fr
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| !frozen[*k])
+                    .map(|(_, f)| *f)
+                    .sum::<f32>()
+                    .max(1.0);
+                let size = leftover / denom;
+                let mut changed = false;
+                for k in 0..ncols {
+                    if fr[k] > 0.0 && !frozen[k] && fr[k] * size < floor[k] {
+                        frozen[k] = true;
+                        width[k] = floor[k];
+                        leftover = (leftover - floor[k]).max(0.0);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    for k in 0..ncols {
+                        if fr[k] > 0.0 && !frozen[k] {
+                            width[k] = fr[k] * size;
+                        }
+                    }
+                    break;
+                }
+            }
+        } else {
+            // No flexible tracks: automatic tracks share what is left.
+            let n_auto = auto.iter().filter(|a| **a).count();
+            let leftover = avail_c - fixed_sum;
+            if n_auto > 0 && leftover > 0.0 {
+                for k in 0..ncols {
+                    if auto[k] {
+                        width[k] += leftover / n_auto as f32;
+                    }
+                }
+            }
+        }
+        let mut xs = vec![0.0f32; ncols];
+        for k in 1..ncols {
+            xs[k] = xs[k - 1] + width[k - 1] + gap_c;
+        }
+        // Lay every item out at the width of its cells and read its height.
+        let span_w = |c: &Cell| -> f32 {
+            width[c.c..c.c + c.cs].iter().sum::<f32>() + gap_c * (c.cs - 1) as f32
+        };
+        let mut boxes: Vec<Option<LBox>> = Vec::new();
+        for (it, cell) in items.iter().zip(&cells) {
+            let Some(c) = cell else {
+                boxes.push(None);
+                continue;
+            };
+            let cell_w = span_w(c);
+            let w = match it.style.width {
+                Size::Dim(d) => {
+                    let v = dim_px(d, content_w);
+                    if it.style.border_box {
+                        v - it.extras(true)
+                    } else {
+                        v
+                    }
+                }
+                Size::Auto => cell_w - content_extra(it),
+            };
+            boxes.push(Some(self.layout_item(it, content_w, w.max(0.0), None)));
+        }
+        // Row heights.
+        let mut heights = vec![0.0f32; nrows];
+        let mut row_auto = vec![true; nrows];
+        let mut row_fr = vec![0.0f32; nrows];
+        for r in 0..nrows {
+            let t = row_template.get(r).copied().unwrap_or(style.grid_auto_rows);
+            let px = |s: TrackSize| match s {
+                TrackSize::Px(p) => Some(p),
+                TrackSize::Pct(f) => def_h.map(|h| f * h),
+                _ => None,
+            };
+            match t.max {
+                TrackSize::Fr(f) if def_h.is_some() => {
+                    row_fr[r] = f;
+                    heights[r] = px(t.min).unwrap_or(0.0);
+                }
+                TrackSize::Px(_) | TrackSize::Pct(_) if px(t.max).is_some() => {
+                    heights[r] = px(t.max).unwrap_or(0.0).max(px(t.min).unwrap_or(0.0));
+                    row_auto[r] = false;
+                }
+                _ => heights[r] = px(t.min).unwrap_or(0.0),
+            }
+        }
+        let outer_h = |it: &FItem, b: &LBox| b.rect.h + it.margin[0] + it.margin[2];
+        for ((it, cell), b) in items.iter().zip(&cells).zip(&boxes) {
+            if let (Some(c), Some(b)) = (cell, b) {
+                if c.rs == 1 && row_auto[c.r] {
+                    heights[c.r] = heights[c.r].max(outer_h(it, b));
+                }
+            }
+        }
+        for ((it, cell), b) in items.iter().zip(&cells).zip(&boxes) {
+            if let (Some(c), Some(b)) = (cell, b) {
+                if c.rs > 1 {
+                    let have: f32 =
+                        heights[c.r..c.r + c.rs].iter().sum::<f32>() + gap_r * (c.rs - 1) as f32;
+                    let need = outer_h(it, b);
+                    if need > have {
+                        heights[c.r + c.rs - 1] += need - have;
+                    }
+                }
+            }
+        }
+        let total_gap_r = gap_r * (nrows - 1) as f32;
+        if let Some(h) = def_h {
+            let used: f32 = heights.iter().sum::<f32>() + total_gap_r;
+            let fr_total: f32 = row_fr.iter().sum();
+            if fr_total > 0.0 && h > used {
+                let share = (h - used) / fr_total;
+                for r in 0..nrows {
+                    heights[r] += row_fr[r] * share;
+                }
+            }
+        }
+        let mut ys = vec![0.0f32; nrows];
+        for r in 1..nrows {
+            ys[r] = ys[r - 1] + heights[r - 1] + gap_r;
+        }
+        // Position the items in their cells.
+        for ((it, cell), b) in items.iter().zip(&cells).zip(boxes) {
+            let (Some(c), Some(mut b)) = (cell, b) else {
+                continue;
+            };
+            let cell_h = heights[c.r..c.r + c.rs].iter().sum::<f32>() + gap_r * (c.rs - 1) as f32;
+            let align = it.style.align_self.unwrap_or(style.align_items);
+            let avail_h = (cell_h - it.margin[0] - it.margin[2]).max(0.0);
+            let mut dy = 0.0;
+            if align == Align::Stretch && it.style.height == Size::Auto {
+                if avail_h > b.rect.h {
+                    b.rect.h = avail_h;
+                }
+            } else {
+                let spare = (avail_h - b.rect.h).max(0.0);
+                dy = match align {
+                    Align::End => spare,
+                    Align::Center => spare / 2.0,
+                    _ => 0.0,
+                };
+            }
+            b.rect.x = xs[c.c] + it.margin[3];
+            b.rect.y = ys[c.r] + it.margin[0] + dy;
+            self.finish_child(&mut b, content_w);
+            flow.pending
+                .extend(std::mem::take(&mut b.pending).into_iter().map(|mut p| {
+                    p.static_x += b.rect.x;
+                    p.static_y += b.rect.y;
+                    p
+                }));
+            flow.children.push(b);
+        }
+        flow.height = heights.iter().sum::<f32>() + total_gap_r;
+        flow.used_w = xs.last().copied().unwrap_or(0.0) + width.last().copied().unwrap_or(0.0);
+        flow.first_baseline = flow
+            .children
+            .first()
+            .and_then(|c| c.first_baseline.map(|f| f + c.rect.y));
+        flow
+    }
+
+    // -------------------------------------------------------------- flexbox helpers
+
     fn flex_intrinsic(&self, n: NodeId, style: &Rc<Style>) -> (f32, f32) {
         let row = matches!(style.flex_direction, FlexDir::Row | FlexDir::RowReverse);
         let gap = if row { style.column_gap.px } else { 0.0 };
@@ -3629,6 +4067,101 @@ mod tests {
             400.0,
         );
         assert_eq!(lines_of(&l, &d, "a").len(), 2);
+    }
+
+    #[test]
+    fn grid_tracks_share_space_with_fixed_flexible_and_gaps() {
+        let css = "body{margin:0} .g{display:grid;width:400px;grid-template-columns:100px 1fr 2fr;gap:10px} .g>div{height:20px}";
+        let (d, l) = page(
+            r#"<div class="g"><div id="a"></div><div id="b"></div><div id="c"></div></div>"#,
+            css,
+            600.0,
+        );
+        assert_rect(r(&d, &l, "a"), 0.0, 0.0, 100.0, 20.0);
+        let fr = (400.0 - 100.0 - 20.0) / 3.0;
+        assert_rect(r(&d, &l, "b"), 110.0, 0.0, fr, 20.0);
+        assert_rect(r(&d, &l, "c"), 120.0 + fr, 0.0, 2.0 * fr, 20.0);
+        // repeat(), rows wrap onto new lines, and row gaps add up; a row is as tall as its tallest item.
+        let css = "body{margin:0} .g{display:grid;width:300px;grid-template-columns:repeat(3,1fr);row-gap:5px} #a{height:30px} #d{height:50px}";
+        let html = r#"<div class="g"><div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div><div id="e"></div></div><div id="after" style="height:1px"></div>"#;
+        let (d, l) = page(html, css, 600.0);
+        assert_rect(r(&d, &l, "b"), 100.0, 0.0, 100.0, 30.0);
+        assert_eq!(r(&d, &l, "b").h, 30.0, "items stretch to the row");
+        assert_rect(r(&d, &l, "d"), 0.0, 35.0, 100.0, 50.0);
+        assert_rect(r(&d, &l, "e"), 100.0, 35.0, 100.0, 50.0);
+        assert_eq!(
+            r(&d, &l, "after").y,
+            85.0,
+            "the container is as tall as its rows and gap"
+        );
+    }
+
+    #[test]
+    fn grid_items_can_span_and_be_placed_explicitly() {
+        let css = "body{margin:0} .g{display:grid;width:300px;grid-template-columns:repeat(3,100px);grid-auto-rows:20px} #a{grid-column:1 / 3} #b{grid-column:span 2} #c{grid-column:1 / -1} #d{grid-row:4;grid-column:3} #e{grid-column:2}";
+        let html = r#"<div class="g"><div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div><div id="e"></div></div>"#;
+        let (d, l) = page(html, css, 600.0);
+        assert_rect(r(&d, &l, "a"), 0.0, 0.0, 200.0, 20.0);
+        // b does not fit beside a (one column left), so it starts the next row.
+        assert_rect(r(&d, &l, "b"), 0.0, 20.0, 200.0, 20.0);
+        assert_rect(r(&d, &l, "c"), 0.0, 40.0, 300.0, 20.0);
+        assert_rect(r(&d, &l, "d"), 200.0, 60.0, 100.0, 20.0);
+        assert_eq!(r(&d, &l, "e").x, 100.0);
+    }
+
+    #[test]
+    fn auto_fill_makes_as_many_columns_as_fit_and_auto_columns_follow_their_content() {
+        let css = "body{margin:0} .g{display:grid;width:350px;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:0} .g>div{height:10px}";
+        let (d, l) = page(
+            r#"<div class="g"><div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div></div>"#,
+            css,
+            600.0,
+        );
+        let w = 350.0 / 3.0;
+        assert_rect(r(&d, &l, "a"), 0.0, 0.0, w, 10.0);
+        assert_rect(r(&d, &l, "c"), 2.0 * w, 0.0, w, 10.0);
+        assert_rect(r(&d, &l, "d"), 0.0, 10.0, w, 10.0);
+        // `auto 1fr`: the sidebar is as wide as its text, the rest goes to the content.
+        let css = "body{margin:0} .g{display:grid;width:300px;grid-template-columns:auto 1fr}";
+        let (d, l) = page(
+            r#"<div class="g"><div id="a">abcd</div><div id="b">x</div></div>"#,
+            css,
+            600.0,
+        );
+        let a = r(&d, &l, "a").w;
+        assert!(a > 10.0 && a < 100.0, "the first column fits its text: {a}");
+        assert_rect(r(&d, &l, "b"), a, 0.0, 300.0 - a, r(&d, &l, "b").h);
+    }
+
+    #[test]
+    fn grid_alignment_margins_and_hostile_templates() {
+        let css = "body{margin:0} .g{display:grid;width:200px;grid-template-columns:1fr 1fr;grid-auto-rows:100px;align-items:center} #a{height:20px;margin:5px} #b{height:40px;align-self:end}";
+        let (d, l) = page(
+            r#"<div class="g"><div id="a"></div><div id="b"></div></div>"#,
+            css,
+            600.0,
+        );
+        assert_rect(r(&d, &l, "a"), 5.0, 40.0, 90.0, 20.0);
+        assert_rect(r(&d, &l, "b"), 100.0, 60.0, 100.0, 40.0);
+        for css in [
+            "body{margin:0} .g{display:grid;grid-template-columns:repeat(100000,1fr)}",
+            "body{margin:0} .g{display:grid;grid-template-columns:repeat(auto-fill,0px)}",
+            "body{margin:0} .g{display:grid;grid-template-columns:repeat(auto-fill,minmax(0,1fr)) repeat(auto-fill,1fr)}",
+            "body{margin:0} .g{display:grid;grid-template-columns:minmax(1fr,1fr) -5px nonsense 1fr 1fr}",
+            "body{margin:0} .g{display:grid;grid-template-columns:100px} .g>div{grid-column:1 / 99999;grid-row:-5 / span 99999}",
+            "body{margin:0} .g{display:grid;grid-template-columns:1fr 1fr} .g>div{grid-column:0;grid-row:span 0}",
+            "body{margin:0} .g{display:inline-grid;grid-template-columns:50% 50%;height:0} .g>div{grid-column:2 / 1}",
+        ] {
+            let (d, l) = page(r#"<div class="g"><div id="a">x</div><div id="b">y</div><div id="c">z</div></div>"#, css, 300.0);
+            assert!(l.height.is_finite() && r(&d, &l, "a").w.is_finite(), "{css}");
+        }
+        // A grid with no children is empty and does not break its neighbours.
+        let (d, l) = page(
+            r#"<div class="g"></div><div id="x" style="height:5px"></div>"#,
+            "body{margin:0}.g{display:grid;grid-template-columns:1fr}",
+            300.0,
+        );
+        assert_eq!(r(&d, &l, "x").y, 0.0);
     }
 
     #[test]

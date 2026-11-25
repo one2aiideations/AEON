@@ -13,11 +13,13 @@ page tools. The rest of this README is the wider product guide; this section is 
 |---|---|
 | HTML tokenizer and document tree | Done, with tree editing for scripts. |
 | CSS: selectors, `@media`, cascade, `calc`, `var`, colours | Done for the common subset. |
-| Layout: block, inline, flex, tables, lists, positioning | Done. Floats, grid, `rowspan` and images are **not** done. |
-| JavaScript: syntax of modern scripts, closures, classes, destructuring, exceptions, timers | Done, with step, depth, object and size limits. No `Promise`, `async`, generators, `Symbol`, `Map`, `Set`, regular expressions or `new Date()` yet. |
+| Layout: block, inline, flex, grid (tracks, `fr`, `repeat`, `auto-fill`, spans, placement), tables, lists, positioning | Done. Floats, grid areas, `rowspan` are **not** done. |
+| Pictures: PNG, baseline JPEG, GIF (first frame) | Done. Progressive JPEG, WebP, SVG and animation are not. |
+| Browser: address bar, history, links, forms (GET), style sheets, scripts, pictures | Done in the Browser window (Ctrl-B). POST forms, cookies, downloads and tabs are not. |
+| JavaScript: syntax of modern scripts, closures, classes, destructuring, exceptions, timers | Done, with step, depth, object and size limits. `Map`, `Set` and `Promise` exist. No `async`/`await`, generators, `Symbol`, regular expressions or `new Date()` yet. |
 | `document`, elements, events (with bubbling), `classList`, `style`, `innerHTML`, selectors | Done. No network, storage or `eval`. |
 | Markdown preview | Done. |
-| Browser shell: tabs, history, bookmarks, publishing, MCP discovery | Not started; see the sections below. |
+| Tabs, bookmarks, publishing, MCP discovery | Not started; see the sections below. |
 
 Everything is tested in `cargo test -p mouli-web`; display tests live in `mouli-screen`. Testing so far
 is in QEMU only, not on real hardware.

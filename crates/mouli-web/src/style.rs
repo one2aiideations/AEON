@@ -19,6 +19,223 @@ use std::rc::Rc;
 /// The default root font size in pixels.
 pub const ROOT_FONT_SIZE: f32 = 16.0;
 
+/// One size in a grid track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrackSize {
+    /// Pixels.
+    Px(f32),
+    /// A fraction of the container (0 to 1).
+    Pct(f32),
+    /// A share of the free space.
+    Fr(f32),
+    /// Sized by the content.
+    Auto,
+}
+
+/// A grid track: `minmax(min, max)` (a plain size has both the same, `1fr` has an automatic
+/// minimum).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Track {
+    /// The least the track may be.
+    pub min: TrackSize,
+    /// The most the track may take.
+    pub max: TrackSize,
+}
+
+impl Track {
+    /// A track sized by its content.
+    pub const AUTO: Track = Track {
+        min: TrackSize::Auto,
+        max: TrackSize::Auto,
+    };
+}
+
+/// `grid-template-columns` or `grid-template-rows`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridTemplate {
+    /// The listed tracks.
+    pub tracks: Vec<Track>,
+    /// `repeat(auto-fill | auto-fit, track)`: where it goes among the listed tracks, the track,
+    /// and whether it is `auto-fit`.
+    pub repeat: Option<(usize, Track, bool)>,
+}
+
+/// Where an item sits along one axis of the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GridLine {
+    /// The first line (1-based; negative counts from the end).
+    pub start: Option<i32>,
+    /// The last line.
+    pub end: Option<i32>,
+    /// `span n` (when no end is given).
+    pub span: Option<u32>,
+}
+
+fn split_top(v: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut depth, mut cur) = (0i32, String::new());
+    for c in v.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth <= 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn track_size(t: &str, font: f32, vp: Viewport) -> Option<TrackSize> {
+    let t = t.trim();
+    if t == "auto" || t == "min-content" || t == "max-content" {
+        return Some(TrackSize::Auto);
+    }
+    if let Some(n) = t.strip_suffix("fr") {
+        return n
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|x| *x >= 0.0)
+            .map(TrackSize::Fr);
+    }
+    let d = dim_value(t, font, vp)?;
+    Some(if d.pct != 0.0 {
+        TrackSize::Pct(d.pct)
+    } else {
+        TrackSize::Px(d.px)
+    })
+}
+
+fn one_track(t: &str, font: f32, vp: Viewport) -> Option<Track> {
+    let t = t.trim();
+    if let Some(inner) = t.strip_prefix("minmax(").and_then(|r| r.strip_suffix(')')) {
+        let (a, b) = inner.split_once(',')?;
+        let (min, max) = (track_size(a, font, vp)?, track_size(b, font, vp)?);
+        // A flexible minimum is not allowed; it behaves as automatic.
+        let min = if matches!(min, TrackSize::Fr(_)) {
+            TrackSize::Auto
+        } else {
+            min
+        };
+        return Some(Track { min, max });
+    }
+    if t.starts_with("fit-content(") {
+        return Some(Track::AUTO);
+    }
+    let sz = track_size(t, font, vp)?;
+    Some(match sz {
+        TrackSize::Fr(_) => Track {
+            min: TrackSize::Auto,
+            max: sz,
+        },
+        other => Track {
+            min: other,
+            max: other,
+        },
+    })
+}
+
+fn parse_template(v: &str, font: f32, vp: Viewport) -> Option<GridTemplate> {
+    let mut out = GridTemplate::default();
+    for tok in split_top(v) {
+        if tok == "none" {
+            return Some(GridTemplate::default());
+        }
+        if tok.starts_with('[') || tok.ends_with(']') {
+            continue; // line names
+        }
+        if let Some(inner) = tok
+            .strip_prefix("repeat(")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            let (count, body) = inner.split_once(',')?;
+            let tracks: Vec<Track> = split_top(body.trim())
+                .iter()
+                .filter(|t| !t.starts_with('['))
+                .filter_map(|t| one_track(t, font, vp))
+                .collect();
+            if tracks.is_empty() {
+                return None;
+            }
+            match count.trim() {
+                "auto-fill" | "auto-fit" => {
+                    if out.repeat.is_some() {
+                        return None;
+                    }
+                    out.repeat = Some((out.tracks.len(), tracks[0], count.trim() == "auto-fit"));
+                }
+                n => {
+                    let n: usize = n.parse().ok().filter(|n| (1..=1000).contains(n))?;
+                    if out.tracks.len() + n * tracks.len() > 1000 {
+                        return None;
+                    }
+                    for _ in 0..n {
+                        out.tracks.extend(tracks.iter().copied());
+                    }
+                }
+            }
+            continue;
+        }
+        out.tracks.push(one_track(&tok, font, vp)?);
+        if out.tracks.len() > 1000 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn parse_line_pair(v: &str) -> Option<GridLine> {
+    let part = |p: &str| -> Option<(Option<i32>, Option<u32>)> {
+        let p = p.trim();
+        if p == "auto" || p.is_empty() {
+            return Some((None, None));
+        }
+        if let Some(n) = p.strip_prefix("span") {
+            return Some((
+                None,
+                Some(
+                    n.trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=1000).contains(n))?,
+                ),
+            ));
+        }
+        Some((
+            Some(
+                p.parse::<i32>()
+                    .ok()
+                    .filter(|n| *n != 0 && n.abs() <= 10_000)?,
+            ),
+            None,
+        ))
+    };
+    let mut halves = v.splitn(2, '/');
+    let a = part(halves.next()?)?;
+    let b = match halves.next() {
+        Some(x) => part(x)?,
+        None => (None, None),
+    };
+    Some(GridLine {
+        start: a.0,
+        end: b.0,
+        span: a.1.or(b.1),
+    })
+}
+
 /// A resolved length: pixels plus a fraction of the containing size.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Dim {
@@ -79,6 +296,10 @@ keyword_enum!(
         Flex,
         /** An inline flex container. */
         InlineFlex,
+        /** A grid container. */
+        Grid,
+        /** An inline grid container. */
+        InlineGrid,
         /** A list item (block with a marker). */
         ListItem,
         /** A table. */
@@ -415,6 +636,18 @@ pub struct Style {
     pub flex_basis: Size,
     /// Flex order.
     pub order: i32,
+    /// `grid-template-columns`.
+    pub grid_columns: GridTemplate,
+    /// `grid-template-rows`.
+    pub grid_rows: GridTemplate,
+    /// `grid-auto-rows`.
+    pub grid_auto_rows: Track,
+    /// `grid-auto-columns`.
+    pub grid_auto_columns: Track,
+    /// `grid-column` of this item.
+    pub grid_column: GridLine,
+    /// `grid-row` of this item.
+    pub grid_row: GridLine,
     /// Row gap.
     pub row_gap: Dim,
     /// Column gap.
@@ -484,6 +717,12 @@ impl Style {
             order: 0,
             row_gap: zero,
             column_gap: zero,
+            grid_columns: GridTemplate::default(),
+            grid_rows: GridTemplate::default(),
+            grid_auto_rows: Track::AUTO,
+            grid_auto_columns: Track::AUTO,
+            grid_column: GridLine::default(),
+            grid_row: GridLine::default(),
             border_spacing: 0.0,
             border_collapse: false,
             vars: Rc::new(BTreeMap::new()),
@@ -1334,7 +1573,9 @@ fn apply(s: &mut Style, name: &str, raw: &str, ctx: &Ctx<'_>) {
         "display" => {
             s.display = match kw {
                 "none" => Display::None,
-                "block" | "flow-root" | "grid" | "inline-grid" | "contents" => Display::Block,
+                "block" | "flow-root" | "contents" => Display::Block,
+                "grid" => Display::Grid,
+                "inline-grid" => Display::InlineGrid,
                 "inline" => Display::Inline,
                 "inline-block" => Display::InlineBlock,
                 "flex" => Display::Flex,
@@ -1694,6 +1935,56 @@ fn apply(s: &mut Style, name: &str, raw: &str, ctx: &Ctx<'_>) {
         "order" => {
             if let Ok(x) = v.parse::<i32>() {
                 s.order = x;
+            }
+        }
+        "grid-template-columns" => {
+            if let Some(t) = parse_template(v, font, vp) {
+                s.grid_columns = t;
+            }
+        }
+        "grid-template-rows" => {
+            if let Some(t) = parse_template(v, font, vp) {
+                s.grid_rows = t;
+            }
+        }
+        "grid-auto-rows" => {
+            if let Some(t) = split_top(v).first().and_then(|t| one_track(t, font, vp)) {
+                s.grid_auto_rows = t;
+            }
+        }
+        "grid-auto-columns" => {
+            if let Some(t) = split_top(v).first().and_then(|t| one_track(t, font, vp)) {
+                s.grid_auto_columns = t;
+            }
+        }
+        "grid-column" => {
+            if let Some(l) = parse_line_pair(v) {
+                s.grid_column = l;
+            }
+        }
+        "grid-row" => {
+            if let Some(l) = parse_line_pair(v) {
+                s.grid_row = l;
+            }
+        }
+        "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => {
+            if let Some(l) = parse_line_pair(v) {
+                let target = if name.starts_with("grid-column") {
+                    &mut s.grid_column
+                } else {
+                    &mut s.grid_row
+                };
+                if name.ends_with("start") {
+                    target.start = l.start;
+                    if l.span.is_some() {
+                        target.span = l.span;
+                    }
+                } else {
+                    target.end = l.start;
+                    if l.span.is_some() && target.start.is_some() {
+                        target.span = l.span;
+                    }
+                }
             }
         }
         "row-gap" => {
