@@ -9,7 +9,7 @@ publish.workspace = true
 [features]
 # Everything is on by default so `cargo test` covers it all. The OS image uses none of the
 # optional parts (mouli-hosted asks for default-features = false).
-default = ["topstar", "security", "comms", "identity", "auth", "mesh", "billing"]
+default = ["topstar", "security", "comms", "identity", "auth", "mesh", "billing", "keys"]
 topstar = ["dep:serde", "dep:serde_json", "dep:thiserror", "dep:sha2", "dep:uuid"]
 security = ["dep:serde_json", "dep:sha2"]
 comms = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:x25519-dalek"]
@@ -17,6 +17,7 @@ identity = ["dep:ed25519-dalek", "dep:sha2"]
 auth = ["dep:sha2"]
 mesh = ["dep:sha2"]
 billing = ["dep:sha2"]
+keys = ["dep:chacha20poly1305", "dep:sha2"]
 
 [dependencies]
 mouli-interface = { path = "../mouli-interface" }

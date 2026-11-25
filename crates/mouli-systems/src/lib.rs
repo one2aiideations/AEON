@@ -17189,3 +17189,1767 @@ pub mod billing {
         }
     }
 }
+
+/// Bring-your-own-key management: an encrypted vault for API keys.
+///
+/// People bring their own keys for hosted models. The vault keeps any number of them on the data
+/// disk, **encrypted with a key made from a passphrase** (PBKDF2-HMAC-SHA256, then
+/// ChaCha20-Poly1305 per record), so a lost or copied stick does not give the keys away. On top of
+/// storage it enforces how a key may be used:
+///
+/// * a key is **bound to hosts** (`api.openai.com`, `*.example.com`): handing it to any other
+///   host is refused, so a compromised agent cannot send it somewhere else;
+/// * it can **expire**, be **revoked**, be **rotated** (only a fingerprint of the old key is
+///   kept), and have a **daily use limit**;
+/// * the secret is only ever handed to a closure ([`keys::Vault::with_secret`]), never returned,
+///   and prints as `[redacted]`;
+/// * every use and every refusal is written to a hash-chained **audit trail** inside the vault.
+///
+/// Randomness is never read inside the engine: the host passes an [`keys::Entropy`] source
+/// (`/dev/urandom` through [`keys::UrandomEntropy`]). The clock is never read: callers pass `now`.
+///
+/// Honest limits: the secret is overwritten when dropped, but only as a best effort (the allocator
+/// may have copied it, and without `unsafe` the compiler is not forced to keep the writes); the
+/// vault is **unlocked in memory** while open; an attacker who can replace the file with an *older
+/// valid copy* is not detected (no counter outside the file); PBKDF2 is not memory-hard (a strong
+/// passphrase matters).
+#[cfg(feature = "keys")]
+#[allow(clippy::module_inception)]
+pub mod keys {
+    #![forbid(unsafe_code)]
+
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use sha2::{Digest, Sha256};
+    use std::fmt;
+
+    /// Most keys in a vault.
+    pub const MAX_KEYS: usize = 200;
+    /// Most audit records kept.
+    pub const MAX_AUDIT: usize = 1_000;
+    /// Largest vault file accepted, in bytes.
+    pub const MAX_FILE: usize = 4 * 1024 * 1024;
+    /// The fewest PBKDF2 iterations accepted.
+    pub const MIN_ITERATIONS: u32 = 10_000;
+    /// The most PBKDF2 iterations accepted when opening (a guard against a file that would hang).
+    pub const MAX_ITERATIONS: u32 = 10_000_000;
+    /// The iterations used for new vaults.
+    pub const STANDARD_ITERATIONS: u32 = 600_000;
+    const MAGIC: &str = "mouli-vault 1";
+
+    /// Why a vault call failed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum KeyError {
+        /// An input is invalid (the text says which).
+        Invalid(&'static str),
+        /// No such key.
+        NotFound,
+        /// The passphrase is wrong (or the file's first record was changed).
+        WrongPassphrase,
+        /// The file was changed, truncated, reordered or built with another key.
+        Tampered,
+        /// The file is not a vault (line number, 1-based).
+        Format(usize),
+        /// The key is revoked.
+        Revoked,
+        /// The key has expired.
+        Expired,
+        /// The key may not be sent to this host.
+        HostNotAllowed,
+        /// The key's daily limit is used up.
+        LimitReached,
+        /// A limit was reached (the text says which).
+        Full(&'static str),
+        /// The entropy source failed.
+        Entropy,
+    }
+
+    impl fmt::Display for KeyError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Invalid(w) => write!(f, "invalid {w}"),
+                Self::NotFound => f.write_str("no such key"),
+                Self::WrongPassphrase => f.write_str("wrong passphrase"),
+                Self::Tampered => f.write_str("the key vault was changed or damaged"),
+                Self::Format(n) => write!(f, "the key vault file is malformed (line {n})"),
+                Self::Revoked => f.write_str("the key is revoked"),
+                Self::Expired => f.write_str("the key has expired"),
+                Self::HostNotAllowed => f.write_str("the key may not be sent to that host"),
+                Self::LimitReached => f.write_str("the key's daily limit is used up"),
+                Self::Full(w) => write!(f, "limit reached: {w}"),
+                Self::Entropy => f.write_str("no random numbers available"),
+            }
+        }
+    }
+
+    impl std::error::Error for KeyError {}
+
+    /// A source of random bytes, supplied by the host.
+    pub trait Entropy {
+        /// Fills `buf` with random bytes.
+        ///
+        /// # Errors
+        /// [`KeyError::Entropy`] when none are available.
+        fn fill(&mut self, buf: &mut [u8]) -> Result<(), KeyError>;
+    }
+
+    /// Random bytes from `/dev/urandom`.
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    pub struct UrandomEntropy;
+
+    #[cfg(unix)]
+    impl Entropy for UrandomEntropy {
+        fn fill(&mut self, buf: &mut [u8]) -> Result<(), KeyError> {
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(buf))
+                .map_err(|_| KeyError::Entropy)
+        }
+    }
+
+    // ------------------------------------------------------------------ primitives
+
+    fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        for p in parts {
+            h.update(p);
+        }
+        h.finalize().into()
+    }
+
+    /// HMAC-SHA256.
+    fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            k[..32].copy_from_slice(&sha256(&[key]));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+        let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+        let inner = sha256(&[&ipad, data]);
+        sha256(&[&opad, &inner])
+    }
+
+    /// PBKDF2-HMAC-SHA256 producing 32 bytes.
+    fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+        let mut s = salt.to_vec();
+        s.extend_from_slice(&1u32.to_be_bytes());
+        let mut u = hmac(password, &s);
+        let mut t = u;
+        for _ in 1..iterations {
+            u = hmac(password, &u);
+            for (a, b) in t.iter_mut().zip(u.iter()) {
+                *a ^= b;
+            }
+        }
+        t
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn unhex(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) || !s.is_ascii() {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    fn esc(s: &str) -> String {
+        let mut o = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || b"-_./:@".contains(&b) {
+                o.push(char::from(b));
+            } else {
+                o.push_str(&format!("%{b:02X}"));
+            }
+        }
+        o
+    }
+
+    fn unesc(s: &str) -> Option<String> {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                let h = s.get(i + 1..i + 3)?;
+                if !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                out.push(u8::from_str_radix(h, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    // ------------------------------------------------------------------ secrets
+
+    /// A secret that never prints and is overwritten when dropped (best effort).
+    pub struct Secret(String);
+
+    impl Secret {
+        fn new(s: String) -> Self {
+            Self(s)
+        }
+
+        fn expose(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for Secret {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Secret([redacted])")
+        }
+    }
+
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            let mut v = std::mem::take(&mut self.0).into_bytes();
+            v.fill(0);
+            std::hint::black_box(&v);
+        }
+    }
+
+    impl Clone for Secret {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    /// Cleans up a pasted key: trims it, removes surrounding quotes and a `Bearer ` prefix, and
+    /// refuses anything with spaces, control or non-ASCII characters, or a length outside 8 to 512.
+    /// The second value lists what was changed, for showing to the person.
+    ///
+    /// # Errors
+    /// [`KeyError::Invalid`] when the text cannot be a key.
+    pub fn normalise_secret(raw: &str) -> Result<(String, Vec<&'static str>), KeyError> {
+        let mut notes = Vec::new();
+        let mut s = raw.trim();
+        if s.len() != raw.len() {
+            notes.push("spaces around the key were removed");
+        }
+        if let Some(r) = s
+            .strip_prefix("Bearer ")
+            .or_else(|| s.strip_prefix("bearer "))
+        {
+            s = r.trim();
+            notes.push("a Bearer prefix was removed");
+        }
+        for q in ['"', '\''] {
+            if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+                s = &s[1..s.len() - 1];
+                notes.push("quotes around the key were removed");
+                break;
+            }
+        }
+        if s.len() < 8 || s.len() > 512 {
+            return Err(KeyError::Invalid("key length"));
+        }
+        if s.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+            return Err(KeyError::Invalid("key characters"));
+        }
+        Ok((s.to_string(), notes))
+    }
+
+    /// A hint when the key does not look like the provider's usual keys (not an error: providers
+    /// change their formats).
+    #[must_use]
+    pub fn format_hint(provider: &str, secret: &str) -> Option<&'static str> {
+        let (prefix, name) = match provider {
+            "openai" => ("sk-", "OpenAI keys start with sk-"),
+            "anthropic" => ("sk-ant-", "Anthropic keys start with sk-ant-"),
+            "openrouter" => ("sk-or-", "OpenRouter keys start with sk-or-"),
+            "groq" => ("gsk_", "Groq keys start with gsk_"),
+            _ => return None,
+        };
+        (!secret.starts_with(prefix)).then_some(name)
+    }
+
+    fn label_ok(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 64 && !s.chars().any(char::is_control)
+    }
+
+    fn provider_ok(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 40
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+
+    /// A host name a key may be sent to: letters, digits, dots and hyphens; a leading `*.` allows
+    /// any sub-domain. IP addresses are refused (a key belongs to a service, not an address).
+    fn host_pattern_ok(h: &str) -> bool {
+        let body = h.strip_prefix("*.").unwrap_or(h);
+        !body.is_empty()
+            && body.len() <= 253
+            && body.contains('.')
+            && body.split('.').all(|l| {
+                !l.is_empty()
+                    && l.len() <= 63
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            && !body
+                .split('.')
+                .all(|l| l.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    fn host_matches(pattern: &str, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        let pattern = pattern.to_ascii_lowercase();
+        match pattern.strip_prefix("*.") {
+            Some(rest) => host.len() > rest.len() + 1 && host.ends_with(&format!(".{rest}")),
+            None => host == pattern,
+        }
+    }
+
+    fn fingerprint(provider: &str, secret: &str) -> String {
+        hex(&sha256(&[
+            b"mouli-key-fp|",
+            provider.as_bytes(),
+            b"|",
+            secret.as_bytes(),
+        ])[..6])
+    }
+
+    // ------------------------------------------------------------------ the vault
+
+    /// What to store.
+    #[derive(Debug, Clone)]
+    pub struct NewKey<'a> {
+        /// The provider (`openai`, `anthropic`, ...): lowercase letters, digits, `-`, `_`.
+        pub provider: &'a str,
+        /// A name the person recognises (`work account`).
+        pub label: &'a str,
+        /// The key itself (cleaned with [`normalise_secret`] first).
+        pub secret: &'a str,
+        /// The hosts it may be sent to (at least one).
+        pub hosts: &'a [&'a str],
+        /// When it stops working (seconds), if ever.
+        pub expires: Option<u64>,
+        /// The most uses per day, if limited.
+        pub daily_limit: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Entry {
+        id: String,
+        provider: String,
+        label: String,
+        secret: Secret,
+        hosts: Vec<String>,
+        created: u64,
+        expires: Option<u64>,
+        revoked: Option<u64>,
+        daily_limit: Option<u64>,
+        used_day: u64,
+        used_count: u64,
+        last_used: Option<u64>,
+        history: Vec<(u64, String)>,
+    }
+
+    /// What can be shown about a key (never the secret).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct KeyInfo {
+        /// The key's id.
+        pub id: String,
+        /// The provider.
+        pub provider: String,
+        /// The label.
+        pub label: String,
+        /// A short fingerprint to tell keys apart (not the key, and not part of it).
+        pub fingerprint: String,
+        /// The hosts it may be sent to.
+        pub hosts: Vec<String>,
+        /// When it was added.
+        pub created: u64,
+        /// When it expires.
+        pub expires: Option<u64>,
+        /// When it was revoked.
+        pub revoked: Option<u64>,
+        /// `active`, `expired` or `revoked`.
+        pub status: &'static str,
+        /// Uses today.
+        pub used_today: u64,
+        /// The daily limit.
+        pub daily_limit: Option<u64>,
+        /// The last use.
+        pub last_used: Option<u64>,
+        /// Earlier fingerprints from rotations, with the time each was replaced.
+        pub rotated: Vec<(u64, String)>,
+    }
+
+    /// One line of the audit trail.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AuditRecord {
+        /// A running number.
+        pub seq: u64,
+        /// When.
+        pub time: u64,
+        /// The key id, or `-`.
+        pub id: String,
+        /// What happened (`add`, `used`, `denied_host`, `revoked`, ...).
+        pub outcome: String,
+        /// What the key was used for, as given by the caller.
+        pub purpose: String,
+        /// The host it was handed to, if any.
+        pub host: String,
+        /// The previous record's hash.
+        pub prev: String,
+        /// This record's hash.
+        pub hash: String,
+    }
+
+    /// The vault, unlocked.
+    pub struct Vault {
+        iterations: u32,
+        salt: [u8; 16],
+        key: [u8; 32],
+        entries: Vec<Entry>,
+        audit: Vec<AuditRecord>,
+        audit_base: String,
+        next_id: u64,
+        next_seq: u64,
+    }
+
+    impl fmt::Debug for Vault {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Vault({} keys, [redacted])", self.entries.len())
+        }
+    }
+
+    impl Drop for Vault {
+        fn drop(&mut self) {
+            self.key = [0; 32];
+            std::hint::black_box(&self.key);
+        }
+    }
+
+    const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn derive(passphrase: &str, salt: &[u8; 16], iterations: u32) -> [u8; 32] {
+        let master = pbkdf2(passphrase.as_bytes(), salt, iterations);
+        sha256(&[b"mouli-vault/enc|", &master])
+    }
+
+    fn seal(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &str,
+        plain: &[u8],
+    ) -> Result<Vec<u8>, KeyError> {
+        ChaCha20Poly1305::new(Key::from_slice(key))
+            .encrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: plain,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| KeyError::Invalid("encryption"))
+    }
+
+    fn unseal(key: &[u8; 32], nonce: &[u8], aad: &str, ct: &[u8]) -> Option<Vec<u8>> {
+        if nonce.len() != 12 {
+            return None;
+        }
+        ChaCha20Poly1305::new(Key::from_slice(key))
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .ok()
+    }
+
+    fn audit_hash(
+        prev: &str,
+        seq: u64,
+        time: u64,
+        id: &str,
+        outcome: &str,
+        purpose: &str,
+        host: &str,
+    ) -> String {
+        hex(&sha256(&[
+            prev.as_bytes(),
+            b"|",
+            format!("{seq}|{time}|{id}|{outcome}|{purpose}|{host}").as_bytes(),
+        ]))
+    }
+
+    impl Vault {
+        /// Makes a new, empty vault protected by `passphrase` (at least 8 characters).
+        ///
+        /// # Errors
+        /// [`KeyError::Invalid`] for a short passphrase or too few iterations; [`KeyError::Entropy`].
+        pub fn create(
+            passphrase: &str,
+            iterations: u32,
+            rng: &mut dyn Entropy,
+        ) -> Result<Self, KeyError> {
+            if passphrase.chars().count() < 8 {
+                return Err(KeyError::Invalid("passphrase (at least 8 characters)"));
+            }
+            if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+                return Err(KeyError::Invalid("iterations"));
+            }
+            let mut salt = [0u8; 16];
+            rng.fill(&mut salt)?;
+            Ok(Self {
+                iterations,
+                salt,
+                key: derive(passphrase, &salt, iterations),
+                entries: Vec::new(),
+                audit: Vec::new(),
+                audit_base: ZERO.into(),
+                next_id: 1,
+                next_seq: 1,
+            })
+        }
+
+        fn log(&mut self, time: u64, id: &str, outcome: &str, purpose: &str, host: &str) {
+            let prev = self
+                .audit
+                .last()
+                .map_or_else(|| self.audit_base.clone(), |r| r.hash.clone());
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let clean =
+                |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(80).collect() };
+            let (purpose, host) = (clean(purpose), clean(host));
+            let hash = audit_hash(&prev, seq, time, id, outcome, &purpose, &host);
+            self.audit.push(AuditRecord {
+                seq,
+                time,
+                id: id.into(),
+                outcome: outcome.into(),
+                purpose,
+                host,
+                prev,
+                hash,
+            });
+            if self.audit.len() > MAX_AUDIT {
+                let first = self.audit.remove(0);
+                self.audit_base = first.hash;
+            }
+        }
+
+        /// Adds a key and returns its id.
+        ///
+        /// # Errors
+        /// [`KeyError`] for a bad provider, label, key, host list, or when the vault is full.
+        pub fn add(&mut self, k: &NewKey<'_>, now: u64) -> Result<String, KeyError> {
+            if !provider_ok(k.provider) {
+                return Err(KeyError::Invalid("provider"));
+            }
+            if !label_ok(k.label) {
+                return Err(KeyError::Invalid("label"));
+            }
+            let (secret, _) = normalise_secret(k.secret)?;
+            if k.hosts.is_empty()
+                || k.hosts.len() > 8
+                || k.hosts.iter().any(|h| !host_pattern_ok(h))
+            {
+                return Err(KeyError::Invalid("hosts (one to eight host names)"));
+            }
+            if k.daily_limit == Some(0) {
+                return Err(KeyError::Invalid("daily limit"));
+            }
+            if self.entries.len() >= MAX_KEYS {
+                return Err(KeyError::Full("keys"));
+            }
+            let id = format!("k{}", self.next_id);
+            self.next_id += 1;
+            self.entries.push(Entry {
+                id: id.clone(),
+                provider: k.provider.into(),
+                label: k.label.into(),
+                secret: Secret::new(secret),
+                hosts: k.hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+                created: now,
+                expires: k.expires,
+                revoked: None,
+                daily_limit: k.daily_limit,
+                used_day: now / 86_400,
+                used_count: 0,
+                last_used: None,
+                history: Vec::new(),
+            });
+            self.log(now, &id, "add", "", "");
+            Ok(id)
+        }
+
+        fn status(e: &Entry, now: u64) -> &'static str {
+            if e.revoked.is_some() {
+                "revoked"
+            } else if e.expires.is_some_and(|x| x <= now) {
+                "expired"
+            } else {
+                "active"
+            }
+        }
+
+        /// What is stored, without secrets.
+        #[must_use]
+        pub fn list(&self, now: u64) -> Vec<KeyInfo> {
+            self.entries
+                .iter()
+                .map(|e| KeyInfo {
+                    id: e.id.clone(),
+                    provider: e.provider.clone(),
+                    label: e.label.clone(),
+                    fingerprint: fingerprint(&e.provider, e.secret.expose()),
+                    hosts: e.hosts.clone(),
+                    created: e.created,
+                    expires: e.expires,
+                    revoked: e.revoked,
+                    status: Self::status(e, now),
+                    used_today: if e.used_day == now / 86_400 {
+                        e.used_count
+                    } else {
+                        0
+                    },
+                    daily_limit: e.daily_limit,
+                    last_used: e.last_used,
+                    rotated: e.history.clone(),
+                })
+                .collect()
+        }
+
+        /// The first usable key of a provider (most recently added first), if any.
+        #[must_use]
+        pub fn find_active(&self, provider: &str, now: u64) -> Option<String> {
+            self.entries
+                .iter()
+                .rev()
+                .find(|e| e.provider == provider && Self::status(e, now) == "active")
+                .map(|e| e.id.clone())
+        }
+
+        /// Hands the secret of key `id` to `f`, for sending to `host`, after checking that the key
+        /// is active, may go to that host and is within its daily limit. Every call, allowed or
+        /// refused, is written to the audit trail with `purpose` (cut to 80 characters).
+        ///
+        /// # Errors
+        /// [`KeyError::NotFound`], [`KeyError::Revoked`], [`KeyError::Expired`],
+        /// [`KeyError::HostNotAllowed`], [`KeyError::LimitReached`].
+        pub fn with_secret<R>(
+            &mut self,
+            id: &str,
+            host: &str,
+            purpose: &str,
+            now: u64,
+            f: impl FnOnce(&str) -> R,
+        ) -> Result<R, KeyError> {
+            let Some(i) = self.entries.iter().position(|e| e.id == id) else {
+                self.log(now, "-", "denied_unknown", purpose, host);
+                return Err(KeyError::NotFound);
+            };
+            let refuse = |me: &mut Self, why: &str, e: KeyError| -> Result<R, KeyError> {
+                me.log(now, id, why, purpose, host);
+                Err(e)
+            };
+            let e = &self.entries[i];
+            if e.revoked.is_some() {
+                return refuse(self, "denied_revoked", KeyError::Revoked);
+            }
+            if e.expires.is_some_and(|x| x <= now) {
+                return refuse(self, "denied_expired", KeyError::Expired);
+            }
+            if !e.hosts.iter().any(|p| host_matches(p, host)) {
+                return refuse(self, "denied_host", KeyError::HostNotAllowed);
+            }
+            let day = now / 86_400;
+            let used = if e.used_day == day { e.used_count } else { 0 };
+            if e.daily_limit.is_some_and(|l| used >= l) {
+                return refuse(self, "denied_limit", KeyError::LimitReached);
+            }
+            let e = &mut self.entries[i];
+            e.used_day = day;
+            e.used_count = used + 1;
+            e.last_used = Some(now);
+            let out = f(e.secret.expose());
+            self.log(now, id, "used", purpose, host);
+            Ok(out)
+        }
+
+        /// Replaces a key's secret. Only a fingerprint of the old one is kept.
+        ///
+        /// # Errors
+        /// [`KeyError::NotFound`] or [`KeyError::Invalid`] for a bad new key.
+        pub fn rotate(&mut self, id: &str, new_secret: &str, now: u64) -> Result<(), KeyError> {
+            let (secret, _) = normalise_secret(new_secret)?;
+            let e = self
+                .entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or(KeyError::NotFound)?;
+            let old = fingerprint(&e.provider, e.secret.expose());
+            e.history.push((now, old));
+            if e.history.len() > 20 {
+                e.history.remove(0);
+            }
+            e.secret = Secret::new(secret);
+            e.revoked = None;
+            e.used_count = 0;
+            self.log(now, id, "rotated", "", "");
+            Ok(())
+        }
+
+        /// Stops a key from being used. It stays listed, so the history is not lost.
+        ///
+        /// # Errors
+        /// [`KeyError::NotFound`].
+        pub fn revoke(&mut self, id: &str, now: u64) -> Result<(), KeyError> {
+            let e = self
+                .entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or(KeyError::NotFound)?;
+            e.revoked.get_or_insert(now);
+            self.log(now, id, "revoked", "", "");
+            Ok(())
+        }
+
+        /// Removes a key and its secret for good.
+        ///
+        /// # Errors
+        /// [`KeyError::NotFound`].
+        pub fn delete(&mut self, id: &str, now: u64) -> Result<(), KeyError> {
+            let i = self
+                .entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or(KeyError::NotFound)?;
+            self.entries.remove(i);
+            self.log(now, id, "deleted", "", "");
+            Ok(())
+        }
+
+        /// Changes the hosts a key may be sent to.
+        ///
+        /// # Errors
+        /// [`KeyError::NotFound`] or [`KeyError::Invalid`].
+        pub fn set_hosts(&mut self, id: &str, hosts: &[&str], now: u64) -> Result<(), KeyError> {
+            if hosts.is_empty() || hosts.len() > 8 || hosts.iter().any(|h| !host_pattern_ok(h)) {
+                return Err(KeyError::Invalid("hosts (one to eight host names)"));
+            }
+            let e = self
+                .entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or(KeyError::NotFound)?;
+            e.hosts = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+            self.log(now, id, "hosts_changed", "", "");
+            Ok(())
+        }
+
+        /// The audit trail, oldest first.
+        #[must_use]
+        pub fn audit(&self) -> &[AuditRecord] {
+            &self.audit
+        }
+
+        /// Whether the audit trail is unbroken from its first kept record.
+        #[must_use]
+        pub fn audit_ok(&self) -> bool {
+            let mut prev = self.audit_base.clone();
+            for (i, r) in self.audit.iter().enumerate() {
+                if r.prev != prev
+                    || r.seq == 0
+                    || (i > 0 && r.seq != self.audit[i - 1].seq + 1)
+                    || r.hash
+                        != audit_hash(
+                            &r.prev, r.seq, r.time, &r.id, &r.outcome, &r.purpose, &r.host,
+                        )
+                {
+                    return false;
+                }
+                prev.clone_from(&r.hash);
+            }
+            true
+        }
+
+        /// Protects the vault with a new passphrase (the same keys; new salt).
+        ///
+        /// # Errors
+        /// [`KeyError::Invalid`] for a short passphrase; [`KeyError::Entropy`].
+        pub fn change_passphrase(
+            &mut self,
+            new: &str,
+            rng: &mut dyn Entropy,
+        ) -> Result<(), KeyError> {
+            if new.chars().count() < 8 {
+                return Err(KeyError::Invalid("passphrase (at least 8 characters)"));
+            }
+            let mut salt = [0u8; 16];
+            rng.fill(&mut salt)?;
+            self.salt = salt;
+            self.key = derive(new, &salt, self.iterations);
+            Ok(())
+        }
+
+        fn entry_text(e: &Entry) -> String {
+            let mut t = format!(
+                "provider {}\nlabel {}\nsecret {}\ncreated {}\nused_day {}\nused_count {}\n",
+                esc(&e.provider),
+                esc(&e.label),
+                esc(e.secret.expose()),
+                e.created,
+                e.used_day,
+                e.used_count
+            );
+            t.push_str(&format!(
+                "hosts {}\n",
+                e.hosts.iter().map(|h| esc(h)).collect::<Vec<_>>().join(" ")
+            ));
+            if let Some(x) = e.expires {
+                t.push_str(&format!("expires {x}\n"));
+            }
+            if let Some(x) = e.revoked {
+                t.push_str(&format!("revoked {x}\n"));
+            }
+            if let Some(x) = e.daily_limit {
+                t.push_str(&format!("daily_limit {x}\n"));
+            }
+            if let Some(x) = e.last_used {
+                t.push_str(&format!("last_used {x}\n"));
+            }
+            for (time, fp) in &e.history {
+                t.push_str(&format!("hist {time} {fp}\n"));
+            }
+            t
+        }
+
+        fn parse_entry(id: &str, text: &str) -> Option<Entry> {
+            let mut provider = None;
+            let mut label = None;
+            let mut secret = None;
+            let mut hosts = None;
+            let (mut created, mut used_day, mut used_count) = (None, None, None);
+            let (mut expires, mut revoked, mut daily_limit, mut last_used) =
+                (None, None, None, None);
+            let mut history = Vec::new();
+            for line in text.lines() {
+                let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+                match k {
+                    "provider" => provider = Some(unesc(v)?),
+                    "label" => label = Some(unesc(v)?),
+                    "secret" => secret = Some(unesc(v)?),
+                    "hosts" => {
+                        hosts = Some(
+                            v.split(' ')
+                                .filter(|h| !h.is_empty())
+                                .map(unesc)
+                                .collect::<Option<Vec<_>>>()?,
+                        )
+                    }
+                    "created" => created = Some(v.parse().ok()?),
+                    "used_day" => used_day = Some(v.parse().ok()?),
+                    "used_count" => used_count = Some(v.parse().ok()?),
+                    "expires" => expires = Some(v.parse().ok()?),
+                    "revoked" => revoked = Some(v.parse().ok()?),
+                    "daily_limit" => daily_limit = Some(v.parse().ok()?),
+                    "last_used" => last_used = Some(v.parse().ok()?),
+                    "hist" => {
+                        let (t, fp) = v.split_once(' ')?;
+                        history.push((t.parse().ok()?, fp.to_string()));
+                    }
+                    _ => return None,
+                }
+            }
+            let (provider, label, secret, hosts) = (provider?, label?, secret?, hosts?);
+            if !provider_ok(&provider)
+                || !label_ok(&label)
+                || hosts.is_empty()
+                || hosts.iter().any(|h| !host_pattern_ok(h))
+            {
+                return None;
+            }
+            Some(Entry {
+                id: id.into(),
+                provider,
+                label,
+                secret: Secret::new(secret),
+                hosts,
+                created: created?,
+                expires,
+                revoked,
+                daily_limit,
+                used_day: used_day?,
+                used_count: used_count?,
+                last_used,
+                history,
+            })
+        }
+
+        fn audit_text(&self) -> String {
+            let mut t = format!("base {}\n", self.audit_base);
+            for r in &self.audit {
+                t.push_str(&format!(
+                    "a {} {} {} {} {} {} {} {}\n",
+                    r.seq,
+                    r.time,
+                    esc(&r.id),
+                    esc(&r.outcome),
+                    esc(&r.purpose),
+                    esc(&r.host),
+                    r.prev,
+                    r.hash
+                ));
+            }
+            t
+        }
+
+        fn parse_audit(text: &str) -> Option<(String, Vec<AuditRecord>)> {
+            let mut lines = text.lines();
+            let base = lines.next()?.strip_prefix("base ")?.to_string();
+            let mut out = Vec::new();
+            for l in lines {
+                let p: Vec<&str> = l.split(' ').collect();
+                if p.len() != 9 || p[0] != "a" {
+                    return None;
+                }
+                out.push(AuditRecord {
+                    seq: p[1].parse().ok()?,
+                    time: p[2].parse().ok()?,
+                    id: unesc(p[3])?,
+                    outcome: unesc(p[4])?,
+                    purpose: unesc(p[5])?,
+                    host: unesc(p[6])?,
+                    prev: p[7].to_string(),
+                    hash: p[8].to_string(),
+                });
+            }
+            Some((base, out))
+        }
+
+        /// The vault as text for saving. Every record gets a fresh random nonce, so the same key is
+        /// never used twice with one nonce.
+        ///
+        /// # Errors
+        /// [`KeyError::Entropy`] or [`KeyError::Invalid`].
+        pub fn save(&self, rng: &mut dyn Entropy) -> Result<String, KeyError> {
+            let mut nonce = || -> Result<[u8; 12], KeyError> {
+                let mut n = [0u8; 12];
+                rng.fill(&mut n)?;
+                Ok(n)
+            };
+            let mut lines: Vec<String> = vec![
+                MAGIC.into(),
+                format!("kdf pbkdf2-sha256 {} {}", self.iterations, hex(&self.salt)),
+            ];
+            let n = nonce()?;
+            let meta = format!("next_id {}\nnext_seq {}\n", self.next_id, self.next_seq);
+            lines.push(format!(
+                "meta {} {}",
+                hex(&n),
+                hex(&seal(&self.key, &n, "meta", meta.as_bytes())?)
+            ));
+            for e in &self.entries {
+                let n = nonce()?;
+                let ct = seal(
+                    &self.key,
+                    &n,
+                    &format!("rec|{}", e.id),
+                    Self::entry_text(e).as_bytes(),
+                )?;
+                lines.push(format!("rec {} {} {}", e.id, hex(&n), hex(&ct)));
+            }
+            let n = nonce()?;
+            let ct = seal(&self.key, &n, "audit", self.audit_text().as_bytes())?;
+            lines.push(format!("audit {} {}", hex(&n), hex(&ct)));
+            let digest = sha256(&[lines.join("\n").as_bytes()]);
+            let n = nonce()?;
+            let ct = seal(
+                &self.key,
+                &n,
+                &format!("seal|{}", self.entries.len()),
+                &digest,
+            )?;
+            lines.push(format!("seal {} {}", hex(&n), hex(&ct)));
+            let mut out = lines.join("\n");
+            out.push('\n');
+            Ok(out)
+        }
+
+        /// Opens a saved vault.
+        ///
+        /// # Errors
+        /// [`KeyError::Format`] for a file that is not a vault; [`KeyError::WrongPassphrase`];
+        /// [`KeyError::Tampered`] when a record was changed, removed, added or reordered.
+        pub fn open(text: &str, passphrase: &str) -> Result<Self, KeyError> {
+            if text.len() > MAX_FILE {
+                return Err(KeyError::Format(1));
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.first() != Some(&MAGIC) {
+                return Err(KeyError::Format(1));
+            }
+            let kdf: Vec<&str> = lines
+                .get(1)
+                .ok_or(KeyError::Format(2))?
+                .split(' ')
+                .collect();
+            let (iterations, salt) = match kdf.as_slice() {
+                ["kdf", "pbkdf2-sha256", it, salt] => {
+                    let it: u32 = it.parse().map_err(|_| KeyError::Format(2))?;
+                    let salt: [u8; 16] = unhex(salt)
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or(KeyError::Format(2))?;
+                    (it, salt)
+                }
+                _ => return Err(KeyError::Format(2)),
+            };
+            if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+                return Err(KeyError::Format(2));
+            }
+            let key = derive(passphrase, &salt, iterations);
+            let field =
+                |n: usize, parts: &[&str], want: usize| -> Result<(Vec<u8>, Vec<u8>), KeyError> {
+                    if parts.len() != want {
+                        return Err(KeyError::Format(n));
+                    }
+                    let nonce = unhex(parts[want - 2]).ok_or(KeyError::Format(n))?;
+                    let ct = unhex(parts[want - 1]).ok_or(KeyError::Format(n))?;
+                    Ok((nonce, ct))
+                };
+            // The meta record doubles as the passphrase check.
+            let meta_parts: Vec<&str> = lines
+                .get(2)
+                .ok_or(KeyError::Format(3))?
+                .split(' ')
+                .collect();
+            if meta_parts.first() != Some(&"meta") {
+                return Err(KeyError::Format(3));
+            }
+            let (n, ct) = field(3, &meta_parts, 3)?;
+            let meta = unseal(&key, &n, "meta", &ct).ok_or(KeyError::WrongPassphrase)?;
+            let meta = String::from_utf8(meta).map_err(|_| KeyError::Tampered)?;
+            let mut it = meta.lines();
+            let next_id: u64 = it
+                .next()
+                .and_then(|l| l.strip_prefix("next_id "))
+                .and_then(|v| v.parse().ok())
+                .ok_or(KeyError::Tampered)?;
+            let next_seq: u64 = it
+                .next()
+                .and_then(|l| l.strip_prefix("next_seq "))
+                .and_then(|v| v.parse().ok())
+                .ok_or(KeyError::Tampered)?;
+            let mut entries = Vec::new();
+            let mut audit_state = None;
+            let mut sealed = false;
+            let mut seal_index = 0;
+            for (i, line) in lines.iter().enumerate().skip(3) {
+                let n = i + 1;
+                let p: Vec<&str> = line.split(' ').collect();
+                match p.first().copied() {
+                    Some("rec") if audit_state.is_none() && !sealed => {
+                        let (nonce, ct) = field(n, &p, 4)?;
+                        if entries.len() >= MAX_KEYS || p[1].len() > 20 {
+                            return Err(KeyError::Format(n));
+                        }
+                        let plain = unseal(&key, &nonce, &format!("rec|{}", p[1]), &ct)
+                            .ok_or(KeyError::Tampered)?;
+                        let text = String::from_utf8(plain).map_err(|_| KeyError::Tampered)?;
+                        let e = Self::parse_entry(p[1], &text).ok_or(KeyError::Tampered)?;
+                        if entries.iter().any(|x: &Entry| x.id == e.id) {
+                            return Err(KeyError::Tampered);
+                        }
+                        entries.push(e);
+                    }
+                    Some("audit") if audit_state.is_none() && !sealed => {
+                        let (nonce, ct) = field(n, &p, 3)?;
+                        let plain = unseal(&key, &nonce, "audit", &ct).ok_or(KeyError::Tampered)?;
+                        let text = String::from_utf8(plain).map_err(|_| KeyError::Tampered)?;
+                        audit_state = Some(Self::parse_audit(&text).ok_or(KeyError::Tampered)?);
+                    }
+                    Some("seal") if audit_state.is_some() && !sealed => {
+                        let (nonce, ct) = field(n, &p, 3)?;
+                        let digest = sha256(&[lines[..i].join("\n").as_bytes()]);
+                        let plain = unseal(&key, &nonce, &format!("seal|{}", entries.len()), &ct)
+                            .ok_or(KeyError::Tampered)?;
+                        if plain != digest {
+                            return Err(KeyError::Tampered);
+                        }
+                        sealed = true;
+                        seal_index = i;
+                    }
+                    _ => return Err(KeyError::Format(n)),
+                }
+            }
+            let (Some((audit_base, audit)), true) = (audit_state, sealed) else {
+                return Err(KeyError::Tampered);
+            };
+            if seal_index + 1 != lines.len() {
+                return Err(KeyError::Format(seal_index + 2));
+            }
+            let v = Self {
+                iterations,
+                salt,
+                key,
+                entries,
+                audit,
+                audit_base,
+                next_id,
+                next_seq,
+            };
+            if !v.audit_ok() {
+                return Err(KeyError::Tampered);
+            }
+            Ok(v)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Counts up, so every call gives different bytes and tests are repeatable.
+        struct Counter(u8);
+        impl Entropy for Counter {
+            fn fill(&mut self, buf: &mut [u8]) -> Result<(), KeyError> {
+                for b in buf {
+                    self.0 = self.0.wrapping_mul(31).wrapping_add(7);
+                    *b = self.0;
+                }
+                Ok(())
+            }
+        }
+
+        struct NoEntropy;
+        impl Entropy for NoEntropy {
+            fn fill(&mut self, _: &mut [u8]) -> Result<(), KeyError> {
+                Err(KeyError::Entropy)
+            }
+        }
+
+        const PASS: &str = "correct horse battery";
+        const SECRET: &str = "sk-live-ABCDEF0123456789";
+
+        fn key<'a>(hosts: &'a [&'a str]) -> NewKey<'a> {
+            NewKey {
+                provider: "openai",
+                label: "work account",
+                secret: SECRET,
+                hosts,
+                expires: None,
+                daily_limit: None,
+            }
+        }
+
+        fn vault() -> (Vault, String) {
+            let mut rng = Counter(1);
+            let mut v = Vault::create(PASS, MIN_ITERATIONS, &mut rng).unwrap();
+            let id = v.add(&key(&["api.openai.com"]), 1_000).unwrap();
+            (v, id)
+        }
+
+        #[test]
+        fn hmac_and_pbkdf2_match_published_values() {
+            assert_eq!(
+                hex(&hmac(&[0x0b; 20], b"Hi There")),
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+            );
+            assert_eq!(
+                hex(&hmac(
+                    &[0xaa; 131],
+                    b"Test Using Larger Than Block-Size Key - Hash Key First"
+                )),
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+                "a key longer than the block is hashed first"
+            );
+            assert_eq!(
+                hex(&pbkdf2(b"password", b"salt", 1)),
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+            );
+            assert_eq!(
+                hex(&pbkdf2(b"password", b"salt", 2)),
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+            );
+            assert_eq!(
+                hex(&pbkdf2(b"password", b"salt", 4096)),
+                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+            );
+        }
+
+        #[test]
+        fn a_vault_round_trips_and_the_saved_text_hides_everything() {
+            let (v, id) = vault();
+            let text = v.save(&mut Counter(9)).unwrap();
+            for secret in [
+                SECRET,
+                "ABCDEF0123456789",
+                "openai",
+                "work",
+                "api.openai.com",
+                id.as_str()
+                    .trim_start_matches('k')
+                    .to_string()
+                    .as_str()
+                    .to_owned()
+                    .as_str(),
+            ] {
+                if secret.len() > 1 {
+                    assert!(
+                        !text.contains(secret),
+                        "{secret} appears in the saved vault"
+                    );
+                }
+            }
+            let back = Vault::open(&text, PASS).unwrap();
+            let l = back.list(2_000);
+            assert_eq!(l.len(), 1);
+            assert_eq!(
+                (l[0].provider.as_str(), l[0].label.as_str(), l[0].status),
+                ("openai", "work account", "active")
+            );
+            let mut back = back;
+            let got = back
+                .with_secret(&id, "api.openai.com", "chat", 2_000, str::to_string)
+                .unwrap();
+            assert_eq!(got, SECRET);
+            assert!(back.audit_ok());
+        }
+
+        #[test]
+        fn a_wrong_passphrase_is_told_apart_from_damage() {
+            let (v, _) = vault();
+            let text = v.save(&mut Counter(2)).unwrap();
+            assert_eq!(
+                Vault::open(&text, "wrong passphrase").unwrap_err(),
+                KeyError::WrongPassphrase
+            );
+            assert_eq!(
+                Vault::open(&text, "").unwrap_err(),
+                KeyError::WrongPassphrase
+            );
+        }
+
+        #[test]
+        fn any_change_to_the_file_is_detected() {
+            let (mut v, _) = vault();
+            v.add(
+                &NewKey {
+                    label: "second",
+                    secret: "sk-second-0123456789",
+                    ..key(&["api.openai.com"])
+                },
+                1_001,
+            )
+            .unwrap();
+            let text = v.save(&mut Counter(3)).unwrap();
+            assert!(Vault::open(&text, PASS).is_ok());
+            let lines: Vec<&str> = text.lines().collect();
+            // Flip a hex digit inside each encrypted line in turn.
+            for i in 2..lines.len() {
+                let mut l: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+                let last = l[i].pop().unwrap();
+                l[i].push(if last == '0' { '1' } else { '0' });
+                let r = Vault::open(&(l.join("\n") + "\n"), PASS);
+                assert!(r.is_err(), "line {} changed but the vault opened", i + 1);
+            }
+            // Remove a key record.
+            let mut l: Vec<&str> = lines.clone();
+            let at = l.iter().position(|s| s.starts_with("rec ")).unwrap();
+            l.remove(at);
+            assert_eq!(
+                Vault::open(&(l.join("\n") + "\n"), PASS).unwrap_err(),
+                KeyError::Tampered
+            );
+            // Swap two key records.
+            let mut l: Vec<&str> = lines.clone();
+            let a = l.iter().position(|s| s.starts_with("rec ")).unwrap();
+            l.swap(a, a + 1);
+            assert_eq!(
+                Vault::open(&(l.join("\n") + "\n"), PASS).unwrap_err(),
+                KeyError::Tampered
+            );
+            // Duplicate a record under another id (the id is bound into the encryption).
+            let mut l: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+            let a = l.iter().position(|s| s.starts_with("rec k1 ")).unwrap();
+            l[a] = l[a].replacen("rec k1 ", "rec k9 ", 1);
+            assert!(Vault::open(&(l.join("\n") + "\n"), PASS).is_err());
+            // Truncated: the seal is gone.
+            let t: Vec<&str> = lines[..lines.len() - 1].to_vec();
+            assert!(Vault::open(&(t.join("\n") + "\n"), PASS).is_err());
+            // Text added after the seal.
+            assert!(Vault::open(&format!("{text}extra\n"), PASS).is_err());
+        }
+
+        #[test]
+        fn malformed_files_are_refused_without_panicking() {
+            for bad in [
+                "",
+                "garbage",
+                "mouli-vault 2\n",
+                "mouli-vault 1\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 100 00\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 99999999999 00112233445566778899aabbccddeeff\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 1000 00112233445566778899aabbccddeeff\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 20000000 00112233445566778899aabbccddeeff\nmeta aa bb\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 10000 00112233445566778899aabbccddeeff\nmeta zz yy\n",
+                "mouli-vault 1\nkdf pbkdf2-sha256 10000 00112233445566778899aabbccddeeff\nnotmeta a b\n",
+                "mouli-vault 1\nkdf scrypt 10000 00112233445566778899aabbccddeeff\n",
+            ] {
+                assert!(Vault::open(bad, PASS).is_err(), "{bad:?}");
+            }
+            assert!(Vault::open(&"x".repeat(MAX_FILE + 1), PASS).is_err());
+        }
+
+        #[test]
+        fn every_save_uses_fresh_nonces() {
+            let (v, _) = vault();
+            let a = v.save(&mut Counter(5)).unwrap();
+            let b = v.save(&mut Counter(6)).unwrap();
+            assert_ne!(a, b, "same content, different ciphertext");
+            let n = |t: &str| {
+                t.lines()
+                    .find(|l| l.starts_with("rec "))
+                    .unwrap()
+                    .split(' ')
+                    .nth(2)
+                    .unwrap()
+                    .to_string()
+            };
+            assert_ne!(n(&a), n(&b));
+            assert_eq!(v.save(&mut NoEntropy).unwrap_err(), KeyError::Entropy);
+        }
+
+        #[test]
+        fn creation_rules() {
+            assert!(Vault::create("short", MIN_ITERATIONS, &mut Counter(1)).is_err());
+            assert!(Vault::create(PASS, MIN_ITERATIONS - 1, &mut Counter(1)).is_err());
+            assert!(Vault::create(PASS, MAX_ITERATIONS + 1, &mut Counter(1)).is_err());
+            assert_eq!(
+                Vault::create(PASS, MIN_ITERATIONS, &mut NoEntropy).unwrap_err(),
+                KeyError::Entropy
+            );
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    Vault::create(PASS, MIN_ITERATIONS, &mut Counter(1)).unwrap()
+                ),
+                "Vault(0 keys, [redacted])"
+            );
+        }
+
+        #[test]
+        fn a_key_goes_only_to_its_hosts() {
+            let (mut v, id) = vault();
+            for host in ["api.openai.com", "API.OpenAI.com"] {
+                assert!(
+                    v.with_secret(&id, host, "chat", 2_000, |_| ()).is_ok(),
+                    "{host}"
+                );
+            }
+            for host in [
+                "evil.example.com",
+                "openai.com",
+                "api.openai.com.evil.io",
+                "xapi.openai.com",
+                "",
+                "api.openai.com:8080",
+            ] {
+                assert_eq!(
+                    v.with_secret(&id, host, "chat", 2_000, |_| ()),
+                    Err(KeyError::HostNotAllowed),
+                    "{host:?}"
+                );
+            }
+            v.set_hosts(&id, &["*.openai.com"], 2_000).unwrap();
+            assert!(v
+                .with_secret(&id, "eu.api.openai.com", "chat", 2_000, |_| ())
+                .is_ok());
+            assert!(
+                v.with_secret(&id, "openai.com", "chat", 2_000, |_| ())
+                    .is_err(),
+                "the bare domain is not a sub-domain"
+            );
+            assert!(v
+                .with_secret(&id, "notopenai.com", "chat", 2_000, |_| ())
+                .is_err());
+        }
+
+        #[test]
+        fn host_patterns_and_inputs_are_validated() {
+            let mut v = Vault::create(PASS, MIN_ITERATIONS, &mut Counter(1)).unwrap();
+            for bad in [
+                &[][..],
+                &["localhost"][..],
+                &["127.0.0.1"][..],
+                &["1.2.3.4"][..],
+                &["a b.com"][..],
+                &["-bad.com"][..],
+                &["bad-.com"][..],
+                &["a..com"][..],
+                &["*"][..],
+                &["*.com.*"][..],
+                &["http://x.com"][..],
+                &["x.com/path"][..],
+            ] {
+                assert!(v.add(&key(bad), 0).is_err(), "{bad:?}");
+            }
+            let nine = ["a.com"; 9];
+            assert!(v.add(&key(&nine), 0).is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        provider: "Open AI",
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        provider: "",
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        label: "",
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        label: "a\nb",
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        secret: "short",
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v
+                .add(
+                    &NewKey {
+                        daily_limit: Some(0),
+                        ..key(&["a.com"])
+                    },
+                    0
+                )
+                .is_err());
+            assert!(v.add(&key(&["a.com"]), 0).is_ok());
+        }
+
+        #[test]
+        fn expiry_revocation_and_limits_stop_use() {
+            let mut rng = Counter(1);
+            let mut v = Vault::create(PASS, MIN_ITERATIONS, &mut rng).unwrap();
+            let id = v
+                .add(
+                    &NewKey {
+                        expires: Some(5_000),
+                        daily_limit: Some(2),
+                        ..key(&["api.openai.com"])
+                    },
+                    1_000,
+                )
+                .unwrap();
+            let day = 86_400;
+            assert!(v
+                .with_secret(&id, "api.openai.com", "a", 1_000, |_| ())
+                .is_ok());
+            assert!(v
+                .with_secret(&id, "api.openai.com", "b", 1_001, |_| ())
+                .is_ok());
+            assert_eq!(
+                v.with_secret(&id, "api.openai.com", "c", 1_002, |_| ()),
+                Err(KeyError::LimitReached)
+            );
+            assert_eq!(v.list(1_003)[0].used_today, 2);
+            assert_eq!(
+                v.with_secret(&id, "api.openai.com", "d", 5_000, |_| ()),
+                Err(KeyError::Expired)
+            );
+            assert_eq!(v.list(5_000)[0].status, "expired");
+            // A new day resets the count (a key without an expiry).
+            let id2 = v
+                .add(
+                    &NewKey {
+                        label: "two",
+                        daily_limit: Some(1),
+                        ..key(&["api.openai.com"])
+                    },
+                    10,
+                )
+                .unwrap();
+            assert!(v
+                .with_secret(&id2, "api.openai.com", "", 10, |_| ())
+                .is_ok());
+            assert!(v
+                .with_secret(&id2, "api.openai.com", "", 11, |_| ())
+                .is_err());
+            assert!(
+                v.with_secret(&id2, "api.openai.com", "", day + 5, |_| ())
+                    .is_ok(),
+                "next day"
+            );
+            v.revoke(&id2, day + 6).unwrap();
+            assert_eq!(
+                v.with_secret(&id2, "api.openai.com", "", day + 7, |_| ()),
+                Err(KeyError::Revoked)
+            );
+            assert_eq!(
+                v.list(day + 7).iter().find(|k| k.id == id2).unwrap().status,
+                "revoked"
+            );
+            assert_eq!(
+                v.with_secret("k99", "api.openai.com", "", 0, |_| ()),
+                Err(KeyError::NotFound)
+            );
+        }
+
+        #[test]
+        fn rotation_keeps_only_a_fingerprint_of_the_old_key() {
+            let (mut v, id) = vault();
+            let before = v.list(0)[0].fingerprint.clone();
+            v.revoke(&id, 5).unwrap();
+            v.rotate(&id, "sk-new-0123456789ABCDEF", 10).unwrap();
+            let info = &v.list(11)[0];
+            assert_ne!(info.fingerprint, before);
+            assert_eq!(info.rotated, vec![(10, before.clone())]);
+            assert_eq!(info.status, "active", "a new key is usable again");
+            let got = v
+                .with_secret(&id, "api.openai.com", "t", 12, str::to_string)
+                .unwrap();
+            assert_eq!(got, "sk-new-0123456789ABCDEF");
+            let text = v.save(&mut Counter(4)).unwrap();
+            assert!(!text.contains(SECRET));
+            assert_eq!(
+                v.rotate("nope", "sk-new-0123456789ABCDEF", 0),
+                Err(KeyError::NotFound)
+            );
+            assert!(v.rotate(&id, "x", 0).is_err());
+        }
+
+        #[test]
+        fn find_active_prefers_the_newest_usable_key_of_a_provider() {
+            let mut v = Vault::create(PASS, MIN_ITERATIONS, &mut Counter(1)).unwrap();
+            let a = v.add(&key(&["api.openai.com"]), 0).unwrap();
+            let b = v
+                .add(
+                    &NewKey {
+                        label: "b",
+                        secret: "sk-bbbbbbbbbbbb",
+                        ..key(&["api.openai.com"])
+                    },
+                    0,
+                )
+                .unwrap();
+            assert_eq!(v.find_active("openai", 1), Some(b.clone()));
+            v.revoke(&b, 2).unwrap();
+            assert_eq!(v.find_active("openai", 3), Some(a));
+            assert_eq!(v.find_active("anthropic", 3), None);
+        }
+
+        #[test]
+        fn deleting_removes_the_secret_from_what_is_saved() {
+            let (mut v, id) = vault();
+            v.delete(&id, 5).unwrap();
+            assert!(v.list(6).is_empty());
+            assert_eq!(v.delete(&id, 6), Err(KeyError::NotFound));
+            let back = Vault::open(&v.save(&mut Counter(8)).unwrap(), PASS).unwrap();
+            assert!(back.list(7).is_empty());
+            assert!(back.audit().iter().any(|r| r.outcome == "deleted"));
+        }
+
+        #[test]
+        fn the_passphrase_can_be_changed() {
+            let (mut v, id) = vault();
+            assert!(v.change_passphrase("short", &mut Counter(2)).is_err());
+            v.change_passphrase("a brand new passphrase", &mut Counter(2))
+                .unwrap();
+            let text = v.save(&mut Counter(3)).unwrap();
+            assert_eq!(
+                Vault::open(&text, PASS).unwrap_err(),
+                KeyError::WrongPassphrase
+            );
+            let mut back = Vault::open(&text, "a brand new passphrase").unwrap();
+            assert_eq!(
+                back.with_secret(&id, "api.openai.com", "", 9, str::to_string)
+                    .unwrap(),
+                SECRET
+            );
+        }
+
+        #[test]
+        fn the_audit_trail_records_uses_and_refusals_and_detects_tampering() {
+            let (mut v, id) = vault();
+            v.with_secret(&id, "api.openai.com", "chat\nforged line", 10, |_| ())
+                .unwrap();
+            let _ = v.with_secret(&id, "evil.example.com", "chat", 11, |_| ());
+            let _ = v.with_secret("zzz", "api.openai.com", "chat", 12, |_| ());
+            let outcomes: Vec<&str> = v.audit().iter().map(|r| r.outcome.as_str()).collect();
+            assert_eq!(
+                outcomes,
+                vec!["add", "used", "denied_host", "denied_unknown"]
+            );
+            assert!(
+                !v.audit()[1].purpose.contains('\n'),
+                "control characters are dropped"
+            );
+            assert!(v.audit_ok());
+            assert_eq!(v.audit()[2].host, "evil.example.com");
+            assert!(v
+                .audit()
+                .iter()
+                .all(|r| !r.purpose.contains(SECRET) && !r.host.contains(SECRET)));
+            // It survives saving and loading, still verifying.
+            let back = Vault::open(&v.save(&mut Counter(4)).unwrap(), PASS).unwrap();
+            assert_eq!(back.audit(), v.audit());
+            // An altered record breaks the chain.
+            let mut bad = v;
+            bad.audit[1].outcome = "denied_host".into();
+            assert!(!bad.audit_ok());
+        }
+
+        #[test]
+        fn the_audit_trail_is_bounded_and_still_verifies() {
+            let (mut v, id) = vault();
+            for t in 0..(MAX_AUDIT as u64 + 50) {
+                v.with_secret(&id, "api.openai.com", "x", 10 + t, |_| ())
+                    .unwrap();
+            }
+            assert_eq!(v.audit().len(), MAX_AUDIT);
+            assert!(
+                v.audit_ok(),
+                "the chain is checked from the first kept record"
+            );
+            let back = Vault::open(&v.save(&mut Counter(5)).unwrap(), PASS).unwrap();
+            assert_eq!(back.audit().len(), MAX_AUDIT);
+        }
+
+        #[test]
+        fn the_vault_is_bounded() {
+            let mut v = Vault::create(PASS, MIN_ITERATIONS, &mut Counter(1)).unwrap();
+            for i in 0..MAX_KEYS {
+                v.add(
+                    &NewKey {
+                        label: &format!("k{i}"),
+                        ..key(&["a.com"])
+                    },
+                    0,
+                )
+                .unwrap();
+            }
+            assert_eq!(v.add(&key(&["a.com"]), 0), Err(KeyError::Full("keys")));
+        }
+
+        #[test]
+        fn secrets_never_print() {
+            let (mut v, id) = vault();
+            assert!(!format!("{v:?}").contains("sk-"));
+            assert_eq!(
+                format!("{:?}", Secret::new("sk-xxxxxxxxxx".into())),
+                "Secret([redacted])"
+            );
+            let listed = format!("{:?}", v.list(0));
+            assert!(
+                !listed.contains(SECRET) && !listed.contains("ABCDEF"),
+                "{listed}"
+            );
+            for e in [
+                KeyError::HostNotAllowed,
+                KeyError::Revoked,
+                KeyError::Tampered,
+            ] {
+                assert!(!e.to_string().contains("sk-"));
+            }
+            let _ = v.with_secret(&id, "x.com", "", 0, |_| ());
+        }
+
+        #[test]
+        fn pasted_keys_are_cleaned_and_odd_ones_refused() {
+            assert_eq!(
+                normalise_secret("  sk-abcdefgh1234  ").unwrap(),
+                (
+                    "sk-abcdefgh1234".into(),
+                    vec!["spaces around the key were removed"]
+                )
+            );
+            assert_eq!(
+                normalise_secret("Bearer sk-abcdefgh1234").unwrap().0,
+                "sk-abcdefgh1234"
+            );
+            assert_eq!(
+                normalise_secret("\"sk-abcdefgh1234\"").unwrap().0,
+                "sk-abcdefgh1234"
+            );
+            assert_eq!(
+                normalise_secret("'sk-abcdefgh1234'").unwrap().0,
+                "sk-abcdefgh1234"
+            );
+            assert!(normalise_secret("sk-abcdefgh1234").unwrap().1.is_empty());
+            for bad in [
+                "",
+                "short",
+                "has space inside1234",
+                "tab\there12345678",
+                "nul\0abcdefgh",
+                "ünïcode-key-12345",
+                "line1\nline2-abcdef",
+                &"a".repeat(513),
+            ] {
+                assert!(normalise_secret(bad).is_err(), "{bad:?}");
+            }
+            assert!(normalise_secret(&"a".repeat(512)).is_ok());
+        }
+
+        #[test]
+        fn a_hint_appears_when_a_key_does_not_look_right() {
+            assert_eq!(format_hint("openai", "sk-abc"), None);
+            assert!(format_hint("openai", "abc123456").unwrap().contains("sk-"));
+            assert!(format_hint("anthropic", "sk-abc")
+                .unwrap()
+                .contains("sk-ant-"));
+            assert_eq!(format_hint("anthropic", "sk-ant-abc"), None);
+            assert_eq!(format_hint("unknownprovider", "whatever"), None);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn the_system_entropy_source_gives_different_bytes() {
+            let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+            let mut e = UrandomEntropy;
+            e.fill(&mut a).unwrap();
+            e.fill(&mut b).unwrap();
+            assert_ne!(a, b);
+            assert_ne!(a, [0u8; 16]);
+        }
+    }
+}
