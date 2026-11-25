@@ -240,6 +240,17 @@ impl Recorder {
         self.save();
     }
 
+    /// A model file was removed from the disk by the person.
+    pub fn model_removed(&mut self, name: &str, now: u64) {
+        if let Ok(m) = self.graph.node("model", name, now) {
+            let _ = self.graph.set(m, "status", "removed");
+            if let Ok(p) = self.graph.node("person", "owner", now) {
+                let _ = self.graph.link(p, m, "removed", now, &[]);
+            }
+        }
+        self.save();
+    }
+
     /// Erases the saved log and the in-memory graph. Returns a message for the person.
     pub fn forget(&mut self, now: u64) -> String {
         let removed = match &self.path {
@@ -455,6 +466,16 @@ mod tests {
             "still works in memory"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_model_is_recorded() {
+        let mut r = Recorder::in_memory(0);
+        r.model_removed("old.gguf", 5);
+        let g = r.graph();
+        let m = g.find("model", "old.gguf").unwrap();
+        assert_eq!(m.props["status"], "removed");
+        assert_eq!(g.in_edges(m.id, Some("removed")).len(), 1);
     }
 
     #[test]

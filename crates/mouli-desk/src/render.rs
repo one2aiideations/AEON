@@ -158,6 +158,7 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Studio) => &STUDIO,
             Some(Tab::Editor) => &CODE,
             Some(Tab::Player) => &PLAYER,
+            Some(Tab::Storage) => &DISK,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;

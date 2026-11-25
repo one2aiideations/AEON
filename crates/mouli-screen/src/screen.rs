@@ -24,6 +24,10 @@ pub enum Action {
     ChooseModel(usize),
     /// Look for models again (a USB stick may have been plugged in).
     RescanModels,
+    /// Look at the data disk again.
+    RescanStorage,
+    /// Remove the stored model at this index in the Storage list (the host decides if it may).
+    DeleteStorage(usize),
     /// Open Wi-Fi setup.
     Wifi,
     /// Use a hosted model online.
@@ -79,11 +83,13 @@ pub enum Tab {
     Editor,
     /// The video and YouTube player.
     Player,
+    /// What is on the data disk.
+    Storage,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -94,6 +100,7 @@ impl Tab {
         Tab::Studio,
         Tab::Editor,
         Tab::Player,
+        Tab::Storage,
     ];
 
     /// The name shown in the tab bar.
@@ -109,10 +116,11 @@ impl Tab {
             Tab::Studio => "Studio",
             Tab::Editor => "Code",
             Tab::Player => "Player",
+            Tab::Storage => "Storage",
         }
     }
 
-    /// The function key that opens it (F1 to F10).
+    /// The function key that opens it (F1 to F11).
     pub const fn key(self) -> Key {
         Key::F(self as u8 + 1)
     }
@@ -193,7 +201,8 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 10);
+        assert_eq!(Tab::ALL.len(), 11);
+        assert_eq!(Tab::Storage.key(), Key::F(11));
         assert_eq!(Tab::Editor.key(), Key::F(9));
         assert_eq!(Tab::Player.key(), Key::F(10));
         assert_eq!(
@@ -208,7 +217,8 @@ mod tests {
                 "Sheet",
                 "Studio",
                 "Code",
-                "Player"
+                "Player",
+                "Storage"
             ]
         );
     }

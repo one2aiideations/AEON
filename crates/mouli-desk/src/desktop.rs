@@ -100,7 +100,7 @@ impl Desktop {
         let icons = vec![
             IconSpot {
                 label: "Storage",
-                tab: None,
+                tab: Some(Tab::Storage),
             },
             IconSpot {
                 label: "Chat",
@@ -272,7 +272,7 @@ impl Desktop {
             }
             Command::Help => {
                 self.show_alert(&[
-                    "F1 Chat  F2 Models  F9 Code",
+                    "F1 Chat  F2 Models  F9 Code  F11 Storage",
                     "Ctrl-N     new conversation",
                     "Ctrl-W     close the window",
                     "Ctrl-Q     shut down",
@@ -343,7 +343,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=10) => Tab::ALL
+            Key::F(n @ 1..=11) => Tab::ALL
                 .get(usize::from(n) - 1)
                 .filter(|t| !MOVED_OUT.contains(t))
                 .map(|t| Command::Open(*t)),
@@ -622,6 +622,19 @@ mod tests {
     }
 
     #[test]
+    fn the_storage_icon_and_f11_open_the_storage_window() {
+        let (mut d, mut s) = setup();
+        let (x, y) = centre(d.icon_rect(0));
+        click(&mut d, &mut s, x, y, 1000);
+        let a = click(&mut d, &mut s, x, y, 1100);
+        assert_eq!(a, Action::Show(Tab::Storage));
+        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Storage));
+        let (mut d, mut s) = setup();
+        assert_eq!(d.on_key(&mut s, Key::F(11)), Action::Show(Tab::Storage));
+        assert_eq!(d.wm.top().map(|w| w.tab), Some(Tab::Storage));
+    }
+
+    #[test]
     fn clicking_empty_desktop_deselects() {
         let (mut d, mut s) = setup();
         let (x, y) = centre(d.icon_rect(1));
@@ -758,7 +771,7 @@ mod tests {
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[7]; // Admin > Security
+        let item = d.menu.item_rects(3)[8]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);
@@ -822,10 +835,8 @@ mod tests {
     fn dialogs_block_everything_until_dismissed() {
         let (mut d, mut s) = setup();
         d.open(&mut s, Tab::Chat);
-        let (x, y) = centre(d.icon_rect(0));
-        click(&mut d, &mut s, x, y, 0);
-        click(&mut d, &mut s, x, y, 100);
-        let alert = d.alert.clone().expect("the disk icon shows About");
+        d.execute(&mut s, Command::About);
+        let alert = d.alert.clone().expect("About shows a dialog");
         // Keys and clicks elsewhere do nothing while it shows.
         assert_eq!(d.on_key(&mut s, Key::Char('a')), Action::None);
         assert_eq!(

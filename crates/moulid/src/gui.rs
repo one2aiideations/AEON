@@ -712,6 +712,7 @@ pub struct Session<D: Display> {
     offset: Arc<AtomicI32>,
     settings: Option<crate::persist::Store>,
     graph: Recorder,
+    data_root: Option<std::path::PathBuf>,
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it).
@@ -734,6 +735,7 @@ impl<D: Display> Session<D> {
             offset: Arc::new(AtomicI32::new(0)),
             settings: None,
             graph: Recorder::in_memory(unix_now()),
+            data_root: None,
         }
     }
 
@@ -770,6 +772,7 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     s.settings = data_dir.and_then(|d| crate::persist::Store::open(d).ok());
     if let Some(d) = data_dir {
         s.graph = Recorder::open(d, unix_now());
+        s.data_root = Some(d.to_path_buf());
     }
     if let Some(m) = s
         .settings
@@ -883,6 +886,7 @@ where
         offset,
         settings,
         mut graph,
+        data_root,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -940,6 +944,7 @@ where
         device.shell.chat.push(Role::Notice, &w);
     }
     let model_name = models.loaded.clone();
+    refresh_storage(&mut device.shell, data_root.as_deref());
     let mut history = fresh(&system_text);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
@@ -1024,7 +1029,27 @@ where
             };
             match action {
                 Action::None => {}
-                Action::Show(tab) => desktop.open(&mut device.shell, tab),
+                Action::Show(tab) => {
+                    desktop.open(&mut device.shell, tab);
+                    if tab == Tab::Storage {
+                        refresh_storage(&mut device.shell, data_root.as_deref());
+                    }
+                }
+                Action::RescanStorage => {
+                    refresh_storage(&mut device.shell, data_root.as_deref());
+                    device.shell.storage.message = "Looked at the disk again.".into();
+                }
+                Action::DeleteStorage(i) => {
+                    let message = delete_stored_model(
+                        &mut device.shell,
+                        data_root.as_deref(),
+                        i,
+                        &model_name,
+                        &mut graph,
+                    );
+                    refresh_storage(&mut device.shell, data_root.as_deref());
+                    device.shell.storage.message = message;
+                }
                 Action::Send(text) if text.trim_start().starts_with("/time.zone") => {
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/time.zone".len()..].to_string();
@@ -1112,6 +1137,51 @@ where
         }
         desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
         display.present(&desktop.render(&device.shell))?;
+    }
+}
+
+/// Fills the Storage window from the data disk (or shows that there is none).
+fn refresh_storage(shell: &mut Shell, root: Option<&Path>) {
+    match root {
+        Some(r) => {
+            let s = crate::storage::scan(r);
+            shell.storage.set(s.rows, s.free, s.total, "MOULI-DATA");
+        }
+        None => shell.storage.set(Vec::new(), None, None, ""),
+    }
+}
+
+/// Removes the model the person chose in the Storage window, unless it is the one in use.
+/// Returns the message to show.
+fn delete_stored_model(
+    shell: &mut Shell,
+    root: Option<&Path>,
+    index: usize,
+    loaded: &str,
+    graph: &mut Recorder,
+) -> String {
+    let Some(root) = root else {
+        return "There is no data disk.".into();
+    };
+    let Some(row) = shell.storage.rows.get(index).cloned() else {
+        return "That row is not on the list any more.".into();
+    };
+    let stem = row
+        .name
+        .rsplit_once('.')
+        .map_or(row.name.as_str(), |(s, _)| s);
+    if !loaded.is_empty() && (row.name == loaded || stem == loaded) {
+        return format!("{} is the model in use; load another one first.", row.name);
+    }
+    match crate::storage::remove_model(root, &row) {
+        crate::storage::Removal::Removed(name, bytes) => {
+            graph.model_removed(&name, unix_now());
+            format!(
+                "Removed {name} and freed {}.",
+                mouli_screen::screens::size_text(bytes)
+            )
+        }
+        crate::storage::Removal::Refused(why) => why,
     }
 }
 
@@ -2228,6 +2298,88 @@ mod tests {
         assert_eq!(g.get(call).unwrap().props["tool"], "code.apply");
         let file = g.find("file", "a.txt").unwrap();
         assert_eq!(g.in_edges(file.id, Some("touched"))[0].props["how"], "edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn storage_run(loaded: &str, keys: Vec<Ev>) -> std::path::PathBuf {
+        let dir = tmp("storage");
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(dir.join("models/a.gguf"), vec![1u8; 100]).unwrap();
+        std::fs::write(dir.join("models/b.gguf"), vec![1u8; 50]).unwrap();
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.data_root = Some(dir.clone());
+        session.graph = Recorder::open(&dir, 1);
+        for k in keys {
+            tx.send(k).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls),
+            "s",
+            1000,
+            &ModelsInfo::only(loaded),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_storage_window_removes_a_model_after_two_presses_and_records_it() {
+        let dir = storage_run(
+            "other",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('d')),
+            ],
+        );
+        assert!(
+            !dir.join("models/a.gguf").exists(),
+            "the largest model, first in the list, was removed"
+        );
+        assert!(dir.join("models/b.gguf").exists());
+        let back = Recorder::open(&dir, 9);
+        assert_eq!(
+            back.graph().find("model", "a.gguf").unwrap().props["status"],
+            "removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_press_or_the_wrong_keys_remove_nothing() {
+        let dir = storage_run(
+            "other",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Down),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('x')),
+                Ev::Key(Key::Esc),
+                Ev::Key(Key::Char('r')),
+            ],
+        );
+        assert!(dir.join("models/a.gguf").exists() && dir.join("models/b.gguf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_model_in_use_cannot_be_removed() {
+        let dir = storage_run(
+            "a",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('d')),
+            ],
+        );
+        assert!(dir.join("models/a.gguf").exists(), "a is the loaded model");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

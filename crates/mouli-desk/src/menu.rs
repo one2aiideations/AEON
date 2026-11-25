@@ -125,6 +125,7 @@ impl MenuBar {
                         item("Chat", "F1", Command::Open(Tab::Chat)),
                         item("Models", "F2", Command::Open(Tab::Models)),
                         item("Code", "F9", Command::Open(Tab::Editor)),
+                        item("Storage", "F11", Command::Open(Tab::Storage)),
                         SEP,
                         item("Admin", "", Command::Nothing),
                         item("Approvals", "F3", Command::Open(Tab::Approvals)),
