@@ -1,6 +1,6 @@
 # MOULI-CODE — Repository Analysis (Phase 1)
 
-**Repository:** `CMKIXVI/mouliapp`  
+**Repository:** `CMKIXVI/aeonapp`  
 **Target folder:** `code/`  
 **Product:** MOULI-CODE  
 **Review date:** 2026-11-22  

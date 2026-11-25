@@ -20,7 +20,7 @@ kernel (K1), with the TOPSTAR and yndra Rust code reusable as a reference.
 
 ## Scale of the port
 
-About 2,900 lines of C in `core/` and about 1,200 in `userspace/moulid/`, with their tests. This is
+About 2,900 lines of C in `core/` and about 1,200 in `userspace/aeond/`, with their tests. This is
 small enough to port early, before the engine grows on top of it. (Line counts measured with `wc`.)
 
 ## Migration rules

@@ -1,5 +1,5 @@
 //! Short-lived, audience-bound authorisation envelopes: the handoff from the authority to a
-//! consumer such as AgentBox (see `docs/MOULIONE_AGENTBOX_BOUNDARY` in the C tree).
+//! consumer such as AgentBox (see `docs/AEONONE_AGENTBOX_BOUNDARY` in the C tree).
 //!
 //! An envelope binds subject, tenant, org node, scopes, audience, decision id, correlation id,
 //! issue and expiry times and a unique token id, and is signed with HMAC-SHA256.

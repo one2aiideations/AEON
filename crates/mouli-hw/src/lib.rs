@@ -1,6 +1,6 @@
 //! Hardware probe and run plan for moulid.
 //!
-//! Rust port of the former C `mouli_hw.c`. Behaviour matched the C version on well-formed input
+//! Rust port of the former C `aeon_hw.c`. Behaviour matched the C version on well-formed input
 //! (checked by a differential test before the C code was retired).
 //!
 //! Known deliberate differences from the C version:

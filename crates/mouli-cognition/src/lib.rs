@@ -11,7 +11,7 @@
 //! * [`workspace`]: global workspace (bounded, salience-ranked broadcast).
 //! * [`working`]: working memory with priorities, expiry and eviction.
 //!
-//! Ported from the retired C core (`mouli_cognitive_core`, `mouli_cognitive_engine`).
+//! Ported from the retired C core (`aeon_cognitive_core`, `aeon_cognitive_engine`).
 #![forbid(unsafe_code)]
 
 pub mod causal;

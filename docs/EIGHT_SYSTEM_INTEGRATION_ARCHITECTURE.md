@@ -8,8 +8,8 @@ This integration includes exactly these eight CMKIXVI repositories:
 
 | System | Repository | Authoritative responsibility |
 |---|---|---|
-| MOULI | `CMKIXVI/MOULI` | Operating-system, hardware, runtime and workload execution authority |
-| MOULI-AUTH | `CMKIXVI/moulione` | Enterprise identity, authorization, tenant/company/plant, persistence, workflow, approval, audit and business-domain authority |
+| MOULI | `CMKIXVI/AEON` | Operating-system, hardware, runtime and workload execution authority |
+| MOULI-AUTH | `CMKIXVI/aeonone` | Enterprise identity, authorization, tenant/company/plant, persistence, workflow, approval, audit and business-domain authority |
 | LibreOne | `CMKIXVI/LibreOne` | Conversational workspace, multimodal interaction and user-facing artifacts |
 | AgentBox | `CMKIXVI/AgentBox` | Agent lifecycle, execution coordination, capability contracts and evaluation |
 | YNDRA | `CMKIXVI/yndra` | Intelligence, cognition and language abstractions; historical recovery remains provenance-first |
@@ -115,7 +115,7 @@ Secrets are resolved at runtime from an approved secret manager. No secret value
 - AgentBox source documentation identifies a deterministic fake provider and missing production tool sandbox/action gateway; production agent execution is not established by this architecture document.
 - TOPSTAR is pinned at `66b5a93f465cdc06a17e8d915a23e45ac75f6c1b` under `integrations/topstar`; its Apache-2.0 license was verified. MOULI now has a bounded C DTO/structural validator and an isolated strict-warning unit test passes. This is not yet a wire decoder, production cryptographic verifier, FFI or runtime integration.
 - YNDRA/AetherLang Phase 2 audit is documented in `docs/YNDRA_AETHERLANG_BOUNDARY.md`. YNDRA currently contains semantic IR plus overlapping architecture/physical-compute/OS execution modules; AetherLang documents the hardware compiler pipeline but says its historical source export is absent. Neither source is pinned because explicit license evidence is missing.
-- MOULI-AUTH/AgentBox Phase 3 audit is documented in `docs/MOULIONE_AGENTBOX_BOUNDARY.md`. MOULI-AUTH remains enterprise authority; AgentBox owns agent lifecycle/execution/evaluation. AgentBox's fake provider and unwired gVisor runner are not production action execution. Neither repo currently exposes a root license file at the audited commit, so no source pin is added.
+- MOULI-AUTH/AgentBox Phase 3 audit is documented in `docs/AEONONE_AGENTBOX_BOUNDARY.md`. MOULI-AUTH remains enterprise authority; AgentBox owns agent lifecycle/execution/evaluation. AgentBox's fake provider and unwired gVisor runner are not production action execution. Neither repo currently exposes a root license file at the audited commit, so no source pin is added.
 - TOMATOAI Phase 5 audit is documented in `docs/TOMATOAI_INTEGRATION.md`. Its VLA interface is proposal-only and the inspected safety helpers are scalar checks, not physical safety certification. No root license evidence is present, so no source pin is added.
 - TOMATOAI requires its own build/test and safety-conformance evidence before runtime integration is claimed.
 - Added `.github/workflows/eight-system-contracts.yml` to run the full MOULI Makefile test suite and the pinned TOPSTAR Rust workspace tests. The workflow has been committed, but no run result is available yet; this is not counted as passing CI.

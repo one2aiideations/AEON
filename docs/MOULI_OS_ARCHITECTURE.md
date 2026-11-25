@@ -1,6 +1,6 @@
 # MOULI AI-native OS — architecture and plan
 
-Status: design proposal plus the first code bridge (`core/mouli_expert_store.c`). The boundaries in
+Status: design proposal plus the first code bridge (`core/aeon_expert_store.c`). The boundaries in
 [EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md](EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md) still hold:
 **MOULI executes**, LibreOne owns the conversational UX, AgentBox owns agents, MOULI-AUTH owns identity
 and audit, TOPSTAR is the cross-system protocol, and AetherLang owns compiler lowering.
@@ -22,15 +22,15 @@ already provides them, and Android and ChromeOS are built the same way.
   The system-call boundary separates the two. **The repository currently has no LICENSE file; the
   owners must choose one** (MIT or Apache-2.0 keep it open and commercially usable; proprietary is
   also possible for userspace).
-- **Configs:** `mouli_x86_64_defconfig` and `mouli_arm64_defconfig`, covering NVMe, USB, net, virtio,
+- **Configs:** `aeon_x86_64_defconfig` and `aeon_arm64_defconfig`, covering NVMe, USB, net, virtio,
   DRM (amdgpu, i915), NVIDIA open kernel modules (out of tree), BPF LSM, io_uring, Landlock, seccomp,
   cgroup v2 and huge pages.
 - **MOULI kernel modules:**
-  - `mouli_mem`: pinned huge-page memory for model weights and the FAST expert tier.
-  - `mouli_gate`: BPF-LSM programs enforcing MOULI's existing process, network and I/O gate policies
-    (`core/mouli_process_gate.c`, `mouli_net_policy.c`, `mouli_io_gate.c`). This turns today's
+  - `aeon_mem`: pinned huge-page memory for model weights and the FAST expert tier.
+  - `aeon_gate`: BPF-LSM programs enforcing MOULI's existing process, network and I/O gate policies
+    (`core/aeon_process_gate.c`, `aeon_net_policy.c`, `aeon_io_gate.c`). This turns today's
     host-testable boundaries into real enforcement.
-- `experimental/mouli_x86_kernel.c` (IDT/APIC/paging) remains research for a possible native kernel
+- `experimental/aeon_x86_kernel.c` (IDT/APIC/paging) remains research for a possible native kernel
   later. It is not on the product path.
 
 ## 3. System layout
@@ -48,7 +48,7 @@ already provides them, and Android and ChromeOS are built the same way.
 ├────────────── moulid (PID 1, C) ───────────────────────┤
 │ mounts, hardware probe, service supervision, updates   │
 ├────────────── mouli-kernel (Linux LTS fork) ───────────┤
-│ drivers · mouli_mem · mouli_gate (BPF-LSM) · io_uring    │
+│ drivers · aeon_mem · aeon_gate (BPF-LSM) · io_uring    │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -57,17 +57,17 @@ already provides them, and Android and ChromeOS are built the same way.
 | Feature | Exists today | To build |
 |---|---|---|
 | Boot image | — | Buildroot external tree → `mouli-x86_64.iso`; QEMU boot test in CI |
-| Init | — | `userspace/moulid` (C): mounts, hardware probe, supervision |
+| Init | — | `userspace/aeond` (C): mounts, hardware probe, supervision |
 | Hardware awareness | `integrations/theory` `hw` (Python) | Port to C inside moulid (VRAM, RAM, SIMD, disk → device, precision, budgets) |
-| Inference | `core/mouli_transformer_compute.c` (primitives), `experimental/mouli_transformer_graph.c` | llama.cpp submodule as the engine; MOULI adapter for model loading |
-| Large-model loading | **`core/mouli_expert_store.c` (new, tested)**; Python reference `sparse_runtime.py` (matches transformers exactly) | Wire the expert store into the engine's MoE path; FAST tier on `mouli_mem` |
-| Model storage/streaming | `mouli_model_stream`, `mouli_model_index`, `mouli_model_manifest`, NVMe queue reads, tensor cache with budget and eviction | Back the DISK tier with io_uring reads |
+| Inference | `core/aeon_transformer_compute.c` (primitives), `experimental/aeon_transformer_graph.c` | llama.cpp submodule as the engine; MOULI adapter for model loading |
+| Large-model loading | **`core/aeon_expert_store.c` (new, tested)**; Python reference `sparse_runtime.py` (matches transformers exactly) | Wire the expert store into the engine's MoE path; FAST tier on `aeon_mem` |
+| Model storage/streaming | `aeon_model_stream`, `aeon_model_index`, `aeon_model_manifest`, NVMe queue reads, tensor cache with budget and eviction | Back the DISK tier with io_uring reads |
 | Model search | `forge` discovery + header-only safetensors checks | C/HTTP service, GGUF/safetensors only, licence filter |
 | Model selection | robust S, cascade routing (`theory_layer.py`) | Service API; S shown for every listed model |
 | On-the-fly model building | `merge` / `forge` (streamed TIES, kept only if S does not drop) | Service: merge → `convert_hf_to_gguf` → `llama-quantize` |
 | Agents | AgentBox (separate repo) | Integration through TOPSTAR contracts; sandbox with Landlock, seccomp and namespaces; user permission prompts |
 | Chat UI | LibreOne (separate repo) | Local web UI in a cage/Wayland kiosk |
-| Security | identity, semantic, process, network and I/O gates (host-tested) | Real enforcement via `mouli_gate` BPF-LSM |
+| Security | identity, semantic, process, network and I/O gates (host-tested) | Real enforcement via `aeon_gate` BPF-LSM |
 
 ## 5. Delivery plan (one pull request each)
 
@@ -76,7 +76,7 @@ already provides them, and Android and ChromeOS are built the same way.
 3. Model services: search, select, build, load (hardware-aware quantisation).
 4. Agents + sandbox (AgentBox via TOPSTAR).
 5. Chat UI kiosk (LibreOne).
-6. Kernel: mouli-kernel configs, `mouli_mem`, `mouli_gate`, GPU support.
+6. Kernel: mouli-kernel configs, `aeon_mem`, `aeon_gate`, GPU support.
 
 ## 6. Verified vs not verified
 

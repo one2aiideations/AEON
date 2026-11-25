@@ -1,6 +1,6 @@
 //! Scalar reference kernels (f32).
 //!
-//! Ported from the retired C `mouli_transformer_compute`. These favour
+//! Ported from the retired C `aeon_transformer_compute`. These favour
 //! clarity over speed and are the oracle for optimised backends.
 
 use crate::OpError;

@@ -19,7 +19,7 @@
 //! provider, model and API key, agrees that messages leave the machine, and messages are washed
 //! of secrets first. Nothing is sent without that consent.
 //!
-//! Ported from the retired C `userspace/moulid`.
+//! Ported from the retired C `userspace/aeond`.
 #![forbid(unsafe_code)]
 
 pub mod args;

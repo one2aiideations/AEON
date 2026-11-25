@@ -5,7 +5,7 @@
 //! Tools are invoked through a capability-checked [`tools::ToolBus`] and every
 //! actuator command passes the [`action::ActionGate`].
 //!
-//! Ported from the retired C core (`mouli_runtime`, `mouli_system_embodiment`).
+//! Ported from the retired C core (`aeon_runtime`, `aeon_system_embodiment`).
 #![forbid(unsafe_code)]
 
 pub mod action;

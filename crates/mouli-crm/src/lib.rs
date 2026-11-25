@@ -1,7 +1,7 @@
 //! MOULI-CRM domain core.
 //!
 //! Built from the MOULI-CRM product spec (`MOULI-CRM.md`) with design ideas from the owner's
-//! MOULICRM prototype (agent writes go through governed tools, every write audited). This is the
+//! AEONCRM prototype (agent writes go through governed tools, every write audited). This is the
 //! domain layer only: records, state machines and rules, behind one tenant-scoped [`Crm`]
 //! service. What is here:
 //!

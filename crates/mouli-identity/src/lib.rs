@@ -11,9 +11,9 @@
 //! 5. it carries a credential hash and a content address (CID).
 //!
 //! Modules: [`registry`], [`semantic`], [`friction`], [`wire`], [`gate`], [`hooks`].
-//! Ported from the retired C core (`mouli_identity*`, `mouli_semantic*`,
-//! `mouli_friction`, `mouli_syscall`, `mouli_io_gate`, `mouli_process_gate`,
-//! `mouli_net_policy`).
+//! Ported from the retired C core (`aeon_identity*`, `aeon_semantic*`,
+//! `aeon_friction`, `aeon_syscall`, `aeon_io_gate`, `aeon_process_gate`,
+//! `aeon_net_policy`).
 #![forbid(unsafe_code)]
 
 pub mod friction;

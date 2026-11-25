@@ -122,7 +122,7 @@ impl TensorCache {
         Ok(())
     }
 
-    /// Check the cache's internal invariants (the Rust form of the C `mouli_tensor_cache_validate`):
+    /// Check the cache's internal invariants (the Rust form of the C `aeon_tensor_cache_validate`):
     /// resident bytes within budget, entry count within the limit, every entry non-empty with a
     /// distinct non-zero age and a unique name, and `bytes_used` equal to the sum of entry sizes.
     ///

@@ -8,8 +8,8 @@
 //! * [`cache`]: byte-budgeted LRU cache of fully loaded tensors.
 //! * [`experts`]: tiered (fast / RAM LRU / disk) mixture-of-experts store and routing.
 //!
-//! Ported from the retired C core (`mouli_model_*`, `mouli_tensor_binding`,
-//! `mouli_tensor_layout`, `mouli_expert_store`).
+//! Ported from the retired C core (`aeon_model_*`, `aeon_tensor_binding`,
+//! `aeon_tensor_layout`, `aeon_expert_store`).
 #![forbid(unsafe_code)]
 
 pub mod binding;

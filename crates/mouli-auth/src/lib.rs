@@ -2,7 +2,7 @@
 //! approvals and audit, rebuilt in Rust from the MOULI-AUTH specification and the MOULI-AUTH/AgentBox
 //! boundary document.
 //!
-//! The MOULI-AUTH repository itself was not available (the source tree holds only specifications),
+//! The MOULI-AUTH repository (`CMKIXVI/aeonone`) itself was not available (the source tree holds only specifications),
 //! so nothing here is derived from its code and **nothing is verified against the real MOULI-AUTH**.
 //! In particular the envelope scheme is HMAC-SHA256, not the JWKS-style signature MOULI-AUTH is
 //! documented to use; see [`envelope`].

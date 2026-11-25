@@ -8,7 +8,7 @@ MOULI will run models with its own inference engine, written in C11 in this repo
 llama.cpp. llama.cpp (MIT) stays in the image only until milestone E4. It is also used, at test time
 only, as a correctness oracle. It never ships in the final image.
 
-Reasons: one codebase under One2AI's own licence terms, tight integration with `mouli_expert_store.c`
+Reasons: one codebase under One2AI's own licence terms, tight integration with `aeon_expert_store.c`
 and the robust-S model services, and control over memory use on laptops.
 
 Linux (GPL-2.0) remains the kernel. GPL does not prevent selling a product, but kernel patches and
@@ -20,7 +20,7 @@ decision for the owner.
 - Architecture: **x86_64 only** (Intel and AMD). arm64, Apple Silicon and Snapdragon are out of scope.
 - Hardware: **laptop CPU and laptop GPU** (integrated and discrete, Intel/AMD/NVIDIA).
 - Models: 1–8B parameters, 4–6 bit quantised (about 1–5 GB), dense first, MoE through
-  `core/mouli_expert_store.c`.
+  `core/aeon_expert_store.c`.
 - Offline operation.
 
 Consequences:

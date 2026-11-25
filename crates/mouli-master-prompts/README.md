@@ -121,7 +121,7 @@ Include passing/failing test names, source paths, real-versus-mocked integration
 
 ## 12. Source specification and document governance
 
-- **Source specification:** [The Markdown specifications stored in sibling product folders and the MOULI_Master_Prompts archive.](./The Markdown specifications stored in sibling product folders and the MOULI_Master_Prompts archive.)
+- **Source specification:** The Markdown specifications stored in sibling product folders and the AEON_Master_Prompts archive.
 - Preserve the full source specification and its original filename.
 - Update this README when product scope, ownership, contracts or verified implementation status changes.
 - Keep architectural decisions and breaking changes documented and version controlled.

@@ -23,9 +23,9 @@ called done.
 | Leaderboard / `choose_by_robust_score` | Ranks local models; picks the one to use | `/models`, `/use` | PR 3 |
 | Discovery and header-only checks (`model_forge`) | Hugging Face search, safetensors/GGUF header fit | `userspace/models/search.c` | PR 3 |
 | Task-vector screening, TIES soup (`merge`, `screen`, thresholds) | Streamed merge of compatible models; kept only if held-out S does not drop | `userspace/models/merge.c` | PR 3 |
-| Sparse runtime: tiered experts (`sparse_runtime`) | Run large MoE models under a RAM budget | `core/mouli_expert_store.c` (already in C) | done |
+| Sparse runtime: tiered experts (`sparse_runtime`) | Run large MoE models under a RAM budget | `core/aeon_expert_store.c` (already in C) | done |
 | Hot-set profiling, S-checked pruning, dense neuron slicing | Reduce what stays in fast memory without losing S | `userspace/models/prune.c` + engine hooks | after E4 |
-| Hardware plan (`hw`) | Threads, context, precision, budget | `userspace/moulid/mouli_hw.c` | done (extend) |
+| Hardware plan (`hw`) | Threads, context, precision, budget | `userspace/aeond/aeon_hw.c` | done (extend) |
 | 55D profile (`fiftyfive_*`, 55D engine v3.1) | Full profile of a model: language, coding, knowledge, long context, pruning sensitivity, energy | `userspace/models/profile55d/` | staged, below |
 
 ## 55D, in stages

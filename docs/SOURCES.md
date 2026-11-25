@@ -8,12 +8,12 @@ Provenance of everything pulled into this repository from the local `sources/` c
 
 | Source | Went into | Notes |
 |---|---|---|
-| `MOULI-main-full` (C core, `mouli-os`) | `mouli-tensor`, `mouli-model`, `mouli-engine`, `mouli-identity`, `mouli-cognition`, `mouli-runtime`, `mouli-adapters`, `moulid`, `mouli-hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
+| `AEON-main-full` (C core, `aeon-os`) | `mouli-tensor`, `mouli-model`, `mouli-engine`, `mouli-identity`, `mouli-cognition`, `mouli-runtime`, `mouli-adapters`, `moulid`, `mouli-hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
 | Theory toolkit (`TheoryOfIntelligence`, `stem_one_click_v11`) | `mouli-theory` | Robust-S, gap law, calibration, cascade, selection, TIES merge. |
 | 55D research engine (`stem_one_click_v11`) | `mouli-compress` | Model-independent numerics only: entropy, outliers, near-duplicates, quantisation error, pruning threshold, singular values, effective rank, low-rank error, RVQ sizes. |
 | `AgentBox-main` | `mouli-forge` (manifest, registry, candidate mutation, evaluation, capability contracts, fitness, comparison), `mouli-memory::context` | Pure logic only; see "Left out". |
 | `topstar-main` | `mouli-topstar` | The upstream snapshot did not compile or pass its tests; repairs listed in the crate README. |
-| `MOULIOS` (user-provided) | `mouli-agents`, `mouli-architecture`, `mouli-business`, `mouli-mail`, `mouli-project`, `mouli-studio`, `mouli-system`, `mouli-web`, ... | Docs and small binaries; `mail`, `web`, `agents` merged into existing crates. |
+| `AEONOS` (user-provided) | `mouli-agents`, `mouli-architecture`, `mouli-business`, `mouli-mail`, `mouli-project`, `mouli-studio`, `mouli-system`, `mouli-web`, ... | Docs and small binaries; `mail`, `web`, `agents` merged into existing crates. |
 | Archive chats (`archive-code`) | `mouli-core`, `mouli-agents`, `mouli-sched`, `mouli-neuro`, `mouli-mesh`, `mouli-memory`, `mouli-web`, `mouli-comms`, `mouli-store` (earlier), plus mesh repair/aggregation, neuro eligibility traces, working memory, ontology | Concepts re-expressed in Rust; the archive code itself is unreviewed ChatGPT output. |
 | Project specs (`TheoryOfIntelligence/prompts`) | `mouli-gguf`, `mouli-quant`, `mouli-tokenizer`, `mouli-llm` | Written from the GGUF format and the engine plan (milestones E1, E2), not from other engines. |
 
@@ -52,4 +52,4 @@ These were checked against tests written alongside them, **not** against a refer
 
 ## MOULI-AUTH
 
-`sources/` contains no MOULI-AUTH code, only specifications (`MOULI-AUTH.md`, the MOULI-AUTH/AgentBox boundary document, and product READMEs that cite it). The repository `CMKIXVI/moulione` could not be fetched with this machine's GitHub login. `mouli-auth` is therefore built from the specifications alone and has not been compared with the real service. Open items: confirm the real token/JWKS contract, replace HMAC with the asymmetric scheme once a crypto dependency is reviewed, and confirm MOULI-AUTH's license (the boundary document records none).
+`sources/` contains no MOULI-AUTH code, only specifications (`MOULI-AUTH.md`, the MOULI-AUTH/AgentBox boundary document, and product READMEs that cite it). The repository `CMKIXVI/aeonone` could not be fetched with this machine's GitHub login. `mouli-auth` is therefore built from the specifications alone and has not been compared with the real service. Open items: confirm the real token/JWKS contract, replace HMAC with the asymmetric scheme once a crypto dependency is reviewed, and confirm MOULI-AUTH's license (the boundary document records none).

@@ -1,7 +1,7 @@
 # mouli-biz
 
 The MOULI-BUSINESS monolith (v0.13): a local-first CRM/ERP core in one Rust binary with SQLite
-storage. It was ported from `MOULI-BUSINESS.rs`; the only changes are compile fixes, lint cleanup
+storage. It was ported from `AEON-BUSINESS.rs`; the only changes are compile fixes, lint cleanup
 and three corrected test assertions (see the commit message).
 
 What it holds: customers, transactions, memory and events; a small trainable decision policy with
