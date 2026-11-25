@@ -25,8 +25,7 @@ runs `moulid`'s own console.
 
 | Crate | Purpose |
 |---|---|
-| `mouli-gguf`, `mouli-quant`, `mouli-tokenizer` | GGUF reading and writing, dequantisation, tokenizers |
-| `mouli-tensor`, `mouli-model`, `mouli-engine`, `mouli-llm` | Tensors, model index, CPU kernels, llama-family forward pass |
+| `mouli-llm` | The model engine in one crate: GGUF reader and writer (`gguf`), dequantisation (`quant`), tokenizer, tensors, weight storage with cache, expert store and block sources (`weights`), CPU kernels and the forward pass |
 | `mouli-compress` | Weight analysis and compression planning |
 | `mouli-hosted` | Hosted-model chat client (streaming) over MOULI's own HTTPS |
 | `mouli-http`, `mouli-tls`, `mouli-pki`, `mouli-crypto` | Own HTTP/1.1 client, TLS 1.3 client, X.509 verification, crypto primitives |

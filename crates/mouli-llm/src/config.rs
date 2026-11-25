@@ -1,7 +1,7 @@
 //! Model hyper-parameters read from GGUF metadata.
 
-use mouli_gguf::{Gguf, GgufError};
-use mouli_quant::QuantError;
+use crate::gguf::{Gguf, GgufError};
+use crate::quant::QuantError;
 use std::fmt;
 
 /// How rotary position embedding pairs up dimensions.

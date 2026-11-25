@@ -5,7 +5,7 @@
 //! fits in memory.
 
 use crate::gguf_info::{self, estimate_ram, file_type_name, GgufInfo};
-use mouli_gguf::parse_header_only;
+use mouli_llm::gguf::parse_header_only;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -239,7 +239,7 @@ pub fn discover(builtin: &Path, mount: bool) -> Vec<Found> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mouli_gguf::{GgmlType, GgufWriter, Value};
+    use mouli_llm::gguf::{GgmlType, GgufWriter, Value};
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("moulid-{tag}-{}", std::process::id()));

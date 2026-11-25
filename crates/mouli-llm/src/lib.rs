@@ -11,6 +11,13 @@
 //! on a real model; milestone E2 requires that before outputs are trusted. Speed is scalar and
 //! single-threaded: this is the correctness baseline for later SIMD work (E3).
 
+pub mod gguf;
+pub mod kernels;
+pub mod quant;
+pub mod tensor;
+pub mod tokenizer;
+pub mod weights;
+
 mod config;
 mod model;
 mod sampler;

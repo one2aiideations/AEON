@@ -1,9 +1,9 @@
 //! One generation session: KV cache, position and the per-token forward pass.
 
 use crate::config::{LlmError, RopeStyle};
+use crate::kernels::ops;
 use crate::model::Model;
 use crate::sampler::Sampler;
-use mouli_engine::ops;
 
 /// State of one conversation with a [`Model`]: the KV cache and the next position.
 pub struct Session<'m> {
@@ -53,7 +53,7 @@ fn rope(
     }
 }
 
-fn map_op<T>(r: Result<T, mouli_engine::OpError>) -> Result<T, LlmError> {
+fn map_op<T>(r: Result<T, crate::kernels::OpError>) -> Result<T, LlmError> {
     r.map_err(|_| LlmError::NonFinite)
 }
 

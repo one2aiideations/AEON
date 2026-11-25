@@ -1,7 +1,7 @@
 //! Weight analysis for compression planning.
 //!
 //! Model-independent numerics normalised from the 55D research engine. Each function
-//! takes plain `f32` slices, so it works on tensors read by `mouli-gguf` or produced
+//! takes plain `f32` slices, so it works on tensors read by `mouli-llm::gguf` or produced
 //! anywhere else. These functions *measure*: none changes a model, and a plan (for
 //! example a pruning threshold) is not evidence that the planned model still works.
 //!

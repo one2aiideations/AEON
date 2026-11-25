@@ -177,7 +177,7 @@ impl Runtime {
 
         self.enter(Phase::Model);
         let x = [observation, 1.0, 0.0, -observation];
-        mouli_engine::ops::rmsnorm(&x, &[], self.cfg.epsilon, &mut self.model_output)
+        mouli_llm::kernels::ops::rmsnorm(&x, &[], self.cfg.epsilon, &mut self.model_output)
             .map_err(|_| RuntimeError::Model)?;
 
         self.enter(Phase::Action);

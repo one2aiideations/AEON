@@ -16,14 +16,18 @@ claiming that a dense 70B model is interactive on a laptop (it is not; section 4
 
 ## 2. What exists today (facts, 2026-11-25)
 
+The former crates `mouli-gguf`, `mouli-quant`, `mouli-tokenizer`, `mouli-tensor`, `mouli-model` and `mouli-engine` were merged into this crate
+(history kept) as the modules `gguf`, `quant`, `tokenizer`, `tensor`, `weights` and `kernels`. All 144 unit tests and the integration tests moved with them
+and pass; `moulid` and `mouli-runtime` now depend on `mouli-llm`.
+
 | Piece | Where | State |
 |---|---|---|
-| GGUF reader and writer | `mouli-gguf` (2,478 lines) | Round trips, malformed input and fuzz tests; not run on real model files |
-| Dequantisation | `mouli-quant` | Q4_0, Q8_0, K-quants, floats from the published layouts; tested on hand-built blocks; no comparison on real tensors |
-| Tokenizer | `mouli-tokenizer` | BPE and SentencePiece; only the GPT-2 pre-tokenizer, so other model families may split differently |
+| GGUF reader and writer | `mouli-llm::gguf` (2,478 lines) | Round trips, malformed input and fuzz tests; not run on real model files |
+| Dequantisation | `mouli-llm::quant` | Q4_0, Q8_0, K-quants, floats from the published layouts; tested on hand-built blocks; no comparison on real tensors |
+| Tokenizer | `mouli-llm::tokenizer` | BPE and SentencePiece; only the GPT-2 pre-tokenizer, so other model families may split differently |
 | Forward pass | `mouli-llm` (857 lines, 8 tests) | `llama` and `qwen2` dense only; scalar, single-threaded; compared with a naive implementation on tiny synthetic models; **no real-model logits comparison** |
-| Reference kernels | `mouli-engine` | ops and quant helpers (about 320 lines) |
-| Weight access | `mouli-model` (1,756 lines) | tensor index, one-tensor readers, byte sources (file, block device), bounded stream, tensor LRU cache, tiered MoE expert store with hot-set masks; **not used by `mouli-llm`** |
+| Reference kernels | `mouli-llm::kernels` | ops and quant helpers (about 320 lines) |
+| Weight access | `mouli-llm::weights` (1,756 lines) | tensor index, one-tensor readers, byte sources (file, block device), bounded stream, tensor LRU cache, tiered MoE expert store with hot-set masks; **not used by `mouli-llm`** |
 | Domain slicing logic | `sparse_runtime.py` (Python, 500 lines) | profiling, hot sets, neuron slicing, robust-score check; verified on tiny random models only |
 | Mesh | `mouli-mesh` (913 lines, 18 tests) | peer network pieces; not connected to inference |
 | Shipping engine | llama.cpp in the OS image | does all inference today |
@@ -119,7 +123,7 @@ No other module may use `unsafe`. The memory-mapping crate already in the worksp
 | M2 | `WeightProvider` trait; Resident and Lazy-map providers; load report and progress; planner v0 (RAM and measured disk speed) | Strategy-equivalence test passes; memory bound test passes |
 | M3 | AVX2 kernels for Q4_K, Q6_K, Q8_0 dot products, threads | Equal to scalar; benchmark vs llama.cpp on the same machine reported |
 | M4 | Server with streaming and cancel; moulid flag to choose the engine; A/B in QEMU | Boot test passes with the Rust engine; streaming visible in the desktop chat |
-| M5 | Mixture-of-experts architecture support; MoE paging provider using `mouli-model::experts` | Equivalence with Resident on a small MoE; working-set measurement on a real MoE |
+| M5 | Mixture-of-experts architecture support; MoE paging provider using `mouli-llm::weights::experts` | Equivalence with Resident on a small MoE; working-set measurement on a real MoE |
 | M6 | Layer-streaming provider with read-ahead; batch scheduler; overnight batch mode | Equivalence test; throughput measured on a real file larger than RAM |
 | M7 | Speculative decoding: n-gram first, then a draft model | Acceptance rate and speed measured on CPU |
 | M8 | Domain slicing tool (offline, Rust) writing sliced GGUF with the robust-score report | A sliced model plus its report on a real model; quality loss stated |

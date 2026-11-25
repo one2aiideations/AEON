@@ -8,14 +8,14 @@ Provenance of everything pulled into this repository from the local `sources/` c
 
 | Source | Went into | Notes |
 |---|---|---|
-| `AEON-main-full` (C core, `aeon-os`) | `mouli-tensor`, `mouli-model`, `mouli-engine`, `mouli-identity`, `mouli-cognition`, `mouli-runtime`, `mouli-adapters`, `moulid`, `mouli-hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
+| `AEON-main-full` (C core, `aeon-os`) | `mouli-llm::tensor`, `mouli-llm::weights`, `mouli-llm::kernels`, `mouli-identity`, `mouli-cognition`, `mouli-runtime`, `mouli-adapters`, `moulid`, `mouli-hw` | Module-by-module map and the non-Rust remainder in [`PORT_STATUS.md`](PORT_STATUS.md). |
 | Theory toolkit (`TheoryOfIntelligence`, `stem_one_click_v11`) | `mouli-theory` | Robust-S, gap law, calibration, cascade, selection, TIES merge. |
 | 55D research engine (`stem_one_click_v11`) | `mouli-compress` | Model-independent numerics only: entropy, outliers, near-duplicates, quantisation error, pruning threshold, singular values, effective rank, low-rank error, RVQ sizes. |
 | `AgentBox-main` | `mouli-forge` (manifest, registry, candidate mutation, evaluation, capability contracts, fitness, comparison), `mouli-memory::context` | Pure logic only; see "Left out". |
 | `topstar-main` | `mouli-topstar` | The upstream snapshot did not compile or pass its tests; repairs listed in the crate README. |
 | `AEONOS` (user-provided) | `mouli-agents`, `mouli-architecture`, `mouli-business`, `mouli-mail`, `mouli-project`, `mouli-studio`, `mouli-system`, `mouli-web`, ... | Docs and small binaries; `mail`, `web`, `agents` merged into existing crates. |
 | Archive chats (`archive-code`) | `mouli-core`, `mouli-agents`, `mouli-sched`, `mouli-neuro`, `mouli-mesh`, `mouli-memory`, `mouli-web`, `mouli-comms`, `mouli-store` (earlier), plus mesh repair/aggregation, neuro eligibility traces, working memory, ontology | Concepts re-expressed in Rust; the archive code itself is unreviewed ChatGPT output. |
-| Project specs (`TheoryOfIntelligence/prompts`) | `mouli-gguf`, `mouli-quant`, `mouli-tokenizer`, `mouli-llm` | Written from the GGUF format and the engine plan (milestones E1, E2), not from other engines. |
+| Project specs (`TheoryOfIntelligence/prompts`) | `mouli-llm::gguf`, `mouli-llm::quant`, `mouli-llm::tokenizer`, `mouli-llm` | Written from the GGUF format and the engine plan (milestones E1, E2), not from other engines. |
 
 `mouli-memory::chunk` is original code (the RAG archive chat contained only file trees).
 
@@ -32,9 +32,9 @@ Provenance of everything pulled into this repository from the local `sources/` c
 
 These were checked against tests written alongside them, **not** against a reference implementation on real data:
 
-* `mouli-gguf`: parser tested by round trips, malformed inputs, truncation at every byte and 10,000 random mutations; not yet run on real model files.
-* `mouli-quant`: block layouts from the published format; tests use hand-built blocks. The E1 comparison with a reference engine on real tensors is open.
-* `mouli-tokenizer`: only the GPT-2 pre-tokenizer exists, so models with another `tokenizer.ggml.pre` may split differently; no comparison with a reference tokenizer yet.
+* `mouli-llm::gguf`: parser tested by round trips, malformed inputs, truncation at every byte and 10,000 random mutations; not yet run on real model files.
+* `mouli-llm::quant`: block layouts from the published format; tests use hand-built blocks. The E1 comparison with a reference engine on real tensors is open.
+* `mouli-llm::tokenizer`: only the GPT-2 pre-tokenizer exists, so models with another `tokenizer.ggml.pre` may split differently; no comparison with a reference tokenizer yet.
 * `mouli-llm`: compared with an independent naive implementation on tiny synthetic models; no real-model logits comparison (E2); scalar and single-threaded.
 * C-to-Rust differential tests (identity, semantic wire, tensor): not run; C files have not been removed.
 * `mouli-topstar`, `mouli-compress`, `mouli-forge`, `mouli-memory`: unit-tested only.

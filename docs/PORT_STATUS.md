@@ -7,20 +7,20 @@ public APIs. **Differential tests against the C code (same input through both, o
 
 | C module | Rust location | Status |
 |---|---|---|
-| `aeon_tensor`, `aeon_tensor_view`, `aeon_tensor_layout`, `aeon_runtime_memory` | `mouli-tensor` (`layout`, `view`, `arena`) | ported |
-| `aeon_tensor_binding`, `aeon_tensor_materialization` | `mouli-model::binding`, `mouli-model::cache::materialize` | ported |
-| `aeon_tensor_cache*` (residency, invalidation, policy, materialization) | `mouli-model::cache` (LRU, budget, `invalidate`, `set_budget`, `validate`) | ported; only the LRU policy exists in C and in Rust |
-| `aeon_model_index`, `aeon_model_manifest`, `aeon_model_stream`, `aeon_model_storage` | `mouli-model::{index, manifest, source}` | ported |
-| `aeon_nvme_storage`, `aeon_nvme_queue_read` | `mouli-model::block` | ported (software block source; no NVMe hardware path) |
-| `aeon_expert_store` | `mouli-model::experts` | ported |
-| `aeon_transformer_compute` | `mouli-engine::ops` | ported (CPU reference kernels) |
+| `aeon_tensor`, `aeon_tensor_view`, `aeon_tensor_layout`, `aeon_runtime_memory` | `mouli-llm::tensor` (`layout`, `view`, `arena`) | ported |
+| `aeon_tensor_binding`, `aeon_tensor_materialization` | `mouli-llm::weights::binding`, `mouli-llm::weights::cache::materialize` | ported |
+| `aeon_tensor_cache*` (residency, invalidation, policy, materialization) | `mouli-llm::weights::cache` (LRU, budget, `invalidate`, `set_budget`, `validate`) | ported; only the LRU policy exists in C and in Rust |
+| `aeon_model_index`, `aeon_model_manifest`, `aeon_model_stream`, `aeon_model_storage` | `mouli-llm::weights::{index, manifest, source}` | ported |
+| `aeon_nvme_storage`, `aeon_nvme_queue_read` | `mouli-llm::weights::block` | ported (software block source; no NVMe hardware path) |
+| `aeon_expert_store` | `mouli-llm::weights::experts` | ported |
+| `aeon_transformer_compute` | `mouli-llm::kernels::ops` | ported (CPU reference kernels) |
 | `aeon_identity`, `aeon_identity_crypto` | `mouli-identity::registry` (`ed25519-dalek`, `sha2`) | ported |
 | `aeon_friction` | `mouli-identity::friction` | ported |
 | `aeon_semantic_frame`, `aeon_semantic_gate`, `aeon_semantic_wire` | `mouli-identity::{semantic, gate, wire}` | ported |
 | `aeon_syscall` (`submit_semantic`), `aeon_process_gate`, `aeon_io_gate`, `aeon_net_policy` | `mouli-identity::gate` | ported |
 | `aeon_ebpf_boundary` (classification), `aeon_kernel_adapter` (hooks) | `mouli-identity::hooks` | classification and hook bookkeeping ported; **attaching real eBPF/netfilter hooks stays kernel-side** |
 | `aeon_cognitive_core`, `aeon_cognitive_engine` | `mouli-cognition`, `mouli-core` | ported |
-| `aeon_runtime`, `aeon_system_embodiment` (actions, sensors, tools, memory region check) | `mouli-runtime::{action, sensors, tools}`, `mouli-tensor::arena` | ported |
+| `aeon_runtime`, `aeon_system_embodiment` (actions, sensors, tools, memory region check) | `mouli-runtime::{action, sensors, tools}`, `mouli-llm::tensor::arena` | ported |
 | `aeon_detect_cpu_caps` | `mouli-hw` (`parse_cpuinfo`, `probe`, `plan`) | ported (reads `/proc`, not compile-time flags) |
 | `aeon_topstar_contract` | `mouli-adapters::topstar`, and the fuller `mouli-topstar` crate | ported |
 | `userspace/aeond` | `moulid` | ported; HTTP surface not diffed against C |

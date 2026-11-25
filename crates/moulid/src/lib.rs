@@ -6,7 +6,7 @@
 //! (or `--selftest`) it sends one prompt, prints the reply and powers off.
 //!
 //! The inference server is still an external HTTP process (llama-server
-//! compatible `/health` and `/completion`); it is replaced by `mouli-engine`
+//! compatible `/health` and `/completion`); it is to be replaced by `mouli-llm`
 //! once that can run a full model.
 //!
 //! Wired networking ([`net`]) is brought up with DHCP from the local network; nothing contacts the

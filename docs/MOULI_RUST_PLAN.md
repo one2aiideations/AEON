@@ -53,7 +53,7 @@ small enough to port early, before the engine grows on top of it. (Line counts m
 
 ## Effect on other plans
 
-- Engine milestones E1–E6: written in Rust (`mouli-gguf`, `mouli-tokenizer`, `mouli-engine`,
+- Engine milestones E1–E6: written in Rust (`mouli-llm::gguf`, `mouli-llm::tokenizer`, `mouli-llm::kernels`,
   `mouli-vulkan`); SIMD via `core::arch` behind runtime detection.
 - Model services (PR 3), agents (PR 4), chat UI glue (PR 5): Rust.
 - Kernel track K1: Rust, `no_std`.

@@ -1,8 +1,8 @@
 //! Weights: tensor lookup, shape checks and quantised matrix-vector products.
 
 use crate::config::{Config, LlmError};
-use mouli_gguf::types::GgmlType;
-use mouli_gguf::{parse, Gguf, MappedGguf};
+use crate::gguf::types::GgmlType;
+use crate::gguf::{parse, Gguf, MappedGguf};
 use std::path::Path;
 
 enum Backing {
@@ -90,8 +90,8 @@ impl Model {
         if t.dims.len() != 2 || t.dims[0] as usize != cols || t.dims[1] as usize != rows {
             return Err(LlmError::BadTensorShape(name.to_string()));
         }
-        if !mouli_quant::is_supported(t.ty) {
-            return Err(LlmError::Quant(mouli_quant::QuantError::Unsupported(t.ty)));
+        if !crate::quant::is_supported(t.ty) {
+            return Err(LlmError::Quant(crate::quant::QuantError::Unsupported(t.ty)));
         }
         let r = t.data_range(g.data_start)?;
         let (start, end) = (r.start as usize, r.end as usize);
@@ -115,7 +115,7 @@ impl Model {
             return Err(LlmError::BadTensorShape(name.to_string()));
         }
         let data = g.tensor_data(bytes, name)?;
-        Ok(mouli_quant::dequantize_vec(t.ty, data, len)?)
+        Ok(crate::quant::dequantize_vec(t.ty, data, len)?)
     }
 
     fn build(gguf: Gguf, backing: Backing) -> Result<Model, LlmError> {
@@ -174,7 +174,7 @@ impl Model {
 
     /// `out = m * x` with on-the-fly dequantisation.
     pub(crate) fn matvec(&self, m: &Mat, x: &[f32], out: &mut [f32]) -> Result<(), LlmError> {
-        Ok(mouli_quant::matvec(
+        Ok(crate::quant::matvec(
             m.ty,
             &self.bytes()[m.start..m.end],
             m.rows,
@@ -191,9 +191,9 @@ impl Model {
         if row >= m.rows {
             return Err(LlmError::BadToken(token));
         }
-        let rb = mouli_quant::byte_len(m.ty, m.cols)?;
+        let rb = crate::quant::byte_len(m.ty, m.cols)?;
         let start = m.start + row * rb;
-        Ok(mouli_quant::dequantize(
+        Ok(crate::quant::dequantize(
             m.ty,
             &self.bytes()[start..start + rb],
             out,
