@@ -5,18 +5,19 @@
 //! wrapping, grow and shrink, alignment), grid (fixed, `fr`, `auto` and `minmax` tracks,
 //! `repeat` with counts and `auto-fill`, gaps, spans and explicit placement, alignment), tables
 //! (auto widths, colspan), lists with markers, relative, absolute and fixed positioning,
+//! floats with `clear` (text wraps around them, a new formatting context contains them),
 //! percentage and `calc()` sizes, min and max sizes, `box-sizing`, and `overflow: hidden`.
 //!
-//! What is not: floats (a floated box is laid out as a normal block), grid template areas and
-//! dense packing, `rowspan`, multi-column layout, `writing-mode`, transforms, and sticky
+//! What is not: floats that escape a plain container to affect blocks outside it, grid template
+//! areas and dense packing, `rowspan`, multi-column layout, `writing-mode`, transforms, and sticky
 //! positioning (treated as relative). Layout
 //! approximates a browser's; it is deterministic and uses only the [`Fonts`] it is given.
 
 use crate::dom::{Dom, NodeId};
 use crate::style::{
-    Align, BorderStyle, Dim, Display, FlexDir, FlexWrap, Float, GridLine, GridTemplate, Justify,
-    LineHeight, ListStyle, Overflow, Position, Size, Style, Styles, TextAlign, TextTransform,
-    Track, TrackSize, VAlign, Viewport, WhiteSpace,
+    Align, BorderStyle, Clear, Dim, Display, FlexDir, FlexWrap, Float, GridLine, GridTemplate,
+    Justify, LineHeight, ListStyle, Overflow, Position, Size, Style, Styles, TextAlign,
+    TextTransform, Track, TrackSize, VAlign, Viewport, WhiteSpace,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -301,6 +302,33 @@ impl LBox {
     }
 }
 
+/// A floated box, as the outer rectangle it takes from the lines beside it (in the content
+/// coordinates of the box whose flow it belongs to).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FloatBox {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    left: bool,
+}
+
+/// The room left for a line between floats: where it may start and where it must end, for a line
+/// occupying `y` to `y + h` of a box `width` wide.
+fn band(floats: &[FloatBox], y: f32, h: f32, width: f32) -> (f32, f32) {
+    let (mut left, mut right) = (0.0f32, width);
+    for f in floats {
+        if f.h > 0.0 && f.y < y + h.max(0.01) && f.y + f.h > y {
+            if f.left {
+                left = left.max(f.x + f.w);
+            } else {
+                right = right.min(f.x);
+            }
+        }
+    }
+    (left, right.max(left))
+}
+
 /// An absolutely positioned box waiting for its containing block.
 #[derive(Debug, Clone, PartialEq)]
 struct Pending {
@@ -421,6 +449,9 @@ struct Ctx<'a> {
     fonts: &'a dyn Fonts,
     intrinsic: RefCell<HashMap<NodeId, (f32, f32)>>,
     count: RefCell<usize>,
+    /// Floats the next block's flow should wrap its text around (set by the parent just before
+    /// laying the block out, in that block's content coordinates).
+    ambient: RefCell<Vec<FloatBox>>,
 }
 
 /// Lays out a document.
@@ -432,6 +463,7 @@ pub fn layout(dom: &Dom, styles: &Styles, fonts: &dyn Fonts, vp: Viewport) -> La
         fonts,
         intrinsic: RefCell::new(HashMap::new()),
         count: RefCell::new(0),
+        ambient: RefCell::new(Vec::new()),
     };
     let html = dom.children(dom.root()).first().copied().unwrap_or(0);
     let Some(style) = styles.rc(html) else {
@@ -965,7 +997,21 @@ impl Ctx<'_> {
         text_indent: f32,
     ) -> InlineOut {
         let atoms = self.collect_atoms(run, parent, Some(avail));
-        self.break_lines(atoms, parent, avail, text_indent)
+        self.break_lines(atoms, parent, avail, text_indent, &[], 0.0)
+    }
+
+    /// Like `layout_inline`, with lines kept clear of the floats `ex` (the run's first line is at
+    /// `y0` in the floats' coordinates).
+    fn layout_inline_beside(
+        &self,
+        run: &[NodeId],
+        parent: &Rc<Style>,
+        avail: f32,
+        ex: &[FloatBox],
+        y0: f32,
+    ) -> InlineOut {
+        let atoms = self.collect_atoms(run, parent, Some(avail));
+        self.break_lines(atoms, parent, avail, 0.0, ex, y0)
     }
 
     fn strut(&self, s: &Style) -> (f32, f32) {
@@ -982,12 +1028,20 @@ impl Ctx<'_> {
         parent: &Rc<Style>,
         avail: f32,
         _text_indent: f32,
+        ex: &[FloatBox],
+        y0: f32,
     ) -> InlineOut {
         let avail = avail.max(0.0);
         let mut lines: Vec<Line> = Vec::new();
         let mut y = 0.0f32;
         let mut max_w = 0.0f32;
         let (strut_a, strut_d) = self.strut(parent);
+        // Where the current line may start and how wide it may be (floats take room from both).
+        let next_band = |y: f32| -> (f32, f32) {
+            let (l, r) = band(ex, y0 + y, strut_a + strut_d, avail);
+            (l, (r - l).max(0.0))
+        };
+        let (mut line_off, mut line_avail) = next_band(0.0);
         // The line being built.
         let mut cur: Vec<Placed> = Vec::new();
         let mut cur_w = 0.0f32;
@@ -1002,7 +1056,9 @@ impl Ctx<'_> {
                       lines: &mut Vec<Line>,
                       y: &mut f32,
                       max_w: &mut f32,
-                      last: bool| {
+                      last: bool,
+                      la: f32,
+                      lo: f32| {
             // Trailing spaces hang off the end and do not count.
             while matches!(
                 cur.last(),
@@ -1019,7 +1075,7 @@ impl Ctx<'_> {
                 // A blank line made by a break still takes up space.
             }
             let (items, asc, desc) = self.build_line_items(
-                cur, start_open, parent, strut_a, strut_d, avail, width, last,
+                cur, start_open, parent, strut_a, strut_d, la, lo, width, last,
             );
             start_open.clone_from(open);
             let h = asc + desc;
@@ -1051,7 +1107,10 @@ impl Ctx<'_> {
                         &mut y,
                         &mut max_w,
                         false,
+                        line_avail,
+                        line_off,
                     );
+                    (line_off, line_avail) = next_band(y);
                     cur_w = 0.0;
                     can_break = false;
                     line_has_content = false;
@@ -1088,7 +1147,7 @@ impl Ctx<'_> {
                     nowrap,
                     ..
                 } => {
-                    let fits = cur_w + w <= avail + 0.01;
+                    let fits = cur_w + w <= line_avail + 0.01;
                     if !fits && can_break && line_has_content && !nowrap {
                         finish(
                             &mut cur,
@@ -1098,10 +1157,13 @@ impl Ctx<'_> {
                             &mut y,
                             &mut max_w,
                             false,
+                            line_avail,
+                            line_off,
                         );
+                        (line_off, line_avail) = next_band(y);
                         cur_w = 0.0;
                     }
-                    if w > avail + 0.01 && style.break_words && !nowrap {
+                    if w > line_avail + 0.01 && style.break_words && !nowrap {
                         // Split an overlong word into pieces that fit.
                         let f = font_of(style);
                         let mut piece = String::new();
@@ -1113,7 +1175,7 @@ impl Ctx<'_> {
                         for ch in text.chars() {
                             let mut t = piece.clone();
                             t.push(ch);
-                            if self.fonts.text_width(&t, &f) + cur_w > avail + 0.01
+                            if self.fonts.text_width(&t, &f) + cur_w > line_avail + 0.01
                                 && !piece.is_empty()
                             {
                                 let pw = self.fonts.text_width(&piece, &f);
@@ -1136,7 +1198,10 @@ impl Ctx<'_> {
                                     &mut y,
                                     &mut max_w,
                                     false,
+                                    line_avail,
+                                    line_off,
                                 );
+                                (line_off, line_avail) = next_band(y);
                                 cur_w = 0.0;
                             }
                             piece.push(ch);
@@ -1164,7 +1229,7 @@ impl Ctx<'_> {
                     can_break = false;
                 }
                 Atom::Atomic { w, .. } => {
-                    if cur_w + w > avail + 0.01 && line_has_content {
+                    if cur_w + w > line_avail + 0.01 && line_has_content {
                         finish(
                             &mut cur,
                             &mut open,
@@ -1173,7 +1238,10 @@ impl Ctx<'_> {
                             &mut y,
                             &mut max_w,
                             false,
+                            line_avail,
+                            line_off,
                         );
+                        (line_off, line_avail) = next_band(y);
                         cur_w = 0.0;
                     }
                     cur_w += w;
@@ -1195,6 +1263,8 @@ impl Ctx<'_> {
                 &mut y,
                 &mut max_w,
                 true,
+                line_avail,
+                line_off,
             );
         }
         let first_baseline = lines.first().map(|l| l.y + l.baseline);
@@ -1216,6 +1286,7 @@ impl Ctx<'_> {
         strut_a: f32,
         strut_d: f32,
         avail: f32,
+        offset: f32,
         width: f32,
         _last: bool,
     ) -> (Vec<Item>, f32, f32) {
@@ -1263,11 +1334,12 @@ impl Ctx<'_> {
         let _ = bottom_h;
         // Horizontal alignment.
         let free = (avail - width).max(0.0);
-        let mut x = match parent.text_align {
-            TextAlign::Center => free / 2.0,
-            TextAlign::Right => free,
-            _ => 0.0,
-        };
+        let mut x = offset
+            + match parent.text_align {
+                TextAlign::Center => free / 2.0,
+                TextAlign::Right => free,
+                _ => 0.0,
+            };
         let line_h = asc + desc;
         let mut items: Vec<Item> = Vec::new();
         let mut spans: Vec<(NodeId, Rc<Style>, f32, bool)> = Vec::new();
@@ -1494,6 +1566,10 @@ struct FlowState {
     first_baseline: Option<f32>,
     used_w: f32,
     pending: Vec<Pending>,
+    /// Floats that apply to this flow: those inherited from outside, then its own.
+    floats: Vec<FloatBox>,
+    /// The lowest bottom of this flow's own floats.
+    own_float_bottom: f32,
 }
 
 fn effective_border(s: &Style) -> [f32; 4] {
@@ -1526,6 +1602,7 @@ impl Ctx<'_> {
         forced: Option<Forced>,
     ) -> LBox {
         self.tick();
+        let inherited = std::mem::take(&mut *self.ambient.borrow_mut());
         let forced = forced.unwrap_or_default();
         let mut b = LBox::new(Some(node), style.clone(), BoxKind::Block);
         let cb_w = cb_w.clamp(0.0, MAX_W);
@@ -1658,7 +1735,14 @@ impl Ctx<'_> {
                     self.layout_grid(node, style, content_w, own_h)
                 }
                 Display::Table => self.layout_table(node, style, content_w),
-                _ => self.layout_flow(node, style, content_w, own_h, top_c, bot_c),
+                _ => self.layout_flow(
+                    node,
+                    style,
+                    content_w,
+                    own_h,
+                    (top_c, bot_c),
+                    (bfc, if bfc { Vec::new() } else { inherited }),
+                ),
             }
         };
         // Height.
@@ -1866,8 +1950,8 @@ impl Ctx<'_> {
         style: &Rc<Style>,
         content_w: f32,
         def_h: Option<f32>,
-        top_c: bool,
-        bot_c: bool,
+        (top_c, bot_c): (bool, bool),
+        (bfc, inherited): (bool, Vec<FloatBox>),
     ) -> Flow {
         let kids = self.visible_children(node);
         let has_block = kids
@@ -1879,7 +1963,7 @@ impl Ctx<'_> {
         }
         if !has_block {
             let run: Vec<NodeId> = kids.iter().copied().filter(|&c| !self.is_abs(c)).collect();
-            let out = self.layout_inline(&run, style, content_w, 0.0);
+            let out = self.layout_inline_beside(&run, style, content_w, &inherited, 0.0);
             flow.height = out.height;
             flow.used_w = out.used_w;
             flow.first_baseline = out.first_baseline;
@@ -1909,6 +1993,8 @@ impl Ctx<'_> {
             first_baseline: None,
             used_w: 0.0,
             pending: Vec::new(),
+            floats: inherited,
+            own_float_bottom: 0.0,
         };
         let mut run: Vec<NodeId> = Vec::new();
         for c in kids {
@@ -1933,11 +2019,33 @@ impl Ctx<'_> {
             if !self.room() {
                 break;
             }
+            if cs.float != Float::None {
+                self.place_float(&mut st, c, &cs, content_w, def_h);
+                continue;
+            }
+            if cs.clear != Clear::None && !st.floats.is_empty() {
+                let bottom = st
+                    .floats
+                    .iter()
+                    .filter(|f| match cs.clear {
+                        Clear::Left => f.left,
+                        Clear::Right => !f.left,
+                        _ => true,
+                    })
+                    .map(|f| f.y + f.h)
+                    .fold(0.0f32, f32::max);
+                if st.y + st.margin_acc.max(0.0) < bottom {
+                    st.y = bottom;
+                    st.margin_acc = 0.0;
+                    st.at_start = false;
+                }
+            }
+            self.set_ambient_for(&st, &cs, content_w);
             let cb = self.layout_block(c, &cs, content_w, def_h, None);
             self.push_block(&mut st, cb, top_c, content_w);
         }
         self.flush_run(&mut st, &mut run, style, content_w, top_c);
-        flow.empty = st.at_start;
+        flow.empty = st.at_start && st.own_float_bottom == 0.0;
         if st.at_start {
             flow.top_escape = st.margin_acc;
             flow.bottom_escape = 0.0;
@@ -1953,11 +2061,144 @@ impl Ctx<'_> {
             flow.top_escape = st.top_escape;
         }
         flow.height = st.y;
+        if bfc {
+            // A box that makes its own formatting context contains its floats.
+            flow.height = flow.height.max(st.own_float_bottom);
+        }
         flow.children = st.children;
         flow.first_baseline = st.first_baseline;
         flow.used_w = st.used_w;
         flow.pending = st.pending;
         flow
+    }
+
+    /// Hands the floats still in play to a block laid out next, if it is a plain block whose
+    /// text should wrap around them (blocks that make their own formatting context do not).
+    fn set_ambient_for(&self, st: &FlowState, cs: &Rc<Style>, content_w: f32) {
+        let own_context = cs.float != Float::None
+            || cs.overflow_x != Overflow::Visible
+            || cs.overflow_y != Overflow::Visible
+            || matches!(
+                cs.display,
+                Display::Flex
+                    | Display::InlineFlex
+                    | Display::Grid
+                    | Display::InlineGrid
+                    | Display::Table
+                    | Display::TableCell
+                    | Display::InlineBlock
+            )
+            || matches!(cs.position, Position::Absolute | Position::Fixed);
+        let mut amb = self.ambient.borrow_mut();
+        amb.clear();
+        if own_context || st.floats.is_empty() {
+            return;
+        }
+        let (border, padding) = self.pad_border(cs, content_w);
+        let ml = size_px(cs.margin[3], content_w).unwrap_or(0.0);
+        let m_top = size_px(cs.margin[0], content_w).unwrap_or(0.0);
+        let ox = ml + border[3] + padding[3];
+        let oy = st.y + collapse(st.margin_acc, m_top) + border[0] + padding[0];
+        for f in &st.floats {
+            if f.y + f.h > oy {
+                amb.push(FloatBox {
+                    x: f.x - ox,
+                    y: f.y - oy,
+                    ..*f
+                });
+            }
+        }
+    }
+
+    /// Lays out a floated box beside the lines at the current position and records the room it
+    /// takes, without moving the flow down.
+    fn place_float(
+        &self,
+        st: &mut FlowState,
+        c: NodeId,
+        cs: &Rc<Style>,
+        content_w: f32,
+        def_h: Option<f32>,
+    ) {
+        let (border, padding) = self.pad_border(cs, content_w);
+        let extras_h = border[1] + border[3] + padding[1] + padding[3];
+        let ml = size_px(cs.margin[3], content_w).unwrap_or(0.0);
+        let mr = size_px(cs.margin[1], content_w).unwrap_or(0.0);
+        let avail = (content_w - ml - mr - extras_h).max(0.0);
+        let width = match cs.width {
+            Size::Dim(d) => {
+                let v = dim_px(d, content_w);
+                if cs.border_box {
+                    v - extras_h
+                } else {
+                    v
+                }
+            }
+            Size::Auto => match self.replaced(c, cs) {
+                Some(r) => self.replaced_size(c, &r, cs).0,
+                None => {
+                    let (lo, hi) = self.intrinsic(c);
+                    hi.min(avail.max(lo)).max(lo.min(avail))
+                }
+            },
+        };
+        let mut b = self.layout_block(
+            c,
+            cs,
+            content_w,
+            def_h,
+            Some(Forced {
+                w: Some(width.max(0.0)),
+                h: None,
+                bfc: true,
+            }),
+        );
+        let outer_w = b.rect.w + b.margin[1] + b.margin[3];
+        let outer_h = b.rect.h + b.margin[0] + b.margin[2];
+        let left = cs.float == Float::Left;
+        let mut y = st.y + st.margin_acc.max(0.0);
+        // Slide down past floats until there is room beside them.
+        for _ in 0..64 {
+            let (l, r) = band(&st.floats, y, outer_h, content_w);
+            let beside = st
+                .floats
+                .iter()
+                .any(|f| f.h > 0.0 && f.y < y + outer_h.max(0.01) && f.y + f.h > y);
+            if !beside || r - l >= outer_w - 0.01 {
+                break;
+            }
+            let next = st
+                .floats
+                .iter()
+                .filter(|f| f.y + f.h > y && f.h > 0.0)
+                .map(|f| f.y + f.h)
+                .fold(f32::INFINITY, f32::min);
+            if !next.is_finite() {
+                break;
+            }
+            y = next;
+        }
+        let (l, r) = band(&st.floats, y, outer_h, content_w);
+        let x = if left { l } else { (r - outer_w).max(l) };
+        b.rect.x = x + b.margin[3];
+        b.rect.y = y + b.margin[0];
+        b.out_of_flow = true;
+        st.floats.push(FloatBox {
+            x,
+            y,
+            w: outer_w,
+            h: outer_h,
+            left,
+        });
+        st.own_float_bottom = st.own_float_bottom.max(y + outer_h);
+        self.finish_child(&mut b, content_w);
+        st.pending
+            .extend(std::mem::take(&mut b.pending).into_iter().map(|mut p| {
+                p.static_x += b.rect.x;
+                p.static_y += b.rect.y;
+                p
+            }));
+        st.children.push(b);
     }
 
     fn flush_run(
@@ -1972,7 +2213,9 @@ impl Ctx<'_> {
             return;
         }
         let nodes = std::mem::take(run);
-        let out = self.layout_inline(&nodes, style, content_w, 0.0);
+        let floats = st.floats.clone();
+        let y0 = st.y + st.margin_acc.max(0.0);
+        let out = self.layout_inline_beside(&nodes, style, content_w, &floats, y0);
         if out.lines.is_empty() || out.height == 0.0 {
             return;
         }
@@ -4162,6 +4405,216 @@ mod tests {
             300.0,
         );
         assert_eq!(r(&d, &l, "x").y, 0.0);
+    }
+
+    /// The (top, left edge of the first text) of every line of the box with this id.
+    fn line_starts(l: &Layout, dom: &Dom, id: &str) -> Vec<(f32, f32)> {
+        fn find(b: &LBox, node: NodeId) -> Option<&LBox> {
+            if b.node == Some(node) {
+                return Some(b);
+            }
+            b.children.iter().find_map(|c| find(c, node))
+        }
+        fn collect(b: &LBox, out: &mut Vec<(f32, f32)>) {
+            for ln in &b.lines {
+                if let Some(x) = ln.items.iter().find_map(|i| {
+                    if let Item::Text { x, .. } = i {
+                        Some(*x)
+                    } else {
+                        None
+                    }
+                }) {
+                    out.push((ln.y, x));
+                }
+            }
+            for c in &b.children {
+                collect(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(b) = find(&l.root, dom.by_id(id).unwrap()) {
+            collect(b, &mut out);
+        }
+        out
+    }
+
+    const WORDS: &str =
+        "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp";
+
+    #[test]
+    fn text_wraps_around_a_left_float_and_returns_to_the_edge_below_it() {
+        let css =
+            "body{margin:0} #w{width:300px} #f{float:left;width:100px;height:50px} p{margin:0}";
+        let html = format!(r#"<div id="w"><div id="f"></div><p id="p">{WORDS}</p></div>"#);
+        let (d, l) = page(&html, css, 600.0);
+        assert_rect(r(&d, &l, "f"), 0.0, 0.0, 100.0, 50.0);
+        let lines = line_starts(&l, &d, "p");
+        assert!(lines.len() >= 4, "{lines:?}");
+        for (y, x) in &lines {
+            if *y < 50.0 {
+                assert_eq!(
+                    *x, 100.0,
+                    "a line beside the float starts after it: {lines:?}"
+                );
+            } else {
+                assert_eq!(
+                    *x, 0.0,
+                    "a line below the float uses the full width: {lines:?}"
+                );
+            }
+        }
+        assert!(lines.iter().any(|(y, _)| *y >= 50.0), "{lines:?}");
+        // Beside the float the lines are narrower: 200 pixels hold five 40-pixel words.
+        assert_eq!(lines_of(&l, &d, "p")[0], "aaaa bbbb cccc dddd eeee");
+        assert_eq!(
+            r(&d, &l, "p").h,
+            lines.len() as f32 * 20.0,
+            "the paragraph is as tall as its lines"
+        );
+    }
+
+    #[test]
+    fn a_right_float_takes_the_right_edge_and_shortens_lines_from_that_side() {
+        let css = "body{margin:0} #w{width:300px} #f{float:right;width:100px;height:50px;margin-left:10px} p{margin:0}";
+        let html = format!(r#"<div id="w"><div id="f"></div><p id="p">{WORDS}</p></div>"#);
+        let (d, l) = page(&html, css, 600.0);
+        assert_rect(r(&d, &l, "f"), 200.0, 0.0, 100.0, 50.0);
+        let lines = line_starts(&l, &d, "p");
+        assert!(lines.iter().all(|(_, x)| *x == 0.0));
+        // 190 pixels hold four words (the float's margin counts): "aaaa bbbb cccc dddd".
+        assert_eq!(lines_of(&l, &d, "p")[0], "aaaa bbbb cccc dddd");
+    }
+
+    #[test]
+    fn floats_sit_side_by_side_wrap_to_a_new_row_and_are_contained_only_by_a_new_context() {
+        let css = "body{margin:0} #c{width:400px} .f{float:left;width:50%;height:30px} #after{height:5px}";
+        let html = r#"<div id="c"><div class="f" id="a"></div><div class="f" id="b"></div><div class="f" id="c2"></div></div><div id="after"></div>"#;
+        let (d, l) = page(html, css, 600.0);
+        assert_rect(r(&d, &l, "a"), 0.0, 0.0, 200.0, 30.0);
+        assert_rect(r(&d, &l, "b"), 200.0, 0.0, 200.0, 30.0);
+        assert_rect(r(&d, &l, "c2"), 0.0, 30.0, 200.0, 30.0);
+        assert_eq!(
+            r(&d, &l, "c").h,
+            0.0,
+            "a plain container does not grow around its floats"
+        );
+        assert_eq!(r(&d, &l, "after").y, 0.0);
+        // With overflow:hidden (or clear on what follows) the floats are contained.
+        let css2 = format!("{css} #c{{overflow:hidden}}");
+        let (d, l) = page(html, &css2, 600.0);
+        assert_eq!(r(&d, &l, "c").h, 60.0);
+        assert_eq!(r(&d, &l, "after").y, 60.0);
+        // Clearing works on a later block in the same container (floats do not yet escape a
+        // plain container to affect blocks outside it).
+        let inside = r#"<div id="c"><div class="f" id="a"></div><div class="f" id="b"></div><div class="f" id="c2"></div><div id="after"></div></div>"#;
+        let css3 = format!("{css} #after{{clear:both}}");
+        let (d, l) = page(inside, &css3, 600.0);
+        assert_eq!(
+            r(&d, &l, "after").y,
+            60.0,
+            "clear moves the block below the floats"
+        );
+        let css4 = format!("{css} #after{{clear:right}}");
+        let (d, l) = page(inside, &css4, 600.0);
+        assert_eq!(
+            r(&d, &l, "after").y,
+            0.0,
+            "clearing the other side does nothing"
+        );
+        let css5 = format!("{css} #after{{clear:left}}");
+        let (d, l) = page(inside, &css5, 600.0);
+        assert_eq!(r(&d, &l, "after").y, 60.0);
+        // Mixed sides: left floats and a right float on one row.
+        let (d, l) = page(
+            r#"<div style="width:300px"><div id="l" style="float:left;width:100px;height:20px"></div><div id="r" style="float:right;width:100px;height:20px"></div></div>"#,
+            "body{margin:0}",
+            600.0,
+        );
+        assert_rect(r(&d, &l, "l"), 0.0, 0.0, 100.0, 20.0);
+        assert_rect(r(&d, &l, "r"), 200.0, 0.0, 100.0, 20.0);
+    }
+
+    #[test]
+    fn floats_too_wide_to_fit_beside_another_drop_below_it() {
+        let css = "body{margin:0} #w{width:250px} .f{float:left;width:150px;height:40px}";
+        let (d, l) = page(
+            r#"<div id="w"><div class="f" id="a"></div><div class="f" id="b"></div></div>"#,
+            css,
+            600.0,
+        );
+        assert_rect(r(&d, &l, "a"), 0.0, 0.0, 150.0, 40.0);
+        assert_rect(r(&d, &l, "b"), 0.0, 40.0, 150.0, 40.0);
+    }
+
+    #[test]
+    fn text_inside_a_plain_block_beside_a_float_wraps_around_it_too() {
+        let css = "body{margin:0} #w{width:300px} #f{float:left;width:100px;height:50px} #i{padding:0 0 0 10px} p{margin:0}";
+        let html = format!(
+            r#"<div id="w"><div id="f"></div><div id="i"><p id="p">{WORDS}</p></div></div>"#
+        );
+        let (d, l) = page(&html, css, 600.0);
+        let lines = line_starts(&l, &d, "p");
+        // The padded block starts at x = 10; the float reaches 100, so text starts 90 inside it.
+        assert!(
+            lines
+                .iter()
+                .filter(|(y, _)| *y < 50.0)
+                .all(|(_, x)| (*x - 90.0).abs() < 0.01),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|(y, _)| *y >= 50.0)
+                .all(|(_, x)| *x == 0.0),
+            "{lines:?}"
+        );
+        // A block that makes its own formatting context sits beside the float instead of under it.
+        let css2 = "body{margin:0} #w{width:300px} #f{float:left;width:100px;height:50px} #i{overflow:hidden} p{margin:0}";
+        let (d, l) = page(&html, css2, 600.0);
+        let lines = line_starts(&l, &d, "p");
+        assert!(lines.iter().all(|(_, x)| *x == 0.0), "{lines:?}");
+    }
+
+    #[test]
+    fn floats_with_odd_sizes_and_in_great_numbers_do_no_harm() {
+        let many: String = (0..300)
+            .map(|i| {
+                format!(
+                    r#"<div style="float:{};width:{}px;height:{}px"></div>"#,
+                    if i % 2 == 0 { "left" } else { "right" },
+                    10 + i % 90,
+                    5 + i % 40
+                )
+            })
+            .collect();
+        let html = format!("<div style=\"width:200px;overflow:hidden\">{many}<p>text after the floats that goes on a while to wrap</p></div>");
+        let (_, l) = page(&html, "body{margin:0}", 600.0);
+        assert!(l.height.is_finite() && l.height > 0.0);
+        for css in [
+            "body{margin:0} #f{float:left;width:0;height:0}",
+            "body{margin:0} #f{float:left;width:99999px;height:20px}",
+            "body{margin:0} #f{float:right;width:50%;height:20px;margin:0 -50px}",
+            "body{margin:0} #f{float:left;width:50px} #f>div{float:left;width:60px;height:10px}",
+            "body{margin:0} #f{float:left;display:inline-block} p{clear:both}",
+        ] {
+            let (d, l) = page(
+                r#"<div id="w" style="width:300px"><div id="f"><div>x</div></div><p id="p">some text beside</p></div>"#,
+                css,
+                600.0,
+            );
+            assert!(
+                l.height.is_finite() && r(&d, &l, "p").y.is_finite(),
+                "{css}"
+            );
+        }
+        // A float with no width takes the width of its content.
+        let (d, l) = page(
+            r#"<div style="width:300px"><div id="f" style="float:left">abcd</div></div>"#,
+            "body{margin:0}",
+            600.0,
+        );
+        assert_eq!(r(&d, &l, "f").w, 32.0);
     }
 
     #[test]
