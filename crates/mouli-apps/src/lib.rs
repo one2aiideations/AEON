@@ -6,6 +6,7 @@
 //! their state in a shared handle so the screens can draw it.
 #![forbid(unsafe_code)]
 
+mod code;
 mod crm;
 mod sheet;
 mod store;
@@ -15,6 +16,7 @@ use mouli_interface::{Result, Workspace};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+pub use code::{ChangedFile, CodeApp, CodeState, PatchError, SharedCode, Stage, View, NOT_ALLOWED};
 pub use crm::{Clock, CrmApp, SharedCrm};
 pub use sheet::{range_text, SharedBook, SheetApp};
 pub use store::{parse_workbook, workbook_text};
@@ -52,4 +54,15 @@ pub fn register_crm(ws: &mut Workspace, tenant: &str, clock: Clock) -> Result<Sh
     let crm = CrmApp::new_crm();
     ws.register_app(Box::new(CrmApp::new(crm.clone(), tenant, clock)))?;
     Ok(crm)
+}
+
+/// Creates the Code application and registers it with `ws`. Choose the project folder with
+/// [`CodeState::open`] on the returned handle.
+///
+/// # Errors
+/// The registry's error when a capability name is taken.
+pub fn register_code(ws: &mut Workspace) -> Result<SharedCode> {
+    let state = CodeState::shared();
+    ws.register_app(Box::new(CodeApp::new(state.clone())))?;
+    Ok(state)
 }

@@ -1,42 +1,88 @@
-//! Code review: parse a diff, assess it against the real files, and apply or undo it atomically.
+//! Code review: the screen side of the Code application.
+//!
+//! The change itself (parse, check, apply, undo) lives in `mouli_apps::CodeState`. Without the
+//! Code application attached to the workspace the device calls that state directly; with it
+//! attached the same steps run as capabilities, so applying and undoing need a second person's
+//! approval and are recorded by the gate.
 
 use crate::{Backend, Device};
-use mouli_code::apply::ApplyOptions;
-use mouli_code::diff::{self, FilePatch};
-use mouli_code::quality::{assess, brackets_balanced, PatchPolicy};
-use mouli_code::workspace::{Receipt, Workspace as Files, WorkspaceError};
+use mouli_apps::{CodeState, SharedCode, Stage, NOT_ALLOWED};
 use mouli_screen::screens::{Check, FileChange, PatchState};
 use std::path::Path;
 
-/// Why a change could not be put under review.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PatchError {
-    /// The diff text is not a valid unified diff.
-    BadDiff(String),
-    /// The folder or a file in it could not be read.
-    Files(String),
-    /// The diff does not fit the files as they are now.
-    DoesNotApply(String),
+pub use mouli_apps::PatchError;
+
+/// The shared state and what the screen last showed of it.
+pub(crate) struct PatchSlot {
+    pub(crate) state: SharedCode,
+    /// Whether the capabilities are registered, so steps go through the gate.
+    pub(crate) gated: bool,
+    shown: u64,
 }
 
-impl std::fmt::Display for PatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PatchError::BadDiff(m) => write!(f, "not a valid diff: {m}"),
-            PatchError::Files(m) => write!(f, "cannot read the files: {m}"),
-            PatchError::DoesNotApply(m) => write!(f, "does not fit the files: {m}"),
+impl Default for PatchSlot {
+    fn default() -> Self {
+        Self {
+            state: CodeState::shared(),
+            gated: false,
+            shown: 0,
         }
     }
 }
 
-impl std::error::Error for PatchError {}
+impl PatchSlot {
+    pub(crate) fn with(state: SharedCode) -> Self {
+        Self {
+            state,
+            gated: true,
+            shown: 0,
+        }
+    }
+}
 
-#[derive(Default)]
-pub(crate) struct PatchSlot {
-    files: Option<Files>,
-    patches: Vec<FilePatch>,
-    receipt: Option<Receipt>,
-    passed: bool,
+const fn screen_state(s: Stage) -> PatchState {
+    match s {
+        Stage::Proposed => PatchState::Proposed,
+        Stage::Applied => PatchState::Applied,
+        Stage::RolledBack => PatchState::RolledBack,
+        Stage::Rejected => PatchState::Rejected,
+    }
+}
+
+/// Copies the state into the review screen when it has changed since the last copy.
+pub(crate) fn sync<B: Backend>(d: &mut Device<B>) {
+    let st = d.patch.state.borrow();
+    if st.version() == d.patch.shown {
+        return;
+    }
+    let version = st.version();
+    match st.view() {
+        Some(v) => {
+            let files = v
+                .files
+                .iter()
+                .map(|f| FileChange {
+                    path: f.path.clone(),
+                    added: f.added,
+                    removed: f.removed,
+                    diff: f.diff.clone(),
+                })
+                .collect();
+            let checks = v
+                .checks
+                .iter()
+                .map(|(name, passed)| Check {
+                    name: name.clone(),
+                    passed: *passed,
+                })
+                .collect();
+            d.shell.review.set(&v.summary, files, checks);
+            d.shell.review.state = screen_state(v.stage);
+        }
+        None => d.shell.review.set("", vec![], vec![]),
+    }
+    drop(st);
+    d.patch.shown = version;
 }
 
 pub(crate) fn propose<B: Backend>(
@@ -44,134 +90,51 @@ pub(crate) fn propose<B: Backend>(
     root: &Path,
     text: &str,
 ) -> Result<(), PatchError> {
-    let patches = diff::parse(text).map_err(|e| PatchError::BadDiff(format!("{e:?}")))?;
-    if patches.is_empty() {
-        return Err(PatchError::BadDiff("it changes no files".into()));
-    }
-    let files = Files::open(root).map_err(|e| PatchError::Files(format!("{e:?}")))?;
-    let paths: Vec<&str> = patches.iter().map(FilePatch::path).collect();
-    let current = files
-        .read_many(paths.iter().copied())
-        .map_err(|e| PatchError::Files(format!("{e:?}")))?;
-    let report = assess(
-        &current,
-        &patches,
-        &PatchPolicy::default(),
-        &brackets_balanced,
-    )
-    .map_err(|e| PatchError::DoesNotApply(format!("{e:?}")))?;
-
-    let mut checks = vec![
-        Check {
-            name: "fits the files".into(),
-            passed: true,
-        },
-        Check {
-            name: "policy".into(),
-            passed: report.acceptable,
-        },
-    ];
-    for f in report.findings.iter().filter(|f| f.kind.is_blocking()) {
-        checks.push(Check {
-            name: format!("{:?}", f.kind),
-            passed: false,
-        });
-    }
-    let changes: Vec<FileChange> = patches
-        .iter()
-        .map(|p| {
-            let diff_lines: Vec<String> = diff::render(std::slice::from_ref(p))
-                .lines()
-                .map(str::to_string)
-                .collect();
-            let count = |c: char, skip: &str| {
-                diff_lines
-                    .iter()
-                    .filter(|l| l.starts_with(c) && !l.starts_with(skip))
-                    .count()
-            };
-            FileChange {
-                path: p.path().to_string(),
-                added: count('+', "+++"),
-                removed: count('-', "---"),
-                diff: diff_lines,
-            }
-        })
-        .collect();
-    let summary = format!("{} file(s), risk {}/100", patches.len(), report.risk);
-    d.shell.review.set(&summary, changes, checks);
-    d.patch = PatchSlot {
-        files: Some(files),
-        patches,
-        receipt: None,
-        passed: report.acceptable,
+    let summary = {
+        let mut st = d.patch.state.borrow_mut();
+        st.open(root)?;
+        st.propose(text)?
     };
     d.audit_event("patch.propose", &summary, "ok");
     Ok(())
 }
 
 pub(crate) fn apply<B: Backend>(d: &mut Device<B>) {
-    // The screen already refuses when a check failed; the controller checks again because the
-    // screen is not the authority.
-    if !d.patch.passed || d.patch.receipt.is_some() {
-        d.shell.review.message = "This change cannot be applied.".into();
-        d.audit_event(
-            "patch.apply",
-            "-",
-            "denied: checks did not pass or already applied",
-        );
+    if d.patch.gated {
+        d.call_patch("code.apply");
         return;
     }
-    let Some(files) = d.patch.files.take() else {
-        d.shell.review.message = "No change is loaded.".into();
-        return;
-    };
-    let result = files.apply(&d.patch.patches, ApplyOptions::default());
-    d.patch.files = Some(files);
+    let result = d.patch.state.borrow_mut().apply();
     match result {
-        Ok(receipt) => {
-            let n = receipt.changed_paths().len();
-            d.patch.receipt = Some(receipt);
-            d.review_state(PatchState::Applied);
-            d.audit_event("patch.apply", &format!("{n} file(s)"), "ok");
-        }
-        Err(e) => {
-            d.shell.review.message = format!("Nothing was changed: {}", describe(&e));
-            d.audit_event("patch.apply", "-", &format!("failed: {}", describe(&e)));
+        Ok(n) => d.audit_event("patch.apply", &format!("{n} file(s)"), "ok"),
+        Err(m) => {
+            let kind = if m == NOT_ALLOWED { "denied" } else { "failed" };
+            d.audit_event("patch.apply", "-", &format!("{kind}: {m}"));
+            d.shell.review.message = m;
         }
     }
 }
 
 pub(crate) fn rollback<B: Backend>(d: &mut Device<B>) {
-    let (Some(files), Some(receipt)) = (d.patch.files.take(), d.patch.receipt.take()) else {
-        d.shell.review.message = "Nothing has been applied.".into();
+    if d.patch.gated {
+        d.call_patch("code.rollback");
         return;
-    };
-    let result = files.rollback(&receipt);
-    d.patch.files = Some(files);
+    }
+    let result = d.patch.state.borrow_mut().rollback();
     match result {
-        Ok(()) => {
-            d.review_state(PatchState::RolledBack);
-            d.audit_event("patch.rollback", "-", "ok");
-        }
-        Err(e) => {
-            // Keep the receipt: the person may fix the file and try again.
-            d.patch.receipt = Some(receipt);
-            d.shell.review.message = format!("Not undone, nothing was touched: {}", describe(&e));
-            d.audit_event("patch.rollback", "-", &format!("failed: {}", describe(&e)));
+        Ok(()) => d.audit_event("patch.rollback", "-", "ok"),
+        Err(m) => {
+            d.audit_event("patch.rollback", "-", &format!("failed: {m}"));
+            d.shell.review.message = m;
         }
     }
 }
 
 pub(crate) fn reject<B: Backend>(d: &mut Device<B>) {
-    d.patch = PatchSlot::default();
-    d.review_state(PatchState::Rejected);
-    d.audit_event("patch.reject", "-", "ok");
-}
-
-fn describe(e: &WorkspaceError) -> String {
-    match e {
-        WorkspaceError::ChangedSince(p) => format!("{p} was edited after the change was applied"),
-        other => format!("{other:?}"),
+    if d.patch.gated {
+        d.call_patch("code.reject");
+        return;
     }
+    d.patch.state.borrow_mut().reject();
+    d.audit_event("patch.reject", "-", "ok");
 }

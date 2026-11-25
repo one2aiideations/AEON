@@ -7,6 +7,7 @@ publish.workspace = true
 description = "MOULI-APPS: adapters that turn the application crates (Sheet, Studio) into governed capabilities of the main interface"
 
 [dependencies]
+mouli-code = { path = "../mouli-code" }
 mouli-crm = { path = "../mouli-crm" }
 mouli-interface = { path = "../mouli-interface" }
 mouli-sheet = { path = "../mouli-sheet" }

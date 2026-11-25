@@ -17,7 +17,7 @@ use mouli_interface::routing::Route;
 use mouli_interface::{Reply, Workspace};
 use mouli_screen::key::Key;
 use mouli_screen::screen::Action;
-use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, PatchState, Role};
+use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, Role};
 use mouli_screen::shell::Shell;
 
 pub use patch::PatchError;
@@ -96,6 +96,14 @@ impl<B: Backend> Device<B> {
     /// and Studio screens show their real state.
     pub fn attach_apps(&mut self, apps: Apps) {
         self.apps = Some(apps);
+        self.refresh();
+    }
+
+    /// Connects the Code application registered in the workspace (see `mouli_apps::register_code`).
+    /// From then on applying, undoing and rejecting a change on the review screen are capability
+    /// calls: applying and undoing need a second person's approval.
+    pub fn attach_code(&mut self, state: mouli_apps::SharedCode) {
+        self.patch = patch::PatchSlot::with(state);
         self.refresh();
     }
 
@@ -258,6 +266,7 @@ impl<B: Backend> Device<B> {
     /// Shows `text` on the screen of the application that owns `capability` (or in the chat).
     fn app_message(&mut self, capability: &str, text: &str) {
         match capability.split('.').next() {
+            Some("code") => self.shell.review.message = text.to_string(),
             Some("sheet") => self.shell.sheet.message = text.to_string(),
             Some("studio") => self.shell.studio.message = text.to_string(),
             _ => self.notice(text),
@@ -277,6 +286,11 @@ impl<B: Backend> Device<B> {
             Ok(Reply::Chat { .. }) => {}
             Err(e) => self.app_message(capability, &e.to_string()),
         }
+    }
+
+    /// Runs a Code capability for the review screen and shows the outcome there.
+    pub(crate) fn call_patch(&mut self, capability: &str) {
+        self.call(capability, Vec::new());
     }
 
     fn decide(&mut self, id: &str, approve: bool) {
@@ -353,6 +367,7 @@ impl<B: Backend> Device<B> {
         self.shell.security.set(score, findings);
         self.save_apps();
         self.refresh_apps();
+        patch::sync(self);
     }
 
     /// Copies the applications' state into their screens.
@@ -421,9 +436,5 @@ impl<B: Backend> Device<B> {
     pub(crate) fn audit_event(&mut self, action: &str, subject: &str, outcome: &str) {
         let user = self.user.clone();
         self.ws.record_event(&user, action, subject, outcome);
-    }
-
-    pub(crate) fn review_state(&mut self, s: PatchState) {
-        self.shell.review.set_state(s);
     }
 }

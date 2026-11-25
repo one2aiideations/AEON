@@ -669,3 +669,142 @@ fn keeping_apps_without_attaching_them_is_an_error() {
     let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
     assert!(d.keep_apps_in(&data_dir("none")).is_err());
 }
+
+// ---------------------------------------------------------------- code through the gate
+
+fn code_workspace() -> (Workspace, mouli_apps::SharedCode) {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_role(Permissions::new("dev", &["code.*"]));
+    ws.add_role(Permissions::new("viewer", &["code.status"]));
+    ws.add_model(model());
+    let code = mouli_apps::register_code(&mut ws).unwrap();
+    (ws, code)
+}
+
+fn read(dir: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("src/tax.rs")).unwrap()
+}
+
+#[test]
+fn applying_from_the_review_screen_waits_for_a_second_person() {
+    let (dir, diff, new) = project();
+    let old = read(&dir);
+    let (ws, code) = code_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "dev").unwrap();
+    d.attach_code(code);
+    d.propose_patch(dir.path(), &diff).unwrap();
+    d.on_key(Key::F(6));
+    assert_eq!(d.shell.review.state, PatchState::Proposed);
+
+    d.on_key(Key::Char('a'));
+    assert_eq!(read(&dir), old, "held, not written");
+    assert_eq!(d.shell.review.state, PatchState::Proposed);
+    assert!(
+        d.shell.review.message.contains("Held for approval"),
+        "{}",
+        d.shell.review.message
+    );
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert_eq!(d.shell.approvals.rows[0].capability, "code.apply");
+    assert!(
+        !d.shell.approvals.rows[0].can_decide,
+        "the requester cannot approve their own change"
+    );
+    let _ = new;
+}
+
+#[test]
+fn an_owner_approving_a_held_apply_writes_the_files_and_updates_the_screen() {
+    let (dir, diff, new) = project();
+    let (mut ws, code) = code_workspace();
+    code.borrow_mut().open(dir.path()).unwrap();
+    code.borrow_mut().propose(&diff).unwrap();
+    let dana = ws.open_session("acme", "dana", "dev").unwrap();
+    let held = ws
+        .call("acme", &dana, "code.apply", Default::default())
+        .unwrap();
+    assert!(matches!(
+        held,
+        mouli_interface::Reply::AwaitingApproval { .. }
+    ));
+
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "olga", "owner").unwrap();
+    d.attach_code(code);
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert_eq!(read(&dir), new);
+    d.on_key(Key::F(6));
+    assert_eq!(d.shell.review.state, PatchState::Applied);
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "approve" && r.outcome == "approved"));
+}
+
+#[test]
+fn undoing_is_also_held_and_a_viewer_cannot_even_propose() {
+    let (dir, diff, _new) = project();
+    let (mut ws, code) = code_workspace();
+    let viewer = ws.open_session("acme", "vic", "viewer").unwrap();
+    code.borrow_mut().open(dir.path()).unwrap();
+    let r = ws.call(
+        "acme",
+        &viewer,
+        "code.propose",
+        [("diff".to_string(), diff.clone())].into_iter().collect(),
+    );
+    assert!(!matches!(r, Ok(mouli_interface::Reply::Done(_))), "{r:?}");
+    assert!(code.borrow().view().is_none());
+
+    // The rest as one person who may do everything but still needs a second to approve.
+    code.borrow_mut().propose(&diff).unwrap();
+    let dana = ws.open_session("acme", "dana", "dev").unwrap();
+    ws.call("acme", &dana, "code.apply", Default::default())
+        .unwrap();
+    // Approve the apply as the owner, straight on the workspace.
+    let id = ws.pending_approvals()[0].0.to_string();
+    ws.decide("acme", &id, "olga", "owner", true).unwrap();
+    assert_eq!(
+        code.borrow().view().unwrap().stage,
+        mouli_apps::Stage::Applied
+    );
+
+    let held = ws
+        .call("acme", &dana, "code.rollback", Default::default())
+        .unwrap();
+    assert!(matches!(
+        held,
+        mouli_interface::Reply::AwaitingApproval { .. }
+    ));
+    assert_eq!(
+        code.borrow().view().unwrap().stage,
+        mouli_apps::Stage::Applied,
+        "still applied while the undo is held"
+    );
+}
+
+#[test]
+fn a_call_cannot_point_the_application_at_another_folder() {
+    let (mut ws, code) = code_workspace();
+    let dana = ws.open_session("acme", "dana", "dev").unwrap();
+    // No folder was chosen by the host: a model's call cannot choose one.
+    let r = ws.call(
+        "acme",
+        &dana,
+        "code.propose",
+        [
+            (
+                "diff".to_string(),
+                "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+            ),
+            ("root".to_string(), "/etc".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    assert!(r.is_err(), "{r:?}");
+    assert!(code.borrow().view().is_none());
+}
