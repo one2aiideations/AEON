@@ -99,7 +99,7 @@ impl Desktop {
     pub fn new(width: i32, height: i32) -> Self {
         let icons = vec![
             IconSpot {
-                label: "MOULI HD",
+                label: "Storage",
                 tab: None,
             },
             IconSpot {
@@ -720,7 +720,7 @@ mod tests {
                 "{gone} is not a desktop icon: {labels:?}"
             );
         }
-        for kept in ["MOULI HD", "Chat", "Models", "Code"] {
+        for kept in ["Storage", "Chat", "Models", "Code"] {
             assert!(labels.contains(&kept), "{kept} stays: {labels:?}");
         }
         for moved in ["Sheet", "Studio", "Player"] {
