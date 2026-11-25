@@ -12,6 +12,8 @@ mouli-gguf = { path = "../mouli-gguf" }
 mouli-http = { path = "../mouli-http" }
 mouli-hosted = { path = "../mouli-hosted" }
 mouli-interface = { path = "../mouli-interface" }
+mouli-screen = { path = "../mouli-screen" }
+mouli-desk = { path = "../mouli-desk" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "term"] }

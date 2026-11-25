@@ -4,6 +4,7 @@
 use mouli_hw::{Hw, Plan};
 use moulid::args::{Args, DEFAULT_MODEL_DIR};
 use moulid::clocksync;
+use moulid::gui;
 use moulid::hosted::{self, HostedBackend};
 use moulid::hwprobe;
 use moulid::models::{describe, discover, Found};
@@ -327,16 +328,32 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 // Keep about 80% of the server's context for the conversation; the rest is for
                 // the reply and for the estimate being rough.
                 let max_tokens = usize::try_from(plan.ctx).unwrap_or(2048).saturating_mul(4) / 5;
-                let end = chat_loop(
-                    &mut ServerBackend {
-                        port: a.port,
-                        log: store.map(|s| (s.clone(), s.new_session())),
-                    },
-                    &mut input,
-                    &mut out,
-                    SYSTEM_PROMPT,
-                    max_tokens,
-                );
+                let mut backend = ServerBackend {
+                    port: a.port,
+                    log: store.map(|s| (s.clone(), s.new_session())),
+                };
+                let text_only = cmdline_has(&system::kernel_cmdline(), "mouli.text=1");
+                let session = if text_only {
+                    None
+                } else {
+                    match gui::start() {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            say(&format!("MOULI: no desktop ({e}); using the text chat"));
+                            None
+                        }
+                    }
+                };
+                let end = match session {
+                    Some(s) => gui::run(s, backend, SYSTEM_PROMPT, max_tokens, &m.name),
+                    None => chat_loop(
+                        &mut backend,
+                        &mut input,
+                        &mut out,
+                        SYSTEM_PROMPT,
+                        max_tokens,
+                    ),
+                };
                 stop(&mut child);
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}

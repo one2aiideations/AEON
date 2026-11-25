@@ -31,6 +31,7 @@ pub mod context;
 pub mod download_plan;
 pub mod fslabel;
 pub mod gguf_info;
+pub mod gui;
 pub mod hosted;
 pub mod http;
 pub mod hwprobe;
