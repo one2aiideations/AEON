@@ -76,6 +76,13 @@ MOULI-AGENTS owns agent definitions, configuration, registry, skills, tools, tea
 - MOULI-SECURITY
 - MOULI-COMPLIANCE
 
+### Scientific discovery and engineering
+- MOULI-MATERIALS
+- MOULI-CHEMISTRY
+- MOULI-DRUG
+- MOULI-SOLVER
+- MOULI-QUANTUM
+
 ### Industry applications
 - MOULI-EDU
 - MOULI-HEALTH
@@ -91,6 +98,9 @@ MOULI-AGENTS owns agent definitions, configuration, registry, skills, tools, tea
 - MOULI-COMMERCE owns commerce storefront, marketplace and order experiences; it integrates with ERP for inventory/accounting and Finance for regulated payment/financial services.
 - MOULI-INTELLIGENCE owns analytics and decision-support experiences; MOULI-DATA owns data storage and retrieval.
 - MOULI-SECURITY owns security product workflows; MOULI-AUTH remains the identity and authorization authority.
+- MOULI-MATERIALS, MOULI-CHEMISTRY and MOULI-DRUG own autonomous discovery campaigns, candidates, evidence and reports in their domains. They share one rule set: every candidate is screened for hazard, toxicity and controlled substances before it is shown or ranked, predictions are labelled as predictions, and any synthesis, purchase or laboratory request needs a recorded human approval. They use MOULI-AGENTS for agents, MOULI-AUTH for approvals and audit, MOULI-DATA for storage, and external scientific engines only through adapters.
+- MOULI-SOLVER owns hard-problem workbenches: formal statements, experiments and an evidence ledger that never mistakes computed evidence for a machine-checked proof.
+- MOULI-QUANTUM owns quantum programs, simulations and hardware job records; hardware runs need a budget and an approval.
 - MOULI-COMPLIANCE owns regulatory frameworks, obligations, controls, evidence, assessments, privacy registers and compliance reporting; it uses MOULI-AUTH for workflow, approvals and audit, MOULI-DATA for persistence and MOULI-AGENTS for workflow design and agents, and does not certify compliance or give legal advice.
 - MOULI-WORK owns productivity experiences; MOULI-DATA owns persistence.
 - Industry applications use shared authorities and must not recreate them.
