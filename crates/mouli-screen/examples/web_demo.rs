@@ -1,8 +1,13 @@
 //! Renders a sample page (or an HTML file given as the first argument) to a PNG, to see what the
 //! web view looks like: `cargo run -p mouli-screen --example web_demo -- page.html out.png`.
+//! The page's scripts run first, and pictures are read from `data:` addresses or from files next
+//! to the HTML file.
 
 use mouli_screen::raster::{to_png, Canvas};
 use mouli_screen::webview::Page;
+use mouli_web::scripting::Scripting;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 const SAMPLE: &str = r##"<!doctype html><html><head><title>MOULI preview</title><style>
   :root { --brand: #1565c0; --soft: #e3f2fd; }
@@ -41,7 +46,32 @@ fn main() {
     );
     let out = args.get(2).map_or("web_demo.png", String::as_str);
     let (w, h) = (820usize, 640usize);
-    let page = Page::load(&html, w as f32, h as f32);
+    // Scripts run first; the page is then drawn from the document they left behind.
+    let scripting = Scripting::new(&html);
+    for line in scripting.console() {
+        eprintln!("console: {line}");
+    }
+    let dom = scripting.snapshot();
+    let base = args.get(1).and_then(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    });
+    let mut images = HashMap::new();
+    for (raw, target) in mouli_web::browser::image_refs(&dom.inner_html(0), "https://demo.invalid/")
+    {
+        let bytes = if target.starts_with("data:") {
+            mouli_web::browser::decode_data_uri(&target)
+        } else {
+            base.as_ref()
+                .and_then(|b| std::fs::read(b.join(raw.trim_start_matches('/'))).ok())
+        };
+        if let Some(bm) = bytes.and_then(|b| mouli_web::image::decode(&b).ok()) {
+            images.insert(raw, bm);
+        }
+    }
+    let mut page = Page::from_dom(dom, w as f32, h as f32);
+    page.set_images(Rc::new(images));
     let mut c = Canvas {
         width: w,
         height: h,
