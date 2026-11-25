@@ -12,6 +12,8 @@
 //! * [`scripting`]: `document`, elements, events and timers, so page scripts can change the page.
 //! * [`markdown`]: Markdown to HTML (all raw HTML is escaped).
 //!
+//! * [`browser`]: web addresses, history, and fetching what a page needs (no I/O of its own).
+//!
 //! For the assistant:
 //!
 //! * [`readable`]: title and main text, skipping navigation and chrome.
@@ -21,6 +23,7 @@
 //! * [`rate`]: per-host token bucket so agents stay polite.
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod css;
 pub mod display;
 pub mod dom;
