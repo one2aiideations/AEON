@@ -3675,7 +3675,9 @@ pub mod quant {
         }
         let work = rows.saturating_mul(cols).saturating_mul(t) / 8;
         let threads = if work >= PARALLEL_MIN_WORK && rows >= 2 * MIN_ROWS_PER_THREAD {
-            thread_count().min(rows / MIN_ROWS_PER_THREAD).max(1)
+            thread_count_batched()
+                .min(rows / MIN_ROWS_PER_THREAD)
+                .max(1)
         } else {
             1
         };
@@ -3730,7 +3732,8 @@ pub mod quant {
     /// Fewest rows a thread is given.
     const MIN_ROWS_PER_THREAD: usize = 32;
 
-    /// How many threads matrix products may use: the machine's, at most 8, or `MOULI_THREADS`.
+    /// How many threads matrix-vector products may use: the machine's physical cores (a second
+    /// thread on the same core only fights over memory bandwidth), at most 8, or `MOULI_THREADS`.
     #[must_use]
     pub fn thread_count() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -3738,9 +3741,51 @@ pub mod quant {
             let env = std::env::var("MOULI_THREADS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok());
-            let hw = std::thread::available_parallelism().map_or(1, usize::from);
-            env.unwrap_or(hw.min(8)).clamp(1, 64)
+            env.unwrap_or_else(|| physical_cores().min(8)).clamp(1, 64)
         })
+    }
+
+    /// Threads for matrix-matrix products, which do enough arithmetic per byte read that every
+    /// hardware thread helps.
+    fn thread_count_batched() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            let env = std::env::var("MOULI_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+            env.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(8)
+            })
+            .clamp(1, 64)
+        })
+    }
+
+    /// Physical cores: the logical count divided by how many hardware threads share a core
+    /// (read from the first core's sibling list on Linux).
+    fn physical_cores() -> usize {
+        let logical = std::thread::available_parallelism().map_or(1, usize::from);
+        let siblings =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+                .ok()
+                .map(|t| {
+                    t.trim()
+                        .split(',')
+                        .map(|part| match part.split_once('-') {
+                            Some((a, b)) => {
+                                b.parse::<usize>()
+                                    .unwrap_or(0)
+                                    .saturating_sub(a.parse::<usize>().unwrap_or(0))
+                                    + 1
+                            }
+                            None => 1,
+                        })
+                        .sum::<usize>()
+                })
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+        (logical / siblings).max(1)
     }
 
     /// Dot product with eight independent running sums, so the CPU can add in parallel (a single
