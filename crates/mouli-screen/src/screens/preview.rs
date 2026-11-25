@@ -10,6 +10,8 @@ use crate::key::Key;
 use crate::raster::Canvas;
 use crate::screen::{Action, Screen};
 use crate::webview::Page;
+use mouli_web::browser as web;
+use mouli_web::dom::{Dom, NodeId};
 use mouli_web::interp::Value;
 use mouli_web::markdown;
 use mouli_web::scripting::Scripting;
@@ -87,6 +89,7 @@ impl std::fmt::Debug for Live {
 
 #[derive(Debug, Clone, Default)]
 struct State {
+    focus: Option<NodeId>,
     live: Live,
     last_tick: Option<Instant>,
     path: Option<String>,
@@ -96,6 +99,35 @@ struct State {
     size: (i32, i32),
     scroll: f32,
     kind: Option<Kind>,
+}
+
+/// What a click on a form control does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Text,
+    Toggle,
+    Submit,
+}
+
+/// Adds a character to (or removes the last character from) what a field holds.
+fn append_text(d: &mut Dom, node: NodeId, add: Option<char>, textarea: bool) {
+    let mut v = if textarea {
+        d.text_content(node)
+    } else {
+        d.attr(node, "value").unwrap_or("").to_string()
+    };
+    match add {
+        Some(c) if v.chars().count() < 10_000 => v.push(c),
+        Some(_) => {}
+        None => {
+            v.pop();
+        }
+    }
+    if textarea {
+        d.set_text_content(node, &v);
+    } else {
+        d.set_attr(node, "value", &v);
+    }
 }
 
 /// The Preview screen.
@@ -119,6 +151,7 @@ impl PreviewScreen {
             let kind = kind_of(path);
             let html = source_to_html(kind, path, text);
             let moved_file = s.path.as_deref() != path;
+            s.focus = None;
             if kind == Kind::Html && html.to_ascii_lowercase().contains("<script") {
                 let sc = Scripting::new(&html);
                 s.page = Some(Page::from_dom(sc.snapshot(), w as f32, h as f32));
@@ -242,6 +275,31 @@ impl PreviewScreen {
             }
         }
         let mut s = self.state.borrow_mut();
+        let hit = s.page.as_ref().and_then(|p| p.element_at(x, y, s.scroll));
+        let control = match (&s.page, hit) {
+            (Some(p), Some(n)) => Self::control_at(p.dom(), n),
+            _ => None,
+        };
+        match control {
+            Some((Control::Text, node)) => {
+                Self::focus(&mut s, Some(node));
+                self.message.clear();
+                return;
+            }
+            Some((Control::Toggle, node)) => {
+                Self::toggle(&mut s, node);
+                self.message.clear();
+                return;
+            }
+            Some((Control::Submit, node)) => {
+                Self::focus(&mut s, None);
+                let (m, l) = Self::submit(&mut s, node, Some(node));
+                self.message = m;
+                self.last_link = l;
+                return;
+            }
+            None => Self::focus(&mut s, None),
+        }
         let Some(page) = s.page.as_ref() else { return };
         let Some(href) = page.link_at(x, y, s.scroll) else {
             self.message.clear();
@@ -257,6 +315,128 @@ impl PreviewScreen {
         }
         self.message = format!("Link: {}", href.chars().take(120).collect::<String>());
         self.last_link = Some(href);
+    }
+
+    /// Finds the control a click landed on: the node or the nearest ancestor that is a field,
+    /// a checkbox or radio button, or a submit button.
+    fn control_at(dom: &Dom, node: NodeId) -> Option<(Control, NodeId)> {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if web::is_text_field(dom, n) {
+                return Some((Control::Text, n));
+            }
+            if web::is_toggle(dom, n) {
+                return Some((Control::Toggle, n));
+            }
+            if web::is_submit(dom, n) {
+                return Some((Control::Submit, n));
+            }
+            cur = dom.parent(n);
+        }
+        None
+    }
+
+    /// Changes the page's document (through its scripts, if it has any).
+    fn edit(s: &mut State, f: impl FnOnce(&mut Dom)) {
+        if let Some(live) = s.live.0.clone() {
+            live.borrow_mut().edit_dom(f);
+            Self::refresh(s);
+        } else if let Some(p) = s.page.as_mut() {
+            p.edit(f);
+        }
+    }
+
+    /// Moves the keyboard focus to a field (or off all fields); the focused field is marked so
+    /// the page shows it.
+    fn focus(s: &mut State, to: Option<NodeId>) {
+        let old = s.focus;
+        if old == to {
+            return;
+        }
+        s.focus = to;
+        Self::edit(s, |d| {
+            if let Some(o) = old {
+                d.remove_attr(o, "data-mouli-focus");
+            }
+            if let Some(n) = to {
+                d.set_attr(n, "data-mouli-focus", "");
+            }
+        });
+    }
+
+    fn toggle(s: &mut State, node: NodeId) {
+        Self::edit(s, |d| {
+            let radio = d
+                .attr(node, "type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("radio"));
+            if radio {
+                let scope = web::form_of(d, node).unwrap_or(d.root());
+                let name = d.attr(node, "name").unwrap_or("").to_string();
+                if !name.is_empty() {
+                    for o in d.descendants(scope) {
+                        if o != node
+                            && d.attr(o, "type")
+                                .is_some_and(|t| t.eq_ignore_ascii_case("radio"))
+                            && d.attr(o, "name") == Some(name.as_str())
+                        {
+                            d.remove_attr(o, "checked");
+                        }
+                    }
+                }
+                d.set_attr(node, "checked", "");
+            } else if d.attr(node, "checked").is_some() {
+                d.remove_attr(node, "checked");
+            } else {
+                d.set_attr(node, "checked", "");
+            }
+        });
+    }
+
+    /// Sends the form that holds `node`: scripts may cancel it; a GET form becomes a link for the
+    /// browser to open; other methods are refused with a message.
+    fn submit(s: &mut State, node: NodeId, submitter: Option<NodeId>) -> (String, Option<String>) {
+        let Some(form) = s.page.as_ref().and_then(|p| web::form_of(p.dom(), node)) else {
+            return ("This field is not inside a form.".into(), None);
+        };
+        if let Some(live) = s.live.0.clone() {
+            let ok = live.borrow_mut().dispatch(form, "submit");
+            Self::refresh(s);
+            if !ok {
+                return (String::new(), None);
+            }
+        }
+        let Some(f) = s
+            .page
+            .as_ref()
+            .map(|p| web::submit_form(p.dom(), form, submitter))
+        else {
+            return (String::new(), None);
+        };
+        match web::form_link(&f) {
+            Some(link) => (
+                format!("Link: {}", link.chars().take(120).collect::<String>()),
+                Some(link),
+            ),
+            None => (
+                "Forms that send data with POST are not supported yet.".into(),
+                None,
+            ),
+        }
+    }
+
+    /// Forgets the page and focus; the next draw loads the source afresh (a new page arrived).
+    pub fn reset(&self) {
+        let mut s = self.state.borrow_mut();
+        s.focus = None;
+        s.hash = 0;
+        s.page = None;
+        s.live = Live(None);
+    }
+
+    /// Whether a field has the keyboard (typing goes into it).
+    #[must_use]
+    pub fn has_focus(&self) -> bool {
+        self.state.borrow().focus.is_some()
     }
 
     /// The current scroll offset in pixels.
@@ -297,6 +477,27 @@ impl Screen for PreviewScreen {
                     return Action::None;
                 }
             }
+        }
+        if let Some(node) = s.focus {
+            let area = s
+                .page
+                .as_ref()
+                .is_some_and(|p| p.dom().tag(node) == Some("textarea"));
+            match key {
+                Key::Char(c) => Self::edit(&mut s, |d| append_text(d, node, Some(c), area)),
+                Key::Backspace => Self::edit(&mut s, |d| append_text(d, node, None, area)),
+                Key::Enter if area => {
+                    Self::edit(&mut s, |d| append_text(d, node, Some('\n'), area))
+                }
+                Key::Enter => {
+                    let (m, l) = Self::submit(&mut s, node, None);
+                    self.message = m;
+                    self.last_link = l;
+                }
+                Key::Esc | Key::Tab => Self::focus(&mut s, None),
+                _ => {}
+            }
+            return Action::None;
         }
         let view = s.size.1 as f32;
         let max = s.page.as_ref().map_or(0.0, Page::max_scroll);

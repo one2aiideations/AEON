@@ -570,6 +570,7 @@ impl Ctx<'_> {
                     "reset" => if value.is_empty() { "Reset" } else { value }.to_string(),
                     "button" => value.to_string(),
                     "checkbox" | "radio" => String::new(),
+                    "password" => "*".repeat(value.chars().count().min(64)),
                     _ => if value.is_empty() {
                         self.dom.attr(n, "placeholder").unwrap_or("")
                     } else {

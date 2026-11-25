@@ -1137,6 +1137,11 @@ impl Scripting {
         std::mem::take(&mut self.host.borrow_mut().dirty)
     }
 
+    /// Changes the document directly (what a person typing into a field does), so scripts see it.
+    pub fn edit_dom(&mut self, f: impl FnOnce(&mut Dom)) {
+        dom_mut(&self.host, f);
+    }
+
     /// A copy of the current document, to lay out.
     #[must_use]
     pub fn snapshot(&self) -> Dom {

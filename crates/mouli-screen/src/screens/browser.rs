@@ -99,6 +99,7 @@ impl BrowserScreen {
         self.address = url.to_string();
         self.status = "Done".into();
         self.page = Some((url.to_string(), html));
+        self.view.reset();
     }
 
     /// The host could not load `requested`; `page` is a page that explains it.
@@ -110,6 +111,7 @@ impl BrowserScreen {
         self.status = message.chars().take(200).collect();
         self.address = requested.to_string();
         self.page = Some((requested.to_string(), page));
+        self.view.reset();
     }
 
     /// The address of the page being shown.
@@ -211,6 +213,11 @@ impl BrowserScreen {
     /// A click on the page at (`x`, `y`) in page pixels. Links open as new pages.
     pub fn click(&mut self, x: f32, y: f32) -> Action {
         self.view.click(x, y);
+        self.follow()
+    }
+
+    /// Opens the link the page view last reported (a clicked link or a submitted form).
+    fn follow(&mut self) -> Action {
         let Some(href) = self.view.last_link.take() else {
             return Action::None;
         };
@@ -260,6 +267,16 @@ impl Screen for BrowserScreen {
             }
             return Action::None;
         }
+        if self.view.has_focus() {
+            // Typing into a field on the page.
+            if key == Key::Ctrl('l') {
+                self.editing = true;
+                self.fresh = true;
+                return Action::None;
+            }
+            self.view.on_key(key);
+            return self.follow();
+        }
         match key {
             Key::Ctrl('l') | Key::Char('l' | '/') => {
                 self.editing = true;
@@ -269,7 +286,10 @@ impl Screen for BrowserScreen {
             Key::Char('[') => self.back(),
             Key::Char(']') => self.forward(),
             Key::Char('r') => self.reload(),
-            other => self.view.on_key(other),
+            other => {
+                self.view.on_key(other);
+                self.follow()
+            }
         }
     }
 
@@ -473,5 +493,43 @@ mod tests {
         assert!(g.to_text().contains("T"));
         let mut tiny = Grid::new(6, 1);
         s.draw_bar(&mut tiny);
+    }
+
+    #[test]
+    fn a_search_form_on_a_page_is_filled_in_and_sent_as_a_new_address() {
+        let mut s = BrowserScreen::default();
+        s.go("https://site.org/home");
+        s.loaded(
+            "https://site.org/home",
+            "https://site.org/home",
+            "<body style=\"margin:0\"><form action=\"/search\"><input name=q style=\"display:block;width:200px;height:30px\"><label><input type=checkbox name=safe checked></label><input type=submit value=Go style=\"display:block;height:30px\"></form></body>".into(),
+        );
+        // Lay the page out (a draw does this), then click in the text field and type.
+        let mut c = Canvas {
+            width: 400,
+            height: 300,
+            pixels: vec![0; 400 * 300],
+        };
+        s.draw_pixels(&mut c, (0, 0, 400, 300));
+        assert_eq!(s.click(20.0, 15.0), Action::None);
+        assert!(s.view.has_focus());
+        for ch in "rust os".chars() {
+            s.on_key(Key::Char(ch));
+        }
+        s.on_key(Key::Backspace);
+        s.on_key(Key::Char('s'));
+        assert_eq!(
+            s.on_key(Key::Enter),
+            Action::Navigate("https://site.org/search?q=rust+os&safe=on".into())
+        );
+        s.loaded(
+            "https://site.org/search?q=rust+os&safe=on",
+            "https://site.org/search?q=rust+os&safe=on",
+            "<p>results</p>".into(),
+        );
+        assert!(!s.view.has_focus(), "a new page has no focused field");
+        // Keys go to the bar again, and Escape leaves a field.
+        s.on_key(Key::Char('l'));
+        assert!(s.editing());
     }
 }

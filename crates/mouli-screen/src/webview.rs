@@ -817,6 +817,12 @@ impl Page {
         layout(dom, &styles, &WebFonts, vp)
     }
 
+    /// Changes the document in place (a person typing into a field) and lays it out again.
+    pub fn edit(&mut self, f: impl FnOnce(&mut Dom)) {
+        f(&mut self.dom);
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default());
+    }
+
     /// Replaces the document (after scripts changed it) and lays it out again.
     pub fn set_dom(&mut self, dom: Dom) {
         self.dom = dom;

@@ -596,6 +596,7 @@ button, input, select, textarea { display: inline-block; font-size: 13.33px; pad
 input[type=checkbox], input[type=radio] { padding: 0; width: 13px; height: 13px }
 textarea { white-space: pre-wrap }
 input[type=hidden] { display: none }
+[data-mouli-focus] { border-color: #1e88e5; background-color: #ffffff }
 fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0 }
 legend { padding: 0 2px }
 summary { display: block }
