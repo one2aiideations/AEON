@@ -2998,13 +2998,16 @@ version = "0.1.0"
 name = "moulid"
 version = "0.1.0"
 dependencies = [
+ "mouli-apps",
  "mouli-desk",
+ "mouli-device",
  "mouli-gguf",
  "mouli-hosted",
  "mouli-http",
  "mouli-hw",
  "mouli-interface",
  "mouli-pki",
+ "mouli-player",
  "mouli-screen",
  "nix",
 ]

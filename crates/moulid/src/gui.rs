@@ -12,11 +12,15 @@
 use crate::ui::{trim_history, Backend, End, Turn};
 use mouli_desk::desktop::Desktop;
 use mouli_desk::input::{EvdevDecoder, MouseEvent};
+use mouli_device::{Backend as DeviceBackend, Device, Outcome};
+use mouli_interface::routing::{ModelEntry, Route};
+use mouli_interface::{Permissions, Policy, Workspace};
 use mouli_screen::key::Key;
 use mouli_screen::raster::Canvas;
 use mouli_screen::screen::{Action, Tab};
 use mouli_screen::screens::Role;
 use mouli_screen::shell::Shell;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -404,32 +408,113 @@ impl TtyGuard {
 
 // ------------------------------------------------------------------- the loop
 
-/// What [`start`] prepared: a screen and the input stream.
+/// What the Player window uses: there is no video player in this image, so it says so instead of
+/// pretending to play.
+struct NoVideo;
+
+impl mouli_player::Backend for NoVideo {
+    fn load(&mut self, _: &mouli_player::Source) -> Result<(), String> {
+        Err("There is no video player in this image yet.".into())
+    }
+    fn pause(&mut self, _: bool) {}
+    fn seek(&mut self, _: u32) {}
+    fn set_volume(&mut self, _: u8) {}
+    fn set_speed(&mut self, _: u16) {}
+    fn stop(&mut self) {}
+}
+
+/// The device's own model route is not used: the desktop talks to the model on its own thread
+/// (so the screen stays alive while it thinks) and keeps the conversation itself.
+pub struct NoRoute;
+
+impl DeviceBackend for NoRoute {
+    fn complete(&mut self, _: &Route, _: &str) -> Result<String, String> {
+        Err("chat is handled by the desktop".into())
+    }
+}
+
+/// The person using the desktop and what they may do. One owner on this machine.
+const TENANT: &str = "local";
+const USER: &str = "owner";
+
+/// Builds the governed workspace with the Sheet, Studio, Code and Player applications, and the
+/// device that connects the screens to it.
+///
+/// With `data_dir` (the MOULI-DATA partition) the sheet and document are saved under
+/// `<data_dir>/apps` after every change and the Code window opens `<data_dir>/projects`.
+/// Without it nothing is saved.
+///
+/// # Errors
+/// A message when the workspace cannot be set up.
+pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
+    let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_model(ModelEntry {
+        id: "local".into(),
+        provider: "local".into(),
+        local: true,
+        caps: BTreeSet::from(["text".to_string()]),
+        context: 4096,
+        cost_per_1k: 0,
+        quality: 50,
+    });
+    let apps = mouli_apps::register(&mut ws).map_err(|e| fail(&e))?;
+    let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
+    let player = mouli_apps::register_player(&mut ws, Box::new(NoVideo)).map_err(|e| fail(&e))?;
+    let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
+    device.attach_apps(apps);
+    device.attach_code(code);
+    device.attach_player(player);
+    if let Some(dir) = data_dir {
+        let apps_dir = dir.join("apps");
+        std::fs::create_dir_all(&apps_dir).map_err(|e| fail(&e))?;
+        device.keep_apps_in(&apps_dir)?;
+        let projects = dir.join("projects");
+        std::fs::create_dir_all(&projects).map_err(|e| fail(&e))?;
+        // A project that cannot be opened leaves the Code window empty; that is not fatal.
+        let _ = device.open_project(&projects);
+    }
+    Ok(device)
+}
+
+/// What [`start`] prepared: a screen, the input stream and the applications.
 pub struct Session<D: Display> {
     display: D,
     tx: Sender<Ev>,
     rx: Receiver<Ev>,
+    device: Device<NoRoute>,
+    saving: bool,
 }
 
 impl<D: Display> Session<D> {
     /// A session over any display and event channel (used by tests).
-    pub fn new(display: D, tx: Sender<Ev>, rx: Receiver<Ev>) -> Self {
-        Self { display, tx, rx }
+    pub fn new(display: D, tx: Sender<Ev>, rx: Receiver<Ev>, device: Device<NoRoute>) -> Self {
+        Self {
+            display,
+            tx,
+            rx,
+            device,
+            saving: false,
+        }
     }
 }
 
-/// Opens the framebuffer and the input devices.
+/// Opens the framebuffer, the input devices and the applications.
 ///
 /// # Errors
 /// A message saying why the desktop cannot start; the text chat should be used instead.
-pub fn start() -> Result<Session<Framebuffer<File>>, String> {
+pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, String> {
     let display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
+    let device = build_device(data_dir)?;
     let (tx, rx) = channel();
     let n = spawn_inputs(Path::new(INPUT_DIR), &tx);
     if n == 0 {
         return Err("no keyboard or mouse device found in /dev/input".into());
     }
-    Ok(Session::new(display, tx, rx))
+    let mut s = Session::new(display, tx, rx, device);
+    s.saving = data_dir.is_some();
+    Ok(s)
 }
 
 fn fresh(system_prompt: &str) -> Vec<Turn> {
@@ -439,9 +524,11 @@ fn fresh(system_prompt: &str) -> Vec<Turn> {
     }]
 }
 
-/// Runs the desktop with the chat window until the person shuts down.
+/// Runs the desktop until the person shuts down.
 ///
-/// The model answers on its own thread, so the desktop stays responsive while it thinks.
+/// The Chat window talks to the model on its own thread, so the desktop stays responsive while it
+/// thinks. Sheet, Studio, Code, Player, Approvals, Audit and Security run through the governed
+/// workspace of the device.
 ///
 /// # Errors
 /// An error from drawing to the display.
@@ -460,6 +547,8 @@ where
         mut display,
         tx,
         rx,
+        mut device,
+        saving,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -467,10 +556,13 @@ where
         i32::try_from(w).unwrap_or(1024),
         i32::try_from(h).unwrap_or(768),
     );
-    desktop.status = "MOULI OS".into();
-    let mut shell = Shell::new();
-    shell.chat.model = model_name.into();
-    desktop.open(&mut shell, Tab::Chat);
+    desktop.status = if saving {
+        "MOULI OS".into()
+    } else {
+        "MOULI OS - nothing is saved (no MOULI-DATA disk)".into()
+    };
+    device.shell.chat.model = model_name.into();
+    desktop.open(&mut device.shell, Tab::Chat);
     let mut history = fresh(system_prompt);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
@@ -486,7 +578,7 @@ where
 
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    display.present(&desktop.render(&shell))?;
+    display.present(&desktop.render(&device.shell))?;
     loop {
         let Ok(first) = rx.recv() else {
             return Ok(End::Eof);
@@ -500,44 +592,51 @@ where
         }
         for ev in batch {
             let action = match ev {
-                Ev::Mouse(m) => desktop.on_mouse(&mut shell, m, now_ms()),
-                Ev::Key(k) => desktop.on_key(&mut shell, k),
+                Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
+                Ev::Key(k) => desktop.on_key(&mut device.shell, k),
                 Ev::Reply(r) => {
-                    on_reply(&mut shell, &mut history, r);
+                    on_reply(&mut device.shell, &mut history, r);
                     Action::None
                 }
             };
             match action {
                 Action::None => {}
-                Action::Quit => return Ok(End::Quit),
-                Action::Show(tab) => desktop.open(&mut shell, tab),
-                Action::Send(text) if !shell.chat.busy => {
-                    shell.chat.push(Role::User, &text);
-                    history.push(Turn {
-                        role: "user",
-                        content: text,
-                    });
-                    trim_history(&mut history, max_tokens);
-                    shell.chat.busy = true;
-                    if req_tx.send(history.clone()).is_err() {
-                        shell.chat.busy = false;
-                        shell.chat.push(Role::Notice, "The model is not running.");
+                Action::Show(tab) => desktop.open(&mut device.shell, tab),
+                Action::Send(text) => {
+                    if !device.shell.chat.busy {
+                        device.shell.chat.push(Role::User, &text);
+                        history.push(Turn {
+                            role: "user",
+                            content: text,
+                        });
+                        trim_history(&mut history, max_tokens);
+                        device.shell.chat.busy = true;
+                        if req_tx.send(history.clone()).is_err() {
+                            device.shell.chat.busy = false;
+                            device
+                                .shell
+                                .chat
+                                .push(Role::Notice, "The model is not running.");
+                        }
                     }
                 }
-                Action::Send(_) => {}
                 Action::NewConversation => {
-                    if !shell.chat.busy {
-                        shell.chat.clear();
+                    if !device.shell.chat.busy {
+                        device.run(Action::NewConversation);
                         history = fresh(system_prompt);
                     }
                 }
-                _ => shell.chat.push(
-                    Role::Notice,
-                    "That is not available in the desktop yet; restart with mouli.text=1 for the text menu.",
-                ),
+                other => match device.run(other) {
+                    Outcome::Quit => return Ok(End::Quit),
+                    Outcome::Handled => {}
+                    Outcome::Host(_) => device.shell.chat.push(
+                        Role::Notice,
+                        "That is not available in the desktop yet; restart with mouli.text=1 for the text menu.",
+                    ),
+                },
             }
         }
-        display.present(&desktop.render(&shell))?;
+        display.present(&desktop.render(&device.shell))?;
     }
 }
 
@@ -825,7 +924,12 @@ mod tests {
     fn typing_a_message_gets_an_answer_and_ctrl_q_ends() {
         let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = channel();
-        let session = Session::new(Shots(shots.clone()), tx.clone(), rx);
+        let session = Session::new(
+            Shots(shots.clone()),
+            tx.clone(),
+            rx,
+            build_device(None).unwrap(),
+        );
         for e in keys_for("hi\n") {
             tx.send(e).unwrap();
         }
@@ -869,5 +973,52 @@ mod tests {
             "assistant",
             "the failed question is dropped"
         );
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("moulid-gui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_device_is_built_with_and_without_a_data_disk() {
+        assert!(build_device(None).is_ok());
+        let d = tmp("dev");
+        std::fs::create_dir_all(d.join("projects")).unwrap();
+        std::fs::write(d.join("projects/hello.txt"), "hi\n").unwrap();
+        assert!(build_device(Some(&d)).is_ok());
+        assert!(d.join("apps").is_dir() && d.join("projects").is_dir());
+        // A data disk that cannot be written is an error, not a panic.
+        assert!(build_device(Some(Path::new("/proc/mouli-nonexistent"))).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_sheet_cell_typed_in_the_desktop_is_saved_on_the_data_disk() {
+        let dir = tmp("sheet");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots), tx.clone(), rx, device);
+        tx.send(Ev::Key(Key::F(7))).unwrap();
+        for e in keys_for("424242\n") {
+            tx.send(e).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let end = run(session, Echo, "sys", 1000, "tiny").unwrap();
+        assert_eq!(end, End::Quit);
+        let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
+        assert!(saved.contains("424242"), "saved sheet: {saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_player_says_plainly_that_it_cannot_play() {
+        use mouli_player::Backend as _;
+        let mut b = NoVideo;
+        let src = mouli_player::source::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert!(b.load(&src).unwrap_err().contains("no video player"));
     }
 }

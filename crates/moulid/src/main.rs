@@ -336,7 +336,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 let session = if text_only {
                     None
                 } else {
-                    match gui::start() {
+                    match gui::start(store.map(persist::Store::root)) {
                         Ok(s) => Some(s),
                         Err(e) => {
                             say(&format!("MOULI: no desktop ({e}); using the text chat"));

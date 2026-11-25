@@ -24,6 +24,7 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - Hardware report and automatic choice of threads and context size.
 - Model menu listing every .gguf file on any disk or USB stick, with a memory check.
 - Graphical desktop drawn on the screen's framebuffer: menu bar, icons and windows, with the chat in a window. Keyboard (US layout) and a USB or PS/2 mouse. Keys: Enter sends, Ctrl+L starts a new chat, F1 to F10 open windows, Ctrl+Q shuts down. Add mouli.text=1 to the kernel command line for the text chat only.
+- With a MOULI-DATA partition, the Sheet and Studio documents are saved under apps/ and the Code window opens the folder projects/ on it. Without one nothing is saved, and the desktop says so.
 - Text chat with commands /models, /clear and /quit when the desktop is not used.
 - Optional MOULI-DATA partition that keeps the last model used and the chat logs.
 - Wired network by DHCP, clock set from the network, Wi-Fi setup screen, hosted-model chat with key entry and washing of emails, card numbers and passwords.
@@ -39,7 +40,7 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 
 ## Known limitations
 
-- In the desktop only the Chat window is connected. The other windows (Sheet, Studio, Code, Player, Approvals and so on) open but are not connected to their applications yet, and there is no sound or video.
+- In the desktop the Chat, Sheet, Studio, Code, Approvals, Audit and Security windows are connected to the governed workspace (policy, approvals, audit chain). The Player window keeps a queue but there is no video player, sound or browser in this image, so nothing can be played. The CRM has no window yet.
 - Choosing a model is still done in the text menu before the desktop starts.
 - Touchpads that report absolute positions are not used; plug in a USB mouse. The keyboard layout is US.
 - CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
