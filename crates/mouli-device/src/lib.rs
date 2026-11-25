@@ -12,6 +12,7 @@
 mod patch;
 mod security;
 
+#[cfg(feature = "office")]
 use mouli_apps::Apps;
 use mouli_interface::routing::Route;
 use mouli_interface::{Reply, Workspace};
@@ -60,12 +61,16 @@ pub struct Device<B: Backend> {
     role: String,
     session: String,
     patch: patch::PatchSlot,
+    #[cfg(feature = "office")]
     apps: Option<Apps>,
+    #[cfg(feature = "office")]
     store: Option<AppStore>,
+    #[cfg(feature = "office")]
     player: Option<mouli_apps::SharedPlayer>,
     agent: Option<String>,
 }
 
+#[cfg(feature = "office")]
 /// Where the applications are saved, and what was last written there.
 struct AppStore {
     dir: std::path::PathBuf,
@@ -94,8 +99,11 @@ impl<B: Backend> Device<B> {
             role: role.into(),
             session,
             patch: patch::PatchSlot::default(),
+            #[cfg(feature = "office")]
             apps: None,
+            #[cfg(feature = "office")]
             store: None,
+            #[cfg(feature = "office")]
             player: None,
             agent: None,
         };
@@ -103,6 +111,7 @@ impl<B: Backend> Device<B> {
         Ok(d)
     }
 
+    #[cfg(feature = "office")]
     /// Connects the applications whose capabilities are registered in the workspace, so the Sheet
     /// and Studio screens show their real state.
     pub fn attach_apps(&mut self, apps: Apps) {
@@ -110,6 +119,7 @@ impl<B: Backend> Device<B> {
         self.refresh();
     }
 
+    #[cfg(feature = "office")]
     /// Connects the player registered in the workspace (see `mouli_apps::register_player`), so the
     /// Player screen shows its real state and its keys control it through the governed gate.
     pub fn attach_player(&mut self, player: mouli_apps::SharedPlayer) {
@@ -117,6 +127,7 @@ impl<B: Backend> Device<B> {
         self.refresh();
     }
 
+    #[cfg(feature = "office")]
     /// Passes on what the player's backend reported (the video ended, an error, the position ...).
     /// The host calls this as events arrive from mpv or from the YouTube page.
     pub fn player_event(&mut self, event: mouli_player::Event) {
@@ -145,6 +156,7 @@ impl<B: Backend> Device<B> {
         Ok(())
     }
 
+    #[cfg(feature = "office")]
     /// Keeps the applications' data in `dir`: loads what is there now, then saves after every
     /// change. Call after [`Device::attach_apps`].
     ///
@@ -170,6 +182,7 @@ impl<B: Backend> Device<B> {
         Ok(())
     }
 
+    #[cfg(feature = "office")]
     /// Writes the applications' data if it changed since the last save.
     fn save_apps(&mut self) {
         let (Some(apps), Some(store)) = (&self.apps, &mut self.store) else {
@@ -380,6 +393,7 @@ impl<B: Backend> Device<B> {
 
     /// Runs a capability a screen asked for, through the same gate as the chat.
     fn call(&mut self, capability: &str, args: Vec<(String, String)>) {
+        #[cfg(feature = "office")]
         if capability.starts_with("player.") && self.player.is_none() {
             self.app_message(capability, "The player is not connected.");
             return;
@@ -509,12 +523,16 @@ impl<B: Backend> Device<B> {
 
         let (score, findings) = security::assess(&self.ws);
         self.shell.security.set(score, findings);
-        self.save_apps();
-        self.refresh_apps();
-        self.refresh_player();
+        #[cfg(feature = "office")]
+        {
+            self.save_apps();
+            self.refresh_apps();
+            self.refresh_player();
+        }
         patch::sync(self);
     }
 
+    #[cfg(feature = "office")]
     /// Copies the player's state into its screen.
     fn refresh_player(&mut self) {
         use mouli_screen::screens::{PlayerRow, PlayerView};
@@ -545,6 +563,7 @@ impl<B: Backend> Device<B> {
         });
     }
 
+    #[cfg(feature = "office")]
     /// Copies the applications' state into their screens.
     fn refresh_apps(&mut self) {
         use mouli_screen::screens::sheet::{MAX_COLS, MAX_ROWS};

@@ -2928,7 +2928,6 @@ dependencies = [
  "mouli-interface",
  "mouli-llm",
  "mouli-pki",
- "mouli-player",
  "mouli-screen",
  "nix",
  "sha2",
