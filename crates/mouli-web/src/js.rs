@@ -8,7 +8,7 @@
 //! exponent `**`; `if`, `for`, `for-in`, `for-of`, `while`, `do-while`, `switch`, `try`/`catch`/
 //! `finally`, labels, `break`, `continue`, `return`, `throw`; automatic semicolon insertion.
 //!
-//! Not supported (a syntax error with a clear message): `async` and `await`, generators,
+//! Not supported (a syntax error with a clear message): generators, `for await`,
 //! `import` and `export`, `with`, and regular-expression literals are parsed but cannot be run yet.
 //! Everything is bounded: source size, nesting depth and the number of tokens.
 
@@ -528,6 +528,8 @@ pub struct Func {
     pub is_ctor: bool,
     /// Whether the body needs the `arguments` object.
     pub uses_arguments: bool,
+    /// An `async` function: calling it gives a promise.
+    pub is_async: bool,
 }
 
 /// A class member.
@@ -749,6 +751,8 @@ pub enum Expr {
     },
     /// An optional chain ends here: short-circuiting inside gives `undefined` for the whole.
     Chain(Box<Expr>),
+    /// `await expr`
+    Await(Box<Expr>),
     /// `a, b, c`
     Seq(Vec<Expr>),
 }
@@ -806,6 +810,10 @@ struct Parser {
     depth: usize,
     uses_args: Vec<bool>,
     advanced: bool,
+    /// Inside the body of an `async` function (where `await` is allowed).
+    in_async: bool,
+    /// The next function parsed is `async`.
+    pending_async: bool,
 }
 
 /// Parses a script.
@@ -820,6 +828,8 @@ pub fn parse(src: &str) -> PResult<Vec<Stmt>> {
         depth: 0,
         uses_args: vec![false],
         advanced: false,
+        in_async: false,
+        pending_async: false,
     };
     let mut out = Vec::new();
     while !p.at_eof() {
@@ -997,8 +1007,18 @@ impl Parser {
                 let f = self.function_rest(true, false)?;
                 Ok(Stmt::Func(f))
             }
-            "async" if matches!(&self.peek_at(1).tok, Tok::Ident(f) if f == "function") => {
-                err(self.line(), "async functions are not supported yet")
+            "async"
+                if !self.peek_at(1).nl_before
+                    && matches!(&self.peek_at(1).tok, Tok::Ident(f) if f == "function") =>
+            {
+                self.next();
+                self.next();
+                if self.is_punct("*") {
+                    return err(self.line(), "generators are not supported");
+                }
+                self.pending_async = true;
+                let f = self.function_rest(true, false)?;
+                Ok(Stmt::Func(f))
             }
             "class" => {
                 let c = self.class()?;
@@ -1405,9 +1425,17 @@ impl Parser {
         is_arrow: bool,
         is_ctor: bool,
     ) -> PResult<Rc<Func>> {
+        let is_async = std::mem::take(&mut self.pending_async);
+        let saved_async = std::mem::replace(&mut self.in_async, is_async);
         self.uses_args.push(false);
-        let params = self.params()?;
-        let body = self.block_body()?;
+        let params = self.params();
+        let body = match params {
+            Ok(_) => self.block_body(),
+            Err(ref e) => Err(e.clone()),
+        };
+        self.in_async = saved_async;
+        let params = params?;
+        let body = body?;
         let uses = self.uses_args.pop().unwrap_or(false);
         Ok(Rc::new(Func {
             name,
@@ -1416,6 +1444,7 @@ impl Parser {
             is_arrow,
             is_ctor,
             uses_arguments: uses,
+            is_async,
         }))
     }
 
@@ -1465,6 +1494,7 @@ impl Parser {
                 return err(self.line(), "static blocks are not supported");
             }
             let mut kind_word: Option<String> = None;
+            let mut async_method = false;
             if let Tok::Ident(w) = self.peek().tok.clone() {
                 if (w == "get" || w == "set")
                     && !self.is_punct_at(1, "(")
@@ -1475,8 +1505,14 @@ impl Parser {
                     kind_word = Some(w.clone());
                     self.next();
                 }
-                if w == "async" && !self.is_punct_at(1, "(") && !self.is_punct_at(1, "=") {
-                    return err(self.line(), "async methods are not supported yet");
+                if w == "async"
+                    && !self.is_punct_at(1, "(")
+                    && !self.is_punct_at(1, "=")
+                    && !self.is_punct_at(1, ";")
+                    && !self.is_punct_at(1, "}")
+                {
+                    self.next();
+                    async_method = true;
                 }
             }
             if self.is_punct("*") {
@@ -1487,6 +1523,7 @@ impl Parser {
                 let is_ctor = !is_static
                     && kind_word.is_none()
                     && matches!(&key, PropKey::Name(n) if &**n == "constructor");
+                self.pending_async = async_method;
                 let f = self.function_tail(
                     if let PropKey::Name(n) = &key {
                         Some(n.clone())
@@ -1592,7 +1629,14 @@ impl Parser {
         }
     }
 
-    fn arrow(&mut self) -> PResult<Expr> {
+    fn arrow(&mut self, is_async: bool) -> PResult<Expr> {
+        let saved_async = std::mem::replace(&mut self.in_async, is_async);
+        let r = self.arrow_inner(is_async);
+        self.in_async = saved_async;
+        r
+    }
+
+    fn arrow_inner(&mut self, is_async: bool) -> PResult<Expr> {
         self.uses_args.push(false);
         let params = if matches!(&self.peek().tok, Tok::Ident(_)) {
             vec![Param {
@@ -1618,6 +1662,7 @@ impl Parser {
             is_arrow: true,
             is_ctor: false,
             uses_arguments: false,
+            is_async,
         })))
     }
 
@@ -1634,13 +1679,19 @@ impl Parser {
             && (matches!(&self.peek_at(1).tok, Tok::Ident(_)) || self.is_punct_at(1, "("))
             && self.async_arrow_or_fn()
         {
-            return err(self.line(), "async functions are not supported yet");
+            self.next();
+            if matches!(&self.peek().tok, Tok::Ident(f) if f == "function") {
+                // `async function (...) {...}` as an expression.
+                self.pending_async = true;
+                return self.conditional(allow_in);
+            }
+            return self.arrow(true);
         }
         if self.is_kw("yield") {
             return err(self.line(), "generators are not supported");
         }
         if self.arrow_ahead() {
-            return self.arrow();
+            return self.arrow(false);
         }
         let left = self.conditional(allow_in)?;
         let op = match &self.peek().tok {
@@ -1799,7 +1850,15 @@ impl Parser {
             Tok::Ident(w) if w == "void" => Some(Unary::Void),
             Tok::Ident(w) if w == "delete" => Some(Unary::Delete),
             Tok::Ident(w) if w == "await" => {
-                return err(self.line(), "`await` is not supported yet")
+                if !self.in_async {
+                    return err(
+                        self.line(),
+                        "`await` is only valid inside an `async` function",
+                    );
+                }
+                self.next();
+                let e = self.unary()?;
+                return Ok(Expr::Await(Box::new(e)));
             }
             _ => None,
         };
@@ -2000,6 +2059,8 @@ impl Parser {
                         depth: self.depth + 1,
                         uses_args: vec![false],
                         advanced: false,
+                        in_async: false,
+                        pending_async: false,
                     };
                     let e = sub.expression().map_err(|e| SyntaxError {
                         message: e.message,
@@ -2084,6 +2145,7 @@ impl Parser {
                 props.push(ObjProp::Spread(self.assignment(true)?));
             } else {
                 let mut accessor: Option<String> = None;
+                let mut async_method = false;
                 if let Tok::Ident(w) = &self.peek().tok {
                     if (w == "get" || w == "set")
                         && !self.is_punct_at(1, "(")
@@ -2099,7 +2161,8 @@ impl Parser {
                         && !self.is_punct_at(1, ",")
                         && !self.is_punct_at(1, "}")
                     {
-                        return err(self.line(), "async methods are not supported yet");
+                        self.next();
+                        async_method = true;
                     }
                 }
                 if self.is_punct("*") {
@@ -2108,6 +2171,7 @@ impl Parser {
                 let shorthand_ok = matches!(&self.peek().tok, Tok::Ident(s) if !is_reserved(s));
                 let key = self.property_key()?;
                 if self.is_punct("(") {
+                    self.pending_async = async_method;
                     let f = self.function_tail(
                         if let PropKey::Name(n) = &key {
                             Some(n.clone())
@@ -2454,16 +2518,22 @@ mod tests {
             ("const x;", "needs a value", 1),
             ("@", "unexpected character", 1),
             ("1 = 2", "invalid assignment target", 1),
-            (
-                "async function f() {}",
-                "async functions are not supported",
-                1,
-            ),
             ("function* g() {}", "generators are not supported", 1),
             ("import x from 'y'", "modules", 1),
             ("with (a) {}", "`with`", 1),
-            ("async () => 1", "async functions", 1),
-            ("let a = await f();", "await", 1),
+            ("let a = await f();", "only valid inside an `async`", 1),
+            (
+                "function f() { await x }",
+                "only valid inside an `async`",
+                1,
+            ),
+            (
+                "async function f() { (() => await x)() }",
+                "only valid inside an `async`",
+                1,
+            ),
+            ("for await (x of y) {}", "`for await`", 1),
+            ("async function* g() {}", "generators", 1),
             ("throw\n1", "line break", 2),
             ("try {}", "needs `catch`", 1),
             ("class A { static { } }", "static blocks", 1),
@@ -2530,5 +2600,45 @@ mod tests {
         }
         let many = "a;".repeat(100_000);
         assert_eq!(ok(&many).len(), 100_000);
+    }
+
+    #[test]
+    fn async_functions_arrows_methods_and_await_parse() {
+        let first = |src: &str| ok(src).remove(0);
+        let Stmt::Func(f) = first("async function f() { await g(); }") else {
+            panic!()
+        };
+        assert!(f.is_async && !f.is_arrow);
+        let Stmt::Expr(Expr::Function(f)) = first("async () => await x") else {
+            panic!()
+        };
+        assert!(f.is_async && f.is_arrow);
+        let Stmt::Expr(Expr::Function(f)) = first("async x => x") else {
+            panic!()
+        };
+        assert!(f.is_async);
+        let Stmt::Expr(Expr::Function(f)) = first("(async function () { return 1 })") else {
+            panic!()
+        };
+        assert!(f.is_async);
+        let Stmt::Expr(Expr::Call { callee, .. }) = first("(async () => {})()") else {
+            panic!()
+        };
+        assert!(matches!(*callee, Expr::Function(ref f) if f.is_async));
+        ok("class A { async m() { await 1 } static async s() {} async = 1; get async() { return 1 } }");
+        ok("const o = { async m() { await 1 }, async: 1, async f() {} }; const async = 3; async + 1;");
+        // A plain function inside an async one is not async, and `await` must not leak into it.
+        let Stmt::Func(f) = first("async function f() { function g() {} return g }") else {
+            panic!()
+        };
+        assert!(f.is_async && matches!(&f.body[0], Stmt::Func(g) if !g.is_async));
+        assert!(parse("async function f() { function g() { await 1 } }").is_err());
+        // `await` binds like a unary operator.
+        let Stmt::Expr(Expr::Function(f)) = first("async () => await a + 1") else {
+            panic!()
+        };
+        assert!(
+            matches!(&f.body[0], Stmt::Return(Some(Expr::Binary(Bin::Add, l, _))) if matches!(**l, Expr::Await(_)))
+        );
     }
 }

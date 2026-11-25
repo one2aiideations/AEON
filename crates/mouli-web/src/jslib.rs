@@ -1829,12 +1829,12 @@ fn install_collections(i: &mut Interp) {
 
 // ------------------------------------------------------------------ promises
 
-fn new_promise(i: &mut Interp) -> Obj {
+pub(crate) fn new_promise(i: &mut Interp) -> Obj {
     let p = i.protos.promise.clone();
     i.alloc(Some(p), Kind::Promise(PromiseData::default()), "Promise")
 }
 
-fn settle(i: &mut Interp, p: &Obj, state: u8, value: Value) {
+pub(crate) fn settle(i: &mut Interp, p: &Obj, state: u8, value: Value) {
     let reactions = {
         let mut b = p.borrow_mut();
         let Kind::Promise(d) = &mut b.kind else {
@@ -1868,7 +1868,7 @@ fn queue_reaction(i: &mut Interp, state: u8, value: Value, on_f: Value, on_r: Va
     }));
 }
 
-fn resolvers(i: &mut Interp, p: &Obj) -> (Value, Value) {
+pub(crate) fn resolvers(i: &mut Interp, p: &Obj) -> (Value, Value) {
     let done = Rc::new(Cell::new(false));
     let (p1, d1) = (p.clone(), done.clone());
     let res = i.native("resolve", move |i, _, a| {
@@ -1887,7 +1887,7 @@ fn resolvers(i: &mut Interp, p: &Obj) -> (Value, Value) {
     (res, rej)
 }
 
-fn resolve(i: &mut Interp, p: &Obj, x: Value) {
+pub(crate) fn resolve(i: &mut Interp, p: &Obj, x: Value) {
     if let Value::Obj(xo) = &x {
         if Rc::ptr_eq(xo, p) {
             let e = i.make_error("TypeError", "a promise cannot be resolved with itself");
@@ -1936,7 +1936,7 @@ fn promise_then(i: &mut Interp, this: &Value, on_f: Value, on_r: Value) -> R<Val
     Ok(Value::Obj(q))
 }
 
-fn promise_from(i: &mut Interp, x: Value) -> Obj {
+pub(crate) fn promise_from(i: &mut Interp, x: Value) -> Obj {
     if let Value::Obj(o) = &x {
         if matches!(o.borrow().kind, Kind::Promise(_)) {
             return o.clone();

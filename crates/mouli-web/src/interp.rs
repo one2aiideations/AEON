@@ -12,8 +12,9 @@
 //! Known differences from the standard (kept deliberately small): strings are Rust text and
 //! `length` counts characters, not UTF-16 units; arrays have no holes; `let` has no temporal dead
 //! zone; objects that form cycles are never freed (the whole interpreter is dropped with the
-//! page; no `async`, generators or `Symbol` yet (`Promise`, `Map`, `Set`, regular expressions and
-//! `Date` exist; dates are in UTC, there is no time zone database).
+//! page); `await` waits by running the event loop, so the caller does not continue meanwhile; no
+//! generators or `Symbol` yet (`Promise`, `Map`, `Set`, regular expressions and `Date` exist;
+//! dates are in UTC, there is no time zone database).
 
 use crate::js::{self, *};
 use std::cell::RefCell;
@@ -1434,7 +1435,77 @@ impl Interp {
         self.depth += 1;
         let r = self.run_body(&func, &s, args);
         self.depth -= 1;
-        r
+        if !func.is_async {
+            return r;
+        }
+        // An async function gives back a promise for what the body produces. A limit that halted
+        // the script is not something a promise may swallow.
+        if self.fatal.is_some() {
+            return r;
+        }
+        let p = crate::jslib::new_promise(self);
+        match r {
+            Ok(v) => crate::jslib::resolve(self, &p, v),
+            Err(e) => crate::jslib::settle(self, &p, 2, e),
+        }
+        Ok(Value::Obj(p))
+    }
+
+    /// The value of `await v`: runs queued promise callbacks and timers (advancing the virtual
+    /// clock) until the promise settles. Unlike a browser, the rest of the calling code does not
+    /// run meanwhile, so an `async` function finishes before its caller continues.
+    fn await_value(&mut self, v: Value) -> R<Value> {
+        let p = crate::jslib::promise_from(self, v);
+        for _ in 0..200_000 {
+            self.step()?;
+            let state = match &p.borrow().kind {
+                Kind::Promise(d) => (d.state, d.value.clone()),
+                _ => (1, None),
+            };
+            match state {
+                (1, v) => return Ok(v.unwrap_or(Value::Undefined)),
+                (2, v) => return Err(v.unwrap_or(Value::Undefined)),
+                _ => {}
+            }
+            if let Some(task) = self.microtasks.pop_front() {
+                task(self);
+            } else if !self.run_next_timer() {
+                return self.throw(
+                    "Error",
+                    "await would wait forever: nothing is left that could settle the promise",
+                );
+            }
+        }
+        self.throw("RangeError", "await waited too long")
+    }
+
+    /// Runs the earliest waiting timer, moving the clock to its time. False when none waits.
+    fn run_next_timer(&mut self) -> bool {
+        let pick = self
+            .timers
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.due.total_cmp(&b.1.due).then(a.1.id.cmp(&b.1.id)))
+            .map(|(i, _)| i);
+        let Some(i) = pick else { return false };
+        let t = self.timers.remove(i);
+        self.clock = t.due.max(self.clock);
+        if let Some(every) = t.every {
+            self.timers.push(Timer {
+                id: t.id,
+                due: self.clock + every,
+                every: t.every,
+                f: t.f.clone(),
+                args: t.args.clone(),
+            });
+        }
+        if let Err(e) = self.call(&t.f, Value::Undefined, t.args) {
+            if self.fatal.is_none() {
+                let m = self.describe_error(&e);
+                self.log_line(m);
+            }
+        }
+        true
     }
 
     fn run_body(&mut self, func: &Rc<Func>, s: &ScopeRef, args: Vec<Value>) -> R<Value> {
@@ -2087,6 +2158,7 @@ impl Interp {
                     is_arrow: false,
                     is_ctor: true,
                     uses_arguments: false,
+                    is_async: false,
                 }),
                 true,
             ),
@@ -2304,6 +2376,10 @@ impl Interp {
                 } else {
                     self.eval(b, s)
                 }
+            }
+            Expr::Await(inner) => {
+                let v = self.eval(inner, s)?;
+                self.await_value(v)
             }
             Expr::Seq(v) => {
                 let mut last = Value::Undefined;
@@ -3419,6 +3495,27 @@ mod tests {
     }
 
     #[test]
+    fn async_functions_return_promises_and_await_waits_for_timers_and_promises() {
+        let pre = "const log = []; const delay = (ms, v) => new Promise(r => setTimeout(() => r(v), ms));";
+        let go = |body: &str| run(&format!("{pre} {body}; log"));
+        assert_eq!(go("async function main() { const a = await delay(10, 'a'); const b = await delay(5, 'b'); return a + b } main().then(v => log.push(v))"), "[ 'ab' ]");
+        assert_eq!(go("async function f() { try { await Promise.reject(new Error('no')) } catch (e) { return 'caught ' + e.message } } f().then(v => log.push(v))"), "[ 'caught no' ]");
+        assert_eq!(go("async function f() { throw new TypeError('bad') } f().catch(e => log.push(e.name))"), "[ 'TypeError' ]");
+        assert_eq!(go("(async () => { log.push(await 5); log.push(await { then(r) { r('thenable') } }) })()"), "[ 5, 'thenable' ]");
+        assert_eq!(go("(async () => { let sum = 0; for (let i = 1; i <= 3; i++) sum += await delay(i, i); log.push(sum) })()"), "[ 6 ]");
+        assert_eq!(go("class A { async m(x) { return (await delay(1, x)) * 2 } } new A().m(21).then(v => log.push(v))"), "[ 42 ]");
+        assert_eq!(go("const o = { async m() { return await Promise.all([delay(3, 'x'), 'y']) } }; o.m().then(v => log.push(v.join()))"), "[ 'x,y' ]");
+        assert_eq!(go("async function f() { return 1 } const p = f(); log.push(p instanceof Promise, typeof p.then)"), "[ true, 'function' ]");
+        assert_eq!(go("async function a() { return await b() + 1 } async function b() { return await delay(1, 10) } a().then(v => log.push(v))"), "[ 11 ]");
+        assert_eq!(go("async function f() { await new Promise(() => {}) } f().catch(e => log.push(e.message.slice(0, 22)))"), "[ 'await would wait forev' ]");
+        assert_eq!(go("setInterval(() => {}, 1); async function f() { await delay(50, 1); log.push('done') } f()"), "[ 'done' ]");
+        // Awaiting something that never settles while a timer keeps running gives up after a bound.
+        assert_eq!(go("setInterval(() => {}, 1); (async () => { await new Promise(() => {}) })().catch(e => log.push(e.message))"), "[ 'await waited too long' ]");
+        // Plain functions called from async code are unaffected, and `await` of an array is the array.
+        assert_eq!(go("function plain() { return 3 } (async () => log.push(await plain(), await [1, 2]))()"), "[ 3, [ 1, 2 ] ]");
+    }
+
+    #[test]
     fn limits_halt_runaway_scripts_and_cannot_be_caught() {
         assert!(run("while (true) {}").contains("ran for too long"));
         assert!(
@@ -3445,7 +3542,7 @@ mod tests {
     #[test]
     fn syntax_errors_come_back_as_text_and_nothing_panics() {
         assert!(run("let = ;").contains("SyntaxError"));
-        assert!(run("async function f() {}").contains("not supported"));
+        assert!(run("function* g() {}").contains("not supported"));
         for src in [
             "null.x",
             "undefined()",
