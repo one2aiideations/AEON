@@ -107,6 +107,17 @@ impl<B: Backend> Device<B> {
         self.refresh();
     }
 
+    /// Opens a project folder for the Code application and lists its files in the editor.
+    ///
+    /// # Errors
+    /// [`PatchError`] when the folder cannot be opened.
+    pub fn open_project(&mut self, root: &std::path::Path) -> Result<(), PatchError> {
+        self.patch.state.borrow_mut().open(root)?;
+        self.call("code.files", Vec::new());
+        self.refresh();
+        Ok(())
+    }
+
     /// Keeps the applications' data in `dir`: loads what is there now, then saves after every
     /// change. Call after [`Device::attach_apps`].
     ///
@@ -266,6 +277,9 @@ impl<B: Backend> Device<B> {
     /// Shows `text` on the screen of the application that owns `capability` (or in the chat).
     fn app_message(&mut self, capability: &str, text: &str) {
         match capability.split('.').next() {
+            Some("code") if matches!(capability, "code.files" | "code.read" | "code.edit") => {
+                self.shell.editor.message = text.to_string();
+            }
             Some("code") => self.shell.review.message = text.to_string(),
             Some("sheet") => self.shell.sheet.message = text.to_string(),
             Some("studio") => self.shell.studio.message = text.to_string(),
@@ -275,9 +289,17 @@ impl<B: Backend> Device<B> {
 
     /// Runs a capability a screen asked for, through the same gate as the chat.
     fn call(&mut self, capability: &str, args: Vec<(String, String)>) {
-        let args = args.into_iter().collect();
+        if capability.starts_with("code.") && !self.patch.gated {
+            self.app_message(capability, "The Code application is not connected.");
+            return;
+        }
+        let args: std::collections::BTreeMap<String, String> = args.into_iter().collect();
+        let path = args.get("path").cloned().unwrap_or_default();
         match self.ws.call(&self.tenant, &self.session, capability, args) {
-            Ok(Reply::Done(_)) => self.app_message(capability, ""),
+            Ok(Reply::Done(out)) => {
+                self.app_message(capability, "");
+                self.deliver(capability, &path, &out.text);
+            }
             Ok(Reply::AwaitingApproval { id }) => self.app_message(
                 capability,
                 &format!("Held for approval ({id}). Someone else must approve it under Approvals."),
@@ -285,6 +307,27 @@ impl<B: Backend> Device<B> {
             Ok(Reply::Refused { by }) => self.app_message(capability, &format!("Refused by {by}.")),
             Ok(Reply::Chat { .. }) => {}
             Err(e) => self.app_message(capability, &e.to_string()),
+        }
+    }
+
+    /// Hands what a capability returned to the screen that asked for it.
+    fn deliver(&mut self, capability: &str, path: &str, text: &str) {
+        match capability {
+            "code.files" => {
+                let files = text.lines().map(str::to_string).collect();
+                self.shell.editor.set_files(files);
+            }
+            "code.read" => {
+                if let Err(m) = self.shell.editor.load(path, text) {
+                    self.shell.editor.message = m;
+                }
+            }
+            "code.edit" => {
+                self.shell.editor.mark_saved();
+                self.shell.editor.message =
+                    "Sent for review. Approve it under F6 to write the file.".into();
+            }
+            _ => {}
         }
     }
 

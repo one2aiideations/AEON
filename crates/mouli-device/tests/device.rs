@@ -808,3 +808,110 @@ fn a_call_cannot_point_the_application_at_another_folder() {
     assert!(r.is_err(), "{r:?}");
     assert!(code.borrow().view().is_none());
 }
+
+// ---------------------------------------------------------------- the code editor
+
+fn editor_device(dir: &tempfile::TempDir, user: &str, role: &str) -> Device<Echo> {
+    let (ws, code) = code_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", user, role).unwrap();
+    d.attach_code(code);
+    d.open_project(dir.path()).unwrap();
+    d
+}
+
+#[test]
+fn the_editor_lists_the_project_opens_a_file_and_sends_an_edit_for_review() {
+    let (dir, _diff, _new) = project();
+    let old = read(&dir);
+    let mut d = editor_device(&dir, "dana", "dev");
+    assert_eq!(d.shell.editor.files, vec!["src/tax.rs"]);
+    d.on_key(Key::F(9));
+    assert_eq!(d.shell.active, Tab::Editor);
+    d.on_key(Key::Enter); // open the only file
+    assert_eq!(d.shell.editor.path(), Some("src/tax.rs"));
+    assert_eq!(d.shell.editor.text(), old);
+
+    // Edit: put a comment on the first line, then send it.
+    type_keys(&mut d, "// tax\n");
+    assert!(d.shell.editor.is_dirty());
+    d.on_key(Key::Ctrl('s'));
+    assert!(!d.shell.editor.is_dirty(), "sent");
+    assert_eq!(read(&dir), old, "nothing is written by saving");
+
+    d.on_key(Key::F(6));
+    assert_eq!(d.shell.review.state, PatchState::Proposed);
+    assert_eq!(d.shell.review.files[0].path, "src/tax.rs");
+    assert_eq!(d.shell.review.files[0].added, 1);
+    assert!(d.shell.review.all_checks_pass());
+}
+
+#[test]
+fn an_edit_from_the_editor_is_written_only_after_a_second_person_approves_the_apply() {
+    let (dir, _diff, _new) = project();
+    let old = read(&dir);
+    let (mut ws, code) = code_workspace();
+    code.borrow_mut().open(dir.path()).unwrap();
+    // Dana edits and asks to apply, as the editor and review screens would.
+    let dana = ws.open_session("acme", "dana", "dev").unwrap();
+    let edit: std::collections::BTreeMap<String, String> = [
+        ("path".to_string(), "src/tax.rs".to_string()),
+        ("text".to_string(), format!("// reviewed\n{old}")),
+    ]
+    .into_iter()
+    .collect();
+    ws.call("acme", &dana, "code.edit", edit).unwrap();
+    let held = ws
+        .call("acme", &dana, "code.apply", Default::default())
+        .unwrap();
+    assert!(matches!(
+        held,
+        mouli_interface::Reply::AwaitingApproval { .. }
+    ));
+    assert_eq!(read(&dir), old);
+    let id = ws.pending_approvals()[0].0.to_string();
+    ws.decide("acme", &id, "olga", "owner", true).unwrap();
+    assert_eq!(read(&dir), format!("// reviewed\n{old}"));
+}
+
+#[test]
+fn the_editor_shows_why_it_cannot_continue() {
+    let (dir, _diff, _new) = project();
+    // A viewer may not even read files.
+    let mut d = editor_device(&dir, "vic", "viewer");
+    assert!(d.shell.editor.files.is_empty());
+    assert!(
+        !d.shell.editor.message.is_empty(),
+        "{}",
+        d.shell.editor.message
+    );
+
+    // A device without the Code application says so instead of failing silently.
+    let mut plain = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    plain.on_key(Key::F(9));
+    plain.on_key(Key::Ctrl('r'));
+    assert!(plain.shell.editor.message.contains("not connected"));
+    let _ = &mut d;
+}
+
+#[test]
+fn a_second_edit_of_another_file_is_refused_while_one_is_under_review() {
+    let (dir, _diff, _new) = project();
+    std::fs::write(dir.path().join("src/other.rs"), "fn o() {}\n").unwrap();
+    let mut d = editor_device(&dir, "dana", "dev");
+    d.on_key(Key::F(9));
+    d.on_key(Key::Enter); // src/other.rs sorts first
+    type_keys(&mut d, "x");
+    d.on_key(Key::Ctrl('s'));
+    d.on_key(Key::Esc);
+    d.on_key(Key::Down);
+    d.on_key(Key::Enter); // src/tax.rs
+    assert_eq!(d.shell.editor.path(), Some("src/tax.rs"));
+    type_keys(&mut d, "y");
+    d.on_key(Key::Ctrl('s'));
+    assert!(d.shell.editor.is_dirty(), "not sent");
+    assert!(
+        d.shell.editor.message.contains("under review"),
+        "{}",
+        d.shell.editor.message
+    );
+}

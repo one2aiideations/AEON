@@ -106,6 +106,10 @@ impl Desktop {
                 label: "Studio",
                 tab: Some(Tab::Studio),
             },
+            IconSpot {
+                label: "Code",
+                tab: Some(Tab::Editor),
+            },
         ];
         Self {
             width,
@@ -123,11 +127,14 @@ impl Desktop {
         }
     }
 
-    /// Where icon `i` sits.
+    /// Where icon `i` sits. Icons run down the right edge; when they do not all fit in one column
+    /// they continue in the next column to the left.
     pub fn icon_rect(&self, i: usize) -> crate::geom::Rect {
+        let per_column = ((self.height - MENU_H - 12) / ICON_CELL).max(1) as usize;
+        let (column, row) = ((i / per_column) as i32, (i % per_column) as i32);
         crate::geom::Rect::new(
-            self.width - ICON_CELL,
-            MENU_H + 12 + i as i32 * ICON_CELL,
+            self.width - ICON_CELL * (column + 1),
+            MENU_H + 12 + row * ICON_CELL,
             ICON_CELL,
             ICON_CELL - 4,
         )
@@ -247,7 +254,7 @@ impl Desktop {
             Key::Ctrl('n') => Some(Command::NewConversation),
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
-            Key::F(n @ 1..=8) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
+            Key::F(n @ 1..=9) => Tab::ALL.get(usize::from(n) - 1).map(|t| Command::Open(*t)),
             _ => None,
         };
         if let Some(cmd) = command {
@@ -829,6 +836,26 @@ mod tests {
                 expect.get(x, y),
                 "({x},{y})"
             );
+        }
+    }
+
+    #[test]
+    fn every_icon_is_fully_on_the_screen_and_none_overlap_at_supported_sizes() {
+        for (w, h) in [(640, 480), (800, 600), (1024, 768), (1280, 1024)] {
+            let d = Desktop::new(w, h);
+            let rects: Vec<_> = (0..d.icons.len()).map(|i| d.icon_rect(i)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                // The label sits 40 pixels below the picture and is about 16 high.
+                assert!(r.x >= 0 && r.right() <= w, "{w}x{h} icon {i} {r:?}");
+                assert!(
+                    r.y + 40 + 18 <= h,
+                    "{w}x{h} icon {i} label is cut off: {r:?}"
+                );
+                for o in rects.iter().skip(i + 1) {
+                    let x = r.intersect(o);
+                    assert!(x.w == 0 || x.h == 0, "{w}x{h} overlap {r:?} {o:?}");
+                }
+            }
         }
     }
 

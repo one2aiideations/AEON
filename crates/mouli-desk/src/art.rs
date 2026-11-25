@@ -219,3 +219,23 @@ pub const STUDIO: Icon = [
     "..kkkkkkkkkk....",
     "................",
 ];
+
+/// Code: an editor window with a title bar and lines of source.
+pub const CODE: Icon = [
+    "................",
+    ".kkkkkkkkkkkkkk.",
+    ".kbrybbbbbbbbbk.",
+    ".kkkkkkkkkkkkkk.",
+    ".kooooddddddddk.",
+    ".kdddyyyyyydddk.",
+    ".kdddwwwwwwwwdk.",
+    ".kdddwwwwdddddk.",
+    ".kdddyyyddyyydk.",
+    ".kddddddddooook.",
+    ".kdddwwwwwwdddk.",
+    ".kddddddddddddk.",
+    ".kdddyyyyyydddk.",
+    ".kkkkkkkkkkkkkk.",
+    "................",
+    "................",
+];

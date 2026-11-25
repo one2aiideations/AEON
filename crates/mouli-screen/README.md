@@ -1,9 +1,11 @@
 # mouli-screen
 
 The on-device screens as dependency-free state machines drawn into a character-cell grid:
-Chat (F1), Models (F2), Approvals (F3), Audit (F4), Security (F5), Code review (F6), Sheet (F7) and
-Studio (F8). The Sheet and Studio screens only show a copy of the application's state; edits are
-reported as `Action::Call` with structured arguments.
+Chat (F1), Models (F2), Approvals (F3), Audit (F4), Security (F5), Code review (F6), Sheet (F7),
+Studio (F8) and the code editor (F9). The Sheet, Studio and editor screens only show a copy of the
+application's state; edits are reported as `Action::Call` with structured arguments. The editor has
+a file list, line numbers, colouring for Rust, TOML and Markdown (one line at a time), undo, redo and
+find; saving asks for a change to be proposed for review. It has no selection or clipboard yet.
 
 `Grid` is rasterised into XRGB8888 or RGB565 pixels, or into a PNG
 (`cargo run -p mouli-screen --example screenshots -- <dir>`). Two renderers exist: `raster::render`

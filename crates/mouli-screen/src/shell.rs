@@ -4,7 +4,8 @@ use crate::grid::{fit, theme, Grid, Rect};
 use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
 use crate::screens::{
-    Approvals, Audit, Chat, ModelPicker, Review, SecurityScreen, SheetScreen, StudioScreen,
+    Approvals, Audit, Chat, EditorScreen, ModelPicker, Review, SecurityScreen, SheetScreen,
+    StudioScreen,
 };
 
 /// The whole interface.
@@ -26,6 +27,8 @@ pub struct Shell {
     pub sheet: SheetScreen,
     /// The document editor.
     pub studio: StudioScreen,
+    /// The code editor.
+    pub editor: EditorScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -43,6 +46,7 @@ impl Default for Shell {
             review: Review::default(),
             sheet: SheetScreen::default(),
             studio: StudioScreen::default(),
+            editor: EditorScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -66,6 +70,7 @@ impl Shell {
             Tab::Review => &self.review,
             Tab::Sheet => &self.sheet,
             Tab::Studio => &self.studio,
+            Tab::Editor => &self.editor,
         }
     }
 
@@ -80,6 +85,7 @@ impl Shell {
             Tab::Review => &mut self.review,
             Tab::Sheet => &mut self.sheet,
             Tab::Studio => &mut self.studio,
+            Tab::Editor => &mut self.editor,
         }
     }
 
@@ -193,7 +199,7 @@ mod tests {
     fn the_header_lists_every_screen_and_the_footer_shows_hints() {
         let mut s = Shell::new();
         s.status = "wlan0 connected".into();
-        let t = drawn(&s, 120, 20);
+        let t = drawn(&s, 140, 20);
         let header = t.lines().next().unwrap();
         for tab in Tab::ALL {
             assert!(header.contains(tab.label()), "{header}");
@@ -205,7 +211,7 @@ mod tests {
         let footer = t.lines().nth(19).unwrap();
         assert!(footer.contains("Enter load"), "{footer}");
         s.on_key(Key::F(1));
-        assert!(drawn(&s, 120, 20)
+        assert!(drawn(&s, 140, 20)
             .lines()
             .nth(19)
             .unwrap()
@@ -246,7 +252,7 @@ mod tests {
             !narrow.lines().next().unwrap().contains(".."),
             "no stray dots"
         );
-        assert!(drawn(&s, 120, 20)
+        assert!(drawn(&s, 140, 20)
             .lines()
             .next()
             .unwrap()

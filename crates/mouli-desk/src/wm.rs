@@ -177,8 +177,8 @@ impl WindowManager {
         let mut w = Window {
             id,
             tab,
-            x: 24 + 32 * (n % 8),
-            y: self.menu_h + 12 + 32 * (n % 8),
+            x: self.cascade_at(n).0,
+            y: self.cascade_at(n).1,
             cols,
             rows,
             zoomed: false,
@@ -298,18 +298,31 @@ impl WindowManager {
         }
     }
 
+    /// Where the `n`th cascaded window goes (counting from 0). Each is 32 pixels below and to the
+    /// right of the one before, as many as fit on the screen; after that the pile starts again,
+    /// shifted a little so the new windows do not sit exactly on the old ones.
+    fn cascade_at(&self, n: i32) -> (i32, i32) {
+        let min_h = 3 + TITLE_H + STATUS_H + MIN_ROWS * CELL_H;
+        let slots = ((self.height - self.menu_h - 12 - min_h) / 32 + 1).clamp(1, 16);
+        let (slot, round) = (n % slots, n / slots);
+        (
+            24 + 32 * slot + 16 * round,
+            self.menu_h + 12 + 32 * slot + 8 * round,
+        )
+    }
+
     /// Stacks all windows with their title bars showing.
     pub fn cascade(&mut self) {
         let ids: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
         for (n, id) in ids.into_iter().enumerate() {
             let n = n as i32;
-            let (menu_h, mc, mr) = (self.menu_h, self.max_cols(), self.max_rows());
+            let (mc, mr) = (self.max_cols(), self.max_rows());
+            let at = self.cascade_at(n);
             if let Some(w) = self.get_mut(id) {
                 w.zoomed = false;
                 w.cols = 72.min(mc);
                 w.rows = 22.min(mr);
-                w.x = 24 + 32 * (n % 8);
-                w.y = menu_h + 12 + 32 * (n % 8);
+                (w.x, w.y) = at;
             }
             self.clamp_into_view(id);
         }
@@ -488,6 +501,19 @@ mod tests {
             .windows
             .iter()
             .all(|w| w.outer().right() <= 1024 && w.outer().bottom() <= 768));
+    }
+
+    #[test]
+    fn cascaded_windows_never_sit_exactly_on_one_another_even_on_the_smallest_screen() {
+        let mut m = WindowManager::new(640, 480, 32);
+        for t in Tab::ALL {
+            m.open(t);
+        }
+        m.cascade();
+        let mut spots: Vec<(i32, i32)> = m.windows.iter().map(|w| (w.x, w.y)).collect();
+        spots.sort_unstable();
+        spots.dedup();
+        assert_eq!(spots.len(), m.windows.len(), "{spots:?}");
     }
 
     #[test]

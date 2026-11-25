@@ -73,11 +73,13 @@ pub enum Tab {
     Sheet,
     /// The document editor.
     Studio,
+    /// The code editor.
+    Editor,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 9] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -86,6 +88,7 @@ impl Tab {
         Tab::Review,
         Tab::Sheet,
         Tab::Studio,
+        Tab::Editor,
     ];
 
     /// The name shown in the tab bar.
@@ -99,10 +102,11 @@ impl Tab {
             Tab::Review => "Review",
             Tab::Sheet => "Sheet",
             Tab::Studio => "Studio",
+            Tab::Editor => "Code",
         }
     }
 
-    /// The function key that opens it (F1 to F8).
+    /// The function key that opens it (F1 to F9).
     pub const fn key(self) -> Key {
         Key::F(self as u8 + 1)
     }
@@ -183,7 +187,8 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 8);
+        assert_eq!(Tab::ALL.len(), 9);
+        assert_eq!(Tab::Editor.key(), Key::F(9));
         assert_eq!(
             Tab::ALL.iter().map(|t| t.label()).collect::<Vec<_>>(),
             vec![
@@ -194,7 +199,8 @@ mod tests {
                 "Security",
                 "Review",
                 "Sheet",
-                "Studio"
+                "Studio",
+                "Code"
             ]
         );
     }

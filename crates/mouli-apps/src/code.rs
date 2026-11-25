@@ -9,14 +9,25 @@
 //! The project folder is chosen by the host ([`CodeState::open`]), never by a call, so a model
 //! cannot point the application at another directory.
 
+use mouli_code::apply::safe_relative_path;
 use mouli_code::apply::ApplyOptions;
 use mouli_code::diff::{self, FilePatch};
+use mouli_code::make::make_patch;
 use mouli_code::quality::{assess, brackets_balanced, PatchPolicy};
 use mouli_code::workspace::{Receipt, Workspace as Files, WorkspaceError};
 use mouli_interface::{Application, Call, CapabilitySpec, Error, Output, Result, Risk};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+
+/// Largest file the editor reads, in bytes.
+pub const MAX_FILE: u64 = 256 * 1024;
+/// Most files listed.
+const MAX_FILES: usize = 5_000;
+/// Deepest folder searched.
+const MAX_DEPTH: usize = 12;
+/// Folders never listed: generated or private.
+const SKIP_DIRS: [&str; 3] = ["target", "node_modules", ".git"];
 
 /// Largest diff accepted, in bytes.
 const MAX_DIFF: usize = 1 << 20;
@@ -143,6 +154,110 @@ impl CodeState {
             v.stage = stage;
         }
         self.version += 1;
+    }
+
+    /// The files below the project folder as relative paths with `/`, sorted. Hidden entries,
+    /// build output and symbolic links are left out; the list is capped.
+    ///
+    /// # Errors
+    /// A message when no folder is open.
+    pub fn list_files(&self) -> std::result::Result<Vec<String>, String> {
+        let files = self.files.as_ref().ok_or("No project folder is open.")?;
+        let mut out = Vec::new();
+        let mut stack = vec![(files.root().to_path_buf(), String::new(), 0usize)];
+        while let Some((dir, prefix, depth)) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                // `file_type` does not follow symbolic links, so a link is neither a file nor a folder.
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let rel = format!("{prefix}{name}");
+                if kind.is_dir() {
+                    if depth < MAX_DEPTH && !SKIP_DIRS.contains(&name.as_str()) {
+                        stack.push((entry.path(), format!("{rel}/"), depth + 1));
+                    }
+                } else if kind.is_file() && safe_relative_path(&rel).is_ok() {
+                    out.push(rel);
+                    if out.len() >= MAX_FILES {
+                        out.sort();
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The text of one file.
+    ///
+    /// # Errors
+    /// A message when no folder is open, the path is unsafe, the file is missing, too large or
+    /// not text.
+    pub fn read(&self, path: &str) -> std::result::Result<String, String> {
+        let files = self.files.as_ref().ok_or("No project folder is open.")?;
+        let rel = safe_relative_path(path).map_err(|e| format!("{e:?}"))?;
+        if let Ok(meta) = std::fs::metadata(files.root().join(rel)) {
+            if meta.len() > MAX_FILE {
+                return Err(format!("{rel} is larger than {} KB.", MAX_FILE / 1024));
+            }
+        }
+        files
+            .read(rel)
+            .map_err(|e| describe(&e))?
+            .ok_or_else(|| format!("{rel} does not exist."))
+    }
+
+    /// Turns "this file should now read `new_text`" into a proposal and holds it for review.
+    /// A file that does not exist yet is created by the change. One change is under review at a
+    /// time: a second file is refused until the first is applied or rejected, and a new edit of
+    /// the same file replaces the held one.
+    ///
+    /// # Errors
+    /// A message when the text is unchanged, another file's change is held, or the proposal is
+    /// refused (see [`CodeState::propose`]).
+    pub fn edit(&mut self, path: &str, new_text: &str) -> std::result::Result<String, String> {
+        let rel = safe_relative_path(path)
+            .map_err(|e| format!("{e:?}"))?
+            .to_string();
+        if let Some(v) = &self.view {
+            let busy =
+                v.stage == Stage::Proposed || (v.stage == Stage::Applied && self.receipt.is_some());
+            let same = v.files.len() == 1 && v.files[0].path == rel && v.stage == Stage::Proposed;
+            if busy && !same {
+                let held = v.files.first().map_or("a file", |f| f.path.as_str());
+                return Err(if v.stage == Stage::Applied {
+                    format!(
+                        "The change to {held} was applied and can still be rolled back. Roll it back or reject it before editing again."
+                    )
+                } else {
+                    format!("A change to {held} is already under review. Apply or reject it first.")
+                });
+            }
+        }
+        let old = match self
+            .files
+            .as_ref()
+            .ok_or("No project folder is open.")?
+            .read(&rel)
+        {
+            Ok(t) => t,
+            Err(e) => return Err(describe(&e)),
+        };
+        let patch = make_patch(&rel, old.as_deref(), Some(new_text), 3)
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("The text is the same as the file.")?;
+        self.propose(&diff::render(&[patch]))
+            .map_err(|e| e.to_string())
     }
 
     /// Reads `text` as a unified diff, checks it against the real files and holds it for review.
@@ -305,6 +420,15 @@ impl Application for CodeApp {
                 Risk::Write,
             )
             .requires(&["diff"]),
+            CapabilitySpec::new("code.files", "list the project's files", Risk::Read),
+            CapabilitySpec::new("code.read", "read one file (path=src/lib.rs)", Risk::Read)
+                .requires(&["path"]),
+            CapabilitySpec::new(
+                "code.edit",
+                "propose the file's new whole text as a change (path=.. text=..); nothing is written until applied",
+                Risk::Write,
+            )
+            .requires(&["path", "text"]),
             CapabilitySpec::new("code.reject", "throw the held change away", Risk::Write),
             CapabilitySpec::new(
                 "code.apply",
@@ -338,6 +462,26 @@ impl Application for CodeApp {
                     s
                 }
             },
+            "code.files" => st.list_files().map_err(bad)?.join("\n"),
+            "code.read" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .ok_or_else(|| bad("path is required"))?;
+                st.read(path).map_err(bad)?
+            }
+            "code.edit" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .ok_or_else(|| bad("path is required"))?;
+                let text = call
+                    .args
+                    .get("text")
+                    .ok_or_else(|| bad("text is required"))?;
+                let summary = st.edit(path, text).map_err(bad)?;
+                format!("Held for review: {summary}.")
+            }
             "code.propose" => {
                 let diff = call
                     .args
@@ -365,5 +509,146 @@ impl Application for CodeApp {
             text,
             artifacts: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn project() -> (tempfile::TempDir, CodeState) {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        fs::create_dir_all(d.path().join("target/debug")).unwrap();
+        fs::create_dir_all(d.path().join(".git")).unwrap();
+        fs::write(d.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        fs::write(d.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(d.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(d.path().join("target/debug/junk"), "x").unwrap();
+        fs::write(d.path().join(".git/config"), "x").unwrap();
+        fs::write(d.path().join(".hidden"), "x").unwrap();
+        let mut st = CodeState::default();
+        st.open(d.path()).unwrap();
+        (d, st)
+    }
+
+    #[test]
+    fn files_are_listed_sorted_without_hidden_build_or_link_entries() {
+        let (d, st) = project();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", d.path().join("link.txt")).unwrap();
+            std::os::unix::fs::symlink("/etc", d.path().join("linkdir")).unwrap();
+        }
+        assert_eq!(
+            st.list_files().unwrap(),
+            vec!["Cargo.toml", "src/lib.rs", "src/main.rs"]
+        );
+        assert!(CodeState::default().list_files().is_err());
+    }
+
+    #[test]
+    fn reading_is_refused_for_unsafe_missing_large_and_binary_files() {
+        let (d, st) = project();
+        assert_eq!(st.read("src/lib.rs").unwrap(), "fn a() {}\n");
+        for bad in [
+            "../x",
+            "/etc/passwd",
+            ".git/config",
+            "src/../../x",
+            "",
+            "a\\b",
+        ] {
+            assert!(st.read(bad).is_err(), "{bad}");
+        }
+        assert!(st
+            .read("src/none.rs")
+            .unwrap_err()
+            .contains("does not exist"));
+        fs::write(d.path().join("big.txt"), vec![b'x'; MAX_FILE as usize + 1]).unwrap();
+        assert!(st.read("big.txt").unwrap_err().contains("larger"));
+        fs::write(d.path().join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(st.read("bin.dat").is_err());
+        assert!(CodeState::default().read("a").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", d.path().join("l.txt")).unwrap();
+            assert!(st.read("l.txt").is_err(), "a link is not followed");
+        }
+    }
+
+    #[test]
+    fn an_edit_becomes_a_held_proposal_and_writes_nothing() {
+        let (d, mut st) = project();
+        let summary = st.edit("src/lib.rs", "fn a() {}\nfn b() {}\n").unwrap();
+        assert!(summary.contains("1 file"), "{summary}");
+        let v = st.view().unwrap();
+        assert_eq!((v.files[0].added, v.files[0].removed), (1, 0));
+        assert_eq!(v.stage, Stage::Proposed);
+        assert_eq!(
+            fs::read_to_string(d.path().join("src/lib.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+        // Applying writes exactly the edit; rollback restores it.
+        st.apply().unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("src/lib.rs")).unwrap(),
+            "fn a() {}\nfn b() {}\n"
+        );
+        st.rollback().unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("src/lib.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_can_create_a_new_file_and_an_unchanged_text_is_refused() {
+        let (d, mut st) = project();
+        assert!(st
+            .edit("src/lib.rs", "fn a() {}\n")
+            .unwrap_err()
+            .contains("same"));
+        st.edit("src/new.rs", "pub fn n() {}\n").unwrap();
+        st.apply().unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("src/new.rs")).unwrap(),
+            "pub fn n() {}\n"
+        );
+    }
+
+    #[test]
+    fn only_one_change_is_held_and_a_new_edit_of_the_same_file_replaces_it() {
+        let (_d, mut st) = project();
+        st.edit("src/lib.rs", "one\n").unwrap();
+        st.edit("src/lib.rs", "two\n").unwrap();
+        assert_eq!(st.view().unwrap().files.len(), 1);
+        let e = st.edit("src/main.rs", "x\n").unwrap_err();
+        assert!(
+            e.contains("src/lib.rs") && e.contains("under review"),
+            "{e}"
+        );
+        st.reject();
+        st.edit("src/main.rs", "x\n").unwrap();
+    }
+
+    #[test]
+    fn after_an_apply_another_edit_waits_until_the_change_is_rolled_back_or_rejected() {
+        let (_d, mut st) = project();
+        st.edit("src/lib.rs", "one\n").unwrap();
+        st.apply().unwrap();
+        let e = st.edit("src/main.rs", "x\n").unwrap_err();
+        assert!(e.contains("rolled back"), "{e}");
+        st.rollback().unwrap();
+        st.edit("src/main.rs", "x\n").unwrap();
+    }
+
+    #[test]
+    fn unsafe_edit_paths_and_no_folder_are_refused() {
+        let (_d, mut st) = project();
+        assert!(st.edit("../x", "a\n").is_err());
+        assert!(st.edit(".git/config", "a\n").is_err());
+        assert!(CodeState::default().edit("a", "b\n").is_err());
     }
 }
