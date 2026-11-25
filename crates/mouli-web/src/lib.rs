@@ -22,6 +22,7 @@ pub mod dom;
 pub mod gate;
 pub mod html;
 pub mod intents;
+pub mod js;
 pub mod layout;
 pub mod markdown;
 pub mod rate;
