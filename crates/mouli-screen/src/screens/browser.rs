@@ -32,6 +32,7 @@ pub struct BrowserScreen {
     page: Option<(String, String)>,
     loading: Option<String>,
     record: bool,
+    reader: bool,
     /// The page view (the same engine as the Preview).
     pub view: PreviewScreen,
 }
@@ -114,6 +115,7 @@ impl BrowserScreen {
         self.status = "Done".into();
         self.page = Some((url.to_string(), html));
         self.view.reset();
+        self.reader = false;
         self.view.set_images(Rc::new(images));
     }
 
@@ -194,6 +196,12 @@ impl BrowserScreen {
         }
         match &self.page {
             Some((url, html)) => {
+                if self.reader {
+                    let text = browser::reader_html(html);
+                    let path = format!("{url}#reader.html");
+                    self.view.draw_pixels(canvas, area, (Some(&path), &text));
+                    return;
+                }
                 let path = format!("{url}.html");
                 self.view.draw_pixels(canvas, area, (Some(&path), html));
             }
@@ -301,6 +309,22 @@ impl Screen for BrowserScreen {
             Key::Char('[') => self.back(),
             Key::Char(']') => self.forward(),
             Key::Char('r') => self.reload(),
+            Key::Char('v') => {
+                self.reader = !self.reader;
+                self.status = if self.reader {
+                    "Reading view".into()
+                } else {
+                    "Page view".into()
+                };
+                Action::None
+            }
+            Key::Char('s') => match &self.page {
+                Some((url, html)) => {
+                    self.status = "Asked the assistant to summarise (see Chat).".into();
+                    Action::Send(browser::text_for_model(html, url, 4000))
+                }
+                None => Action::None,
+            },
             other => {
                 self.view.on_key(other);
                 self.follow()
@@ -349,7 +373,7 @@ impl Screen for BrowserScreen {
             "Type an address  Enter open  Esc cancel".into()
         } else {
             format!(
-                "l address  [ back  ] forward  r reload  Up/Down scroll    {}",
+                "l address  [ ] back/forward  r reload  v reading view  s summarise  {}",
                 self.status
             )
         }
@@ -546,5 +570,41 @@ mod tests {
         // Keys go to the bar again, and Escape leaves a field.
         s.on_key(Key::Char('l'));
         assert!(s.editing());
+    }
+
+    #[test]
+    fn the_reading_view_toggles_and_summarise_asks_the_assistant_with_the_page_text() {
+        let mut s = BrowserScreen::default();
+        assert_eq!(
+            s.on_key(Key::Char('s')),
+            Action::None,
+            "nothing to summarise yet"
+        );
+        s.go("https://a.com/p");
+        s.loaded(
+            "https://a.com/p",
+            "https://a.com/p",
+            "<title>T</title><body><nav>menu</nav><p>Real text.</p></body>".into(),
+        );
+        let Action::Send(msg) = s.on_key(Key::Char('s')) else {
+            panic!("expected a message for the assistant")
+        };
+        assert!(
+            msg.contains("Real text.") && msg.contains("https://a.com/p") && !msg.contains("menu"),
+            "{msg}"
+        );
+        assert_eq!(s.on_key(Key::Char('v')), Action::None);
+        let mut c = Canvas {
+            width: 400,
+            height: 200,
+            pixels: vec![0; 400 * 200],
+        };
+        s.draw_pixels(&mut c, (0, 0, 400, 200));
+        assert!(
+            c.pixels.contains(&0x00FF_FFFF),
+            "the reading view has a white page"
+        );
+        s.on_key(Key::Char('v'));
+        assert!(s.status.contains("Page view"));
     }
 }

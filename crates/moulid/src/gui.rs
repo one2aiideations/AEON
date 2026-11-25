@@ -1135,6 +1135,16 @@ where
                     graph.tool_call("owner", &text, &output, unix_now());
                 }
                 Action::Send(text) => {
+                    // A page summary asked for in the browser is answered in the Chat window.
+                    let from_browser = text.starts_with("Summarise this web page");
+                    if from_browser {
+                        if device.shell.chat.busy {
+                            device.shell.browser.status =
+                                "The assistant is busy; try again in a moment.".into();
+                        } else {
+                            desktop.open(&mut device.shell, Tab::Chat);
+                        }
+                    }
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
                         graph.user_message(&text, unix_now());
