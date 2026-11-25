@@ -1,0 +1,10 @@
+[package]
+name = "mouli-neuro"
+version = "0.1.0"
+description = "MOULI event-driven spiking runtime: CPU-friendly sparse compute with local learning"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

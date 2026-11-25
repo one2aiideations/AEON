@@ -1,0 +1,15 @@
+[package]
+name = "mouli-llm"
+version = "0.1.0"
+description = "MOULI CPU forward pass for llama-family GGUF models (RMSNorm, RoPE, grouped-query attention, SwiGLU, KV cache, sampler)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mouli-gguf = { path = "../mouli-gguf" }
+mouli-quant = { path = "../mouli-quant" }
+mouli-engine = { path = "../mouli-engine" }

@@ -1,0 +1,17 @@
+[package]
+name = "mouli-studio"
+version = "0.1.0"
+description = "MOULI-STUDIO: one creative/office application (documents, spreadsheets via mouli-sheet, and fail-closed engine stubs)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Network AI providers. Off by default; the scaffold refuses remote calls without it.
+net = []
+
+[dependencies]
+mouli-sheet = { path = "../mouli-sheet" }
+
+[lints]
+workspace = true

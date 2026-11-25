@@ -1,8 +1,8 @@
 #!/bin/sh
-# Boot the AEON image in QEMU on the serial console.
-#   os/run-qemu.sh [OUTPUT_DIR] [extra kernel args, e.g. aeon.selftest=1]
+# Boot the MOULI image in QEMU on the serial console.
+#   os/run-qemu.sh [OUTPUT_DIR] [extra kernel args, e.g. mouli.selftest=1]
 set -eu
-OUT="${1:-$(dirname "$0")/../.aeon-out}"
+OUT="${1:-$(dirname "$0")/../.mouli-out}"
 shift || true
 # The engine is built for AVX2; QEMU's default CPU model lacks it, so use "max" without KVM.
 ACCEL="-cpu max"

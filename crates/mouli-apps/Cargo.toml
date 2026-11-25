@@ -1,0 +1,21 @@
+[package]
+name = "mouli-apps"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-APPS: adapters that turn the application crates (Sheet, Studio, CRM, Code) into governed capabilities of the main interface"
+
+[dependencies]
+mouli-code = { path = "../mouli-code" }
+mouli-crm = { path = "../mouli-crm" }
+mouli-interface = { path = "../mouli-interface" }
+mouli-player = { path = "../mouli-player" }
+mouli-sheet = { path = "../mouli-sheet" }
+mouli-studio = { path = "../mouli-studio" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "mouli-compress"
+version = "0.1.0"
+description = "MOULI weight analysis and compression planning: entropy, outliers, quantisation error, pruning threshold, low-rank error (from the 55D research engine)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

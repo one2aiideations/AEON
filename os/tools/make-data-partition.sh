@@ -1,10 +1,10 @@
 #!/bin/sh
-# Format ONE EXISTING PARTITION as AEON's data partition (ext4, label AEON-DATA).
+# Format ONE EXISTING PARTITION as MOULI's data partition (ext4, label MOULI-DATA).
 #
 #   sudo os/tools/make-data-partition.sh /dev/sdb3
 #
 # Everything on that partition is erased. Create the (empty) partition first with any partition
-# tool (GParted, fdisk, Disks), for example in the free space after the AEON image on your USB
+# tool (GParted, fdisk, Disks), for example in the free space after the MOULI image on your USB
 # stick. This script refuses whole disks, mounted partitions and the partition holding / .
 set -eu
 
@@ -26,11 +26,11 @@ fi
 root_dev="$(findmnt -no SOURCE / 2>/dev/null || true)"
 [ "$root_dev" != "$dev" ] || { echo "$dev holds the running system" >&2; exit 1; }
 
-echo "About to ERASE $dev and format it as ext4 with label AEON-DATA:"
+echo "About to ERASE $dev and format it as ext4 with label MOULI-DATA:"
 lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$dev"
 printf 'Type the device name again to confirm (%s): ' "$dev"
 read -r answer
 [ "$answer" = "$dev" ] || { echo "not confirmed; nothing changed"; exit 1; }
 
-mkfs.ext4 -F -L AEON-DATA "$dev"
-echo "Done. AEON will save settings and chat history there, and also loads models from its models/ folder."
+mkfs.ext4 -F -L MOULI-DATA "$dev"
+echo "Done. MOULI will save settings and chat history there, and also loads models from its models/ folder."

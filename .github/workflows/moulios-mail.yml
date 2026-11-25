@@ -1,0 +1,39 @@
+name: MOULI-MAIL Rust CI
+
+on:
+  push:
+    paths:
+      - "crates/mouli-mail/**"
+      - ".github/workflows/moulios-mail.yml"
+  pull_request:
+    paths:
+      - "crates/mouli-mail/**"
+      - ".github/workflows/moulios-mail.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mouli-mail
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mail
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Compile
+        run: cargo check --all-targets
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets
+      - name: Release build
+        run: cargo build --release

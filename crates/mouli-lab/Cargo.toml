@@ -1,0 +1,21 @@
+[package]
+name = "mouli-lab"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-LAB: a standard-library-only research harness for the Aetheron dendritic model: gradient-checked layers, MLP/EWC baselines, a Split-MNIST continual benchmark and temporal (delayed-match) models. Research code, not product code."
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# Numerical research code: indexed loops mirror the maths and are checked by gradient tests.
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+manual_memcpy = "allow"

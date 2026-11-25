@@ -1,0 +1,17 @@
+[package]
+name = "mouli-hosted"
+version = "0.1.0"
+description = "Hosted-model chat client (OpenAI-compatible, streaming) over MOULI's own HTTPS, with API key storage"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mouli-http = { path = "../mouli-http" }
+mouli-gateway = { path = "../mouli-gateway" }
+
+[dev-dependencies]
+mouli-pki = { path = "../mouli-pki" }
+
+[lints]
+workspace = true

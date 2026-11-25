@@ -1,0 +1,10 @@
+[package]
+name = "mouli-core"
+version = "0.1.0"
+description = "MOULI object model: kernel objects, capability registry, cognitive engine and agent lifecycle"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "mouli-orchestra"
+version = "0.1.0"
+description = "MOULI multi-agent orchestration: registry, routing, consensus, governance, resilience, gated self-repair"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

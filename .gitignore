@@ -1,7 +1,12 @@
 # Rust
 target/
 
+# Python
+__pycache__/
+*.pyc
+
 # never commit model weights or caches
 *.safetensors
 *.gguf
 *.bin
+!crates/mouli-screen/fonts/*.bin

@@ -1,0 +1,13 @@
+[package]
+name = "mouli-interface"
+version = "0.1.0"
+description = "MOULI main interface: governed conversation workspace shared by all applications (sessions, intents, artifacts, approvals, policy, data washing, model routing, audit)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

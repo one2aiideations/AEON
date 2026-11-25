@@ -1,0 +1,60 @@
+# @PRODUCT_NAME@ - Release Notes
+Version @VERSION@ - @DATE@
+
+Author: Chandra Mouli Krishna Moorthy - cmklive@gmail.com
+
+## What this release is
+
+A bootable, Linux-based image of @PRODUCT_NAME@ for 64-bit PCs. It starts from a USB stick (BIOS and UEFI), shows the MOULI logo, probes the hardware, lets you pick a language model from a disk or USB stick, and chats with it locally and offline, in a graphical desktop window (or on the text console if no screen or input device can be used). Optionally it connects over Ethernet or Wi-Fi, and can chat with a hosted model after you agree that messages leave the computer.
+
+ISO SHA-256: @ISO_SHA256@
+
+## What is in the image
+
+- Linux kernel 6.18 with drivers for common wired and Wi-Fi adapters and the firmware for common Intel, Realtek, MediaTek and Atheros Wi-Fi chips.
+- moulid, the MOULI start-up program written in Rust: console, networking, hardware plan, model menu, chat, saving settings.
+- llama.cpp as the local inference engine (CPU).
+- A small set of system tools (BusyBox, wpa_supplicant, iw).
+
+Licences of all parts are listed in 05-Licensing/LICENSE.txt.
+
+## Features
+
+- Start-up logo with the product and author details.
+- Hardware report and automatic choice of threads and context size.
+- Model menu listing every .gguf file on any disk or USB stick, with a memory check.
+- Graphical desktop drawn on the screen's framebuffer: menu bar, icons and windows, with the chat in a window. Keyboard (US layout), a USB or PS/2 mouse, touchpads (Apple, Elan, Synaptics and multitouch pads: move, tap to click, press to click, two-finger scroll) and Bluetooth mice and trackpads. Mice and touchpads plugged in or connected after the desktop started are picked up, and the chat window lists the input devices found. Keys: Enter sends, Ctrl+L starts a new chat, F1 to F10 open windows, Ctrl+Q shuts down. Add mouli.text=1 to the kernel command line for the text chat only.
+- Bluetooth: press b in the model menu to scan, pair, trust and connect a mouse or trackpad that pairs without a code (BlueZ). With a MOULI-DATA partition the pairing is kept in plain text on it and reconnects at the next start.
+- With a MOULI-DATA partition, the Sheet and Studio documents are saved under apps/ and the Code window opens the folder projects/ on it. Without one nothing is saved, and the desktop says so.
+- Text chat with commands /models, /clear and /quit when the desktop is not used.
+- Optional MOULI-DATA partition that keeps the last model used and the chat logs.
+- Wired network by DHCP, clock set from the network, Wi-Fi setup screen, hosted-model chat with key entry and washing of emails, card numbers and passwords.
+
+## How it was tested
+
+- Automated tests of the Rust code (unit and integration).
+- The image is built and started in QEMU under BIOS and UEFI with a very small test model. The test checks the start-up output, a chat reply, saving to a MOULI-DATA disk and reading it back, wired networking, and Wi-Fi against virtual radios.
+- The screen is checked with a virtual display under BIOS and UEFI.
+- The desktop was tested in QEMU with a virtual screen, keyboard and mouse: it drew, took typed text, answered through the model and followed mouse movement.
+- The text chat (version 1.0) was reported working by the author on one 2017 MacBook Air with a Qwen model. The desktop has NOT yet been tried on a real PC.
+- It has NOT been tested with real Wi-Fi radios, or for speed and memory with a full-size model.
+
+## Known limitations
+
+- In the desktop the Chat, Sheet, Studio, Code, Approvals, Audit and Security windows are connected to the governed workspace (policy, approvals, audit chain). The Player window keeps a queue but there is no video player, sound or browser in this image, so nothing can be played. The CRM has no window yet.
+- Choosing a model is still done in the text menu before the desktop starts.
+- Touchpads and Bluetooth are NEW and have not been tried on real hardware: only generated finger events and a virtual setup were tested. The pointer scale on a touchpad is learned, so the first sweep across the pad may overshoot. Bluetooth needs an adapter whose firmware is built in or included (CSR and Intel adapters work; many Broadcom and some Realtek ones need a firmware file that is not in this image). Keyboards that ask you to type a code, headsets and audio are not supported. The keyboard layout is US.
+- CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
+- Secure Boot must be off. There is no installer: it runs from the stick and keeps nothing unless a MOULI-DATA partition is present.
+- US keyboard layout only.
+- Wi-Fi: no WPA3-only, enterprise or hidden networks; networks are not remembered after a restart; Broadcom chips are not supported.
+- The program that starts the system does not handle the terminate signal and does not clean up orphaned processes.
+- Chat logs and a saved API key on the MOULI-DATA partition are stored as plain text.
+
+## Upgrading
+
+There is nothing to upgrade in place. Write the new ISO to the stick as described in the Installation Guide. Files on a separate MOULI-DATA partition are kept as long as that partition is not overwritten.
+
+## Verifying this release
+
+Use the SHA256SUMS file in 03-Verification as described in the Installation Guide.

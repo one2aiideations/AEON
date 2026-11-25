@@ -1,0 +1,22 @@
+[package]
+name = "mouli-device"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MOULI-DEVICE: the controller that connects the on-device screens to the governed workspace (policy, approvals, audit chain) and to code review/apply. Not yet linked into moulid."
+
+[dependencies]
+mouli-screen = { path = "../mouli-screen" }
+mouli-interface = { path = "../mouli-interface" }
+mouli-code = { path = "../mouli-code" }
+mouli-apps = { path = "../mouli-apps" }
+mouli-player = { path = "../mouli-player" }
+mouli-studio = { path = "../mouli-studio" }
+
+[dev-dependencies]
+tempfile = "3"
+mouli-desk = { path = "../mouli-desk" }
+
+[lints]
+workspace = true
