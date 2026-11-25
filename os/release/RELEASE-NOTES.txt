@@ -1,0 +1,53 @@
+# @PRODUCT_NAME@ - Release Notes
+Version @VERSION@ - @DATE@
+
+Author: Chandra Mouli Krishna Moorthy - cmklive@gmail.com
+
+## What this release is
+
+A bootable image of @PRODUCT_NAME@ for 64-bit PCs. It starts from a USB stick (BIOS and UEFI), shows the MOULI logo, probes the hardware, lets you pick a language model from a disk or USB stick, and chats with it on the console, locally and offline. Optionally it connects over Ethernet or Wi-Fi, and can chat with a hosted model after you agree that messages leave the computer.
+
+ISO SHA-256: @ISO_SHA256@
+
+## What is in the image
+
+- Linux kernel 6.18 with drivers for common wired and Wi-Fi adapters and the firmware for common Intel, Realtek, MediaTek and Atheros Wi-Fi chips.
+- moulid, the MOULI start-up program written in Rust: console, networking, hardware plan, model menu, chat, saving settings.
+- llama.cpp as the local inference engine (CPU).
+- A small set of system tools (BusyBox, wpa_supplicant, iw).
+
+Licences of all parts are listed in 05-Licensing/LICENSE.txt.
+
+## Features
+
+- Start-up logo with the product and author details.
+- Hardware report and automatic choice of threads and context size.
+- Model menu listing every .gguf file on any disk or USB stick, with a memory check.
+- Chat with commands /models, /clear and /quit.
+- Optional MOULI-DATA partition that keeps the last model used and the chat logs.
+- Wired network by DHCP, clock set from the network, Wi-Fi setup screen, hosted-model chat with key entry and washing of emails, card numbers and passwords.
+
+## How it was tested
+
+- Automated tests of the Rust code (unit and integration).
+- The image is built and started in QEMU under BIOS and UEFI with a very small test model. The test checks the start-up output, a chat reply, saving to a MOULI-DATA disk and reading it back, wired networking, and Wi-Fi against virtual radios.
+- The screen is checked with a virtual display under BIOS and UEFI.
+- It has NOT been tested on real PCs, with real Wi-Fi radios, or for speed and memory with a full-size model.
+
+## Known limitations
+
+- Text interface only. The desktop and application screens that exist in the source are not part of this image yet.
+- CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
+- Secure Boot must be off. There is no installer: it runs from the stick and keeps nothing unless a MOULI-DATA partition is present.
+- US keyboard layout only.
+- Wi-Fi: no WPA3-only, enterprise or hidden networks; networks are not remembered after a restart; Broadcom chips are not supported.
+- The program that starts the system does not handle the terminate signal and does not clean up orphaned processes.
+- Chat logs and a saved API key on the MOULI-DATA partition are stored as plain text.
+
+## Upgrading
+
+There is nothing to upgrade in place. Write the new ISO to the stick as described in the Installation Guide. Files on a separate MOULI-DATA partition are kept as long as that partition is not overwritten.
+
+## Verifying this release
+
+Use the SHA256SUMS file in 03-Verification as described in the Installation Guide.

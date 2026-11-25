@@ -1,0 +1,97 @@
+# @PRODUCT_NAME@ - Installation Guide
+Version @VERSION@ - @DATE@
+
+@PRODUCT_NAME@ runs from a USB stick. It does not install onto the computer's internal disk and it does not change what is already on it. Remove the stick and the computer is as it was.
+
+## 1. What you need
+
+- A 64-bit PC (x86_64) with a CPU from 2013 or later (it must support AVX2; MOULI warns at start if it does not).
+- Memory for the model you want to use. A model must fit in free RAM; the model menu marks the ones that do not.
+- A USB stick at least as large as the ISO file (about @ISO_SIZE_MB@ MB). Everything on it will be erased.
+- A second USB stick or a disk holding at least one language model file ending in .gguf (a model of 1 to 3 billion parameters in Q4_K_M form is a good start).
+- A keyboard. USB, PS/2 and I2C-HID keyboards work; the layout is US.
+
+## 2. Check that the download is intact
+
+Open a terminal in the release folder (the folder @PRODUCT_FOLDER@, which contains 01-ISO) and run the check that matches your system. Every line must say OK.
+
+Linux:
+
+    sha256sum -c 03-Verification/SHA256SUMS
+
+macOS:
+
+    shasum -a 256 -c 03-Verification/SHA256SUMS
+
+Windows (PowerShell): print the value and compare it with the line for the ISO in 03-Verification\SHA256SUMS:
+
+    Get-FileHash 01-ISO\@PRODUCT_FILE@.iso -Algorithm SHA256
+
+The expected SHA-256 of the ISO is:
+
+    @ISO_SHA256@
+
+If a check fails, download the files again. Do not use a stick written from a file that fails the check.
+
+## 3. Write the ISO to the USB stick
+
+The ISO is a raw disk image. Write it as an image, not as a file copy. Writing erases the whole stick.
+
+Linux. First find the stick's device name with lsblk (for example /dev/sdb). Choosing the wrong device destroys that device's data.
+
+    lsblk
+    sudo dd if=01-ISO/@PRODUCT_FILE@.iso of=/dev/sdX bs=4M conv=fsync status=progress
+
+macOS. Find the stick with diskutil list (for example disk4), unmount it, then write to the raw device:
+
+    diskutil list
+    diskutil unmountDisk /dev/diskN
+    sudo dd if=01-ISO/@PRODUCT_FILE@.iso of=/dev/rdiskN bs=4m
+
+Windows. Use Rufus or balenaEtcher. In Rufus choose the ISO and, when asked, pick "DD Image mode" (not "ISO Image mode"). In balenaEtcher choose "Flash from file".
+
+## 4. Start the computer from the stick
+
+- Turn Secure Boot off in the firmware settings. The MOULI kernel is not signed, so a computer with Secure Boot on will refuse to start it.
+- Start the computer and open the one-time boot menu (usually F12, F10, F9, Esc or F2 at power-on) and choose the USB stick. Both BIOS and UEFI start-up are supported.
+- In the MOULI menu choose "MOULI". If the screen stays blank, restart and choose "safe graphics" or "verbose boot messages".
+
+## 5. First start
+
+MOULI shows its logo, then the hardware it found and the plan it made. It then lists every .gguf model on any disk or USB stick that is plugged in.
+
+- Type the number of a model and press Enter. When it has loaded you can chat.
+- To use a model on a second stick, plug it in and press r then Enter in the menu to look again.
+- Commands in the chat: /models changes model, /clear starts over, /quit powers the computer off.
+
+## 6. Keeping settings and chat history (optional)
+
+MOULI runs from memory. By default nothing is saved. To keep the last model you used and your chat logs, give it a partition with a filesystem labelled MOULI-DATA (ext4 or FAT, on any disk or USB stick). It is found at start without any setup.
+
+To make one, create an empty partition in free space with any partition tool, then give it the label MOULI-DATA. On Linux, for a partition such as /dev/sdb3 that is not mounted (check with lsblk first; this erases it):
+
+    sudo mkfs.ext4 -L MOULI-DATA /dev/sdb3
+
+Chat logs on that partition are plain text: anyone who has the stick can read them. A .gguf file placed in the models folder of that partition appears in the model menu.
+
+## 7. Network, Wi-Fi and hosted models (optional)
+
+- Wired Ethernet comes up by itself. MOULI prints one line with its address, or says it is offline.
+- For Wi-Fi press w in the model menu, pick a network by number and type the password. WPA and WPA2 personal and open networks work. WPA3-only, enterprise (802.1X) and hidden networks do not, and networks are not remembered after a restart.
+- To chat with a hosted model press h in the model menu. You enter the provider's address (https), the model name and your API key, and you must agree that your messages leave the computer. Email addresses, card numbers and passwords are replaced before sending. Local models never use the network.
+
+## 8. Stopping
+
+Type /quit in the chat to power off. If you use a MOULI-DATA partition, always power off this way so it is unmounted cleanly. Then remove the stick.
+
+## 9. If something goes wrong
+
+- Black screen: choose "safe graphics" or "verbose boot messages" in the boot menu.
+- The computer does not offer the stick: turn Secure Boot off and check the stick was written as a raw image (step 3).
+- Warning about AVX2: the computer is too old for the inference engine and may crash.
+- A model is marked as too large: choose a smaller or more compressed model, or use a computer with more memory.
+- No models found: the file must end in .gguf and be on a disk or stick that is plugged in; press r then Enter.
+
+## 10. Author and contact
+
+Chandra Mouli Krishna Moorthy - cmklive@gmail.com

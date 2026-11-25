@@ -1,0 +1,46 @@
+@PRODUCT_NAME@ - Licensing
+Version @VERSION@
+
+Copyright (c) 2026 Chandra Mouli Krishna Moorthy (cmklive@gmail.com)
+
+1. MOULI components
+-------------------
+The MOULI start-up program (moulid), the build scripts and the other components written for
+@PRODUCT_NAME@ are copyright of the author named above. A licence for them has not yet been
+published. Until the author publishes one, all rights are reserved and no permission is granted
+beyond running the image as supplied. THE AUTHOR MUST CONFIRM OR REPLACE THIS SECTION BEFORE THE
+RELEASE IS DISTRIBUTED.
+
+2. Other software in the image
+------------------------------
+The image also contains software written by others. It is distributed under its own licence,
+which applies to that software and not to section 1:
+
+  Linux kernel                   GNU General Public License, version 2 only
+  GRUB boot loader               GNU General Public License, version 3 or later
+  BusyBox                        GNU General Public License, version 2
+  C library and runtime          GNU Lesser General Public License, version 2.1 or later
+  llama.cpp and ggml             MIT Licence
+  wpa_supplicant                 BSD 3-clause licence
+  iw, wireless-regdb             ISC licence
+  CA certificate bundle          Mozilla Public Licence, version 2.0
+  Firmware files for Wi-Fi       The licences in the linux-firmware WHENCE file; redistribution
+                                 is permitted by each
+
+The full texts of these licences are in the source packages named in section 3 and at
+https://www.gnu.org/licenses/ , https://opensource.org/licenses/ and https://www.mozilla.org/MPL/2.0/ .
+
+3. Source code
+--------------
+The image is built with Buildroot 2026.02.3 from the recipes in
+https://github.com/one2aiideations/MOULI (directory os/). The corresponding source of the
+GPL and LGPL parts listed above is the source that Buildroot downloads for that version
+(https://buildroot.org/downloads/ and the upstream project of each package). The author will
+send the corresponding source of those parts on request to the address above.
+
+4. No warranty
+--------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM THE USE OF THE SOFTWARE. This release has been tested in QEMU only.

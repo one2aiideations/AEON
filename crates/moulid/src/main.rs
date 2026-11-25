@@ -396,6 +396,7 @@ fn main() -> ExitCode {
     if cmdline_has(&system::kernel_cmdline(), "mouli.selftest=1") {
         args.selftest = true;
     }
+    say(&moulid::banner::banner(moulid::VERSION));
     say(&format!(
         "MOULI {} - AI-native OS{}",
         moulid::VERSION,

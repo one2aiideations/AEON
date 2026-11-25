@@ -2,7 +2,7 @@
 
 Builds a bootable MOULI x86_64 system with Buildroot: a Linux 6.18 kernel, **moulid** as PID 1 and
 **llama.cpp** as the local inference engine. `moulid` is the Rust crate `crates/moulid` (static musl binary,
-built by `os/build.sh`); Buildroot builds the kernel, libc and llama.cpp. On boot moulid probes the hardware, picks threads and
+built by `os/build.sh`); Buildroot builds the kernel, libc and llama.cpp. On boot moulid shows the MOULI OS logo with the author's name and email (`crates/moulid/src/banner.rs`), probes the hardware, picks threads and
 context size, starts `llama-server` on 127.0.0.1, prints `MOULI ready` and offers a chat on the
 console. With `mouli.selftest=1` it sends one prompt, prints the reply and powers off; CI uses this.
 
@@ -53,8 +53,7 @@ for an address with DHCP and prints one line, for example
 `MOULI network: eth0 192.168.1.20/24, dns 192.168.1.1`, or says it is offline. Intel, Realtek,
 Broadcom and Atheros adapters and common USB Ethernet dongles are built in. MOULI only asks your
 network for an address; it does not contact the internet by itself, and the assistant is still
-told it runs offline. The system clock is set from the PC's hardware clock (no network time yet).
-**Wi-Fi is not supported yet**: it needs wireless drivers, firmware files and a connect screen.
+told it runs offline. The system clock starts from the PC's hardware clock and is then set from three network time servers when the network is up. Wi-Fi is described below.
 
 Self-test without a keyboard: `mouli.selftest=1` on the kernel command line loads the baked-in
 model, sends one prompt and powers off. CI boots the ISO under BIOS and UEFI this way.
@@ -78,6 +77,7 @@ model). RAM must hold the model; give QEMU more memory with `-m` in `os/run-qemu
 | `../crates/moulid/` | The init (Rust): mounts, console, loopback, wired network, hardware plan, server supervision, chat, self-test |
 | `tools/make_tiny_gguf.py` | Writes a tiny llama-architecture GGUF for tests |
 | `tools/make-data-partition.sh` | Formats an existing partition as the MOULI-DATA partition |
+| `release/` | Builds the release folder: ISO, installation guide PDF, `SHA256SUMS`, release notes PDF, `LICENSE.txt` (see `release/README.md`) |
 
 Status: verified in QEMU only, not on real hardware. CI builds the image, boots the ISO under BIOS
 and UEFI, loads the tiny test model, gets a chat reply and passes the self-test; the BIOS run also
@@ -116,4 +116,4 @@ Not supported: WPA3-only and enterprise (802.1X) networks, hidden networks, reme
 Passwords go only to a mode-0600 file in RAM. CI tests the whole path on two virtual radios
 (`mac80211_hwsim`): one is an access point, the other scans, must refuse a wrong password and join with the
 right one. Real radios are not tested. The clock matters for hosted models: certificates are checked
-against the date, which MOULI takes from the hardware clock (no network time yet).
+against the date, which MOULI takes from the hardware clock and corrects from the network.

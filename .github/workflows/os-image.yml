@@ -26,6 +26,8 @@ concurrency:
 
 env:
   BR_VERSION: "2026.02.3"
+  # The version in the release folder name and documents (MOULI-OS-Release-v<version>).
+  MOULI_RELEASE_VERSION: "1.0"
   BR2_DL_DIR: ${{ github.workspace }}/../br-dl
 
 jobs:
@@ -80,6 +82,9 @@ jobs:
       - name: Unit tests for moulid (host)
         run: cargo test --locked -p moulid -p mouli-hw
 
+      - name: Tests for the release packaging (PDF writer and release folder script)
+        run: python3 -m unittest discover -s os/release -v
+
       - name: Create the tiny test model
         run: python3 os/tools/make_tiny_gguf.py "$RUNNER_TEMP/mouli-tiny.gguf"
 
@@ -91,6 +96,16 @@ jobs:
 
       - name: Build the release ISO (no model; users bring their own)
         run: os/make-iso.sh "$RUNNER_TEMP/mouli-out" "$RUNNER_TEMP/mouli-out/images/mouli.iso"
+
+      - name: Assemble the release folder (ISO, installation guide, checksums, release notes, licence)
+        run: |
+          os/release/make-release.sh "$RUNNER_TEMP/mouli-out/images/mouli.iso" "$RUNNER_TEMP/release" "$MOULI_RELEASE_VERSION"
+          (cd "$RUNNER_TEMP/release/MOULI-OS-Release-v$MOULI_RELEASE_VERSION" && sha256sum -c 03-Verification/SHA256SUMS)
+          if command -v pdftotext >/dev/null; then
+            for f in 02-Installation-Guide/Installation-Guide.pdf 04-Release-Notes/Release-Notes.pdf; do
+              pdftotext "$RUNNER_TEMP/release/MOULI-OS-Release-v$MOULI_RELEASE_VERSION/$f" - | grep -q "Chandra Mouli Krishna Moorthy"
+            done
+          fi
 
       - name: Check that the screen (not just the serial console) shows output, BIOS and UEFI
         run: |
@@ -130,6 +145,8 @@ jobs:
             -device ich9-ahci,id=ahci -drive if=none,id=data,file="$DATA",format=raw \
             -device ide-hd,drive=data,bus=ahci.0 -nic user,model=e1000 \
             -cdrom "$RUNNER_TEMP/mouli-test.iso" -boot d -nographic -no-reboot | tee boot-bios.log || true
+          grep -q "Chandra Mouli Krishna Moorthy" boot-bios.log
+          grep -q "cmklive@gmail.com" boot-bios.log
           grep -q "MOULI hardware:" boot-bios.log
           grep -q "MOULI ready" boot-bios.log
           grep -q "MOULI chat reply:" boot-bios.log
@@ -151,6 +168,8 @@ jobs:
           ACCEL="-cpu max"; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
           timeout 1500 qemu-system-x86_64 -M q35 -m 2048 -smp 2 $ACCEL -bios "$OVMF" -nic user,model=e1000e \
             -cdrom "$RUNNER_TEMP/mouli-test.iso" -boot d -nographic -no-reboot | tee boot-uefi.log || true
+          grep -q "Chandra Mouli Krishna Moorthy" boot-uefi.log
+          grep -q "cmklive@gmail.com" boot-uefi.log
           grep -q "MOULI hardware:" boot-uefi.log
           grep -q "MOULI ready" boot-uefi.log
           grep -q "MOULI chat reply:" boot-uefi.log
@@ -167,6 +186,15 @@ jobs:
           cp "$RUNNER_TEMP/mouli-out/images/mouli.iso" iso/ || true
           cp boot-bios.log boot-uefi.log artifact/ || true
           cp "$RUNNER_TEMP/mouli-out/images/bzImage" "$RUNNER_TEMP/mouli-out/images/rootfs.cpio.gz" artifact/ || true
+
+      - name: Upload the release folder
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MOULI-OS-Release-v${{ env.MOULI_RELEASE_VERSION }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload the ISO (the only file you need for a USB stick)
         if: always()
