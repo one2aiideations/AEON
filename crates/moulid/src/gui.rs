@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The framebuffer device.
 pub const FB_DEVICE: &str = "/dev/fb0";
@@ -308,6 +308,8 @@ impl KeyDecoder {
 /// Something that happened.
 #[derive(Debug)]
 pub enum Ev {
+    /// An input device appeared after the desktop started (the message names it).
+    NewInput(String),
     /// The mouse did something.
     Mouse(MouseEvent),
     /// A key was pressed.
@@ -400,6 +402,18 @@ impl InputSummary {
 /// to a screen `screen_w` pixels wide. Each device has its own reader thread, which ends when the
 /// device goes away or the receiver is dropped.
 pub fn spawn_inputs(dir: &Path, sys: &Path, screen_w: i32, tx: &Sender<Ev>) -> InputSummary {
+    scan_inputs(dir, sys, screen_w, tx, &mut BTreeSet::new())
+}
+
+/// Like [`spawn_inputs`], but skips the nodes in `seen` and adds the ones it opens to it, so it
+/// can be called again to find devices that appear later (a USB or Bluetooth mouse).
+pub fn scan_inputs(
+    dir: &Path,
+    sys: &Path,
+    screen_w: i32,
+    tx: &Sender<Ev>,
+    seen: &mut BTreeSet<String>,
+) -> InputSummary {
     let mut summary = InputSummary::default();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return summary;
@@ -408,7 +422,7 @@ pub fn spawn_inputs(dir: &Path, sys: &Path, screen_w: i32, tx: &Sender<Ev>) -> I
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let node = entry.file_name().to_string_lossy().into_owned();
-        if !node.starts_with("event") {
+        if !node.starts_with("event") || seen.contains(&node) {
             continue;
         }
         let base = sys.join(&node).join("device");
@@ -436,6 +450,7 @@ pub fn spawn_inputs(dir: &Path, sys: &Path, screen_w: i32, tx: &Sender<Ev>) -> I
         let Ok(mut file) = File::open(entry.path()) else {
             continue;
         };
+        seen.insert(node.clone());
         if roles.keyboard {
             summary.keyboards.push(name.clone());
         }
@@ -478,6 +493,42 @@ pub fn spawn_inputs(dir: &Path, sys: &Path, screen_w: i32, tx: &Sender<Ev>) -> I
         });
     }
     summary
+}
+
+/// How often the desktop looks for newly connected input devices.
+const WATCH_EVERY: Duration = Duration::from_secs(2);
+
+/// Starts a thread that looks for input devices that appear later and reports each on `tx`. It
+/// stops when the receiver is gone.
+pub fn watch_inputs(
+    dir: std::path::PathBuf,
+    sys: std::path::PathBuf,
+    screen_w: i32,
+    tx: Sender<Ev>,
+    mut seen: BTreeSet<String>,
+) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(WATCH_EVERY);
+        let found = scan_inputs(&dir, &sys, screen_w, &tx, &mut seen);
+        let names: Vec<&String> = found
+            .keyboards
+            .iter()
+            .chain(&found.mice)
+            .chain(&found.touchpads)
+            .collect();
+        if !names.is_empty() {
+            let list: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            if tx
+                .send(Ev::NewInput(format!(
+                    "New input device: {}",
+                    list.join(", ")
+                )))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
 }
 
 // ------------------------------------------------------------------ console
@@ -642,10 +693,18 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     let device = build_device(data_dir)?;
     let (tx, rx) = channel();
     let width = i32::try_from(display.size().0).unwrap_or(1024);
-    let inputs = spawn_inputs(Path::new(INPUT_DIR), Path::new(INPUT_SYS), width, &tx);
+    let mut seen = BTreeSet::new();
+    let inputs = scan_inputs(
+        Path::new(INPUT_DIR),
+        Path::new(INPUT_SYS),
+        width,
+        &tx,
+        &mut seen,
+    );
     if inputs.keyboards.is_empty() && !inputs.has_pointer() {
         return Err("no keyboard, mouse or touchpad found in /dev/input".into());
     }
+    watch_inputs(INPUT_DIR.into(), INPUT_SYS.into(), width, tx.clone(), seen);
     let mut s = Session::new(display, tx, rx, device);
     s.saving = data_dir.is_some();
     s.inputs = inputs;
@@ -739,6 +798,10 @@ where
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
                 Ev::Reply(r) => {
                     on_reply(&mut device.shell, &mut history, r);
+                    Action::None
+                }
+                Ev::NewInput(text) => {
+                    device.shell.chat.push(Role::Notice, &text);
                     Action::None
                 }
             };
@@ -1084,9 +1147,13 @@ mod tests {
             tx.send(e).unwrap();
         }
         let t2 = tx.clone();
+        let seen = shots.clone();
         let quitter = std::thread::spawn(move || {
-            // Wait until the reply has been drawn, then shut down.
-            std::thread::sleep(std::time::Duration::from_millis(600));
+            // Wait until the reply has been drawn (start, keys, reply), then shut down.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
         });
         let end = run(session, Echo, "be nice", 10_000, "tiny").unwrap();
@@ -1243,6 +1310,32 @@ mod tests {
         assert_eq!(s.keyboards, vec!["Test keyboard"]);
         assert_eq!(s.mice, vec!["Test mouse"]);
         assert_eq!(s.touchpads, vec!["Test pad"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_device_that_appears_later_is_found_once() {
+        let root = tmp("later");
+        let (dev, sys) = (root.join("dev"), root.join("sys"));
+        std::fs::create_dir_all(&dev).unwrap();
+        let (tx, _rx) = channel();
+        let mut seen = BTreeSet::new();
+        assert_eq!(
+            scan_inputs(&dev, &sys, 1280, &tx, &mut seen),
+            InputSummary::default()
+        );
+        // A mouse connects.
+        std::fs::write(dev.join("event7"), b"").unwrap();
+        let caps = sys.join("event7/device/capabilities");
+        std::fs::create_dir_all(&caps).unwrap();
+        std::fs::write(sys.join("event7/device/name"), "Late mouse\n").unwrap();
+        for (f, v) in [("key", "1f0000 0 0 0 0"), ("rel", "143"), ("abs", "0")] {
+            std::fs::write(caps.join(f), v).unwrap();
+        }
+        let first = scan_inputs(&dev, &sys, 1280, &tx, &mut seen);
+        assert_eq!(first.mice, vec!["Late mouse"]);
+        let again = scan_inputs(&dev, &sys, 1280, &tx, &mut seen);
+        assert_eq!(again, InputSummary::default(), "not opened twice");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

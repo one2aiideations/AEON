@@ -25,6 +25,7 @@
 pub mod args;
 pub mod backoff;
 pub mod banner;
+pub mod bluetooth;
 pub mod civil_time;
 pub mod clocksync;
 pub mod context;

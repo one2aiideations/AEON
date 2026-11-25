@@ -3,6 +3,7 @@
 
 use mouli_hw::{Hw, Plan};
 use moulid::args::{Args, DEFAULT_MODEL_DIR};
+use moulid::bluetooth;
 use moulid::clocksync;
 use moulid::gui;
 use moulid::hosted::{self, HostedBackend};
@@ -260,6 +261,27 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 }
                 continue;
             }
+            Choice::Bluetooth => {
+                if let Some(s) = store {
+                    if let Err(e) =
+                        bluetooth::persist_keys(s.root(), Path::new(bluetooth::STATE_DIR))
+                    {
+                        say(&format!("MOULI bluetooth: {e}"));
+                    }
+                } else {
+                    say(
+                        "MOULI bluetooth: no MOULI-DATA disk, so pairing is forgotten at power-off",
+                    );
+                }
+                let _ = bluetooth::pair_flow(
+                    &mut input,
+                    &mut out,
+                    &mut wifi::System,
+                    Path::new("/sys/class/rfkill"),
+                    Path::new(bluetooth::SYS_BLUETOOTH),
+                );
+                continue;
+            }
             Choice::Wifi => {
                 let joined = wifi::connect_flow(
                     &mut input,
@@ -460,6 +482,26 @@ fn main() -> ExitCode {
         }
     }
     let store = open_store(pid1);
+    if pid1 {
+        let sys = Path::new(bluetooth::SYS_BLUETOOTH);
+        let adapters = bluetooth::adapters(sys);
+        say(&bluetooth::summary(&adapters));
+        // A mouse paired in an earlier session reconnects by itself once the service is running.
+        if let (Some(s), false) = (&store, adapters.is_empty()) {
+            if bluetooth::has_saved_pairings(s.root())
+                && bluetooth::persist_keys(s.root(), Path::new(bluetooth::STATE_DIR)).is_ok()
+            {
+                match bluetooth::start_services(
+                    &mut wifi::System,
+                    Path::new("/sys/class/rfkill"),
+                    sys,
+                ) {
+                    Ok(()) => say("MOULI bluetooth: ready (paired devices reconnect when used)"),
+                    Err(e) => say(&format!("MOULI bluetooth: {e}")),
+                }
+            }
+        }
+    }
     if pid1 && !wired_up {
         if let Some(s) = &store {
             if let Some((ssid, result)) =
