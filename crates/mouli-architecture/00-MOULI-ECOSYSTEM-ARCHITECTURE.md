@@ -11,7 +11,7 @@ The architecture must avoid duplicate identity systems, competing databases, mul
 | Component | Sole responsibility |
 |---|---|
 | **MOULI** | AI/model runtime, compute and hardware execution |
-| **MOULI-AUTH (MOULI-AUTH)** | Enterprise identity, authentication, authorization, tenants, organizations, company/legal entity/plant hierarchy, policy, workflow, approvals and audit governance |
+| **MOULI-AUTH** | Enterprise identity, authentication, authorization, tenants, organizations, company/legal entity/plant hierarchy, policy, workflow, approvals and audit governance |
 | **MOULI-DATA** | Common persistence and data intelligence engine: relational, document, graph, vector, full-text, time-series, object, events and native MOULI-RAG |
 | **MOULI-AGENTS** | Agent registry, factory, teams, skills, tools, workflow design, governance, evaluations, operations centre and marketplace |
 | **AgentBox** | Actual agent execution, sessions, runtime lifecycle, orchestration and tool execution; integrated by MOULI-AGENTS |
@@ -71,9 +71,10 @@ MOULI-AGENTS owns agent definitions, configuration, registry, skills, tools, tea
 - MOULI-FINANCE
 - MOULI-COMMERCE
 
-### Intelligence and security
+### Intelligence, security and compliance
 - MOULI-INTELLIGENCE
 - MOULI-SECURITY
+- MOULI-COMPLIANCE
 
 ### Industry applications
 - MOULI-EDU
@@ -90,6 +91,7 @@ MOULI-AGENTS owns agent definitions, configuration, registry, skills, tools, tea
 - MOULI-COMMERCE owns commerce storefront, marketplace and order experiences; it integrates with ERP for inventory/accounting and Finance for regulated payment/financial services.
 - MOULI-INTELLIGENCE owns analytics and decision-support experiences; MOULI-DATA owns data storage and retrieval.
 - MOULI-SECURITY owns security product workflows; MOULI-AUTH remains the identity and authorization authority.
+- MOULI-COMPLIANCE owns regulatory frameworks, obligations, controls, evidence, assessments, privacy registers and compliance reporting; it uses MOULI-AUTH for workflow, approvals and audit, MOULI-DATA for persistence and MOULI-AGENTS for workflow design and agents, and does not certify compliance or give legal advice.
 - MOULI-WORK owns productivity experiences; MOULI-DATA owns persistence.
 - Industry applications use shared authorities and must not recreate them.
 

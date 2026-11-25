@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-MOULI owns model/runtime and compute execution. MOULIONE is the sole enterprise identity, authorization, tenancy, workflow, approval and audit authority. MOULI-DATA owns common persistence and native RAG. MOULI-AGENTS owns agent definitions and governance; AgentBox executes agent runs. Applications own their domain workflows and records.
+MOULI owns model/runtime and compute execution. MOULI-AUTH is the sole enterprise identity, authorization, tenancy, workflow, approval and audit authority. MOULI-DATA owns common persistence and native RAG. MOULI-AGENTS owns agent definitions and governance; AgentBox executes agent runs. Applications own their domain workflows and records.
 
 **Folder owner:** Architecture governance; this folder defines rules and does not own runtime data or application transactions.
 
@@ -20,7 +20,7 @@ This product must consume shared platform authorities through versioned interfac
 
 ## 3. Functional capability map
 
-- Canonical ownership for MOULI runtime, MOULIONE, MOULI-DATA, MOULI-AGENTS and AgentBox
+- Canonical ownership for MOULI runtime, MOULI-AUTH, MOULI-DATA, MOULI-AGENTS and AgentBox
 - Portfolio map and product-domain boundaries
 - Native MOULI-RAG ownership inside MOULI-DATA
 - Shared identity, tenant, authorization, data, audit, workflow, agent, event, file and observability contracts
@@ -33,7 +33,7 @@ Each capability should be tracked independently through discovery, design, imple
 
 1. A product proposal is mapped to an existing authority before implementation
 2. A cross-product request carries tenant, actor, authorization, correlation and audit context
-3. A data operation is authorized by MOULIONE and persisted through MOULI-DATA
+3. A data operation is authorized by MOULI-AUTH and persisted through MOULI-DATA
 4. An agent definition is managed by MOULI-AGENTS and executed through AgentBox
 5. An iteration is audited, tested and reported before readiness is raised
 
@@ -55,7 +55,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

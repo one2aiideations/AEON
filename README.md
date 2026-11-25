@@ -69,7 +69,7 @@ runs `moulid`'s own console.
 
 ## Product specifications (no code yet)
 
-`mouli-architecture`, `mouli-cloud`, `mouli-commerce`, `mouli-connect`, `mouli-edu`, `mouli-erp`,
+`mouli-architecture`, `mouli-cloud`, `mouli-commerce`, `mouli-compliance`, `mouli-connect`, `mouli-edu`, `mouli-erp`,
 `mouli-finance`, `mouli-health`, `mouli-insure`, `mouli-intelligence`, `mouli-legal`,
 `mouli-logistics`, `mouli-master-prompts` and `mouli-work` are specification folders only.
 
