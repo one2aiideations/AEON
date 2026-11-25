@@ -524,6 +524,95 @@ pub fn form_link(f: &FormSubmit) -> Option<String> {
     Some(format!("{base}?{}", f.query))
 }
 
+/// Most pictures fetched for one page.
+pub const MAX_IMAGES: usize = 24;
+/// Largest picture file or `data:` picture, in bytes.
+pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Decodes base64 (standard alphabet; whitespace and missing padding tolerated).
+#[must_use]
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        acc = acc << 6 | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+        if out.len() > MAX_IMAGE_BYTES {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The bytes inside a `data:` address (base64 or percent-encoded), if it is a picture.
+#[must_use]
+pub fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("data:")?;
+    let (head, body) = rest.split_once(',')?;
+    if !head.to_ascii_lowercase().starts_with("image/") {
+        return None;
+    }
+    if head.to_ascii_lowercase().ends_with(";base64") {
+        return base64_decode(body);
+    }
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+        if out.len() > MAX_IMAGE_BYTES {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The pictures a page uses: each `<img src>` as written, with the address to fetch it from (an
+/// absolute address, or the `data:` address itself). At most [`MAX_IMAGES`], no duplicates.
+#[must_use]
+pub fn image_refs(html: &str, base: &str) -> Vec<(String, String)> {
+    let dom = Dom::parse(html);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for n in dom.find_all("img") {
+        let Some(raw) = dom.attr(n, "src") else {
+            continue;
+        };
+        if out.iter().any(|(r, _)| r == raw) || out.len() >= MAX_IMAGES {
+            continue;
+        }
+        let target = if raw.trim_start().to_ascii_lowercase().starts_with("data:") {
+            raw.trim().to_string()
+        } else if let Some(a) = resolve(base, raw) {
+            a.without_fragment()
+        } else {
+            continue;
+        };
+        out.push((raw.to_string(), target));
+    }
+    out
+}
+
 /// Turns the bytes of a response into text: UTF-8, or Latin-1 when the content type says so.
 #[must_use]
 pub fn decode_body(bytes: &[u8], content_type: &str) -> String {
@@ -861,5 +950,48 @@ mod tests {
         assert_eq!(form_of(&d, id("t")), d.find_all("form").first().copied());
         let lone = Dom::parse("<input id=q>");
         assert!(form_of(&lone, lone.by_id("q").unwrap()).is_none());
+    }
+
+    #[test]
+    fn pictures_are_listed_and_data_addresses_decoded() {
+        assert_eq!(base64_decode("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(base64_decode("aGVs\nbG8").as_deref(), Some(&b"hello"[..]));
+        assert!(base64_decode("a$b").is_none());
+        assert_eq!(
+            decode_data_uri("data:image/png;base64,aGk=").as_deref(),
+            Some(&b"hi"[..])
+        );
+        assert_eq!(
+            decode_data_uri("data:image/gif,%47IF8").as_deref(),
+            Some(&b"GIF8"[..])
+        );
+        assert!(
+            decode_data_uri("data:text/html;base64,aGk=").is_none(),
+            "only pictures"
+        );
+        assert!(decode_data_uri("data:image/png;base64,").is_some());
+        assert!(decode_data_uri("data:image/png,%zz").is_none());
+        let html = "<img src=a.png><img src='/b.jpg?x=1'><img src=a.png><img src='data:image/gif;base64,R0lG'><img src='javascript:x'><img><img src='https://cdn.com/c.gif#f'>";
+        let refs = image_refs(html, "https://s.org/dir/p.html");
+        assert_eq!(
+            refs,
+            vec![
+                ("a.png".to_string(), "https://s.org/dir/a.png".to_string()),
+                (
+                    "/b.jpg?x=1".to_string(),
+                    "https://s.org/b.jpg?x=1".to_string()
+                ),
+                (
+                    "data:image/gif;base64,R0lG".to_string(),
+                    "data:image/gif;base64,R0lG".to_string()
+                ),
+                (
+                    "https://cdn.com/c.gif#f".to_string(),
+                    "https://cdn.com/c.gif".to_string()
+                ),
+            ]
+        );
+        let many: String = (0..60).map(|i| format!("<img src=/{i}.png>")).collect();
+        assert_eq!(image_refs(&many, "https://a.com/").len(), MAX_IMAGES);
     }
 }

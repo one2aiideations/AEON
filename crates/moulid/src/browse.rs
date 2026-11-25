@@ -11,6 +11,8 @@ use std::io::Read;
 
 /// Largest page read, in bytes.
 pub const MAX_PAGE: u64 = 2 * 1024 * 1024;
+/// Most picture bytes fetched for one page.
+pub const MAX_IMAGE_TOTAL: usize = 12 * 1024 * 1024;
 /// Largest style sheet or script read, in bytes.
 pub const MAX_RESOURCE: u64 = 512 * 1024;
 
@@ -21,6 +23,8 @@ pub struct Loaded {
     pub url: String,
     /// The page, with its style sheets and scripts inside it.
     pub html: String,
+    /// The decoded pictures, by the `src` the page wrote.
+    pub images: HashMap<String, mouli_web::image::Bitmap>,
 }
 
 fn headers() -> Vec<(String, String)> {
@@ -47,6 +51,36 @@ fn read_limited(mut r: Box<dyn Read>, limit: u64) -> Result<Vec<u8>, String> {
 }
 
 pub use mouli_web::browser::error_page;
+
+/// Fetches and decodes the pictures a page uses. A picture that cannot be fetched or decoded is
+/// simply left out (the page shows its alternative text instead).
+fn load_images<F: Fetcher>(
+    fetcher: &F,
+    html: &str,
+    base: &str,
+) -> HashMap<String, mouli_web::image::Bitmap> {
+    let mut out = HashMap::new();
+    let mut total = 0usize;
+    for (raw, target) in browser::image_refs(html, base) {
+        let bytes = if target.starts_with("data:") {
+            browser::decode_data_uri(&target)
+        } else if total < MAX_IMAGE_TOTAL {
+            fetcher
+                .get(&target, &headers())
+                .ok()
+                .filter(|r| (200..300).contains(&r.status))
+                .and_then(|r| read_limited(r.body, browser::MAX_IMAGE_BYTES as u64).ok())
+        } else {
+            None
+        };
+        let Some(bytes) = bytes else { continue };
+        total += bytes.len();
+        if let Ok(bm) = mouli_web::image::decode(&bytes) {
+            out.insert(raw, bm);
+        }
+    }
+    out
+}
 
 /// Loads `url`: redirects (at most [`MAX_REDIRECTS`]), size limits, the page's style sheets and
 /// scripts. Plain text is shown as text; other file types are refused with a message.
@@ -100,7 +134,11 @@ pub fn load<F: Fetcher>(fetcher: &F, url: &str) -> Result<Loaded, String> {
         };
         if kind == Content::Text {
             let html = format!("<body style=\"margin:0;background:#fff\"><pre style=\"margin:0;padding:12px;font-size:12px;color:#212121\">{}</pre></body>", text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
-            return Ok(Loaded { url: shown, html });
+            return Ok(Loaded {
+                url: shown,
+                html,
+                images: HashMap::new(),
+            });
         }
         let (css_urls, js_urls) = browser::subresources(&text, &current);
         let fetch_text = |u: &String| -> Option<(String, String)> {
@@ -119,7 +157,12 @@ pub fn load<F: Fetcher>(fetcher: &F, url: &str) -> Result<Loaded, String> {
         } else {
             browser::inline_resources(&text, &current, &css, &js)
         };
-        return Ok(Loaded { url: shown, html });
+        let images = load_images(fetcher, &html, &current);
+        return Ok(Loaded {
+            url: shown,
+            html,
+            images,
+        });
     }
     Err("the site redirected too many times".into())
 }
@@ -312,6 +355,80 @@ mod tests {
                 && !l.html.contains("xxxx"),
             "{}",
             l.html
+        );
+    }
+
+    fn red_png(w: usize, h: usize) -> Vec<u8> {
+        let c = mouli_screen::raster::Canvas {
+            width: w,
+            height: h,
+            pixels: vec![0x00FF_0000; w * h],
+        };
+        mouli_screen::raster::to_png(&c)
+    }
+
+    #[test]
+    fn pictures_are_fetched_decoded_and_keyed_by_the_src_the_page_wrote() {
+        let png = red_png(4, 2);
+        let page = b"<img src=a.png><img src='/b.png'><img src=missing.png><img src=bad.png><img src='data:image/png;base64,AAAA'><p>x</p>";
+        let f = Fake::new(&[
+            (
+                "https://a.com/dir/p.html",
+                200,
+                &[("Content-Type", "text/html")],
+                page,
+            ),
+            (
+                "https://a.com/dir/a.png",
+                200,
+                &[("Content-Type", "image/png")],
+                &png,
+            ),
+            ("https://a.com/b.png", 200, &[], &png),
+            (
+                "https://a.com/dir/bad.png",
+                200,
+                &[],
+                b"not a picture at all",
+            ),
+        ]);
+        let l = load(&f, "https://a.com/dir/p.html").unwrap();
+        let mut keys: Vec<&String> = l.images.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["/b.png", "a.png"]);
+        let b = &l.images["a.png"];
+        assert_eq!((b.w, b.h, b.px[0]), (4, 2, 0xFFFF_0000));
+        // A real data: picture decodes without touching the network.
+        let data = format!("<img src=\"data:image/png;base64,{}\">", {
+            const T: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::new();
+            for ch in png.chunks(3) {
+                let n = (u32::from(ch[0]) << 16)
+                    | (u32::from(*ch.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*ch.get(2).unwrap_or(&0));
+                s.push(T[(n >> 18) as usize & 63] as char);
+                s.push(T[(n >> 12) as usize & 63] as char);
+                s.push(if ch.len() > 1 {
+                    T[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                s.push(if ch.len() > 2 {
+                    T[n as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+            s
+        });
+        let f2 = Fake::new(&[("https://a.com/", 200, &[], data.as_bytes())]);
+        let l2 = load(&f2, "https://a.com/").unwrap();
+        assert_eq!(l2.images.len(), 1);
+        assert_eq!(
+            f2.asked.borrow().len(),
+            1,
+            "only the page itself was fetched"
         );
     }
 

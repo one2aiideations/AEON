@@ -10,12 +10,39 @@ use crate::typeface::{self, blend, Face};
 use mouli_web::css::{State, Stylesheet};
 use mouli_web::display::{paint, Op};
 use mouli_web::dom::{Dom, NodeId};
+use mouli_web::image::Bitmap;
 use mouli_web::layout::{hit_test, layout, node_rect, FontSpec, Fonts, Layout, MarkerKind, Rect};
 use mouli_web::style::{compute, BorderStyle, Gradient, Viewport};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Measures text with the embedded faces, for layout.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WebFonts;
+
+/// The decoded pictures of a page, by the `src` they were asked for as.
+pub type Images = Rc<HashMap<String, Bitmap>>;
+
+/// Font measures plus the sizes of the page's decoded pictures.
+struct PageFonts<'a>(&'a HashMap<String, Bitmap>);
+
+impl Fonts for PageFonts<'_> {
+    fn text_width(&self, text: &str, f: &FontSpec) -> f32 {
+        WebFonts.text_width(text, f)
+    }
+    fn ascent(&self, f: &FontSpec) -> f32 {
+        WebFonts.ascent(f)
+    }
+    fn descent(&self, f: &FontSpec) -> f32 {
+        WebFonts.descent(f)
+    }
+    fn normal_line_height(&self, f: &FontSpec) -> f32 {
+        WebFonts.normal_line_height(f)
+    }
+    fn image_size(&self, src: &str) -> Option<(f32, f32)> {
+        self.0.get(src).map(|b| (b.w as f32, b.h as f32))
+    }
+}
 
 fn face_for(f: &FontSpec) -> &'static Face {
     if f.mono {
@@ -60,6 +87,7 @@ impl Fonts for WebFonts {
 
 struct Surface<'a> {
     c: &'a mut Canvas,
+    images: &'a HashMap<String, Bitmap>,
     clips: Vec<(i32, i32, i32, i32)>,
     ox: i32,
     oy: i32,
@@ -510,6 +538,18 @@ fn gradient_colour(stops: &[(f32, u32)], t: f32) -> u32 {
 /// Draws a display list onto `canvas`, with the page's top-left at (`x`, `y`) and everything
 /// clipped to `clip` (`x`, `y`, `w`, `h` in canvas pixels).
 pub fn draw(canvas: &mut Canvas, ops: &[Op], x: i32, y: i32, clip: (i32, i32, i32, i32)) {
+    draw_with_images(canvas, ops, x, y, clip, &HashMap::new());
+}
+
+/// Like [`draw`], with the decoded pictures the display list refers to.
+pub fn draw_with_images(
+    canvas: &mut Canvas,
+    ops: &[Op],
+    x: i32,
+    y: i32,
+    clip: (i32, i32, i32, i32),
+    images: &HashMap<String, Bitmap>,
+) {
     let (cw, ch) = (canvas.width as i32, canvas.height as i32);
     let base = (
         clip.0.max(0),
@@ -519,6 +559,7 @@ pub fn draw(canvas: &mut Canvas, ops: &[Op], x: i32, y: i32, clip: (i32, i32, i3
     );
     let mut s = Surface {
         c: canvas,
+        images,
         clips: vec![base],
         ox: x,
         oy: y,
@@ -581,41 +622,42 @@ pub fn draw(canvas: &mut Canvas, ops: &[Op], x: i32, y: i32, clip: (i32, i32, i3
                     MarkerKind::Text(t) => s.text(*x, *baseline, t, font, *color, false, false),
                 }
             }
+            Op::Image {
+                r,
+                src,
+                label,
+                font,
+                color,
+            } => {
+                if let Some(bm) = s
+                    .images
+                    .get(src.as_str())
+                    .filter(|_| r.w >= 1.0 && r.h >= 1.0)
+                {
+                    // Pictures are placed on whole pixels so their edges stay crisp.
+                    let rect = mouli_web::layout::Rect {
+                        x: r.x.round(),
+                        y: r.y.round(),
+                        w: r.w.round().max(1.0),
+                        h: r.h.round().max(1.0),
+                    };
+                    s.fill_rounded(rect, [0.0; 4], |px, py| {
+                        sample(
+                            bm,
+                            (px - rect.x) / rect.w * bm.w as f32 - 0.5,
+                            (py - rect.y) / rect.h * bm.h as f32 - 0.5,
+                        )
+                    });
+                } else {
+                    placeholder(&mut s, *r, label, font, *color);
+                }
+            }
             Op::Placeholder {
                 r,
                 label,
                 font,
                 color,
-            } => {
-                s.fill(*r, 0xFFEE_EEEE, [0.0; 4]);
-                s.border(
-                    *r,
-                    [1.0; 4],
-                    [BorderStyle::Solid; 4],
-                    [0xFFBB_BBBB; 4],
-                    [0.0; 4],
-                );
-                let f = FontSpec {
-                    size: font.size.clamp(9.0, 13.0),
-                    bold: false,
-                    italic: false,
-                    mono: false,
-                    letter_spacing: 0.0,
-                };
-                s.clips.push(clip_to(&s, *r));
-                let line = WebFonts.normal_line_height(&f);
-                s.text(
-                    r.x + 4.0,
-                    r.y + 3.0 + WebFonts.ascent(&f),
-                    label,
-                    &f,
-                    scale_alpha(*color, 0.7),
-                    false,
-                    false,
-                );
-                let _ = line;
-                s.clips.pop();
-            }
+            } => placeholder(&mut s, *r, label, font, *color),
             Op::Control {
                 r,
                 kind,
@@ -775,6 +817,61 @@ fn control(
     }
 }
 
+/// Draws the box that stands in for a picture that is missing or cannot be shown.
+fn placeholder(
+    s: &mut Surface,
+    r: mouli_web::layout::Rect,
+    label: &str,
+    font: &FontSpec,
+    color: u32,
+) {
+    s.fill(r, 0xFFEE_EEEE, [0.0; 4]);
+    s.border(
+        r,
+        [1.0; 4],
+        [BorderStyle::Solid; 4],
+        [0xFFBB_BBBB; 4],
+        [0.0; 4],
+    );
+    let f = FontSpec {
+        size: font.size.clamp(9.0, 13.0),
+        bold: false,
+        italic: false,
+        mono: false,
+        letter_spacing: 0.0,
+    };
+    s.clips.push(clip_to(s, r));
+    s.text(
+        r.x + 4.0,
+        r.y + 3.0 + WebFonts.ascent(&f),
+        label,
+        &f,
+        scale_alpha(color, 0.7),
+        false,
+        false,
+    );
+    s.clips.pop();
+}
+
+/// The colour of a bitmap at fractional pixel coordinates (bilinear, edges clamped).
+fn sample(bm: &Bitmap, x: f32, y: f32) -> u32 {
+    let x = x.clamp(0.0, bm.w as f32 - 1.0);
+    let y = y.clamp(0.0, bm.h as f32 - 1.0);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(bm.w - 1), (y0 + 1).min(bm.h - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let at = |px: usize, py: usize| bm.px[py * bm.w + px];
+    let mut out = 0u32;
+    for shift in [24u32, 16, 8, 0] {
+        let ch = |p: u32| ((p >> shift) & 0xFF) as f32;
+        let top = ch(at(x0, y0)) * (1.0 - fx) + ch(at(x1, y0)) * fx;
+        let bottom = ch(at(x0, y1)) * (1.0 - fx) + ch(at(x1, y1)) * fx;
+        let v = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u32;
+        out |= v << shift;
+    }
+    out
+}
+
 // ------------------------------------------------------------------ pages
 
 /// A loaded page: its document, layout and size, ready to be scrolled, drawn and clicked.
@@ -783,6 +880,7 @@ pub struct Page {
     dom: Dom,
     layout: Layout,
     viewport: Viewport,
+    images: Images,
 }
 
 impl Page {
@@ -799,34 +897,42 @@ impl Page {
             w: w.max(50.0),
             h: h.max(50.0),
         };
-        let layout = Self::lay(&dom, viewport, &State::default());
+        let images = Images::default();
+        let layout = Self::lay(&dom, viewport, &State::default(), &images);
         Page {
             dom,
             layout,
             viewport,
+            images,
         }
     }
 
-    fn lay(dom: &Dom, vp: Viewport, st: &State) -> Layout {
+    fn lay(dom: &Dom, vp: Viewport, st: &State, images: &HashMap<String, Bitmap>) -> Layout {
         let sheets: Vec<Stylesheet> = dom
             .style_sheets()
             .iter()
             .map(|s| Stylesheet::parse(s))
             .collect();
         let styles = compute(dom, &sheets, vp, st);
-        layout(dom, &styles, &WebFonts, vp)
+        layout(dom, &styles, &PageFonts(images), vp)
+    }
+
+    /// Gives the page its decoded pictures and lays it out again (their sizes matter).
+    pub fn set_images(&mut self, images: Images) {
+        self.images = images;
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default(), &self.images);
     }
 
     /// Changes the document in place (a person typing into a field) and lays it out again.
     pub fn edit(&mut self, f: impl FnOnce(&mut Dom)) {
         f(&mut self.dom);
-        self.layout = Self::lay(&self.dom, self.viewport, &State::default());
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default(), &self.images);
     }
 
     /// Replaces the document (after scripts changed it) and lays it out again.
     pub fn set_dom(&mut self, dom: Dom) {
         self.dom = dom;
-        self.layout = Self::lay(&self.dom, self.viewport, &State::default());
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default(), &self.images);
     }
 
     /// Lays the page out again for a new window size (after the window is resized).
@@ -835,7 +941,7 @@ impl Page {
             w: w.max(50.0),
             h: h.max(50.0),
         };
-        self.layout = Self::lay(&self.dom, self.viewport, &State::default());
+        self.layout = Self::lay(&self.dom, self.viewport, &State::default(), &self.images);
     }
 
     /// Total height of the page in pixels.
@@ -874,7 +980,7 @@ impl Page {
                 h: h as f32,
             },
         );
-        draw(canvas, &ops, x, y, (x, y, w, h));
+        draw_with_images(canvas, &ops, x, y, (x, y, w, h), &self.images);
     }
 
     /// The element under a point of the window (`x`, `y` relative to the window's top-left).
@@ -1159,5 +1265,63 @@ b</textarea><img alt="logo" width=60 height=30><div style="border:3px dashed red
             let (_, c) = page_canvas(odd, 50, 50);
             assert_eq!(c.pixels.len(), 2500);
         }
+    }
+
+    #[test]
+    fn pictures_take_their_natural_size_keep_proportions_and_are_drawn() {
+        let bm = Bitmap {
+            w: 4,
+            h: 2,
+            px: vec![0xFFFF_0000; 8],
+        };
+        let images: Images = Rc::new(HashMap::from([("a.png".to_string(), bm)]));
+        let mut p = Page::load(
+            "<body style=\"margin:0\"><img src=a.png></body>",
+            100.0,
+            100.0,
+        );
+        assert!(
+            p.height() > 50.0,
+            "without the picture the placeholder size is used"
+        );
+        p.set_images(images.clone());
+        let red_box = |c: &Canvas| {
+            let mut min = (usize::MAX, usize::MAX);
+            let mut max = (0usize, 0usize);
+            for y in 0..c.height {
+                for x in 0..c.width {
+                    if c.get(x, y) == Some(0x00FF_0000) {
+                        min = (min.0.min(x), min.1.min(y));
+                        max = (max.0.max(x), max.1.max(y));
+                    }
+                }
+            }
+            (max.0 + 1 - min.0, max.1 + 1 - min.1)
+        };
+        let mut c = Canvas {
+            width: 100,
+            height: 100,
+            pixels: vec![0x00FF_FFFF; 100 * 100],
+        };
+        p.draw(&mut c, 0, 0, 100, 100, 0.0);
+        assert_eq!(
+            red_box(&c),
+            (4, 2),
+            "the picture is drawn at its natural size"
+        );
+        // A width set on the tag scales it, keeping the 2:1 proportions.
+        let mut q = Page::load(
+            "<body style=\"margin:0\"><img src=a.png width=40></body>",
+            100.0,
+            100.0,
+        );
+        q.set_images(images);
+        let mut c = Canvas {
+            width: 100,
+            height: 100,
+            pixels: vec![0x00FF_FFFF; 100 * 100],
+        };
+        q.draw(&mut c, 0, 0, 100, 100, 0.0);
+        assert_eq!(red_box(&c), (40, 20), "width 40 at 2:1 is 20 tall");
     }
 }

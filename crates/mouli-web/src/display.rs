@@ -74,7 +74,21 @@ pub enum Op {
         /// Colour.
         color: u32,
     },
-    /// An image or other content we cannot show, drawn as a labelled placeholder.
+    /// A picture; drawn from the decoded bitmap for `src` when there is one, otherwise as a
+    /// labelled placeholder.
+    Image {
+        /// Where.
+        r: Rect,
+        /// The picture's `src` (the key of the bitmap).
+        src: String,
+        /// The alternative text, for the placeholder.
+        label: String,
+        /// The font for the label.
+        font: FontSpec,
+        /// Text colour.
+        color: u32,
+    },
+    /// Other content we cannot show, drawn as a labelled placeholder.
     Placeholder {
         /// Where.
         r: Rect,
@@ -408,14 +422,15 @@ impl Painter {
         let f = font(s);
         let color = with_opacity(s.color, s.opacity);
         match rep {
-            Replaced::Image { alt } => {
+            Replaced::Image { alt, src } => {
                 let label = if alt.is_empty() {
                     "image".to_string()
                 } else {
                     alt.clone()
                 };
-                self.ops.push(Op::Placeholder {
+                self.ops.push(Op::Image {
                     r,
+                    src: src.clone(),
                     label,
                     font: f,
                     color,
@@ -642,7 +657,7 @@ mod tests {
         ));
         assert!(o
             .iter()
-            .any(|x| matches!(x, Op::Placeholder { label, .. } if label == "logo")));
+            .any(|x| matches!(x, Op::Image { label, .. } if label == "logo")));
     }
 
     #[test]

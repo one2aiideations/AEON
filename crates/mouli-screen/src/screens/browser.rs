@@ -12,6 +12,9 @@ use crate::raster::Canvas;
 use crate::screen::{Action, Screen};
 use crate::screens::preview::PreviewScreen;
 use mouli_web::browser::{self, History};
+use mouli_web::image::Bitmap;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Longest address that can be typed.
 const MAX_TYPED: usize = 2000;
@@ -89,6 +92,17 @@ impl BrowserScreen {
     /// The host has the page asked for as `requested`; `url` is where it came from after
     /// redirects.
     pub fn loaded(&mut self, requested: &str, url: &str, html: String) {
+        self.loaded_with(requested, url, html, HashMap::new());
+    }
+
+    /// Like [`BrowserScreen::loaded`], with the decoded pictures the page uses (by `src`).
+    pub fn loaded_with(
+        &mut self,
+        requested: &str,
+        url: &str,
+        html: String,
+        images: HashMap<String, Bitmap>,
+    ) {
         if self.loading.as_deref() != Some(requested) {
             return; // an older request that was replaced
         }
@@ -100,6 +114,7 @@ impl BrowserScreen {
         self.status = "Done".into();
         self.page = Some((url.to_string(), html));
         self.view.reset();
+        self.view.set_images(Rc::new(images));
     }
 
     /// The host could not load `requested`; `page` is a page that explains it.

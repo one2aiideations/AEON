@@ -53,6 +53,10 @@ pub trait Fonts {
     fn normal_line_height(&self, f: &FontSpec) -> f32 {
         self.ascent(f) + self.descent(f)
     }
+    /// The natural size of the picture at `src`, when it is known (decoded pictures).
+    fn image_size(&self, _src: &str) -> Option<(f32, f32)> {
+        None
+    }
 }
 
 /// A rectangle.
@@ -96,6 +100,8 @@ pub enum Replaced {
     Image {
         /// The alternative text.
         alt: String,
+        /// The `src` attribute (the key of the decoded picture).
+        src: String,
     },
     /// A text field, button, checkbox and so on.
     Control {
@@ -557,6 +563,7 @@ impl Ctx<'_> {
         match tag {
             "img" => Some(Replaced::Image {
                 alt: self.dom.attr(n, "alt").unwrap_or("").to_string(),
+                src: self.dom.attr(n, "src").unwrap_or("").to_string(),
             }),
             "input" => {
                 let ty = self
@@ -641,13 +648,20 @@ impl Ctx<'_> {
         let f = font_of(style);
         let line = self.line_height(style).max(1.0);
         match r {
-            Replaced::Image { .. } => {
+            Replaced::Image { src, .. } => {
                 let w = self.attr_px(n, "width");
                 let h = self.attr_px(n, "height");
-                match (w, h) {
-                    (Some(w), Some(h)) => (w, h),
-                    (Some(w), None) => (w, w * 0.75),
-                    (None, Some(h)) => (h * 4.0 / 3.0, h),
+                let natural = self
+                    .fonts
+                    .image_size(src)
+                    .filter(|(a, b)| *a > 0.0 && *b > 0.0);
+                match (w, h, natural) {
+                    (Some(w), Some(h), _) => (w, h),
+                    (Some(w), None, Some((a, b))) => (w, w * b / a),
+                    (Some(w), None, None) => (w, w * 0.75),
+                    (None, Some(h), Some((a, b))) => (h * a / b, h),
+                    (None, Some(h), None) => (h * 4.0 / 3.0, h),
+                    (None, None, Some((a, b))) => (a, b),
                     _ => (100.0, 75.0),
                 }
             }
@@ -1606,12 +1620,21 @@ impl Ctx<'_> {
         let flow = if let Some(r) = replaced {
             let (rw, rh) = self.replaced_size(node, &r, style);
             let _ = rw;
+            // A picture whose width was set by style keeps its proportions.
+            let ratio_h = match &r {
+                Replaced::Image { src, .. } if self.attr_px(node, "height").is_none() => self
+                    .fonts
+                    .image_size(src)
+                    .filter(|(a, b)| *a > 0.0 && *b > 0.0)
+                    .map(|(a, b)| content_w * b / a),
+                _ => None,
+            };
             b.kind = BoxKind::Replaced(r);
             Flow {
                 height: if style.height.dim().is_some() || forced.h.is_some() {
                     0.0
                 } else {
-                    rh
+                    ratio_h.unwrap_or(rh)
                 },
                 ..Flow::default()
             }

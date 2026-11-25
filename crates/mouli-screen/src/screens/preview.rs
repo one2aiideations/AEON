@@ -9,7 +9,7 @@ use crate::grid::{theme, wrap, Grid, Rect};
 use crate::key::Key;
 use crate::raster::Canvas;
 use crate::screen::{Action, Screen};
-use crate::webview::Page;
+use crate::webview::{Images, Page};
 use mouli_web::browser as web;
 use mouli_web::dom::{Dom, NodeId};
 use mouli_web::interp::Value;
@@ -89,6 +89,7 @@ impl std::fmt::Debug for Live {
 
 #[derive(Debug, Clone, Default)]
 struct State {
+    images: Images,
     focus: Option<NodeId>,
     live: Live,
     last_tick: Option<Instant>,
@@ -154,11 +155,15 @@ impl PreviewScreen {
             s.focus = None;
             if kind == Kind::Html && html.to_ascii_lowercase().contains("<script") {
                 let sc = Scripting::new(&html);
-                s.page = Some(Page::from_dom(sc.snapshot(), w as f32, h as f32));
+                let mut page = Page::from_dom(sc.snapshot(), w as f32, h as f32);
+                page.set_images(s.images.clone());
+                s.page = Some(page);
                 s.live = Live(Some(Rc::new(RefCell::new(sc))));
                 s.last_tick = Some(Instant::now());
             } else {
-                s.page = Some(Page::load(&html, w as f32, h as f32));
+                let mut page = Page::load(&html, w as f32, h as f32);
+                page.set_images(s.images.clone());
+                s.page = Some(page);
                 s.live = Live(None);
             }
             s.hash = hh;
@@ -421,6 +426,15 @@ impl PreviewScreen {
                 "Forms that send data with POST are not supported yet.".into(),
                 None,
             ),
+        }
+    }
+
+    /// Gives the page the decoded pictures it refers to (by `src`).
+    pub fn set_images(&self, images: Images) {
+        let mut s = self.state.borrow_mut();
+        s.images = images.clone();
+        if let Some(p) = s.page.as_mut() {
+            p.set_images(images);
         }
     }
 

@@ -1053,7 +1053,10 @@ where
                 }
                 Ev::Page { requested, result } => {
                     match result {
-                        Ok(l) => device.shell.browser.loaded(&requested, &l.url, l.html),
+                        Ok(l) => device
+                            .shell
+                            .browser
+                            .loaded_with(&requested, &l.url, l.html, l.images),
                         Err(m) => {
                             let page = crate::browse::error_page(&requested, &m);
                             device.shell.browser.failed(&requested, &m, page);
