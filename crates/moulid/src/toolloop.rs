@@ -44,6 +44,9 @@ proposed and need the person's approval.\nTools:\n",
     for (name, help) in tools.iter().take(MAX_LISTED) {
         s.push_str(&format!("- /{name}: {}\n", one_line(help, 100)));
     }
+    if tools.iter().any(|(n, _)| *n == "code.read") {
+        s.push_str("Example: TOOL: /code.read path=src/lib.rs\n");
+    }
     s
 }
 
@@ -69,12 +72,24 @@ pub fn parse_tool_call(reply: &str, known: &[&str]) -> Option<String> {
             .strip_prefix("TOOL:")
             .or_else(|| t.strip_prefix("Tool:"))
             .map_or(t, str::trim_start);
+        // Some models write `/tool: /code.files` or `/tool /code.files`.
+        let t = t
+            .strip_prefix("/tool:")
+            .or_else(|| t.strip_prefix("/tool "))
+            .map_or(t, str::trim_start);
         let Some(rest) = t.strip_prefix('/') else {
             continue;
         };
-        let name = rest.split_whitespace().next().unwrap_or("");
+        let first = rest.split_whitespace().next().unwrap_or("");
+        // Small models often write `/code.read: src/lib.rs`; the colon is not part of the name.
+        let name = first.trim_end_matches(':');
         if !name.is_empty() && known.contains(&name) {
-            return Some(t.to_string());
+            let after = rest[first.len()..].trim_start();
+            return Some(if after.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {after}")
+            });
         }
     }
     None
@@ -119,6 +134,12 @@ mod tests {
             "whitespace is folded: {p}"
         );
         assert!(p.contains("need the person's approval"));
+        assert!(
+            !tool_prompt(&[("code.status", "x")]).contains("Example:"),
+            "no example without code.read"
+        );
+        let with = tool_prompt(&[("code.read", "Read a file")]);
+        assert!(with.contains("Example: TOOL: /code.read path=src/lib.rs"));
         assert_eq!(tool_prompt(&[]), "", "no tools, no instruction");
         let many: Vec<(String, String)> = (0..50).map(|i| (format!("t{i}"), "x".into())).collect();
         let refs: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
@@ -144,6 +165,21 @@ mod tests {
             "found after other lines"
         );
         assert_eq!(
+            p("/code.read: src/main.rs"),
+            Some("/code.read src/main.rs".into()),
+            "colon after the name"
+        );
+        assert_eq!(p("TOOL: /code.status:"), Some("/code.status".into()));
+        assert_eq!(
+            p("/tool: /code.status"),
+            Some("/code.status".into()),
+            "stray /tool prefix"
+        );
+        assert_eq!(
+            p("/tool /code.read path=a"),
+            Some("/code.read path=a".into())
+        );
+        assert_eq!(
             p("TOOL: /code.read path=a\nTOOL: /code.propose x=1"),
             Some("/code.read path=a".into()),
             "only the first call counts"
@@ -164,6 +200,7 @@ mod tests {
             "/",
             "TOOL:",
             "/code.readx path=a",
+            "/tool code.apply",
             "//code.read",
         ] {
             assert_eq!(p(no), None, "{no:?}");
