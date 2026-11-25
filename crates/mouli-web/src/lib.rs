@@ -7,6 +7,7 @@
 //! * [`css`], [`style`]: stylesheets, selectors, media queries, the cascade and inheritance.
 //! * [`layout`], [`display`]: block, inline, flex and table layout, then a list of paint
 //!   operations for the desktop to rasterise (floats, grid and images are not done yet).
+//! * [`regex`]: the regular-expression matcher behind JavaScript's `RegExp`.
 //! * [`image`]: PNG, JPEG (baseline) and GIF decoders.
 //! * [`js`], [`interp`], [`jslib`]: a JavaScript lexer and parser, a tree-walking interpreter
 //!   with hard limits, and the standard library.
@@ -41,5 +42,6 @@ pub mod layout;
 pub mod markdown;
 pub mod rate;
 pub mod readable;
+pub mod regex;
 pub mod scripting;
 pub mod style;

@@ -12,8 +12,8 @@
 //! Known differences from the standard (kept deliberately small): strings are Rust text and
 //! `length` counts characters, not UTF-16 units; arrays have no holes; `let` has no temporal dead
 //! zone; objects that form cycles are never freed (the whole interpreter is dropped with the
-//! page); no `Promise`, `async`, generators, `Symbol`, `Map`, `Set`, regular expressions or `Date`
-//! objects yet.
+//! page); no `async`, generators, `Symbol` or `Date` objects yet (`Promise`, `Map`, `Set` and
+//! regular expressions exist).
 
 use crate::js::{self, *};
 use std::cell::RefCell;
@@ -151,6 +151,8 @@ pub enum Kind {
     Map(MapData),
     /// A `Promise`.
     Promise(PromiseData),
+    /// A regular expression and its source text.
+    Regex(Rc<crate::regex::Regex>, Rc<str>),
 }
 
 /// What a value is when used as a `Map` key (same-value-zero equality).
@@ -245,6 +247,7 @@ pub struct Protos {
     pub(crate) number: Obj,
     pub(crate) boolean: Obj,
     pub(crate) promise: Obj,
+    pub(crate) regexp: Obj,
     pub(crate) errors: HashMap<&'static str, Obj>,
 }
 
@@ -289,6 +292,7 @@ pub struct Interp {
     /// Lines written by `console.log` and friends (the newest are kept).
     pub console: Vec<String>,
     timers: Vec<Timer>,
+    regex_cache: HashMap<(String, String), Rc<crate::regex::Regex>>,
     pub(crate) microtasks: VecDeque<Microtask>,
     next_timer: u32,
     /// The virtual clock in milliseconds.
@@ -389,6 +393,7 @@ impl Interp {
         let number = mk(Some(object.clone()));
         let boolean = mk(Some(object.clone()));
         let promise = mk(Some(object.clone()));
+        let regexp = mk(Some(object.clone()));
         let error = mk(Some(object.clone()));
         let mut errors = HashMap::new();
         errors.insert("Error", error);
@@ -413,6 +418,7 @@ impl Interp {
                 number,
                 boolean,
                 promise,
+                regexp,
                 errors,
             },
             steps: 0,
@@ -425,6 +431,7 @@ impl Interp {
             short: false,
             console: Vec::new(),
             timers: Vec::new(),
+            regex_cache: HashMap::new(),
             microtasks: VecDeque::new(),
             next_timer: 1,
             clock: 0.0,
@@ -501,6 +508,37 @@ impl Interp {
     pub fn new_obj(&mut self) -> Obj {
         let p = self.protos.object.clone();
         self.alloc(Some(p), Kind::Plain, "Object")
+    }
+
+    /// Makes a regular expression object from a pattern and flags.
+    ///
+    /// # Errors
+    /// A thrown `SyntaxError` for a bad pattern or flags.
+    pub fn new_regexp(&mut self, source: &str, flags: &str) -> R<Value> {
+        let key = (source.to_string(), flags.to_string());
+        let re = if let Some(r) = self.regex_cache.get(&key) {
+            r.clone()
+        } else {
+            match crate::regex::Regex::new(source, flags) {
+                Ok(r) => {
+                    let r = Rc::new(r);
+                    if self.regex_cache.len() < 500 {
+                        self.regex_cache.insert(key, r.clone());
+                    }
+                    r
+                }
+                Err(m) => {
+                    return self.throw(
+                        "SyntaxError",
+                        &format!("Invalid regular expression: /{source}/: {m}"),
+                    )
+                }
+            }
+        };
+        let p = self.protos.regexp.clone();
+        let o = self.alloc(Some(p), Kind::Regex(re, Rc::from(source)), "RegExp");
+        self.define(&o, "lastIndex", Prop::hidden(Value::Num(0.0)));
+        Ok(Value::Obj(o))
     }
 
     /// Makes an array.
@@ -1032,6 +1070,9 @@ impl Interp {
                     } else {
                         format!("{name}: {msg}")
                     };
+                }
+                if let Kind::Regex(re, src) = &o.borrow().kind {
+                    return format!("/{src}/{}", crate::jslib::flags_string(&re.flags));
                 }
                 let special = {
                     let b = o.borrow();
@@ -2171,9 +2212,7 @@ impl Interp {
             Expr::Str(t) => Ok(Value::Str(t.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
-            Expr::Regex(..) => {
-                self.throw("SyntaxError", "regular expressions are not supported yet")
-            }
+            Expr::Regex(p, f) => self.new_regexp(p, f),
             Expr::Ident(n) => match self.lookup(n, s) {
                 Some(v) => Ok(v),
                 None if &**n == "undefined" => Ok(Value::Undefined),
@@ -3220,6 +3259,64 @@ mod tests {
         i.run("function loop() { Promise.resolve().then(loop) } loop();")
             .unwrap();
         assert_eq!(i.pending_timers(), 0);
+    }
+
+    #[test]
+    fn regular_expressions_work_in_scripts() {
+        assert_eq!(run("/b+/.test('abbbc')"), "true");
+        assert_eq!(run("/^\\d+$/.test('12a')"), "false");
+        assert_eq!(run("'a1b22c333'.match(/\\d+/g)"), "[ '1', '22', '333' ]");
+        assert_eq!(run("'abc'.match(/x/)"), "null");
+        assert_eq!(
+            run("const m = 'key=value'.match(/(\\w+)=(\\w+)/); [m[0], m[1], m[2], m.index]"),
+            "[ 'key=value', 'key', 'value', 0 ]"
+        );
+        assert_eq!(
+            run("const m = '2024-05-06'.match(/(?<y>\\d+)-(?<m>\\d+)/); [m.groups.y, m.groups.m]"),
+            "[ '2024', '05' ]"
+        );
+        assert_eq!(run("'a-b-c'.replace(/-/g, '+')"), "a+b+c");
+        assert_eq!(run("'a-b-c'.replace(/-/, '+')"), "a+b-c");
+        assert_eq!(
+            run("'John Smith'.replace(/(\\w+) (\\w+)/, '$2, $1')"),
+            "Smith, John"
+        );
+        assert_eq!(run("'abc'.replace(/b/, '[$&|$`|$\\'|$$]')"), "a[b|a|c|$]c");
+        assert_eq!(run("'a1b2'.replace(/\\d/g, d => d * 2)"), "a2b4");
+        assert_eq!(run("'x'.replace(/(?<n>x)/, '<$<n>>')"), "<x>");
+        assert_eq!(run("'a, b ,c'.split(/\\s*,\\s*/)"), "[ 'a', 'b', 'c' ]");
+        assert_eq!(run("'abc'.split(/(?:)/)"), "[ 'a', 'b', 'c' ]");
+        assert_eq!(run("'a1b2c'.split(/(\\d)/)"), "[ 'a', '1', 'b', '2', 'c' ]");
+        assert_eq!(run("'one two'.search(/two/)"), "4");
+        assert_eq!(
+            run("[...'a1b2'.matchAll(/\\d/g)].map(m => m[0] + m.index)"),
+            "[ '11', '23' ]"
+        );
+        assert_eq!(run("const re = /o/g; const r = []; let m; while ((m = re.exec('foo boo')) !== null) r.push(m.index + ':' + re.lastIndex); r"), "[ '1:2', '2:3', '5:6', '6:7' ]");
+        assert_eq!(run("const re = /a/g; re.test('aa'); re.lastIndex"), "1");
+        assert_eq!(
+            run("new RegExp('a+', 'gi').flags + new RegExp(/x/gi).source"),
+            "gix"
+        );
+        assert_eq!(run("String(/a\\/b/g)"), "/a\\/b/g");
+        assert_eq!(run("const r = /x/gim; [r.global, r.ignoreCase, r.multiline, r.sticky, r.source, r.flags]"), "[ true, true, true, false, 'x', 'gim' ]");
+        assert_eq!(
+            run("/A/i.test('a') && !/A/.test('a') && /a$/m.test('a\\nb')"),
+            "true"
+        );
+        assert_eq!(run("'  hi  '.replace(/^\\s+|\\s+$/g, '')"), "hi");
+        assert_eq!(
+            run("'camelCaseString'.replace(/([A-Z])/g, ' $1').toLowerCase()"),
+            "camel case string"
+        );
+        assert_eq!(run("/(\\d+)\\.(\\d+)/.exec('v10.25')[2]"), "25");
+        assert_eq!(run("'x'.replaceAll(/x/g, 'y')"), "y");
+        assert!(run("'x'.replaceAll(/x/, 'y')").contains("global"));
+        assert!(run("new RegExp('(')").contains("SyntaxError: Invalid regular expression"));
+        assert!(run("/a/.exec.call({}, 'a')").contains("TypeError"));
+        assert!(run("/(a+)+b/.test('a'.repeat(40))").contains("took too long"));
+        assert_eq!(run("/a/"), "/a/");
+        assert_eq!(run("typeof /a/ + (/a/ instanceof RegExp)"), "objecttrue");
     }
 
     #[test]

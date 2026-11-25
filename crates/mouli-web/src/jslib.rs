@@ -6,6 +6,7 @@ use crate::interp::{
     is_callable, make_bound, num_to_string, str_to_num, to_i32, Interp, Kind, MapData, MapKey, Obj,
     PromiseData, Prop, Value, R,
 };
+use crate::regex::{Flags, Match, Regex};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -458,6 +459,7 @@ pub(crate) fn install(i: &mut Interp) {
     install_function(i);
     install_array(i);
     install_string(i);
+    install_regexp(i);
     install_number(i);
     install_errors(i);
     install_collections(i);
@@ -2073,4 +2075,472 @@ fn install_promise(i: &mut Interp) {
         Ok(Value::Undefined)
     });
     i.set_global("queueMicrotask", qm);
+}
+
+// ------------------------------------------------------------------ regular expressions
+
+/// A flags string in the order JavaScript prints it.
+pub(crate) fn flags_string(f: &Flags) -> String {
+    let mut s = String::new();
+    for (on, c) in [
+        (f.global, 'g'),
+        (f.ignore_case, 'i'),
+        (f.multiline, 'm'),
+        (f.dot_all, 's'),
+        (f.unicode, 'u'),
+        (f.sticky, 'y'),
+    ] {
+        if on {
+            s.push(c);
+        }
+    }
+    s
+}
+
+fn regex_of(v: &Value) -> Option<(Rc<Regex>, Rc<str>)> {
+    if let Value::Obj(o) = v {
+        if let Kind::Regex(r, src) = &o.borrow().kind {
+            return Some((r.clone(), src.clone()));
+        }
+    }
+    None
+}
+
+fn exec_at(i: &mut Interp, rx: &Regex, text: &[char], from: usize) -> R<Option<Match>> {
+    rx.exec(text, from)
+        .map_err(|m| i.make_error("RangeError", m))
+}
+
+fn slice(text: &[char], a: usize, b: usize) -> Value {
+    Value::str(&text[a..b].iter().collect::<String>())
+}
+
+fn match_array(i: &mut Interp, text: &[char], m: &Match, rx: &Regex) -> Value {
+    let items: Vec<Value> = m
+        .spans
+        .iter()
+        .map(|sp| sp.map_or(Value::Undefined, |(a, b)| slice(text, a, b)))
+        .collect();
+    let arr = i.new_array(items);
+    if let Value::Obj(o) = &arr {
+        i.put(o, "index", Value::Num(m.spans[0].map_or(0, |s| s.0) as f64));
+        i.put(o, "input", Value::str(&text.iter().collect::<String>()));
+        let groups = if rx.names.is_empty() {
+            Value::Undefined
+        } else {
+            let g = i.new_obj();
+            for (name, idx) in &rx.names {
+                let v = m
+                    .spans
+                    .get(*idx)
+                    .copied()
+                    .flatten()
+                    .map_or(Value::Undefined, |(a, b)| slice(text, a, b));
+                i.put(&g, name, v);
+            }
+            Value::Obj(g)
+        };
+        i.put(o, "groups", groups);
+    }
+    arr
+}
+
+/// Expands `$1`, `$&`, `` $` ``, `$'`, `$<name>` and `$$` in a replacement string.
+fn expand(tpl: &str, text: &[char], m: &Match, rx: &Regex) -> String {
+    let t: Vec<char> = tpl.chars().collect();
+    let (ms, me) = m.spans[0].unwrap_or((0, 0));
+    let mut out = String::new();
+    let mut k = 0;
+    while k < t.len() {
+        if t[k] != '$' || k + 1 >= t.len() {
+            out.push(t[k]);
+            k += 1;
+            continue;
+        }
+        match t[k + 1] {
+            '$' => {
+                out.push('$');
+                k += 2;
+            }
+            '&' => {
+                out.extend(&text[ms..me]);
+                k += 2;
+            }
+            '`' => {
+                out.extend(&text[..ms]);
+                k += 2;
+            }
+            '\'' => {
+                out.extend(&text[me..]);
+                k += 2;
+            }
+            '<' if !rx.names.is_empty() => match t[k + 2..].iter().position(|c| *c == '>') {
+                Some(e) => {
+                    let name: String = t[k + 2..k + 2 + e].iter().collect();
+                    if let Some((_, idx)) = rx.names.iter().find(|(n, _)| *n == name) {
+                        if let Some(Some((a, b))) = m.spans.get(*idx) {
+                            out.extend(&text[*a..*b]);
+                        }
+                    }
+                    k += e + 3;
+                }
+                None => {
+                    out.push('$');
+                    k += 1;
+                }
+            },
+            d if d.is_ascii_digit() => {
+                // One or two digits, as long as the group exists.
+                let two = t
+                    .get(k + 2)
+                    .filter(|c| c.is_ascii_digit())
+                    .map(|c| (d as usize - 48) * 10 + (*c as usize - 48));
+                let (n, used) = match two {
+                    Some(n) if n >= 1 && n <= rx.groups => (n, 3),
+                    _ => (d as usize - 48, 2),
+                };
+                if n >= 1 && n <= rx.groups {
+                    if let Some(Some((a, b))) = m.spans.get(n) {
+                        out.extend(&text[*a..*b]);
+                    }
+                    k += used;
+                } else {
+                    out.push('$');
+                    k += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                k += 1;
+            }
+        }
+    }
+    out
+}
+
+fn all_matches(i: &mut Interp, rx: &Regex, text: &[char]) -> R<Vec<Match>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from <= text.len() {
+        let Some(m) = exec_at(i, rx, text, from)? else {
+            break;
+        };
+        let (s, e) = m.spans[0].unwrap_or((from, from));
+        from = if e == s { e + 1 } else { e };
+        out.push(m);
+        if out.len() > 100_000 {
+            return Err(i.make_error("RangeError", "too many matches"));
+        }
+    }
+    Ok(out)
+}
+
+fn install_regexp(i: &mut Interp) {
+    let proto = i.protos.regexp.clone();
+    let _ = ctor(i, "RegExp", &proto, |i, _, a| {
+        let (src, flags): (String, String) = match regex_of(&arg(a, 0)) {
+            Some((r, s)) => {
+                let f = match arg(a, 1) {
+                    Value::Undefined => flags_string(&r.flags),
+                    v => i.text(&v)?.to_string(),
+                };
+                (s.to_string(), f)
+            }
+            None => {
+                let s = match arg(a, 0) {
+                    Value::Undefined => "(?:)".to_string(),
+                    v => i.text(&v)?.to_string(),
+                };
+                let f = match arg(a, 1) {
+                    Value::Undefined => String::new(),
+                    v => i.text(&v)?.to_string(),
+                };
+                (s, f)
+            }
+        };
+        i.new_regexp(&src, &flags)
+    });
+    for (name, pick) in [
+        ("global", 0u8),
+        ("ignoreCase", 1),
+        ("multiline", 2),
+        ("dotAll", 3),
+        ("unicode", 4),
+        ("sticky", 5),
+    ] {
+        let g = i.native(name, move |i, t, _| {
+            let Some((r, _)) = regex_of(t) else {
+                return Err(i.make_error("TypeError", "not a regular expression"));
+            };
+            let f = r.flags;
+            Ok(Value::Bool(
+                [
+                    f.global,
+                    f.ignore_case,
+                    f.multiline,
+                    f.dot_all,
+                    f.unicode,
+                    f.sticky,
+                ][usize::from(pick)],
+            ))
+        });
+        i.define(
+            &proto,
+            name,
+            Prop {
+                value: Value::Undefined,
+                get: Some(g),
+                set: None,
+                enumerable: false,
+            },
+        );
+    }
+    let g = i.native("source", |i, t, _| match regex_of(t) {
+        Some((_, s)) => Ok(Value::Str(s)),
+        None => Err(i.make_error("TypeError", "not a regular expression")),
+    });
+    i.define(
+        &proto,
+        "source",
+        Prop {
+            value: Value::Undefined,
+            get: Some(g),
+            set: None,
+            enumerable: false,
+        },
+    );
+    let g = i.native("flags", |i, t, _| match regex_of(t) {
+        Some((r, _)) => Ok(Value::str(&flags_string(&r.flags))),
+        None => Err(i.make_error("TypeError", "not a regular expression")),
+    });
+    i.define(
+        &proto,
+        "flags",
+        Prop {
+            value: Value::Undefined,
+            get: Some(g),
+            set: None,
+            enumerable: false,
+        },
+    );
+    method(i, &proto, "toString", |i, t, _| match regex_of(t) {
+        Some((r, s)) => Ok(Value::str(&format!("/{s}/{}", flags_string(&r.flags)))),
+        None => Err(i.make_error("TypeError", "not a regular expression")),
+    });
+    fn run(i: &mut Interp, this: &Value, arg0: &Value) -> R<Value> {
+        let Some((rx, _)) = regex_of(this) else {
+            return Err(i.make_error(
+                "TypeError",
+                "exec called on a value that is not a regular expression",
+            ));
+        };
+        let text: Vec<char> = i.text(arg0)?.chars().collect();
+        let uses_last = rx.flags.global || rx.flags.sticky;
+        let from = if uses_last {
+            let li = i.get_prop(this, "lastIndex")?;
+            let n = i.coerce_num(&li)?;
+            if n.is_finite() && n > 0.0 {
+                n as usize
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if from > text.len() {
+            i.set_prop(this, "lastIndex", Value::Num(0.0))?;
+            return Ok(Value::Null);
+        }
+        match exec_at(i, &rx, &text, from)? {
+            None => {
+                if uses_last {
+                    i.set_prop(this, "lastIndex", Value::Num(0.0))?;
+                }
+                Ok(Value::Null)
+            }
+            Some(m) => {
+                if uses_last {
+                    let end = m.spans[0].map_or(0, |s| s.1);
+                    i.set_prop(this, "lastIndex", Value::Num(end as f64))?;
+                }
+                Ok(match_array(i, &text, &m, &rx))
+            }
+        }
+    }
+    method(i, &proto, "exec", |i, t, a| run(i, t, &arg(a, 0)));
+    method(i, &proto, "test", |i, t, a| {
+        Ok(Value::Bool(!matches!(run(i, t, &arg(a, 0))?, Value::Null)))
+    });
+
+    // String methods that take expressions.
+    let sp = i.protos.string.clone();
+    method(i, &sp, "match", |i, t, a| {
+        let text: Vec<char> = this_str(i, t)?.chars().collect();
+        let rv = match regex_of(&arg(a, 0)) {
+            Some(_) => arg(a, 0),
+            None => {
+                let p = match arg(a, 0) {
+                    Value::Undefined => "(?:)".into(),
+                    v => i.text(&v)?.to_string(),
+                };
+                i.new_regexp(&p, "")?
+            }
+        };
+        let Some((rx, _)) = regex_of(&rv) else {
+            return Ok(Value::Null);
+        };
+        if rx.flags.global {
+            let ms = all_matches(i, &rx, &text)?;
+            if ms.is_empty() {
+                return Ok(Value::Null);
+            }
+            let items = ms
+                .iter()
+                .map(|m| m.spans[0].map_or(Value::Undefined, |(a, b)| slice(&text, a, b)))
+                .collect();
+            Ok(i.new_array(items))
+        } else {
+            Ok(match exec_at(i, &rx, &text, 0)? {
+                Some(m) => match_array(i, &text, &m, &rx),
+                None => Value::Null,
+            })
+        }
+    });
+    method(i, &sp, "matchAll", |i, t, a| {
+        let text: Vec<char> = this_str(i, t)?.chars().collect();
+        let Some((rx, _)) = regex_of(&arg(a, 0)) else {
+            return Err(i.make_error("TypeError", "matchAll needs a regular expression"));
+        };
+        if !rx.flags.global {
+            return Err(i.make_error(
+                "TypeError",
+                "matchAll must be given a global regular expression",
+            ));
+        }
+        let ms = all_matches(i, &rx, &text)?;
+        let items = ms.iter().map(|m| match_array(i, &text, m, &rx)).collect();
+        Ok(i.new_array(items))
+    });
+    method(i, &sp, "search", |i, t, a| {
+        let text: Vec<char> = this_str(i, t)?.chars().collect();
+        let rv = match regex_of(&arg(a, 0)) {
+            Some(_) => arg(a, 0),
+            None => {
+                let p = i.text(&arg(a, 0))?.to_string();
+                i.new_regexp(&p, "")?
+            }
+        };
+        let Some((rx, _)) = regex_of(&rv) else {
+            return Ok(Value::Num(-1.0));
+        };
+        Ok(Value::Num(
+            exec_at(i, &rx, &text, 0)?
+                .and_then(|m| m.spans[0])
+                .map_or(-1.0, |s| s.0 as f64),
+        ))
+    });
+    for name in ["replace", "replaceAll", "split"] {
+        let old = i
+            .get_prop(&Value::Obj(sp.clone()), name)
+            .unwrap_or(Value::Undefined);
+        method(i, &sp, name, move |i, t, a| {
+            let Some((rx, _)) = regex_of(&arg(a, 0)) else {
+                return i.call_value(&old, t.clone(), a.to_vec());
+            };
+            let text: Vec<char> = this_str(i, t)?.chars().collect();
+            if name == "split" {
+                let limit = match arg(a, 1) {
+                    Value::Undefined => usize::MAX,
+                    v => i.coerce_num(&v)?.max(0.0) as usize,
+                };
+                let mut out: Vec<Value> = Vec::new();
+                let (mut last_end, mut from) = (0usize, 0usize);
+                if text.is_empty() {
+                    let m = exec_at(i, &rx, &text, 0)?;
+                    return Ok(i.new_array(if m.is_some() {
+                        Vec::new()
+                    } else {
+                        vec![Value::str("")]
+                    }));
+                }
+                while from <= text.len() {
+                    let Some(m) = exec_at(i, &rx, &text, from)? else {
+                        break;
+                    };
+                    let (s, e) = m.spans[0].unwrap_or((from, from));
+                    if s >= text.len() && e == s {
+                        break;
+                    }
+                    if e == s && s == last_end {
+                        from = s + 1;
+                        continue;
+                    }
+                    out.push(slice(&text, last_end, s));
+                    for sp2 in m.spans.iter().skip(1) {
+                        out.push(sp2.map_or(Value::Undefined, |(x, y)| slice(&text, x, y)));
+                    }
+                    last_end = e;
+                    from = if e == s { e + 1 } else { e };
+                    if out.len() >= limit.min(1_000_000) {
+                        break;
+                    }
+                }
+                out.push(slice(&text, last_end, text.len()));
+                out.truncate(limit.min(1_000_000));
+                return Ok(i.new_array(out));
+            }
+            // replace / replaceAll
+            if name == "replaceAll" && !rx.flags.global {
+                return Err(i.make_error(
+                    "TypeError",
+                    "replaceAll must be given a global regular expression",
+                ));
+            }
+            let ms = if rx.flags.global {
+                all_matches(i, &rx, &text)?
+            } else {
+                exec_at(i, &rx, &text, 0)?.into_iter().collect()
+            };
+            let rep = arg(a, 1);
+            let mut out = String::new();
+            let mut at = 0usize;
+            for m in &ms {
+                let (s, e) = m.spans[0].unwrap_or((0, 0));
+                out.extend(&text[at..s]);
+                if is_callable(&rep) {
+                    let mut args: Vec<Value> = m
+                        .spans
+                        .iter()
+                        .map(|sp| sp.map_or(Value::Undefined, |(x, y)| slice(&text, x, y)))
+                        .collect();
+                    args.push(Value::Num(s as f64));
+                    args.push(Value::str(&text.iter().collect::<String>()));
+                    if !rx.names.is_empty() {
+                        let g = i.new_obj();
+                        for (n, idx) in &rx.names {
+                            let v = m
+                                .spans
+                                .get(*idx)
+                                .copied()
+                                .flatten()
+                                .map_or(Value::Undefined, |(x, y)| slice(&text, x, y));
+                            i.put(&g, n, v);
+                        }
+                        args.push(Value::Obj(g));
+                    }
+                    let r = i.call_value(&rep, Value::Undefined, args)?;
+                    out.push_str(&i.text(&r)?);
+                } else {
+                    let tpl = i.text(&rep)?;
+                    out.push_str(&expand(&tpl, &text, m, &rx));
+                }
+                at = e;
+                if out.len() > crate::interp::MAX_STRING {
+                    return Err(i.make_error("RangeError", "the string is too long"));
+                }
+            }
+            out.extend(&text[at..]);
+            Ok(Value::str(&out))
+        });
+    }
 }
