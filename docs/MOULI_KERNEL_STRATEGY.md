@@ -24,6 +24,8 @@ design intent, not a legal conclusion; it needs legal review before a product sh
 | K4 | Laptop bring-up: suspend/resume, battery, thermals, touchpad, camera, audio | Product-grade laptop | Per-model hardware test matrix |
 
 K0 is the product path. K1 to K4 are a parallel track and do not block the product.
+The design for K1 to K4 (Zircon-style Rust microkernel plus a Linux driver bridge) is in
+`MOULI_MICROKERNEL_SPEC.md`.
 
 ## Design rules
 
