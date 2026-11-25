@@ -17,6 +17,8 @@ pub enum Choice {
     Wifi,
     /// Pair a Bluetooth mouse or trackpad.
     Bluetooth,
+    /// Download a model.
+    Download,
     /// Show the hardware report.
     Info,
     /// Power off.
@@ -86,7 +88,7 @@ pub fn render_menu(models: &[Found], budget_mb: u64, ctx: u32) -> String {
             m.path.display()
         ));
     }
-    s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   b = Bluetooth mouse   h = hosted model (online)   i = hardware info   q = power off\n");
+    s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   b = Bluetooth mouse   d = download a model   h = hosted model (online)   i = hardware info   q = power off\n");
     s
 }
 
@@ -99,6 +101,7 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
         "h" => Some(Choice::Hosted),
         "w" => Some(Choice::Wifi),
         "b" => Some(Choice::Bluetooth),
+        "d" => Some(Choice::Download),
         "i" => Some(Choice::Info),
         "q" => Some(Choice::Quit),
         _ => t

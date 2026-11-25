@@ -12,6 +12,7 @@ mouli-gguf = { path = "../mouli-gguf" }
 mouli-http = { path = "../mouli-http" }
 mouli-hosted = { path = "../mouli-hosted" }
 mouli-interface = { path = "../mouli-interface" }
+sha2 = "0.10"
 mouli-screen = { path = "../mouli-screen" }
 mouli-desk = { path = "../mouli-desk" }
 mouli-device = { path = "../mouli-device" }

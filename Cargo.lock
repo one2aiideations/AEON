@@ -3010,6 +3010,7 @@ dependencies = [
  "mouli-player",
  "mouli-screen",
  "nix",
+ "sha2",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ use moulid::persist::{self, Store};
 use moulid::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
 use moulid::wifi;
 use moulid::wifi_saved;
+use moulid::{catalog, download_ui, fetch};
 use moulid::{cmdline_has, find_model, http, system};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -258,6 +259,31 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                             "  (could not save a copy)"
                         }
                     );
+                }
+                continue;
+            }
+            Choice::Download => {
+                let Some(st) = store else {
+                    say("MOULI: downloading needs a MOULI-DATA disk to keep the model on (see the installation guide).");
+                    continue;
+                };
+                let (entries, warning) = catalog::load(Path::new(catalog::CATALOG_FILE));
+                if let Some(w) = warning {
+                    say(&format!("MOULI: {w}"));
+                }
+                match fetch::HttpFetcher::system() {
+                    Ok(fetcher) => {
+                        let _ = download_ui::flow(
+                            &mut input,
+                            &mut out,
+                            &fetcher,
+                            &fetch::Policy::production(),
+                            &entries,
+                            &st.root().join("models"),
+                            plan.model_budget_mb,
+                        );
+                    }
+                    Err(e) => say(&format!("MOULI: {e}")),
                 }
                 continue;
             }
