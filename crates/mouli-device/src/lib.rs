@@ -44,6 +44,11 @@ pub enum Outcome {
     Host(Action),
 }
 
+/// The principal and role the model's tool calls run as.
+pub const AGENT_USER: &str = "agent:chat";
+/// The workspace role the host must define for [`Device::run_agent`] to work.
+pub const AGENT_ROLE: &str = "agent";
+
 /// The screens, the workspace and the signed-in person.
 pub struct Device<B: Backend> {
     /// The interface to draw and feed keys to.
@@ -58,6 +63,7 @@ pub struct Device<B: Backend> {
     apps: Option<Apps>,
     store: Option<AppStore>,
     player: Option<mouli_apps::SharedPlayer>,
+    agent: Option<String>,
 }
 
 /// Where the applications are saved, and what was last written there.
@@ -91,6 +97,7 @@ impl<B: Backend> Device<B> {
             apps: None,
             store: None,
             player: None,
+            agent: None,
         };
         d.refresh();
         Ok(d)
@@ -266,6 +273,63 @@ impl<B: Backend> Device<B> {
 
     fn notice(&mut self, text: &str) {
         self.shell.chat.push(Role::Notice, text);
+    }
+
+    /// Runs a tool call made by the model in Chat, and returns the text the model should see.
+    ///
+    /// The model acts as its own principal, `agent:chat`, with the workspace role `agent`, never as
+    /// the person: the same policy, approvals and audit apply, and a change that needs approval is
+    /// held for the *person* to decide (four-eyes would refuse the person approving their own
+    /// request). What happened is also shown in the conversation.
+    pub fn run_agent(&mut self, command: &str) -> String {
+        let session = match self.agent.clone() {
+            Some(s) => s,
+            None => match self.ws.open_session(&self.tenant, AGENT_USER, AGENT_ROLE) {
+                Ok(s) => {
+                    self.agent = Some(s.clone());
+                    s
+                }
+                Err(e) => {
+                    let text = format!("The agent cannot act: {e}");
+                    self.notice(&text);
+                    return text;
+                }
+            },
+        };
+        let shown: String = command.chars().take(160).collect();
+        self.notice(&format!("Agent: {shown}"));
+        let text = match self.ws.submit(&self.tenant, &session, command) {
+            Ok(Reply::Done(out)) => {
+                self.shell.chat.push(Role::Tool, &out.text);
+                out.text
+            }
+            Ok(Reply::AwaitingApproval { id }) => {
+                let text = format!(
+                    "The change is held for the person's approval ({id}); it has not been made. Tell them to review it under F3."
+                );
+                self.notice(&format!(
+                    "The agent's request is waiting for your approval ({id}). Press F3 to review it."
+                ));
+                text
+            }
+            Ok(Reply::Refused { by }) => {
+                let text = format!("Refused by {by}.");
+                self.notice(&text);
+                text
+            }
+            Ok(Reply::Chat { .. }) => {
+                let text = "That is not a tool.".to_string();
+                self.notice(&text);
+                text
+            }
+            Err(e) => {
+                let text = e.to_string();
+                self.notice(&text);
+                text
+            }
+        };
+        self.refresh();
+        text
     }
 
     fn send(&mut self, text: &str) {

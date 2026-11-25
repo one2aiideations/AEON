@@ -51,6 +51,7 @@ pub mod sntp;
 pub mod sysinfo;
 pub mod system;
 pub mod textwrap;
+pub mod toolloop;
 pub mod ui;
 pub mod wifi;
 pub mod wifi_saved;

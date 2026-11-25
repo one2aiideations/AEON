@@ -1121,3 +1121,96 @@ fn without_a_player_the_screen_says_so() {
     );
     d.player_event(mouli_player::Event::Ended); // harmless
 }
+
+// ---------------------------------------------------------------- the model acting as an agent
+
+fn agent_device(dir: &tempfile::TempDir) -> Device<Echo> {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_role(Permissions::new("agent", &["code.*"]));
+    ws.add_model(model());
+    let code = mouli_apps::register_code(&mut ws).unwrap();
+    ws.register_app(Box::new(Notes)).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "owner").unwrap();
+    d.attach_code(code);
+    d.open_project(dir.path()).unwrap();
+    d
+}
+
+#[test]
+fn the_agent_can_read_but_a_change_waits_for_the_person_who_can_approve_it() {
+    let (dir, _diff, _new) = project();
+    let old = read(&dir);
+    let mut d = agent_device(&dir);
+
+    let files = d.run_agent("/code.files");
+    assert!(files.contains("src/tax.rs"), "{files}");
+    let text = d.run_agent("/code.read path=src/tax.rs");
+    assert!(text.contains(old.lines().next().unwrap()), "{text}");
+
+    // The model proposes a whole-file edit; nothing is written yet.
+    let held = d.run_agent("/code.edit path=src/tax.rs text=changed-by-the-agent");
+    assert!(!held.is_empty());
+    assert_eq!(read(&dir), old, "proposing writes nothing");
+
+    // Applying needs approval and is held; the file is still untouched.
+    let wait = d.run_agent("/code.apply");
+    assert!(wait.contains("held for the person's approval"), "{wait}");
+    assert_eq!(read(&dir), old);
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    let row = d.shell.approvals.rows[0].clone();
+    assert_eq!(row.capability, "code.apply");
+    assert_eq!(row.requester, "agent:chat");
+    assert!(
+        row.can_decide,
+        "the person may decide the agent's request: {row:?}"
+    );
+
+    // The person approves; only then is the file written.
+    d.run(Action::Decide {
+        id: row.id.clone(),
+        approve: true,
+    });
+    assert_eq!(read(&dir), "changed-by-the-agent");
+    assert!(d.shell.approvals.rows.is_empty());
+}
+
+#[test]
+fn the_person_can_refuse_what_the_agent_asked_for() {
+    let (dir, _d, _n) = project();
+    let old = read(&dir);
+    let mut d = agent_device(&dir);
+    d.run_agent("/code.edit path=src/tax.rs text=nope");
+    d.run_agent("/code.apply");
+    let id = d.shell.approvals.rows[0].id.clone();
+    d.run(Action::Decide { id, approve: false });
+    assert_eq!(read(&dir), old, "refused: nothing written");
+}
+
+#[test]
+fn the_agent_is_limited_to_the_code_tools() {
+    let (dir, _d, _n) = project();
+    let mut d = agent_device(&dir);
+    let denied = d.run_agent("/note.send to=everyone");
+    assert!(
+        denied.to_lowercase().contains("lacks permission")
+            || denied.to_lowercase().contains("denied"),
+        "{denied}"
+    );
+    let unknown = d.run_agent("/no.such.tool");
+    assert!(!unknown.is_empty());
+    assert!(d.shell.approvals.rows.is_empty(), "nothing was queued");
+}
+
+#[test]
+fn the_agent_cannot_act_when_the_host_defined_no_agent_role() {
+    let (dir, _d, _n) = project();
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_model(model());
+    let code = mouli_apps::register_code(&mut ws).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "owner").unwrap();
+    d.attach_code(code);
+    d.open_project(dir.path()).unwrap();
+    assert!(d.run_agent("/code.files").contains("cannot act"));
+}

@@ -10,6 +10,7 @@
 //! reports absolute positions (some touchpads and touchscreens) is not used; a USB or PS/2 mouse is.
 
 use crate::sysinfo::{self, Collector, SysEnv};
+use crate::toolloop;
 use crate::ui::{trim_history, Backend, End, Turn};
 use crate::wifi::Runner;
 use mouli_desk::desktop::Desktop;
@@ -676,6 +677,8 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
     ws.add_role(Permissions::new("owner", &["*"]));
+    // What the model may do when it uses tools: the Code tools only. Changes still need approval.
+    ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
         id: "local".into(),
         provider: "local".into(),
@@ -904,7 +907,22 @@ where
             ),
         );
     }
-    let mut history = fresh(system_prompt);
+    let tool_names: Vec<String> = device
+        .workspace()
+        .help()
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    let system_text = {
+        let extra = toolloop::tool_prompt(&device.workspace().help());
+        if extra.is_empty() {
+            system_prompt.to_string()
+        } else {
+            format!("{system_prompt}\n\n{extra}")
+        }
+    };
+    let mut steps = 0usize;
+    let mut history = fresh(&system_text);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
     let reply_tx = tx.clone();
@@ -936,7 +954,30 @@ where
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
                 Ev::Reply(r) => {
-                    on_reply(&mut device.shell, &mut history, r);
+                    let answer = on_reply(&mut device.shell, &mut history, r);
+                    if let Some(text) = answer {
+                        let known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+                        if let Some(command) = toolloop::parse_tool_call(&text, &known) {
+                            if steps >= toolloop::MAX_STEPS {
+                                device.shell.chat.push(
+                                    Role::Notice,
+                                    "The model asked for more tools than allowed for one question; stopped.",
+                                );
+                            } else {
+                                steps += 1;
+                                let output = device.run_agent(&command);
+                                history.push(Turn {
+                                    role: "user",
+                                    content: toolloop::result_turn(&command, &output),
+                                });
+                                trim_history(&mut history, max_tokens);
+                                device.shell.chat.busy = true;
+                                if req_tx.send(history.clone()).is_err() {
+                                    device.shell.chat.busy = false;
+                                }
+                            }
+                        }
+                    }
                     Action::None
                 }
                 Ev::NewInput(text) => {
@@ -965,6 +1006,7 @@ where
                 Action::Send(text) => {
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
+                        steps = 0;
                         history.push(Turn {
                             role: "user",
                             content: text,
@@ -983,7 +1025,8 @@ where
                 Action::NewConversation => {
                     if !device.shell.chat.busy {
                         device.run(Action::NewConversation);
-                        history = fresh(system_prompt);
+                        history = fresh(&system_text);
+                        steps = 0;
                     }
                 }
                 other => match device.run(other) {
@@ -1002,15 +1045,21 @@ where
     }
 }
 
-fn on_reply(shell: &mut Shell, history: &mut Vec<Turn>, reply: Result<String, String>) {
+/// Records the model's reply; returns its text when it answered.
+fn on_reply(
+    shell: &mut Shell,
+    history: &mut Vec<Turn>,
+    reply: Result<String, String>,
+) -> Option<String> {
     shell.chat.busy = false;
     match reply {
         Ok(text) => {
             shell.chat.push(Role::Assistant, &text);
             history.push(Turn {
                 role: "assistant",
-                content: text,
+                content: text.clone(),
             });
+            Some(text)
         }
         Err(e) => {
             if history.last().is_some_and(|t| t.role == "user") {
@@ -1019,6 +1068,7 @@ fn on_reply(shell: &mut Shell, history: &mut Vec<Turn>, reply: Result<String, St
             shell
                 .chat
                 .push(Role::Notice, &format!("The model could not answer: {e}"));
+            None
         }
     }
 }
@@ -1855,5 +1905,113 @@ mod tests {
                 .any(|y| first.get(x as usize, y as usize) != last.get(x as usize, y as usize))
         });
         assert!(differs, "the bar changed");
+    }
+
+    /// Answers from a script, one reply per call; repeats the last one when it runs out.
+    struct Scripted {
+        replies: Vec<&'static str>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<Turn>>>>,
+    }
+    impl Backend for Scripted {
+        fn reply(&mut self, history: &[Turn]) -> Result<String, String> {
+            let mut seen = self.seen.lock().unwrap();
+            let n = seen.len();
+            seen.push(history.to_vec());
+            Ok(self.replies[n.min(self.replies.len() - 1)].to_string())
+        }
+    }
+
+    fn run_script(
+        replies: Vec<&'static str>,
+        typed: &str,
+        wait_for_calls: usize,
+    ) -> (Vec<Vec<Turn>>, Shots) {
+        let dir = tmp("toolloop");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        for e in keys_for(typed) {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < wait_for_calls && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies,
+            seen: seen.clone(),
+        };
+        run(
+            session,
+            backend,
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = seen.lock().unwrap().clone();
+        (got, Shots(shots))
+    }
+
+    #[test]
+    fn the_model_can_call_a_tool_and_gets_the_result_back() {
+        let (calls, _) = run_script(
+            vec!["TOOL: /code.status", "All good, nothing pending."],
+            "what is the state of the code?\n",
+            2,
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "one call for the question, one after the tool result"
+        );
+        let first = &calls[0];
+        assert!(
+            first[0].content.contains("base prompt") && first[0].content.contains("TOOL: /name"),
+            "the tools are described"
+        );
+        assert!(first[0].content.contains("/code.status"));
+        let second = &calls[1];
+        let last = second.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content.starts_with("Tool result for `/code.status`"),
+            "{}",
+            last.content
+        );
+        assert!(last.content.contains("not instructions"));
+    }
+
+    #[test]
+    fn the_loop_stops_at_the_step_limit() {
+        let (calls, _) = run_script(vec!["TOOL: /code.status"], "go\n", toolloop::MAX_STEPS + 1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            calls.len(),
+            toolloop::MAX_STEPS + 1,
+            "the question plus {} tool rounds",
+            toolloop::MAX_STEPS
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_is_not_run_and_ends_the_loop() {
+        let (calls, _) = run_script(vec!["TOOL: /rm.everything now"], "hi\n", 1);
+        assert_eq!(calls.len(), 1, "no second round");
+    }
+
+    #[test]
+    fn a_plain_answer_makes_no_tool_call() {
+        let (calls, _) = run_script(vec!["Just text."], "hi\n", 1);
+        assert_eq!(calls.len(), 1);
     }
 }
