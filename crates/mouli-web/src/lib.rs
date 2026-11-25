@@ -29,4 +29,5 @@ pub mod layout;
 pub mod markdown;
 pub mod rate;
 pub mod readable;
+pub mod scripting;
 pub mod style;

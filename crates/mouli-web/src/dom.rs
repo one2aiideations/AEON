@@ -454,6 +454,271 @@ impl Dom {
     }
 }
 
+/// Changing a document (what scripts do).
+impl Dom {
+    fn push_node(&mut self, kind: Kind) -> Option<NodeId> {
+        if self.nodes.len() >= MAX_NODES {
+            return None;
+        }
+        self.nodes.push(Node {
+            kind,
+            parent: None,
+            children: Vec::new(),
+        });
+        Some(self.nodes.len() - 1)
+    }
+
+    /// Makes a detached element (`None` when the document is full).
+    pub fn create_element(&mut self, tag: &str) -> Option<NodeId> {
+        let tag: String = tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if tag.is_empty() {
+            return None;
+        }
+        self.push_node(Kind::Element {
+            tag,
+            attrs: Vec::new(),
+        })
+    }
+
+    /// Makes a detached text node.
+    pub fn create_text(&mut self, text: &str) -> Option<NodeId> {
+        self.push_node(Kind::Text(text.to_string()))
+    }
+
+    /// Takes a node out of its parent.
+    pub fn detach(&mut self, id: NodeId) {
+        if let Some(p) = self.nodes.get(id).and_then(|n| n.parent) {
+            self.nodes[p].children.retain(|&c| c != id);
+            self.nodes[id].parent = None;
+        }
+    }
+
+    /// Whether `a` is `b` or lies inside `b`.
+    #[must_use]
+    pub fn is_inside(&self, a: NodeId, b: NodeId) -> bool {
+        let mut cur = Some(a);
+        let mut guard = 0;
+        while let Some(n) = cur {
+            if n == b {
+                return true;
+            }
+            guard += 1;
+            if guard > MAX_NODES {
+                return false;
+            }
+            cur = self.parent(n);
+        }
+        false
+    }
+
+    /// Puts `child` last under `parent` (moving it if it is elsewhere). `false` if that would make
+    /// a cycle or either node is unknown.
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> bool {
+        self.insert_before(parent, child, None)
+    }
+
+    /// Puts `child` under `parent` before `reference` (or last when `None`).
+    pub fn insert_before(
+        &mut self,
+        parent: NodeId,
+        child: NodeId,
+        reference: Option<NodeId>,
+    ) -> bool {
+        if parent >= self.nodes.len()
+            || child >= self.nodes.len()
+            || self.is_inside(parent, child)
+            || matches!(self.nodes[parent].kind, Kind::Text(_))
+            || matches!(self.nodes[child].kind, Kind::Document)
+        {
+            return false;
+        }
+        if let Some(r) = reference {
+            if self.nodes.get(r).and_then(|n| n.parent) != Some(parent) {
+                return false;
+            }
+        }
+        self.detach(child);
+        let at = reference
+            .and_then(|r| self.nodes[parent].children.iter().position(|&c| c == r))
+            .unwrap_or(self.nodes[parent].children.len());
+        self.nodes[parent].children.insert(at, child);
+        self.nodes[child].parent = Some(parent);
+        true
+    }
+
+    /// Sets an attribute (name lowercased).
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        let name = name.to_ascii_lowercase();
+        if let Some(Node {
+            kind: Kind::Element { attrs, .. },
+            ..
+        }) = self.nodes.get_mut(id)
+        {
+            if let Some(a) = attrs.iter_mut().find(|(n, _)| *n == name) {
+                a.1 = value.to_string();
+            } else if attrs.len() < 64 {
+                attrs.push((name, value.to_string()));
+            }
+        }
+    }
+
+    /// Removes an attribute.
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let name = name.to_ascii_lowercase();
+        if let Some(Node {
+            kind: Kind::Element { attrs, .. },
+            ..
+        }) = self.nodes.get_mut(id)
+        {
+            attrs.retain(|(n, _)| *n != name);
+        }
+    }
+
+    /// Replaces a node's children with one text node (or sets the text of a text node).
+    pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        match self.nodes.get_mut(id).map(|n| &mut n.kind) {
+            Some(Kind::Text(t)) => *t = text.to_string(),
+            Some(_) => {
+                self.clear_children(id);
+                if !text.is_empty() {
+                    if let Some(t) = self.create_text(text) {
+                        self.append_child(id, t);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Removes all of a node's children.
+    pub fn clear_children(&mut self, id: NodeId) {
+        let kids = self.children(id).to_vec();
+        for k in kids {
+            self.detach(k);
+        }
+    }
+
+    /// Copies `src` and everything below it from `from` into this document, detached.
+    pub fn import(&mut self, from: &Dom, src: NodeId) -> Option<NodeId> {
+        let node = from.nodes.get(src)?;
+        let copy = match &node.kind {
+            Kind::Document => return None,
+            k => self.push_node(k.clone())?,
+        };
+        for &c in &node.children {
+            if let Some(cc) = self.import(from, c) {
+                self.append_child(copy, cc);
+            }
+        }
+        Some(copy)
+    }
+
+    /// Copies a node of this document, with its descendants when `deep`.
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
+        let snapshot = self.clone();
+        let copy = self.import(&snapshot, id)?;
+        if !deep {
+            self.clear_children(copy);
+        }
+        Some(copy)
+    }
+
+    /// Replaces a node's children with the nodes parsed from `html`.
+    pub fn set_inner_html(&mut self, id: NodeId, html: &str) {
+        if matches!(
+            self.nodes.get(id).map(|n| &n.kind),
+            None | Some(Kind::Text(_))
+        ) {
+            return;
+        }
+        let frag = Dom::parse(&format!("<body>{html}</body>"));
+        self.clear_children(id);
+        if let Some(body) = frag.body() {
+            for &c in frag.children(body) {
+                if let Some(copy) = self.import(&frag, c) {
+                    self.append_child(id, copy);
+                }
+            }
+        }
+    }
+
+    /// The HTML of a node's children.
+    #[must_use]
+    pub fn inner_html(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        for &c in self.children(id) {
+            self.write_html(c, &mut out, 0);
+        }
+        out
+    }
+
+    fn write_html(&self, id: NodeId, out: &mut String, depth: usize) {
+        if depth > MAX_DEPTH + 10 || out.len() > 8_000_000 {
+            return;
+        }
+        let Some(n) = self.nodes.get(id) else { return };
+        match &n.kind {
+            Kind::Text(t) => {
+                let raw = n
+                    .parent
+                    .and_then(|p| self.tag(p))
+                    .is_some_and(|t| matches!(t, "script" | "style"));
+                if raw {
+                    out.push_str(t);
+                } else {
+                    out.push_str(
+                        &t.replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;"),
+                    );
+                }
+            }
+            Kind::Element { tag, attrs } => {
+                out.push('<');
+                out.push_str(tag);
+                for (k, v) in attrs {
+                    out.push(' ');
+                    out.push_str(k);
+                    out.push_str("=\"");
+                    out.push_str(&v.replace('&', "&amp;").replace('"', "&quot;"));
+                    out.push('"');
+                }
+                out.push('>');
+                if !VOID.contains(&tag.as_str()) {
+                    for &c in &n.children {
+                        self.write_html(c, out, depth + 1);
+                    }
+                    out.push_str("</");
+                    out.push_str(tag);
+                    out.push('>');
+                }
+            }
+            Kind::Document => {}
+        }
+    }
+
+    /// Elements below `id` (not `id` itself) in document order.
+    #[must_use]
+    pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.children(id).iter().rev().copied().collect();
+        while let Some(n) = stack.pop() {
+            if out.len() >= MAX_NODES {
+                break;
+            }
+            if matches!(self.nodes[n].kind, Kind::Element { .. }) {
+                out.push(n);
+            }
+            stack.extend(self.nodes[n].children.iter().rev());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,5 +861,39 @@ mod tests {
             let d = Dom::parse(s);
             assert!(d.body().is_some(), "{s:?}");
         }
+    }
+
+    #[test]
+    fn scripts_can_change_the_tree() {
+        let mut d = Dom::parse("<ul id=l><li>a</li></ul>");
+        let l = d.by_id("l").unwrap();
+        let li = d.create_element("LI").unwrap();
+        d.set_text_content(li, "b <&>");
+        assert!(d.append_child(l, li));
+        assert_eq!(d.inner_html(l), "<li>a</li><li>b &lt;&amp;&gt;</li>");
+        // Moving a node takes it out of its old place.
+        let first = d.element_children(l)[0];
+        assert!(d.append_child(l, first));
+        assert_eq!(d.inner_html(l), "<li>b &lt;&amp;&gt;</li><li>a</li>");
+        // Cycles and bad targets are refused.
+        assert!(!d.append_child(first, l));
+        assert!(!d.append_child(l, l));
+        let t = d.create_text("x").unwrap();
+        assert!(!d.append_child(t, li));
+        assert!(!d.insert_before(l, li, Some(t)));
+        d.set_attr(l, "Class", "x y");
+        assert_eq!(d.classes(l), vec!["x", "y"]);
+        d.remove_attr(l, "class");
+        assert!(d.classes(l).is_empty());
+        d.set_inner_html(l, "<b>1</b><i>2</i>");
+        assert_eq!(d.inner_html(l), "<b>1</b><i>2</i>");
+        let copy = d.clone_node(l, true).unwrap();
+        assert_eq!(d.inner_html(copy), "<b>1</b><i>2</i>");
+        let shallow = d.clone_node(l, false).unwrap();
+        assert_eq!(d.inner_html(shallow), "");
+        assert_eq!(d.descendants(l).len(), 2);
+        d.set_text_content(l, "");
+        assert!(d.children(l).is_empty());
+        assert!(d.create_element("").is_none());
     }
 }

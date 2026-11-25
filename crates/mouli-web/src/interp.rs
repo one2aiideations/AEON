@@ -513,6 +513,11 @@ impl Interp {
         Err(self.make_error(kind, msg))
     }
 
+    /// The text shown for an uncaught error value.
+    pub fn error_text(&mut self, e: &Value) -> String {
+        self.describe_error(e)
+    }
+
     fn describe_error(&mut self, e: &Value) -> String {
         if let Some(f) = &self.fatal {
             return format!("Halted: {f}");
