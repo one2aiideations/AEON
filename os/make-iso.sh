@@ -65,5 +65,10 @@ CFG
 
 mkdir -p "$(dirname "$ISO")"
 grub-mkrescue -o "$ISO" "$STAGE" -- -volid MOULI >/dev/null 2>&1 || grub-mkrescue -o "$ISO" "$STAGE"
+# grub-mkrescue silently makes a UEFI-only ISO when grub-pc-bin is missing; refuse that.
+xorriso -indev "$ISO" -report_el_torito plain 2>/dev/null | grep -q "BIOS" || {
+    echo "ISO has no BIOS boot image: install grub-pc-bin and run again" >&2
+    exit 1
+}
 ls -la "$ISO"
 echo "Write to a USB stick with:  sudo dd if=$ISO of=/dev/sdX bs=4M conv=fsync status=progress"
