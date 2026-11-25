@@ -170,7 +170,7 @@ impl DataAuthority {
     }
 }
 
-// This boundary expects a trusted MOULIONE gateway to authenticate the caller,
+// This boundary expects a trusted MOULI-AUTH gateway to authenticate the caller,
 // authorize the request, and inject these headers. Never trust client-supplied
 // copies of these headers on a publicly exposed listener.
 fn request_context(headers: &HeaderMap) -> Result<RequestContext, (StatusCode, String)> {
@@ -308,8 +308,8 @@ async fn readiness(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Read
     (status, Json(Readiness {
         status: if ready { "ready_for_adapter_calls" } else { "not_ready" },
         mouli_data_configured: ready,
-        authorization_boundary: "trusted_moulione_gateway_required",
-        note: "MOULI-DATA endpoint compatibility and MOULIONE authorization enforcement must be verified before production",
+        authorization_boundary: "trusted_mouli_auth_gateway_required",
+        note: "MOULI-DATA endpoint compatibility and MOULI-AUTH authorization enforcement must be verified before production",
     }))
 }
 

@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-MOULI-CLOUD orchestrates infrastructure through adapters; it does not become a new identity provider, general-purpose database, agent runtime or product-specific business authority. MOULIONE governs access and approvals; MOULI-DATA persists control-plane metadata; MOULI-CODE/MOULI-STUDIO can hand off validated artifacts.
+MOULI-CLOUD orchestrates infrastructure through adapters; it does not become a new identity provider, general-purpose database, agent runtime or product-specific business authority. MOULI-AUTH governs access and approvals; MOULI-DATA persists control-plane metadata; MOULI-CODE/MOULI-STUDIO can hand off validated artifacts.
 
 **Folder owner:** Deployment orchestration, compute/network/storage adapters, environments, releases, resource governance, monitoring and recovery workflows.
 
@@ -58,7 +58,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

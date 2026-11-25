@@ -10,7 +10,7 @@ Provide project, program, portfolio and delivery management for teams and enterp
 
 **Folder ownership:** Projects, programs, portfolios, tasks, milestones, dependencies, resource allocation, budgets, delivery risks and project performance.
 
-PROJECT owns delivery planning and tracking, not enterprise identity or financial ledger authority. MOULIONE owns tenant/company context and approvals; MOULI-DATA owns persistence; MOULI-ERP/FINANCE remain authoritative for financial transactions and billing.
+PROJECT owns delivery planning and tracking, not enterprise identity or financial ledger authority. MOULI-AUTH owns tenant/company context and approvals; MOULI-DATA owns persistence; MOULI-ERP/FINANCE remain authoritative for financial transactions and billing.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

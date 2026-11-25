@@ -10,14 +10,14 @@ Provide cybersecurity operations and risk-management capabilities for the MOULI 
 
 **Folder ownership:** Security posture, asset and vulnerability workflows, threat detection, incident response, evidence and security analytics.
 
-SECURITY workflows must operate only on explicitly authorized assets and environments. MOULIONE remains the identity/authorization authority; SECURITY must not create a competing IAM. Defensive actions must be scoped, auditable and reversible where possible; do not expose exploit execution or unapproved intrusive operations.
+SECURITY workflows must operate only on explicitly authorized assets and environments. MOULI-AUTH remains the identity/authorization authority; SECURITY must not create a competing IAM. Defensive actions must be scoped, auditable and reversible where possible; do not expose exploit execution or unapproved intrusive operations.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
 ## 2. Functional capability catalogue
 
 - Security posture and asset inventory
-- Identity and access risk monitoring integrated with MOULIONE
+- Identity and access risk monitoring integrated with MOULI-AUTH
 - Vulnerability discovery, prioritization, remediation and patch tracking
 - Endpoint and workload security integrations
 - Threat intelligence ingestion, detection rules and event correlation
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

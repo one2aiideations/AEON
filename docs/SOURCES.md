@@ -50,6 +50,6 @@ These were checked against tests written alongside them, **not** against a refer
 
 `sources/LibreOne-main` is about 600 lines of Python contract stubs plus a product README; 243 of its files are tests. It was used as the specification for `mouli-interface`. Bugs in the stubs not carried over: dataclass defaults such as `id: UUID = new_id()` are evaluated once, so all instances share one id; approvals could be decided by anyone and reused; `data_washing` only matched `key=value`. Unverified: no application uses the interface yet, and the washing patterns have not been tested against real data.
 
-## MOULIONE
+## MOULI-AUTH
 
-`sources/` contains no MOULIONE code, only specifications (`MOULI-AUTH.md`, the MOULIONE/AgentBox boundary document, and product READMEs that cite it). The repository `CMKIXVI/moulione` could not be fetched with this machine's GitHub login. `mouli-auth` is therefore built from the specifications alone and has not been compared with the real service. Open items: confirm the real token/JWKS contract, replace HMAC with the asymmetric scheme once a crypto dependency is reviewed, and confirm MOULIONE's license (the boundary document records none).
+`sources/` contains no MOULI-AUTH code, only specifications (`MOULI-AUTH.md`, the MOULI-AUTH/AgentBox boundary document, and product READMEs that cite it). The repository `CMKIXVI/moulione` could not be fetched with this machine's GitHub login. `mouli-auth` is therefore built from the specifications alone and has not been compared with the real service. Open items: confirm the real token/JWKS contract, replace HMAC with the asymmetric scheme once a crypto dependency is reviewed, and confirm MOULI-AUTH's license (the boundary document records none).

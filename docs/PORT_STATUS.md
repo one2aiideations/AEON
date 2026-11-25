@@ -48,13 +48,13 @@ Those were written in the C era; treat statements about "C core" as historical.
 | LibreOne README scope (multimodal ingestion, connectors, MCP, enterprise identity, observability) | none | product vision only; no code in the source to port |
 | `libreone/native/mouli_contract.py` | none | superseded: MOULI itself is the native layer |
 
-## Enterprise authority (MOULIONE / MOULI-AUTH)
+## Enterprise authority (MOULI-AUTH)
 
 | Source | Rust | Status |
 |---|---|---|
 | `MOULI-AUTH.md` capability map: tenancy and org hierarchy, RBAC/ABAC policy, maker-checker with limits and escalation, tamper-evident audit | `mouli-auth` | core built from the spec; 21 unit tests |
-| `MOULIONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `mouli-auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme MOULIONE documents** |
-| MOULIONE repository (`CMKIXVI/moulione`) | none | **not available** (not in `sources/`, not reachable from this account); nothing derived from its code |
+| `MOULIONE_AGENTBOX_BOUNDARY.md` authorisation handoff (short-lived, audience-bound, tenant-scoped, replay and revocation checks) | `mouli-auth::envelope` | built with HMAC-SHA256; **not the JWKS scheme MOULI-AUTH documents** |
+| MOULI-AUTH repository (`CMKIXVI/moulione`) | none | **not available** (not in `sources/`, not reachable from this account); nothing derived from its code |
 | Login, MFA, SSO, sessions, persistence, admin APIs, policy lifecycle | none | not implemented |
 
 ## mouli-gateway (new, not a port)

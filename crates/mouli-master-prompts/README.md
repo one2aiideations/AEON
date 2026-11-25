@@ -52,7 +52,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

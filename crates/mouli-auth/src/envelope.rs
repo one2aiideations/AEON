@@ -4,7 +4,7 @@
 //! An envelope binds subject, tenant, org node, scopes, audience, decision id, correlation id,
 //! issue and expiry times and a unique token id, and is signed with HMAC-SHA256.
 //!
-//! Deviation from the boundary document, stated plainly: MOULIONE's real contract is JWKS-style
+//! Deviation from the boundary document, stated plainly: MOULI-AUTH's real contract is JWKS-style
 //! (asymmetric) and was not available to read. HMAC means the verifier holds the signing key, so
 //! this suits one trust domain (the local machine, one deployment) and must not be exposed to
 //! parties that should only verify. Swapping in an asymmetric scheme needs a reviewed crypto

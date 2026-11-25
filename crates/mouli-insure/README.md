@@ -10,7 +10,7 @@ Provide insurance distribution and administration for insurers, brokers, agents,
 
 **Folder ownership:** Insurance products, quotes, applications, underwriting case workflows, policies, premiums, claims, commissions and portfolio analytics.
 
-INSURE owns insurance product and policy lifecycle workflows. MOULIONE governs identity, tenancy, access and approvals; MOULI-DATA owns common persistence; MOULI-FINANCE owns payment and broader financial-service rails where applicable. Underwriting and claim decisions must remain attributable to authorized decision makers and documented rules.
+INSURE owns insurance product and policy lifecycle workflows. MOULI-AUTH governs identity, tenancy, access and approvals; MOULI-DATA owns common persistence; MOULI-FINANCE owns payment and broader financial-service rails where applicable. Underwriting and claim decisions must remain attributable to authorized decision makers and documented rules.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

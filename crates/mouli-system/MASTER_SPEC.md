@@ -8,7 +8,7 @@ A single native Rust desktop application that serves as a unified, AI-native con
 - Internal Rust modules may be declared inside that file.
 - No frontend/backend split, microservices, sidecars, Python, Node, Java, Electron or Flutter runtime.
 - Native OS adapters and native utilities are permitted.
-- Local/offline core; MOULI and MOULI-DB integrations remain optional. MOULIONE is the enterprise identity/authorization authority only when enterprise integration is enabled.
+- Local/offline core; MOULI and MOULI-DB integrations remain optional. MOULI-AUTH is the enterprise identity/authorization authority only when enterprise integration is enabled.
 - Never silently overwrite existing working code.
 
 ## Product areas

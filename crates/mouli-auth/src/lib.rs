@@ -1,10 +1,10 @@
-//! MOULI-AUTH / MOULIONE core: the enterprise authority for identity, tenancy, authorisation,
-//! approvals and audit, rebuilt in Rust from the MOULI-AUTH specification and the MOULIONE and
-//! AgentBox boundary document.
+//! MOULI-AUTH core: the enterprise authority for identity, tenancy, authorisation,
+//! approvals and audit, rebuilt in Rust from the MOULI-AUTH specification and the MOULI-AUTH/AgentBox
+//! boundary document.
 //!
-//! The MOULIONE repository itself was not available (the source tree holds only specifications),
-//! so nothing here is derived from its code and **nothing is verified against the real MOULIONE**.
-//! In particular the envelope scheme is HMAC-SHA256, not the JWKS-style signature MOULIONE is
+//! The MOULI-AUTH repository itself was not available (the source tree holds only specifications),
+//! so nothing here is derived from its code and **nothing is verified against the real MOULI-AUTH**.
+//! In particular the envelope scheme is HMAC-SHA256, not the JWKS-style signature MOULI-AUTH is
 //! documented to use; see [`envelope`].
 //!
 //! - [`org`]: tenant > company > plant hierarchy.

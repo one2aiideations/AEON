@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-Commerce owns shopping and order experiences. MOULI-ERP owns inventory/accounting operational records; MOULI-FINANCE owns regulated financial services and payment/settlement domain processes where applicable; MOULIONE owns identity and authorization; MOULI-DATA owns persistence.
+Commerce owns shopping and order experiences. MOULI-ERP owns inventory/accounting operational records; MOULI-FINANCE owns regulated financial services and payment/settlement domain processes where applicable; MOULI-AUTH owns identity and authorization; MOULI-DATA owns persistence.
 
 **Folder owner:** Storefront, catalog, cart, checkout, orders, seller experiences, promotions, loyalty and commerce-specific analytics.
 
@@ -59,7 +59,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

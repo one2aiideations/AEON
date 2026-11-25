@@ -10,7 +10,7 @@ Provide a native AI-assisted control centre for operating, understanding, mainta
 
 **Folder ownership:** Local system inventory, diagnostics, resource/process/service management, device/network/storage administration and safe maintenance workflows.
 
-Default to read-only. Every mutation requires validated inputs, dry-run preview, user approval, risk classification, audit record and post-action verification. Never run arbitrary AI-generated shell commands, silently disable protections or delete unspecified data. MOULI/MOULI-DB integrations are optional; MOULIONE is used only for enterprise identity/authorization integration.
+Default to read-only. Every mutation requires validated inputs, dry-run preview, user approval, risk classification, audit record and post-action verification. Never run arbitrary AI-generated shell commands, silently disable protections or delete unspecified data. MOULI/MOULI-DB integrations are optional; MOULI-AUTH is used only for enterprise identity/authorization integration.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

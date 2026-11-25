@@ -1,4 +1,4 @@
-# MOULI-AUTH (MOULI-AUTH) — Master Implementation Prompt
+# MOULI-AUTH — Master Implementation Prompt
 **Category:** Enterprise authority  
 **Product mission:** Provide the single enterprise authority for identity, authentication, authorization, tenancy, organizational structure, governance, workflow, approvals and audit across the MOULI ecosystem.
 

@@ -10,7 +10,7 @@ Provide an integrated office and productivity workspace for creating, editing, o
 
 **Folder ownership:** Documents, spreadsheets, presentations, notes, knowledge pages, forms, whiteboards, calendars, tasks and collaboration experiences.
 
-WORK owns productivity experiences, not the underlying general-purpose persistence or enterprise identity. MOULI-DATA stores artifacts and metadata; MOULIONE governs users, sharing and tenant access; MOULI runtime supplies inference; agents run through MOULI-AGENTS/AgentBox.
+WORK owns productivity experiences, not the underlying general-purpose persistence or enterprise identity. MOULI-DATA stores artifacts and metadata; MOULI-AUTH governs users, sharing and tenant access; MOULI runtime supplies inference; agents run through MOULI-AGENTS/AgentBox.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

@@ -10,7 +10,7 @@ Provide legal matter, contract, document, research, intellectual-property and co
 
 **Folder ownership:** Matter lifecycle, contract lifecycle, legal document workflows, research collections, deadlines, counterparty risk and IP portfolio records.
 
-LEGAL supports legal operations; it does not replace qualified legal judgment or authoritative court/registry systems. AI outputs are drafts or research assistance, never legal advice or executed filings without authorized review. MOULIONE governs access and approvals; MOULI-DATA provides governed storage and retrieval.
+LEGAL supports legal operations; it does not replace qualified legal judgment or authoritative court/registry systems. AI outputs are drafts or research assistance, never legal advice or executed filings without authorized review. MOULI-AUTH governs access and approvals; MOULI-DATA provides governed storage and retrieval.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

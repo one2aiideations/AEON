@@ -10,7 +10,7 @@ Provide end-to-end logistics and transportation operations for fleet, warehouse,
 
 **Folder ownership:** Shipment and consignment lifecycle, fleet/carrier records, dispatch, warehouse/yard operations, proof of delivery, freight and exception handling.
 
-LOGISTICS owns transport and fulfilment workflows, not the source order/inventory or enterprise identity. MOULI-ERP/COMMERCE own order and inventory source records; MOULIONE governs actors and approvals; MOULI-DATA stores events and operational records. Optimization recommendations must not bypass safety or dispatcher controls.
+LOGISTICS owns transport and fulfilment workflows, not the source order/inventory or enterprise identity. MOULI-ERP/COMMERCE own order and inventory source records; MOULI-AUTH governs actors and approvals; MOULI-DATA stores events and operational records. Optimization recommendations must not bypass safety or dispatcher controls.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

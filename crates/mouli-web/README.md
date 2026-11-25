@@ -10,7 +10,7 @@ Provide an AI-native web operating environment combining visual website authorin
 
 **Folder ownership:** Browser and website inspection UX, visual authoring, source editing, website intelligence/compiler, publishing integrations and MCP capability discovery.
 
-WEB is a single Rust monolithic application per its source specification. It must not create separate MCP servers, independent databases, duplicate identity systems or a separate browser backend service. External browser-engine integration is permitted only as a bounded adapter; MOULIONE and MOULI-DATA remain shared authorities.
+WEB is a single Rust monolithic application per its source specification. It must not create separate MCP servers, independent databases, duplicate identity systems or a separate browser backend service. External browser-engine integration is permitted only as a bounded adapter; MOULI-AUTH and MOULI-DATA remain shared authorities.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

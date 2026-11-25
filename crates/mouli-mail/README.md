@@ -10,7 +10,7 @@ Deliver a secure AI-native email server and intelligent mail client with standar
 
 **Folder ownership:** Mailboxes, message composition and retrieval, server/client mail workflows, mail rules, search, identity-bound mailbox access and optional AI assistance.
 
-Conventional email must work with AI disabled. AI must never silently send, delete or make external commitments. Mailbox identity and authorization are governed by MOULIONE; persistent data uses the approved MOULI-DATA/storage contract. SMTP/IMAP/JMAP or other protocol compatibility must be claimed only after interoperability tests.
+Conventional email must work with AI disabled. AI must never silently send, delete or make external commitments. Mailbox identity and authorization are governed by MOULI-AUTH; persistent data uses the approved MOULI-DATA/storage contract. SMTP/IMAP/JMAP or other protocol compatibility must be claimed only after interoperability tests.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

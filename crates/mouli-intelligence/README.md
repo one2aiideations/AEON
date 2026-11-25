@@ -10,7 +10,7 @@ Provide governed analytics, business intelligence, forecasting, anomaly detectio
 
 **Folder ownership:** Metric definitions, analytical models, dashboards, reports, forecasts, scenarios, anomaly workflows and decision-support experiences.
 
-INTELLIGENCE owns analytical experiences and decision support, not the underlying data store. MOULI-DATA owns storage, retrieval and data lineage primitives; MOULIONE controls access; domain applications remain authoritative for transactions. Clearly distinguish observed facts, estimates, forecasts and AI-generated interpretations.
+INTELLIGENCE owns analytical experiences and decision support, not the underlying data store. MOULI-DATA owns storage, retrieval and data lineage primitives; MOULI-AUTH controls access; domain applications remain authoritative for transactions. Clearly distinguish observed facts, estimates, forecasts and AI-generated interpretations.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -36,7 +36,7 @@ Treat this list as a capability map, not a claim that every item is implemented.
 3. Validate data quality, freshness and aggregation semantics
 4. Render dashboard/report with drill-down and reproducible filters
 5. Generate forecast/scenario with assumptions and uncertainty labels
-6. Route decisions or actions through application owners and MOULIONE approvals
+6. Route decisions or actions through application owners and MOULI-AUTH approvals
 
 For each workflow, document the initiating actor, tenant context, authorization check, input validation, domain state machine, persistence writes, emitted events, audit records, external dependencies, idempotency strategy, retry behavior, failure handling and user-visible completion state.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

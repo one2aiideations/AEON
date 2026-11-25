@@ -10,7 +10,7 @@ Provide a unified creation workspace for designing, editing, testing, debugging 
 
 **Folder ownership:** Project/workspace creation, visual authoring, code/design tools, agent/prompt design, data/integration configuration, preview, versioning and publish handoff.
 
-STUDIO is the authoring experience, not a separate identity provider, database, deployment authority or agent runtime. MOULIONE governs access and approval; MOULI-DATA persists metadata and knowledge; MOULI-CODE handles repository workflows; MOULI-CLOUD handles deployment; AgentBox executes agents.
+STUDIO is the authoring experience, not a separate identity provider, database, deployment authority or agent runtime. MOULI-AUTH governs access and approval; MOULI-DATA persists metadata and knowledge; MOULI-CODE handles repository workflows; MOULI-CLOUD handles deployment; AgentBox executes agents.
 
 The product must deliver complete, testable workflows rather than isolated screens, endpoints, mocks or sample records. Each feature needs a defined actor, permission, data contract, state transition, failure path, audit behavior and acceptance evidence.
 
@@ -55,7 +55,7 @@ For each workflow, document the initiating actor, tenant context, authorization 
 
 | Authority | Contract expected by this product |
 |---|---|
-| **MOULIONE / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
+| **MOULI-AUTH / auth** | Authentication, actor identity, tenant and organization context, authorization decisions, entitlements, workflow, approvals and audit. |
 | **MOULI-DATA** | Common persistence, query, search, retrieval, provenance and data lifecycle; MOULI-RAG is native to this subsystem. |
 | **MOULI runtime** | Provider-neutral model inference, resource-aware execution, timeout/cancellation and telemetry. |
 | **MOULI-AGENTS / AgentBox** | MOULI-AGENTS manages agent definitions, tools and governance; AgentBox executes agent sessions. |

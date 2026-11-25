@@ -2,7 +2,7 @@
 
 Status: design proposal plus the first code bridge (`core/mouli_expert_store.c`). The boundaries in
 [EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md](EIGHT_SYSTEM_INTEGRATION_ARCHITECTURE.md) still hold:
-**MOULI executes**, LibreOne owns the conversational UX, AgentBox owns agents, MOULIONE owns identity
+**MOULI executes**, LibreOne owns the conversational UX, AgentBox owns agents, MOULI-AUTH owns identity
 and audit, TOPSTAR is the cross-system protocol, and AetherLang owns compiler lowering.
 
 ## 1. Goal

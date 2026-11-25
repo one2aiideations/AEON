@@ -59,7 +59,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

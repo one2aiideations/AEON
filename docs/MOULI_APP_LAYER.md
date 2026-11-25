@@ -17,7 +17,7 @@ assistant able to operate every app through the same governed interface.
 2. **Local first.** Each app works with no network. Sync and remote features are additive.
 3. **MOULI owns the shell, not every engine.** Where a mature open component exists (web engine, video
    codecs), MOULI embeds it and owns the surrounding code (tabs, permissions, storage, agent hooks).
-4. **Identity and audit stay with MOULIONE** online, and with a local single-user key and local
+4. **Identity and audit stay with MOULI-AUTH** online, and with a local single-user key and local
    append-only log offline (see the integration inventory).
 5. **Lean.** Each app is a small service or process under moulid with a sandbox profile. No app
    runs unsandboxed.

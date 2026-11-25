@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-CRM owns customer relationship processes, not enterprise identity or financial/ERP ledgers. MOULIONE owns user/tenant identity and authorization; MOULI-DATA stores customer records and search indexes; MOULI-BUSINESS/ERP owns operational transaction execution.
+CRM owns customer relationship processes, not enterprise identity or financial/ERP ledgers. MOULI-AUTH owns user/tenant identity and authorization; MOULI-DATA stores customer records and search indexes; MOULI-BUSINESS/ERP owns operational transaction execution.
 
 **Folder owner:** Customer relationship records and lifecycle processes, including leads, accounts, contacts, opportunities, campaigns, cases and renewals.
 
@@ -58,7 +58,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

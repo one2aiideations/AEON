@@ -20,7 +20,7 @@ and acceptance criteria: [MOULI_ENGINE_PLAN.md](MOULI_ENGINE_PLAN.md). PR 3 buil
 - **Done when:** search → select → download → load works in the image; a merge of two tiny models yields a loadable GGUF; a tiny MoE under a RAM budget smaller than the model gives the same output as a full load.
 
 ## PR 4 — Agents (AgentBox via TOPSTAR) with sandboxing
-- AgentBox integrated through TOPSTAR intent/action/result/evidence contracts; MOULIONE stays the identity/audit authority.
+- AgentBox integrated through TOPSTAR intent/action/result/evidence contracts; MOULI-AUTH stays the identity/audit authority.
 - Sandbox: Landlock + seccomp + namespaces, user permission prompts, file undo snapshots.
 - **Done when:** a tool runs only after approval; disallowed paths/syscalls are blocked by tests; every action leaves a TOPSTAR evidence record.
 

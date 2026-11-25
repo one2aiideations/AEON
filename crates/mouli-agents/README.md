@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-MOULI-AGENTS does not execute agent sessions itself and must not create a competing runtime. AgentBox remains the execution, session and lifecycle backbone. MOULIONE governs identity and authorization; MOULI-DATA stores configuration, knowledge and records; MOULI supplies model execution.
+MOULI-AGENTS does not execute agent sessions itself and must not create a competing runtime. AgentBox remains the execution, session and lifecycle backbone. MOULI-AUTH governs identity and authorization; MOULI-DATA stores configuration, knowledge and records; MOULI supplies model execution.
 
 **Folder owner:** Agent catalog, profiles, versions, templates, teams, skills, tool permissions, evaluations, marketplace and agent operations UX.
 
@@ -35,7 +35,7 @@ Each capability should be tracked independently through discovery, design, imple
 ## 4. Primary end-to-end workflows
 
 1. Draft an agent definition and validate its capabilities, tools and policy
-2. Bind the agent to an MOULIONE principal, tenant and permission set
+2. Bind the agent to an MOULI-AUTH principal, tenant and permission set
 3. Configure model and knowledge access using MOULI and MOULI-DATA
 4. Submit a run to AgentBox and observe its session, events, artifacts and terminal state
 5. Evaluate a version against regression and safety suites before publication
@@ -59,7 +59,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

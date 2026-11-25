@@ -9,7 +9,7 @@
 //! * [`evidence`]: canonical hashing, integrity checks, bundles and legal-hold-aware retention.
 //!
 //! The ideas come from an earlier Python prototype; this is a clean re-implementation with the
-//! prototype's defects removed, not a translation. MOULIONE remains the identity and
+//! prototype's defects removed, not a translation. MOULI-AUTH remains the identity and
 //! authorization authority: nothing here decides who may act.
 #![forbid(unsafe_code)]
 

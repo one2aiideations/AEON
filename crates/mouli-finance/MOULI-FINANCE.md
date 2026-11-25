@@ -24,7 +24,7 @@ Inspect and reuse existing OpenLoans-related repositories before coding. MOULI-F
 2. Reuse working code; identify duplicates and gaps before replacing components.
 3. For this product application, use one Rust executable and exactly one Rust source file, `src/main.rs`. Organize logical components as internal modules, structs, traits, enums and functions inside that file. Do not introduce separate Rust source files, microservices, sidecars, Electron or Flutter runtimes.
 4. This single-file rule applies to the product application, not to external infrastructure or explicitly named existing platforms that must be integrated (for example AgentBox).
-5. Integrate with MOULIONE for identity, authorization, tenant and governance authority.
+5. Integrate with MOULI-AUTH for identity, authorization, tenant and governance authority.
 6. Integrate with MOULI-DATA for persistence, search and data capabilities. Do not create another general-purpose database.
 7. Use MOULI runtime for model execution and MOULI-AGENTS/AgentBox for agent execution where appropriate. Do not create competing foundational runtimes.
 8. Define stable internal interfaces and versioned external API contracts. Keep provider-specific integrations behind adapters.
@@ -46,7 +46,7 @@ Inspect and reuse existing OpenLoans-related repositories before coding. MOULI-F
 
 ### Phase 1 — Working foundation
 - Build the Rust executable.
-- Establish MOULIONE authorization integration.
+- Establish MOULI-AUTH authorization integration.
 - Establish MOULI-DATA persistence integration.
 - Implement the minimum end-to-end business workflow.
 - Add structured logs, health checks and error handling.

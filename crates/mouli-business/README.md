@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-MOULI-BUSINESS is an application layer, not a second enterprise authority. MOULIONE owns identity, tenant/company/plant hierarchy, authorization, workflow, approval and audit. MOULI-DATA owns persistence. MOULI owns model runtime. AgentBox executes agent sessions. CRM owns customer relationship processes; ERP owns operational and financial transactions.
+MOULI-BUSINESS is an application layer, not a second enterprise authority. MOULI-AUTH owns identity, tenant/company/plant hierarchy, authorization, workflow, approval and audit. MOULI-DATA owns persistence. MOULI owns model runtime. AgentBox executes agent sessions. CRM owns customer relationship processes; ERP owns operational and financial transactions.
 
 **Folder owner:** Customer and commercial processes, operational transactions, enterprise master-data references and cross-domain lead-to-cash / procure-to-pay / plan-to-produce workflows.
 
@@ -59,7 +59,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |

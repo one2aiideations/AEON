@@ -1,8 +1,8 @@
-# MOULI-AUTH / MOULIONE Enterprise Authority
+# MOULI-AUTH Enterprise Authority
 
 > **Purpose:** Provide one authoritative enterprise control plane for identity, authentication, authorization, tenancy, organizational hierarchy, policy, workflow, approvals and audit.
 
-This folder is the product-level specification and implementation guide for **MOULI-AUTH / MOULIONE Enterprise Authority**. It expands the product mandate into an engineering reference. The named source specification remains authoritative for detailed product requirements; this README adds navigation, boundaries, lifecycle expectations and verification guidance without replacing the source prompt.
+This folder is the product-level specification and implementation guide for **MOULI-AUTH Enterprise Authority**. It expands the product mandate into an engineering reference. The named source specification remains authoritative for detailed product requirements; this README adds navigation, boundaries, lifecycle expectations and verification guidance without replacing the source prompt.
 
 ## 1. Product mandate and scope
 
@@ -12,7 +12,7 @@ The implementation must deliver real, end-to-end workflows. A route, screen, sam
 
 ## 2. Canonical ownership
 
-MOULIONE is the sole enterprise authority. It is not the general-purpose database, agent runtime or product business application. MOULI-DATA supplies persistence; applications enforce returned authorization decisions and retain their own domain logic.
+MOULI-AUTH is the sole enterprise authority. It is not the general-purpose database, agent runtime or product business application. MOULI-DATA supplies persistence; applications enforce returned authorization decisions and retain their own domain logic.
 
 **Folder owner:** People, service accounts, agents and integration identities; tenant/company/legal entity/branch/plant hierarchy; RBAC/ABAC; entitlements; policy; workflow; approvals; audit.
 
@@ -58,7 +58,7 @@ For every workflow, document: initiating actor, tenant and organizational contex
 
 | Shared authority | Required interaction |
 |---|---|
-| **MOULIONE / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
+| **MOULI-AUTH / auth** | Authenticate actors; resolve tenant and company/plant context; authorize every protected action; enforce approvals and write audit evidence. |
 | **MOULI-DATA** | Persist and retrieve domain data using tenant-aware contracts; use native RAG when grounded retrieval is needed. |
 | **MOULI runtime** | Request model inference through provider-neutral, observable interfaces; protect prompts and sensitive context. |
 | **MOULI-AGENTS / AgentBox** | Define governed agent capabilities in MOULI-AGENTS; send actual execution to AgentBox; scope tools and permissions. |
@@ -129,7 +129,7 @@ Include the calculation method, passing/failing test names, code paths, real-ver
 
 ## 13. Source files and maintenance
 
-- **Source specification:** [MOULI-AUTH.md (with MOULIONE.md as the ecosystem authority specification)](./MOULI-AUTH.md (with MOULIONE.md as the ecosystem authority specification))
+- **Source specification:** [MOULI-AUTH.md (with MOULI-AUTH.md as the ecosystem authority specification)](./MOULI-AUTH.md (with MOULI-AUTH.md as the ecosystem authority specification))
 - Keep the source prompt intact unless a deliberate, reviewed specification change is requested.
 - Update this README when scope, interfaces, ownership or implementation status materially changes.
 - Record architectural decisions and breaking contract changes in version-controlled documentation.

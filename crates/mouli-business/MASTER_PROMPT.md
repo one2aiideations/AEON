@@ -11,7 +11,7 @@ This is not a second enterprise authority. It is a business application layer th
 | Platform | Sole responsibility |
 |---|---|
 | MOULI | Core runtime and compute/model execution |
-| MOULIONE | Identity, authentication, authorization, tenancy, company/legal-entity/plant identity, enterprise policy, workflow/approval and audit authority |
+| MOULI-AUTH | Identity, authentication, authorization, tenancy, company/legal-entity/plant identity, enterprise policy, workflow/approval and audit authority |
 | MOULI-DATA | Common persistence authority: relational, document, graph, vector, object, search and event capabilities |
 | MOULI-RAG | Grounded retrieval and enterprise/customer knowledge intelligence through MOULI-DATA |
 | AgentBox | Agent lifecycle, execution and orchestration where available |
@@ -40,7 +40,7 @@ MOULI-BUSINESS contains CRM and ERP domain capabilities. It must not create a co
 - Sales orders, delivery, billing, receivables and revenue processes.
 - Workforce, HR, attendance, leave, payroll integration and workforce analytics.
 - Projects, WBS, portfolio, resource planning, project costing and billing.
-- Tax and statutory integration through native MOULIONE/MOULI-DATA capabilities, including India GST/TDS/TCS support.
+- Tax and statutory integration through native MOULI-AUTH/MOULI-DATA capabilities, including India GST/TDS/TCS support.
 - Industry packs: manufacturing, NBFC/digital lending, microfinance, schools, kirana/retail, construction, agriculture, logistics and professional services.
 
 ### Cross-domain business processes
@@ -54,7 +54,7 @@ MOULI-BUSINESS contains CRM and ERP domain capabilities. It must not create a co
 - Loan application-to-underwriting-to-authorized-disbursement-to-collection.
 - Customer issue-to-ticket-to-resolution-to-success follow-up.
 
-A shared canonical entity reference must prevent duplicate customer, supplier, product, company, legal-entity, plant and employee authorities. CRM owns relationship processes; ERP owns operational and financial transactions. Shared identifiers and cross-domain references are resolved through MOULIONE and MOULI-DATA.
+A shared canonical entity reference must prevent duplicate customer, supplier, product, company, legal-entity, plant and employee authorities. CRM owns relationship processes; ERP owns operational and financial transactions. Shared identifiers and cross-domain references are resolved through MOULI-AUTH and MOULI-DATA.
 
 ## Agentic operating model
 
@@ -76,15 +76,15 @@ Provide analytics across revenue, pipeline, margin, cash, working capital, inven
 - One executable supports server, headless, embedded/local and agent/API/MCP modes as capabilities are implemented.
 - All persistence must go through MOULI-DATA. Do not add PostgreSQL, Redis, SQLite, pgvector or another competing store.
 - The current implementation exposes a clearly isolated MOULI-DATA HTTP adapter boundary. Its endpoint contract is provisional and must be reconciled against the actual MOULI-DATA API before production use.
-- Authentication and authorization are delegated to MOULIONE. The current server expects to run behind a trusted MOULIONE gateway which injects authenticated context headers; it is not safe to expose directly to the public internet without that gateway and verified authorization enforcement.
+- Authentication and authorization are delegated to MOULI-AUTH. The current server expects to run behind a trusted MOULI-AUTH gateway which injects authenticated context headers; it is not safe to expose directly to the public internet without that gateway and verified authorization enforcement.
 - External integrations must use documented, authorized APIs, explicit credentials, scoped permissions, rate limits, idempotency, retries and audit evidence.
 - Financial and lending calculations must be deterministic, decimal-safe, versioned and independently tested. Do not use floating-point arithmetic for money.
 - Never claim a subsystem is complete because a route, screen or type exists.
 
 ## Delivery sequence
 
-1. Inspect and inventory MOULI, MOULIONE, MOULI-DATA, MOULI-RAG, AgentBox and existing CRM/ERP repositories.
-2. Verify the actual MOULIONE identity/authorization and MOULI-DATA APIs; implement adapters only against verified contracts.
+1. Inspect and inventory MOULI, MOULI-AUTH, MOULI-DATA, MOULI-RAG, AgentBox and existing CRM/ERP repositories.
+2. Verify the actual MOULI-AUTH identity/authorization and MOULI-DATA APIs; implement adapters only against verified contracts.
 3. Establish canonical master-data identifiers and tenant/company/legal-entity/plant scoping.
 4. Implement CRM foundation: organizations, contacts, leads, accounts, opportunities, activities and Customer 360.
 5. Implement ERP foundation: master data, finance ledger, procurement, inventory, order management and audit references.
@@ -100,4 +100,4 @@ After each iteration report an evidence-backed percentage and per-domain status.
 
 ## Current implementation status
 
-The initial code is a Rust server foundation with business-resource validation and a provisional MOULI-DATA adapter. It is not a complete CRM or ERP. The MOULI-DATA endpoint contract, MOULIONE gateway enforcement, domain-specific transaction semantics, UI, agent execution, and production integration tests remain to be verified and implemented.
+The initial code is a Rust server foundation with business-resource validation and a provisional MOULI-DATA adapter. It is not a complete CRM or ERP. The MOULI-DATA endpoint contract, MOULI-AUTH gateway enforcement, domain-specific transaction semantics, UI, agent execution, and production integration tests remain to be verified and implemented.
