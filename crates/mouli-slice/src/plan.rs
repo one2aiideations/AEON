@@ -84,6 +84,27 @@ impl Plan {
 /// # Errors
 /// A [`SliceError`] for a bad fraction or non-finite statistics.
 pub fn make_plan(profiler: &Profiler, keep_fraction: f64, rule: Rule) -> Result<Plan, SliceError> {
+    let importance = (0..profiler.layers())
+        .map(|layer| profiler.importance(layer))
+        .collect::<Result<Vec<_>, _>>()?;
+    make_plan_from_importance(&importance, keep_fraction, rule)
+}
+
+/// Like [`make_plan`], but from importance scores given directly: one vector per layer, one
+/// value per neuron (all layers the same length). Use it to rank neurons by something other than
+/// mean activation, for example activation times output weight norm.
+///
+/// Scores must be finite and non-negative. The rules, rounding and tie-breaking are those of
+/// [`make_plan`]. A score is a ranking input, not evidence that a neuron is needed.
+///
+/// # Errors
+/// A [`SliceError`] for no layers, layers of different lengths, a bad fraction, or a negative or
+/// non-finite score.
+pub fn make_plan_from_importance(
+    importance: &[Vec<f64>],
+    keep_fraction: f64,
+    rule: Rule,
+) -> Result<Plan, SliceError> {
     if !keep_fraction.is_finite() {
         return Err(SliceError::NonFinite("keep_fraction"));
     }
@@ -92,11 +113,22 @@ pub fn make_plan(profiler: &Profiler, keep_fraction: f64, rule: Rule) -> Result<
         return Err(SliceError::BadParameter("keep_fraction"));
     }
 
-    let layers = profiler.layers();
-    let d_ff = profiler.d_ff();
+    let layers = importance.len();
+    let d_ff = importance.first().map_or(0, Vec::len);
 
     if layers == 0 || d_ff == 0 {
-        return Err(SliceError::BadShape("empty profiler"));
+        return Err(SliceError::BadShape("empty importance"));
+    }
+    for layer in importance {
+        if layer.len() != d_ff {
+            return Err(SliceError::BadShape("layers differ in neuron count"));
+        }
+        if layer.iter().any(|v| !v.is_finite()) {
+            return Err(SliceError::NonFinite("importance"));
+        }
+        if layer.iter().any(|v| *v < 0.0) {
+            return Err(SliceError::BadParameter("importance must not be negative"));
+        }
     }
 
     let per_layer = match rule {
@@ -104,9 +136,8 @@ pub fn make_plan(profiler: &Profiler, keep_fraction: f64, rule: Rule) -> Result<
             let count = ceil_product(d_ff, keep_fraction)?;
             let mut keep = Vec::with_capacity(layers);
 
-            for layer in 0..layers {
-                let importance = profiler.importance(layer)?;
-                let mut ranked = rank_layer(&importance);
+            for layer_importance in importance {
+                let mut ranked = rank_layer(layer_importance);
                 ranked.truncate(count);
                 ranked.sort_unstable();
                 keep.push(ranked);
@@ -114,7 +145,7 @@ pub fn make_plan(profiler: &Profiler, keep_fraction: f64, rule: Rule) -> Result<
 
             keep
         }
-        Rule::Budget => make_budget_plan(profiler, keep_fraction)?,
+        Rule::Budget => make_budget_plan(importance, d_ff, keep_fraction)?,
     };
 
     Ok(Plan { keep: per_layer })
@@ -149,9 +180,12 @@ fn rank_layer(importance: &[f64]) -> Vec<usize> {
     indices
 }
 
-fn make_budget_plan(profiler: &Profiler, fraction: f64) -> Result<Vec<Vec<usize>>, SliceError> {
-    let layers = profiler.layers();
-    let d_ff = profiler.d_ff();
+fn make_budget_plan(
+    all_importance: &[Vec<f64>],
+    d_ff: usize,
+    fraction: f64,
+) -> Result<Vec<Vec<usize>>, SliceError> {
+    let layers = all_importance.len();
 
     let total = layers
         .checked_mul(d_ff)
@@ -175,8 +209,8 @@ fn make_budget_plan(profiler: &Profiler, fraction: f64) -> Result<Vec<Vec<usize>
     let mut importance = Vec::with_capacity(layers);
     let mut means = Vec::with_capacity(layers);
 
-    for layer in 0..layers {
-        let values = profiler.importance(layer)?;
+    for values in all_importance {
+        let values = values.clone();
 
         if values.iter().any(|value| !value.is_finite()) {
             return Err(SliceError::NonFinite("importance"));
@@ -369,6 +403,37 @@ mod tests {
 
         assert_eq!(plan.kept_total(), 4);
         assert!(plan.keep.iter().all(|layer| !layer.is_empty()));
+    }
+
+    #[test]
+    fn plans_from_given_importance_follow_the_scores() {
+        let importance = vec![vec![0.1, 5.0, 0.2, 4.0], vec![9.0, 0.0, 8.0, 0.0]];
+        let plan = make_plan_from_importance(&importance, 0.5, Rule::Uniform).unwrap();
+        assert_eq!(plan.keep, vec![vec![1, 3], vec![0, 2]]);
+        let budget = make_plan_from_importance(&importance, 0.5, Rule::Budget).unwrap();
+        assert_eq!(budget.kept_total(), 4);
+        // The profiler path and the direct path agree.
+        let profiler = profiled(3, 8);
+        let direct: Vec<Vec<f64>> = (0..3).map(|l| profiler.importance(l).unwrap()).collect();
+        for rule in [Rule::Uniform, Rule::Budget] {
+            assert_eq!(
+                make_plan(&profiler, 0.5, rule).unwrap(),
+                make_plan_from_importance(&direct, 0.5, rule).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn given_importance_is_validated() {
+        assert!(make_plan_from_importance(&[], 0.5, Rule::Uniform).is_err());
+        assert!(make_plan_from_importance(&[vec![]], 0.5, Rule::Uniform).is_err());
+        let ragged = vec![vec![1.0, 2.0], vec![1.0]];
+        assert!(make_plan_from_importance(&ragged, 0.5, Rule::Uniform).is_err());
+        let bad = vec![vec![1.0, f64::NAN]];
+        assert!(make_plan_from_importance(&bad, 0.5, Rule::Uniform).is_err());
+        let negative = vec![vec![1.0, -1.0]];
+        assert!(make_plan_from_importance(&negative, 0.5, Rule::Uniform).is_err());
+        assert!(make_plan_from_importance(&[vec![1.0, 2.0]], 0.0, Rule::Uniform).is_err());
     }
 
     #[test]

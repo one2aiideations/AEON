@@ -48,6 +48,7 @@
 //! The crate does not measure speed. Fewer neurons do not, by themselves,
 //! establish a particular latency or memory improvement.
 
+pub mod analysis;
 pub mod closure;
 pub mod gate;
 pub mod gguf_slice;
