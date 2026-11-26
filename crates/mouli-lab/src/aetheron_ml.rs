@@ -21,6 +21,9 @@ pub struct AetheronMlCfg {
     pub bn_eps: F,
     pub ema_momentum: F,
     pub homeostatic: bool,
+    /// Attention across units. When false the attention matrix is the identity (each unit keeps
+    /// its own gated output) and the query and key weights receive no gradient.
+    pub attention: bool,
     pub eta_init: F,
     pub eta_min: F,
     pub eta_max: F,
@@ -45,6 +48,7 @@ impl Default for AetheronMlCfg {
             bn_eps: 1e-6,
             ema_momentum: 0.05,
             homeostatic: true,
+            attention: true,
             eta_init: 0.05,
             eta_min: 1e-4,
             eta_max: 0.5,
@@ -352,7 +356,15 @@ impl AetheronMlUnit {
             let sm = softmax_rows(&scores);
             for nn in 0..n {
                 for mm in 0..n {
-                    attn.d[(bi * n + nn) * n + mm] = sm.d[nn * n + mm];
+                    attn.d[(bi * n + nn) * n + mm] = if !self.cfg.attention {
+                        if nn == mm {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        sm.d[nn * n + mm]
+                    };
                 }
             }
         }
@@ -410,7 +422,8 @@ impl AetheronMlUnit {
         }
         let scale = 1.0 / (dk as F).sqrt();
         let mut d_scores = Mat::zeros(b * n, n);
-        for bi in 0..b {
+        // With attention off the matrix is fixed, so nothing flows into the scores.
+        for bi in 0..if self.cfg.attention { b } else { 0 } {
             for nn in 0..n {
                 let mut dot = 0.0;
                 for mm in 0..n {
