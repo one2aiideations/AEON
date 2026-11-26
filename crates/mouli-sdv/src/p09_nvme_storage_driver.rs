@@ -265,6 +265,8 @@ impl NvmeIoController {
         let current_tail = self.sq_tail.load(Ordering::Relaxed) as usize;
         let next_tail = (current_tail + 1) % NVME_QUEUE_DEPTH;
 
+        // SAFETY: `NvmeIoController` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the submission queue.
+        // The reference ends at the end of this statement's use, before the tail is published.
         let entries = unsafe { &mut *self.sq_entries.get() };
         entries[current_tail] = sqe;
 
@@ -279,6 +281,8 @@ impl NvmeIoController {
     /// Polls the completion queue for a specific command identifier
     pub fn poll_completion(&self, expected_cid: u16, max_spins: u32) -> Result<(), StorageError> {
         let mut spins = 0u32;
+        // SAFETY: `NvmeIoController` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the completion queue.
+        // Within this function the queue is only read (the head is an atomic).
         let cq = unsafe { &*self.cq_entries.get() };
 
         loop {
@@ -417,6 +421,8 @@ impl EventDataRecorder {
         }
 
         let head = self.write_head.load(Ordering::Relaxed) as usize;
+        // SAFETY: `EventDataRecorder` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the sample buffer.
+        // `head` is below the buffer length (it is kept modulo it).
         let buf = unsafe { &mut *self.circular_buffer.get() };
         buf[head] = *record;
 
@@ -436,6 +442,8 @@ impl EventDataRecorder {
             if recorded >= (EDR_POST_CRASH_SAMPLES as u16) {
                 // Post-crash window completed: Permanently lock blackbox memory
                 self.is_locked.store(true, Ordering::SeqCst);
+                // SAFETY: `EventDataRecorder` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the summary.
+                // The buffer reference from earlier ended; this is a different cell.
                 let summ = unsafe { &mut *self.summary.get() };
                 summ.is_memory_locked = true;
             }
@@ -468,6 +476,8 @@ impl EventDataRecorder {
             )
             .is_ok()
         {
+            // SAFETY: `EventDataRecorder` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the summary.
+            // Only the thread that won the compare-exchange on the trigger state gets here.
             let summ = unsafe { &mut *self.summary.get() };
             summ.trigger_timestamp_us = timestamp_us;
             summ.trigger_reason = reason;
@@ -479,6 +489,8 @@ impl EventDataRecorder {
     }
 
     pub fn get_summary(&self) -> EdrCrashSummary {
+        // SAFETY: `EventDataRecorder` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the summary.
+        // The summary is `Copy`, so this copies it out.
         unsafe { *self.summary.get() }
     }
 }
@@ -542,12 +554,18 @@ impl CrashdumpPersistor {
     /// If `raw_stack_ptr` is non-null it must be valid for reads of `CRASHDUMP_STACK_SNIPPET_BYTES`
     /// bytes.
     pub unsafe fn capture_panic_state(&self, regs: &CpuRegisterSnapshot, raw_stack_ptr: *const u8) {
+        // SAFETY: `capture_panic_state` is `unsafe` and not `Sync`: the caller (a panic path) is the only context
+        // using this persistor, so no other reference to the register snapshot is alive.
         let snap = unsafe { &mut *self.cpu_snapshot.get() };
         *snap = *regs;
 
+        // SAFETY: same single-context reason as the line above, for a different cell: nothing else references
+        // the stack snippet.
         let stack_dst = unsafe { &mut *self.stack_snippet.get() };
         if !raw_stack_ptr.is_null() {
             for i in 0..CRASHDUMP_STACK_SNIPPET_BYTES {
+                // SAFETY: the `# Safety` contract of this function: a non-null `raw_stack_ptr` is valid for reads of
+                // `CRASHDUMP_STACK_SNIPPET_BYTES` bytes, and `i` is below that.
                 stack_dst[i] = unsafe { *raw_stack_ptr.add(i) };
             }
         }
@@ -736,6 +754,7 @@ mod tests {
         assert_eq!(cid, 1);
 
         // Emulate hardware CQ completion
+        // SAFETY: single-threaded test: no other reference to the completion queue exists.
         let cq = unsafe { &mut *controller.cq_entries.get() };
         cq[0] = NvmeCompletionQueueEntry {
             command_specific: 0,

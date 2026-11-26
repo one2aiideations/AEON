@@ -365,6 +365,7 @@ impl AutomotiveIdsEngine {
 
     /// Registers a certified ECU communication whitelist rule
     pub fn add_rule(&self, rule: IdsWhitelistRule) -> Result<(), SecurityAnomalyType> {
+        // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the whitelist rules.
         let rules = unsafe { &mut *self.whitelist_rules.get() };
         for slot in rules.iter_mut() {
             if !slot.is_active {
@@ -413,6 +414,9 @@ impl AutomotiveIdsEngine {
     ) -> Result<(), SecurityAnomalyType> {
         // 1. Check if source MAC is currently blacklisted by IPS
         let count = self.blocked_count.load(Ordering::Relaxed) as usize;
+        // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the blocked-source list.
+        // It is only read here: `blacklist_source` writes it, but is called only after this reference's
+        // last use (the loop below).
         let blocked = unsafe { &*self.blocked_macs.get() };
         for i in 0..count {
             if blocked[i] == *src_mac {
@@ -442,6 +446,8 @@ impl AutomotiveIdsEngine {
         }
 
         // 3. Whitelist Policy Verification
+        // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the whitelist rules.
+        // Only read here.
         let rules = unsafe { &*self.whitelist_rules.get() };
         let mut matched = false;
         for rule in rules.iter() {
@@ -485,6 +491,8 @@ impl AutomotiveIdsEngine {
     fn blacklist_source(&self, mac: &[u8; 6]) {
         let count = self.blocked_count.load(Ordering::Relaxed) as usize;
         if count < IDS_MAX_BLOCKED_IDENTIFIERS {
+            // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the blocked-source list.
+            // `count` was checked against the capacity above, so the index is in range.
             let blocked = unsafe { &mut *self.blocked_macs.get() };
             blocked[count] = *mac;
             self.blocked_count
@@ -501,6 +509,7 @@ impl AutomotiveIdsEngine {
         mitigated: bool,
     ) {
         self.incident_count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the last-incident record.
         let inc = unsafe { &mut *self.last_incident.get() };
         inc.timestamp_ms = now_ms;
         inc.anomaly = anomaly;
@@ -510,6 +519,8 @@ impl AutomotiveIdsEngine {
     }
 
     pub fn get_last_incident(&self) -> SecurityIncidentRecord {
+        // SAFETY: `AutomotiveIdsEngine` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the last-incident record.
+        // It is `Copy`, so this copies it out.
         unsafe { *self.last_incident.get() }
     }
 }
@@ -606,6 +617,8 @@ impl SafetyFaultHarness {
         if slot >= FAULT_INJECTION_SLOTS {
             return false;
         }
+        // SAFETY: `SafetyFaultHarness` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the injection slots.
+        // `slot` was checked against the slot count above.
         let slots = unsafe { &mut *self.injection_slots.get() };
         slots[slot] = config;
 
@@ -621,6 +634,8 @@ impl SafetyFaultHarness {
             return;
         }
 
+        // SAFETY: `SafetyFaultHarness` is not `Sync` (see the note on the type): one execution context owns it, so no other thread or handler holds a reference to the node health records.
+        // `node_id` was checked against the node count above.
         let nodes = unsafe { &mut *self.node_health.get() };
         let node = &mut nodes[node_id as usize];
 
