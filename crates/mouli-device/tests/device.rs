@@ -1240,3 +1240,73 @@ fn the_agent_cannot_act_when_the_host_defined_no_agent_role() {
     d.open_project(dir.path()).unwrap();
     assert!(d.run_agent("/code.files").contains("cannot act"));
 }
+
+#[test]
+fn held_approvals_and_the_audit_chain_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut ws = workspace();
+        mouli_device::restore(&mut ws, dir.path()).unwrap();
+        let alice = ws.open_session("acme", "alice", "clerk").unwrap();
+        ws.submit("acme", &alice, "/note.send to=bob").unwrap();
+        let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        type_line(&mut d, "hello");
+    }
+    // The device is gone; start again from the files alone.
+    let mut ws = workspace();
+    let r = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(r.chain_ok);
+    assert_eq!(r.pending, 1);
+    assert!(r.records >= 3);
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert_eq!(d.shell.approvals.rows[0].requester, "alice");
+    // Deciding it runs the original call and empties the saved queue.
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.approvals.rows.is_empty());
+    let saved = std::fs::read_to_string(dir.path().join("pending.txt")).unwrap();
+    assert!(saved.is_empty());
+    // The file only grew, and still verifies after a second restart.
+    let mut ws = workspace();
+    let r2 = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(r2.chain_ok && r2.records > r.records && r2.pending == 0);
+}
+
+#[test]
+fn an_edited_audit_file_loads_but_raises_the_security_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        type_line(&mut d, "hello");
+    }
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let mut ws = workspace();
+    let r = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(!r.chain_ok);
+    let d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert!(d
+        .shell
+        .security
+        .findings
+        .iter()
+        .any(|f| f.id == "audit-chain"));
+}
+
+#[test]
+fn a_damaged_state_file_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("audit.log"), "garbage\n").unwrap();
+    let mut ws = workspace();
+    let e = mouli_device::restore(&mut ws, dir.path()).unwrap_err();
+    assert!(e.contains("audit.log line 1"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("audit.log")).unwrap(),
+        "garbage\n"
+    );
+}

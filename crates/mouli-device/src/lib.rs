@@ -9,6 +9,7 @@
 //! washes the text; the backend only turns a prompt into an answer.
 #![forbid(unsafe_code)]
 
+mod keep;
 mod patch;
 mod security;
 
@@ -21,6 +22,7 @@ use mouli_screen::screen::Action;
 use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, Role};
 use mouli_screen::shell::Shell;
 
+pub use keep::{restore, Restored};
 pub use patch::PatchError;
 
 /// Something that can answer a prompt with the model the workspace chose.
@@ -61,6 +63,7 @@ pub struct Device<B: Backend> {
     role: String,
     session: String,
     patch: patch::PatchSlot,
+    keeper: Option<keep::Keeper>,
     #[cfg(feature = "office")]
     apps: Option<Apps>,
     #[cfg(feature = "office")]
@@ -99,6 +102,7 @@ impl<B: Backend> Device<B> {
             role: role.into(),
             session,
             patch: patch::PatchSlot::default(),
+            keeper: None,
             #[cfg(feature = "office")]
             apps: None,
             #[cfg(feature = "office")]
@@ -469,8 +473,24 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// Keeps the audit chain (append-only, synced) and the held approvals in `dir`, and writes
+    /// everything that is new at once. Load the saved state first with [`restore`].
+    ///
+    /// # Errors
+    /// A message when the directory or an existing file cannot be read.
+    pub fn keep_state_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        self.keeper = Some(keep::Keeper::open(dir)?);
+        self.refresh();
+        Ok(())
+    }
+
     /// Rebuilds the approvals, audit and security screens from the workspace.
     pub fn refresh(&mut self) {
+        if let Some(k) = &mut self.keeper {
+            if let Err(e) = k.save(&self.ws) {
+                self.shell.approvals.message = format!("Could not save the audit log: {e}");
+            }
+        }
         let can_approve = self.ws.role_can(&self.role, "approve");
         let rows: Vec<ApprovalRow> = self
             .ws
