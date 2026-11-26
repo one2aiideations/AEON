@@ -41,6 +41,22 @@ pub trait Backend {
     /// # Errors
     /// A message to show the person when the model cannot answer.
     fn reply(&mut self, history: &[Turn]) -> Result<String, String>;
+
+    /// Like [`Backend::reply`], but calls `on_piece` with each piece of text as it arrives;
+    /// `on_piece` returns false to stop, and the text so far is then returned as the reply.
+    /// A backend that cannot stream answers whole: nothing is shown until it is done and a
+    /// stop only takes effect after it.
+    ///
+    /// # Errors
+    /// As [`Backend::reply`].
+    fn reply_streaming(
+        &mut self,
+        history: &[Turn],
+        on_piece: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        let _ = on_piece;
+        self.reply(history)
+    }
 }
 
 /// Why the chat screen ended.

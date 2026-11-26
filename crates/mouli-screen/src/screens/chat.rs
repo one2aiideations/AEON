@@ -46,6 +46,8 @@ pub struct Chat {
     max_scroll: Cell<usize>,
     /// True while the model is answering (the input is held back).
     pub busy: bool,
+    /// True while the last message is an answer that is still arriving piece by piece.
+    pub streaming: bool,
     /// The loaded model's name, shown above the transcript.
     pub model: String,
     /// A status line (for example "context nearly full").
@@ -74,9 +76,38 @@ impl Chat {
         self.scroll = 0;
     }
 
+    /// Adds a piece of an answer that is still arriving: it extends the answer being shown, or
+    /// starts one.
+    pub fn stream_piece(&mut self, piece: &str) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.text.push_str(piece);
+                self.scroll = 0;
+                return;
+            }
+        }
+        self.push(Role::Assistant, piece);
+        self.streaming = true;
+    }
+
+    /// Ends an answer with its final text: replaces what was streamed, or adds it when nothing
+    /// was streamed.
+    pub fn finish_answer(&mut self, text: &str) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.text = text.to_string();
+            }
+            self.streaming = false;
+            self.scroll = 0;
+        } else {
+            self.push(Role::Assistant, text);
+        }
+    }
+
     /// Forgets the conversation (the input line is kept).
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.streaming = false;
         self.scroll = 0;
     }
 
@@ -115,7 +146,7 @@ impl Chat {
             }
             out.push((String::new(), colour, String::new()));
         }
-        if self.busy {
+        if self.busy && !self.streaming {
             out.push(("mouli".to_string(), theme::OK, "thinking...".to_string()));
         }
         out
@@ -217,7 +248,7 @@ impl Screen for Chat {
         g.boxed(
             box_rect,
             if self.busy {
-                Some("waiting for the model")
+                Some("waiting for the model - Ctrl-C stops it")
             } else {
                 None
             },
@@ -252,6 +283,9 @@ impl Screen for Chat {
     }
 
     fn hints(&self) -> String {
+        if self.busy {
+            return "Ctrl-C stop the answer  Up/PgUp scroll  F2 models".into();
+        }
         "Enter send  Up/PgUp scroll  Ctrl-L new chat  F2 models".into()
     }
 }
@@ -348,6 +382,26 @@ mod tests {
             MAX_INPUT,
             "the limit holds while typing too"
         );
+    }
+
+    #[test]
+    fn pieces_extend_one_answer_and_the_final_text_replaces_them() {
+        let mut c = Chat::default();
+        c.push(Role::User, "hi");
+        c.busy = true;
+        c.stream_piece("Hel");
+        c.stream_piece("lo");
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[1].text, "Hello");
+        assert!(c.streaming);
+        assert!(c.hints().contains("Ctrl-C"));
+        c.finish_answer("Hello there");
+        assert!(!c.streaming);
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[1].text, "Hello there");
+        // Without streaming the answer is simply added.
+        c.finish_answer("Another");
+        assert_eq!(c.messages.len(), 3);
     }
 
     #[test]

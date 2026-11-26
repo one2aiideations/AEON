@@ -11,7 +11,7 @@
 
 use crate::persist::Store;
 use crate::ui::{Backend, Turn};
-use mouli_hosted::{chat_stream, keyfile, Error, Provider, Secret};
+use mouli_hosted::{chat_stream_until, keyfile, Error, Provider, Secret};
 use mouli_http::{Client, Url};
 use mouli_systems::wash::{Action, Kind, Policy, Washer};
 pub use mouli_utility::prompt::{ask, ask_secret};
@@ -279,6 +279,14 @@ fn explain(e: &Error) -> String {
 
 impl Backend for HostedBackend {
     fn reply(&mut self, history: &[Turn]) -> Result<String, String> {
+        self.reply_streaming(history, &mut |_| true)
+    }
+
+    fn reply_streaming(
+        &mut self,
+        history: &[Turn],
+        on_piece: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
         let mut found: BTreeMap<Kind, usize> = BTreeMap::new();
         let mut washed: Vec<(&str, String)> = Vec::with_capacity(history.len());
         for t in history {
@@ -299,14 +307,9 @@ impl Backend for HostedBackend {
             self.record(last.role, &last.content);
         }
         let turns: Vec<(&str, &str)> = washed.iter().map(|(r, c)| (*r, c.as_str())).collect();
-        let answer = chat_stream(
-            &self.client,
-            &self.provider,
-            &turns,
-            REPLY_TOKENS,
-            &mut |_| {},
-        )
-        .map_err(|e| explain(&e))?;
+        let answer =
+            chat_stream_until(&self.client, &self.provider, &turns, REPLY_TOKENS, on_piece)
+                .map_err(|e| explain(&e))?;
         self.record("assistant", &answer);
         // The model may refer to a pseudonym such as [EMAIL_1]; the person wrote the original, so
         // it is put back for them to read (it never left this computer).

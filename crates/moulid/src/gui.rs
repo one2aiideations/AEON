@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -323,6 +323,8 @@ pub enum Ev {
     Mouse(MouseEvent),
     /// A key was pressed.
     Key(Key),
+    /// The model produced a piece of its answer (shown at once, before the answer is complete).
+    Piece(String),
     /// The model finished answering (or failed).
     Reply(Result<String, String>),
     /// The browser finished loading an address (or failed).
@@ -978,10 +980,24 @@ where
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
     let reply_tx = tx.clone();
     let reply_tx_pages = tx.clone();
+    // Ctrl-C while the model is answering sets this; the answer thread then stops reading.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = cancel.clone();
+    let piece_tx = tx.clone();
     std::thread::spawn(move || {
         let mut backend = backend;
         while let Ok(turns) = req_rx.recv() {
-            if reply_tx.send(Ev::Reply(backend.reply(&turns))).is_err() {
+            let answer = backend.reply_streaming(&turns, &mut |piece| {
+                piece_tx.send(Ev::Piece(piece.to_string())).is_ok()
+                    && !thread_cancel.load(Ordering::SeqCst)
+            });
+            let answer = match answer {
+                Ok(text) if thread_cancel.load(Ordering::SeqCst) => {
+                    Ok(format!("{text}\n[stopped]"))
+                }
+                other => other,
+            };
+            if reply_tx.send(Ev::Reply(answer)).is_err() {
                 break;
             }
         }
@@ -1021,9 +1037,20 @@ where
         for ev in batch {
             let action = match ev {
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
+                Ev::Key(Key::Ctrl('c')) if device.shell.chat.busy => {
+                    cancel.store(true, Ordering::SeqCst);
+                    Action::None
+                }
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
+                Ev::Piece(piece) => {
+                    device.shell.chat.stream_piece(&piece);
+                    Action::None
+                }
                 Ev::Reply(r) => {
                     let answer = on_reply(&mut device.shell, &mut history, r);
+                    // A stopped answer is shown but never run as a tool call.
+                    let stopped = cancel.swap(false, Ordering::SeqCst);
+                    let answer = answer.filter(|_| !stopped);
                     if let Some(text) = answer {
                         graph.assistant_message(&text, &model_name, unix_now());
                         let known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
@@ -1281,7 +1308,7 @@ fn on_reply(
     shell.chat.busy = false;
     match reply {
         Ok(text) => {
-            shell.chat.push(Role::Assistant, &text);
+            shell.chat.finish_answer(&text);
             history.push(Turn {
                 role: "assistant",
                 content: text.clone(),
@@ -1289,6 +1316,7 @@ fn on_reply(
             Some(text)
         }
         Err(e) => {
+            shell.chat.streaming = false;
             if history.last().is_some_and(|t| t.role == "user") {
                 history.pop();
             }
@@ -2215,6 +2243,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let got = seen.lock().unwrap().clone();
         (got, Shots(shots))
+    }
+
+    /// Streams "tick " pieces until told to stop (the first question), then answers briefly.
+    struct Endless {
+        stopped: std::sync::Arc<AtomicBool>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Backend for Endless {
+        fn reply(&mut self, _: &[Turn]) -> Result<String, String> {
+            Ok("done".into())
+        }
+        fn reply_streaming(
+            &mut self,
+            _: &[Turn],
+            on_piece: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<String, String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                on_piece("fine");
+                return Ok("fine".into());
+            }
+            let mut text = String::new();
+            for _ in 0..2000 {
+                text.push_str("tick ");
+                if !on_piece("tick ") {
+                    self.stopped.store(true, Ordering::SeqCst);
+                    return Ok(text);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(text)
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_a_streaming_answer_and_the_next_question_still_works() {
+        let dir = tmp("cancel");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        for e in keys_for("first\n") {
+            tx.send(e).unwrap();
+        }
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (st, ca, t2) = (stopped.clone(), calls.clone(), tx.clone());
+        let driver = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            // Let some pieces arrive, then stop the answer.
+            while ca.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            t2.send(Ev::Key(Key::Ctrl('c'))).unwrap();
+            while !st.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            for e in keys_for("second\n") {
+                t2.send(e).unwrap();
+            }
+            while ca.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        run(
+            session,
+            Endless {
+                stopped: stopped.clone(),
+                calls: calls.clone(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        driver.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the backend was told to stop"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the second question was answered"
+        );
     }
 
     #[test]
