@@ -326,6 +326,9 @@ pub struct DiagnosticEventManager {
     lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable `records` array is only accessed between `acquire` and `release`
+// of the same spin lock (Acquire/Release), so accesses are mutually exclusive and ordered. A thread
+// that panics while holding the lock leaves it locked.
 unsafe impl Sync for DiagnosticEventManager {}
 
 impl DiagnosticEventManager {
@@ -364,6 +367,8 @@ impl DiagnosticEventManager {
         freeze_snapshot: &[u8],
     ) -> Result<u8, DemError> {
         self.acquire();
+        // SAFETY: the lock taken by `acquire` is held until `release`, so this is the only
+        // reference to `records`.
         let records = unsafe { &mut *self.records.get() };
         let count = self.record_count.load(Ordering::Relaxed) as usize;
 
@@ -418,6 +423,8 @@ impl DiagnosticEventManager {
 
     pub fn clear_dtc(&self, dtc: u32) -> Result<(), DemError> {
         self.acquire();
+        // SAFETY: the lock taken by `acquire` is held until `release`, so this is the only
+        // reference to `records`.
         let records = unsafe { &mut *self.records.get() };
         let count = self.record_count.load(Ordering::Relaxed) as usize;
 

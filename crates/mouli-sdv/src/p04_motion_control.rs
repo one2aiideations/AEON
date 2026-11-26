@@ -607,6 +607,10 @@ pub struct UptaneDualBankController {
     flash_storage_mock: UnsafeCell<[u8; FLASH_SECTOR_SIZE_BYTES * 4]>,
 }
 
+// SAFETY: `flash_storage_mock` is the only interior-mutable field and `write_firmware_sector`
+// writes it with no lock, taking `&mut` to the whole array. Sound only if firmware sectors are
+// written by one caller at a time (the update sequence is a single flow); two concurrent writes
+// would be a data race. The other fields are atomics.
 unsafe impl Sync for UptaneDualBankController {}
 
 impl UptaneDualBankController {
@@ -716,6 +720,9 @@ impl UptaneDualBankController {
             .store(OtaLifecycleStatus::WritingSectors as u8, Ordering::Relaxed);
 
         // Write directly to non-volatile mock flash
+        // SAFETY: there is no lock here; this relies on the caller writing one sector at a time
+        // and not reading the mock flash meanwhile (see the `Sync` impl). The slice below is
+        // bounds-checked (`sector_index` was checked above and the offset is taken modulo 4).
         let flash = unsafe { &mut *self.flash_storage_mock.get() };
         let offset = (sector_index % 4) * FLASH_SECTOR_SIZE_BYTES;
         flash[offset..offset + FLASH_SECTOR_SIZE_BYTES].copy_from_slice(sector_data);
