@@ -1413,3 +1413,22 @@ fn each_persons_conversation_is_kept_apart_and_comes_back_after_a_restart() {
         1
     );
 }
+
+#[test]
+fn help_lists_screens_and_only_the_capabilities_the_role_may_run() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("reader", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "rita", "reader").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/help");
+    let help = chat_texts(&d).pop().unwrap().1;
+    assert!(help.contains("Chat") && help.contains("Audit"), "{help}");
+    assert!(
+        help.contains("/note.read") && !help.contains("/note.send"),
+        "{help}"
+    );
+    assert!(help.contains("/signin"));
+    d.switch_user("olga", "owner").unwrap();
+    type_line(&mut d, "/help");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("/note.send"));
+}

@@ -850,12 +850,17 @@ impl ModelsInfo {
 
 /// The text at the right of the menu bar: the product name, and a reminder when requests wait for
 /// a second person's approval (the Approvals window is not on the desktop).
-fn status_text(base: &str, pending: usize) -> String {
-    match pending {
-        0 => base.to_string(),
-        1 => format!("{base}  |  1 waiting for approval (F3)"),
-        n => format!("{base}  |  {n} waiting for approval (F3)"),
+fn status_text(base: &str, user: &str, model: &str, pending: usize) -> String {
+    let mut t = format!("{base}  |  {user}");
+    if !model.is_empty() {
+        t.push_str(&format!("  |  {model}"));
     }
+    match pending {
+        0 => {}
+        1 => t.push_str("  |  1 waiting for approval (F3)"),
+        n => t.push_str(&format!("  |  {n} waiting for approval (F3)")),
+    }
+    t
 }
 
 /// Fills the Models window and the chat title from `info`.
@@ -1212,7 +1217,12 @@ where
                 }
             }
         }
-        desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
+        desktop.status = status_text(
+            &base_status,
+            device.user(),
+            &device.shell.chat.model,
+            device.shell.approvals.rows.len(),
+        );
         display.present(&desktop.render(&device.shell))?;
     }
 }
@@ -1910,9 +1920,16 @@ mod tests {
 
     #[test]
     fn the_menu_bar_reminds_when_approvals_are_waiting() {
-        assert_eq!(status_text("MOULI OS", 0), "MOULI OS");
-        assert!(status_text("MOULI OS", 1).contains("1 waiting for approval (F3)"));
-        assert!(status_text("MOULI OS", 3).contains("3 waiting for approval (F3)"));
+        assert_eq!(
+            status_text("MOULI OS", "alice", "", 0),
+            "MOULI OS  |  alice"
+        );
+        assert_eq!(
+            status_text("MOULI OS", "alice", "tiny", 0),
+            "MOULI OS  |  alice  |  tiny"
+        );
+        assert!(status_text("MOULI OS", "a", "", 1).contains("1 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", "a", "m", 3).contains("3 waiting for approval (F3)"));
     }
 
     struct NoRun;

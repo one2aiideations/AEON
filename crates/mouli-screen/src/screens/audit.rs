@@ -56,6 +56,10 @@ pub struct Audit {
     pub filter: Filter,
     /// The selection (an index into the filtered view).
     pub cursor: Cursor,
+    /// Only records whose actor, action, target or outcome contain this text (any case).
+    pub search: String,
+    /// True while the search text is being typed.
+    pub typing: bool,
 }
 
 /// True for outcomes that deserve attention.
@@ -80,9 +84,18 @@ impl Audit {
             .rows
             .iter()
             .filter(|r| self.filter == Filter::All || is_problem(&r.outcome))
+            .filter(|r| self.matches(r))
             .collect();
         v.reverse();
         v
+    }
+
+    fn matches(&self, r: &AuditRow) -> bool {
+        let q = self.search.trim().to_lowercase();
+        q.is_empty()
+            || [&r.actor, &r.action, &r.target, &r.outcome]
+                .iter()
+                .any(|f| f.to_lowercase().contains(&q))
     }
 
     /// The selected record.
@@ -100,8 +113,29 @@ impl Audit {
 
 impl Screen for Audit {
     fn on_key(&mut self, key: Key) -> Action {
+        if self.typing {
+            match key {
+                Key::Char(c) => self.search.push(c),
+                Key::Backspace => {
+                    self.search.pop();
+                }
+                Key::Enter => self.typing = false,
+                Key::Esc => {
+                    self.search.clear();
+                    self.typing = false;
+                }
+                _ => return Action::None,
+            }
+            self.cursor = Cursor::default();
+            return Action::None;
+        }
         let len = self.view().len();
         match key {
+            Key::Char('/') => self.typing = true,
+            Key::Esc => {
+                self.search.clear();
+                self.cursor = Cursor::default();
+            }
             Key::Up | Key::Char('k') => self.cursor.step(-1, len),
             Key::Down | Key::Char('j') => self.cursor.step(1, len),
             Key::PageUp => self.cursor.step(-10, len),
@@ -124,6 +158,12 @@ impl Screen for Audit {
     fn draw(&self, g: &mut Grid, area: Rect) {
         let view = self.view();
         let title = match self.filter {
+            Filter::All if !self.search.is_empty() => format!(
+                "Audit  {} of {} records matching \"{}\"",
+                view.len(),
+                self.rows.len(),
+                self.search
+            ),
             Filter::All => format!("Audit  {} records", self.rows.len()),
             Filter::Problems => format!(
                 "Audit  {} of {} records (problems only)",
@@ -166,6 +206,8 @@ impl Screen for Audit {
                 head + 2,
                 if self.rows.is_empty() {
                     "Nothing has happened yet."
+                } else if !self.search.is_empty() {
+                    "No record matches."
                 } else {
                     "No problems recorded."
                 },
@@ -231,9 +273,12 @@ impl Screen for Audit {
     }
 
     fn hints(&self) -> String {
+        if self.typing {
+            return format!("Search: {}_   Enter keep  Esc clear", self.search);
+        }
         match self.filter {
-            Filter::All => "Up/Down PgUp/PgDn move  f show problems only".into(),
-            Filter::Problems => "Up/Down PgUp/PgDn move  f show everything".into(),
+            Filter::All => "Up/Down PgUp/PgDn move  / search  f show problems only".into(),
+            Filter::Problems => "Up/Down PgUp/PgDn move  / search  f show everything".into(),
         }
     }
 }
@@ -280,6 +325,54 @@ mod tests {
         let area = g.area();
         a.draw(&mut g, area);
         g.to_text()
+    }
+
+    #[test]
+    fn search_matches_actor_action_and_outcome_in_any_case_and_clears_with_esc() {
+        let mut a = log();
+        a.on_key(Key::Char('/'));
+        assert!(a.typing);
+        for c in "ALICE".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(a.view().iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4]);
+        a.on_key(Key::Enter);
+        assert!(!a.typing);
+        assert!(drawn(&a, 100, 20).contains("1 of 6 records matching \"ALICE\""));
+        a.on_key(Key::Esc);
+        assert_eq!(a.view().len(), 6);
+
+        a.on_key(Key::Char('/'));
+        for c in "denied".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(a.view().iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3]);
+        a.on_key(Key::Backspace);
+        a.on_key(Key::Backspace);
+        a.on_key(Key::Backspace);
+        a.on_key(Key::Backspace);
+        a.on_key(Key::Backspace);
+        a.on_key(Key::Backspace);
+        assert_eq!(a.view().len(), 6);
+        for c in "zzz".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert!(a.view().is_empty());
+        assert!(drawn(&a, 100, 20).contains("No record matches."));
+        assert!(a.hints().contains("Search: zzz_"));
+        a.on_key(Key::Esc);
+        assert!(!a.typing && a.search.is_empty());
+    }
+
+    #[test]
+    fn search_and_the_problems_filter_combine() {
+        let mut a = log();
+        a.on_key(Key::Char('f'));
+        a.on_key(Key::Char('/'));
+        for c in "owner".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(a.view().iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3]);
     }
 
     #[test]

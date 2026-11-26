@@ -213,6 +213,35 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// What the person can press and run: the screens with their keys, then every registered
+    /// capability the signed-in role may use.
+    fn help_text(&self) -> String {
+        let mut t = String::from("Screens: ");
+        let keys: Vec<String> = mouli_screen::screen::Tab::ALL
+            .iter()
+            .map(|tab| format!("{} {}", tab.key_name(), tab.label()))
+            .collect();
+        t.push_str(&keys.join(", "));
+        t.push_str("\nCommands: /help, /signin <name> <role>, /<capability> name=value");
+        let mine: Vec<String> = self
+            .ws
+            .help()
+            .into_iter()
+            .filter(|(name, _)| self.ws.role_can(&self.role, name))
+            .map(|(name, what)| format!("  /{name}  {what}"))
+            .collect();
+        if mine.is_empty() {
+            t.push_str("\nYour role may not run any capability.");
+        } else {
+            t.push_str(&format!(
+                "\nYou ({}) may run:\n{}",
+                self.role,
+                mine.join("\n")
+            ));
+        }
+        t
+    }
+
     /// Shows the signed-in person's saved conversation. The model does not remember it: each
     /// start opens a new conversation in the workspace.
     fn restore_chat(&mut self, keeper: &mut keep::Keeper) {
@@ -402,6 +431,11 @@ impl<B: Backend> Device<B> {
     }
 
     fn send(&mut self, text: &str) {
+        if text.trim() == "/help" {
+            let help = self.help_text();
+            self.notice(&help);
+            return;
+        }
         if let Some(rest) = text.strip_prefix("/signin") {
             let mut w = rest.split_whitespace();
             match (w.next(), w.next(), w.next()) {
