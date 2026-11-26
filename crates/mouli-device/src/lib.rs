@@ -820,6 +820,12 @@ impl<B: Backend> Device<B> {
     }
 
     fn decide(&mut self, id: &str, approve: bool) {
+        let was_applied = patch::is_applied(self);
+        self.decide_inner(id, approve);
+        patch::note_origin(self, was_applied, "applied on approval by");
+    }
+
+    fn decide_inner(&mut self, id: &str, approve: bool) {
         match self
             .ws
             .decide(&self.tenant, id, &self.user, &self.role, approve)
@@ -1008,7 +1014,22 @@ impl<B: Backend> Device<B> {
     /// # Errors
     /// [`PatchError`] when the diff cannot be read or does not fit the files.
     pub fn propose_patch(&mut self, root: &std::path::Path, diff: &str) -> Result<(), PatchError> {
-        patch::propose(self, root, diff)
+        patch::propose(self, root, diff, "unknown")
+    }
+
+    /// Like [`Device::propose_patch`], and records who proposed the change (for example the
+    /// model's file name, or `user`) in the audit trail with the proposal and again when the
+    /// change is applied. The label is shortened and cleaned of control characters.
+    ///
+    /// # Errors
+    /// [`PatchError`] when the folder cannot be opened or the text is not an acceptable change.
+    pub fn propose_patch_by(
+        &mut self,
+        root: &std::path::Path,
+        diff: &str,
+        proposer: &str,
+    ) -> Result<(), PatchError> {
+        patch::propose(self, root, diff, proposer)
     }
 
     fn apply_patch(&mut self) {

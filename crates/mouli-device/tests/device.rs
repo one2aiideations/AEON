@@ -2204,3 +2204,102 @@ fn only_someone_who_can_administer_may_set_up_the_first_account() {
     assert!(!d.shell.chat.is_secret());
     assert!(!dir.path().join("users.txt").exists());
 }
+
+fn origin_rows(d: &Device<Echo>) -> Vec<String> {
+    d.shell
+        .audit
+        .rows
+        .iter()
+        .filter(|r| r.action == "patch.origin" || r.action == "patch.propose")
+        .map(|r| format!("{} | {} | {}", r.actor, r.action, r.target))
+        .collect()
+}
+
+#[test]
+fn the_audit_trail_says_which_model_proposed_a_change_and_who_applied_it() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.propose_patch_by(dir.path(), &diff, "qwen2.5-1.5b-q4_k_m.gguf")
+        .unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('a'));
+    // Applying twice must not write a second origin line.
+    d.on_key(Key::Char('a'));
+    let rows = origin_rows(&d);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows[0].contains("patch.propose")
+            && rows[0].contains("[proposed by qwen2.5-1.5b-q4_k_m.gguf]"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[1],
+        "owner | patch.origin | proposed by qwen2.5-1.5b-q4_k_m.gguf, applied by owner"
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+#[test]
+fn a_hostile_or_empty_label_cannot_forge_audit_lines_and_a_rejected_change_has_no_origin() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    let hostile = format!("evil\n9 | owner | patch.origin | forged{}", "x".repeat(200));
+    d.propose_patch_by(dir.path(), &diff, &hostile).unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('x'));
+    let rows = origin_rows(&d);
+    assert_eq!(rows.len(), 1, "only the proposal: {rows:?}");
+    assert!(!rows[0].contains('\n'));
+    let label = rows[0]
+        .split("[proposed by ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']');
+    assert!(label.chars().count() <= 64, "{label}");
+    // An empty label and the plain call both say unknown.
+    d.propose_patch_by(dir.path(), &diff, "  \n ").unwrap();
+    d.propose_patch(dir.path(), &diff).unwrap();
+    d.on_key(Key::F(1)); // any key refreshes the audit rows
+    let rows = origin_rows(&d);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.contains("[proposed by unknown]"))
+            .count(),
+        2,
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_change_applied_after_a_second_persons_approval_names_its_proposer() {
+    let (dir, diff, new) = project();
+    let (ws, code) = code_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "dev").unwrap();
+    d.attach_code(code);
+    d.propose_patch_by(dir.path(), &diff, "llama-3.2-3b.gguf")
+        .unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('a'));
+    assert!(
+        origin_rows(&d).iter().all(|r| !r.contains("patch.origin")),
+        "held, not applied yet"
+    );
+    // The owner approves from the approvals screen of the same device.
+    d.switch_user("owner", "owner").unwrap();
+    d.on_key(Key::F(3));
+    let row = d
+        .shell
+        .approvals
+        .rows
+        .iter()
+        .position(|r| r.capability == "code.apply")
+        .expect("the held apply");
+    d.shell.approvals.cursor.selected = row;
+    d.on_key(Key::Char('a'));
+    assert_eq!(read(&dir), new, "approved apply wrote the file");
+    let rows = origin_rows(&d);
+    assert!(
+        rows.iter().any(|r| r == "owner | patch.origin | proposed by llama-3.2-3b.gguf, applied on approval by owner"),
+        "{rows:?}"
+    );
+}

@@ -18,6 +18,8 @@ pub(crate) struct PatchSlot {
     /// Whether the capabilities are registered, so steps go through the gate.
     pub(crate) gated: bool,
     shown: u64,
+    /// Who proposed the current change (a model name, or `user`), as given when it was proposed.
+    proposer: String,
 }
 
 impl Default for PatchSlot {
@@ -26,6 +28,7 @@ impl Default for PatchSlot {
             state: CodeState::shared(),
             gated: false,
             shown: 0,
+            proposer: String::new(),
         }
     }
 }
@@ -36,6 +39,7 @@ impl PatchSlot {
             state,
             gated: true,
             shown: 0,
+            proposer: String::new(),
         }
     }
 }
@@ -85,28 +89,77 @@ pub(crate) fn sync<B: Backend>(d: &mut Device<B>) {
     d.patch.shown = version;
 }
 
+/// A label that is safe to put in the audit trail: visible characters only, at most 64.
+pub(crate) fn clean_label(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned: String = cleaned.chars().take(64).collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub(crate) fn propose<B: Backend>(
     d: &mut Device<B>,
     root: &Path,
     text: &str,
+    proposer: &str,
 ) -> Result<(), PatchError> {
     let summary = {
         let mut st = d.patch.state.borrow_mut();
         st.open(root)?;
         st.propose(text)?
     };
-    d.audit_event("patch.propose", &summary, "ok");
+    d.patch.proposer = clean_label(proposer);
+    let subject = format!("{summary} [proposed by {}]", d.patch.proposer);
+    d.audit_event("patch.propose", &subject, "ok");
     Ok(())
 }
 
+/// After a step that may have applied the change, records who proposed what was applied and who
+/// applied it, as one line in the audit trail (the gate or the direct path records the apply
+/// itself; this ties it to its source).
+pub(crate) fn note_origin<B: Backend>(d: &mut Device<B>, was_applied: bool, how: &str) {
+    let applied_now = d
+        .patch
+        .state
+        .borrow()
+        .view()
+        .is_some_and(|v| v.stage == Stage::Applied);
+    if applied_now && !was_applied {
+        let subject = format!("proposed by {}, {how} {}", d.patch.proposer, d.user);
+        d.audit_event("patch.origin", &subject, "ok");
+    }
+}
+
+pub(crate) fn is_applied<B: Backend>(d: &Device<B>) -> bool {
+    d.patch
+        .state
+        .borrow()
+        .view()
+        .is_some_and(|v| v.stage == Stage::Applied)
+}
+
 pub(crate) fn apply<B: Backend>(d: &mut Device<B>) {
+    let was_applied = is_applied(d);
     if d.patch.gated {
         d.call_patch("code.apply");
+        note_origin(d, was_applied, "applied by");
         return;
     }
     let result = d.patch.state.borrow_mut().apply();
     match result {
-        Ok(n) => d.audit_event("patch.apply", &format!("{n} file(s)"), "ok"),
+        Ok(n) => {
+            d.audit_event("patch.apply", &format!("{n} file(s)"), "ok");
+            note_origin(d, was_applied, "applied by");
+        }
         Err(m) => {
             let kind = if m == NOT_ALLOWED { "denied" } else { "failed" };
             d.audit_event("patch.apply", "-", &format!("{kind}: {m}"));
