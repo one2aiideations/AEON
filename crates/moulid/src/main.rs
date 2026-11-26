@@ -499,6 +499,9 @@ fn open_store(pid1: bool) -> Option<Store> {
 }
 
 fn main() -> ExitCode {
+    // Before any thread exists, so SIGTERM and SIGHUP can be handled instead of killing us.
+    #[cfg(target_os = "linux")]
+    let _ = moulid::shutdown::block_stop_signals();
     let mut args = match Args::parse(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {

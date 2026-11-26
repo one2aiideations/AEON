@@ -44,6 +44,8 @@ pub mod http;
 pub mod lineedit;
 pub mod models;
 pub mod persist;
+#[cfg(target_os = "linux")]
+pub mod shutdown;
 pub mod storage;
 pub mod sysinfo;
 pub mod textwrap;

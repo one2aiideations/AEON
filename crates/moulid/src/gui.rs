@@ -331,6 +331,8 @@ pub enum Ev {
     WifiScanned(Result<Vec<mouli_screen::screens::WifiRow>, String>),
     /// Joining a Wi-Fi network finished: a summary of the link, or why not.
     WifiJoined(Result<String, String>),
+    /// The system asked the desktop to stop (SIGTERM or SIGHUP).
+    Terminate,
     /// The browser finished loading an address (or failed).
     Page {
         /// The address that was asked for.
@@ -949,12 +951,52 @@ struct TtyGuard {
     saved: Option<nix::sys::termios::Termios>,
 }
 
+/// The terminal settings to put back, kept where a panic hook can reach them.
+#[cfg(target_os = "linux")]
+static SAVED_TTY: std::sync::Mutex<Option<nix::sys::termios::Termios>> =
+    std::sync::Mutex::new(None);
+
+/// How many times the console was restored (the guard, or the panic hook).
+#[cfg(target_os = "linux")]
+static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Puts the terminal back as it was and shows the cursor. Safe to call more than once and from
+/// any thread; does nothing to settings it never saved.
+#[cfg(target_os = "linux")]
+pub fn restore_console() {
+    use nix::sys::termios::{tcflush, tcsetattr, FlushArg, SetArg};
+    RESTORES.fetch_add(1, Ordering::SeqCst);
+    let stdin = std::io::stdin();
+    let _ = tcflush(&stdin, FlushArg::TCIFLUSH);
+    let saved = SAVED_TTY.lock().map(|g| g.clone()).unwrap_or(None);
+    if let Some(t) = &saved {
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, t);
+    }
+    let _ = write!(std::io::stdout(), "\x1b[?25h\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+}
+
+/// Makes a crash put the console back before the panic message is printed, so the message can be
+/// read and the keyboard still echoes. (The release build aborts on panic, which skips every
+/// destructor; this hook is what runs instead.)
+#[cfg(target_os = "linux")]
+pub fn restore_console_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_console();
+        previous(info);
+    }));
+}
+
 #[cfg(target_os = "linux")]
 impl TtyGuard {
     fn new() -> Self {
         use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
         let stdin = std::io::stdin();
         let saved = tcgetattr(&stdin).ok();
+        if let Ok(mut slot) = SAVED_TTY.lock() {
+            slot.clone_from(&saved);
+        }
         if let Some(t) = &saved {
             let mut raw = t.clone();
             raw.local_flags
@@ -971,14 +1013,8 @@ impl TtyGuard {
 #[cfg(target_os = "linux")]
 impl Drop for TtyGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{tcflush, tcsetattr, FlushArg, SetArg};
-        let stdin = std::io::stdin();
-        let _ = tcflush(&stdin, FlushArg::TCIFLUSH);
-        if let Some(t) = &self.saved {
-            let _ = tcsetattr(&stdin, SetArg::TCSANOW, t);
-        }
-        let _ = write!(std::io::stdout(), "\x1b[?25h\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
+        let _ = &self.saved;
+        restore_console();
     }
 }
 
@@ -1114,6 +1150,17 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     let display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
     let device = build_device(data_dir)?;
     let (tx, rx) = channel();
+    // A crash puts the console back first; SIGTERM and SIGHUP end the desktop the normal way.
+    #[cfg(target_os = "linux")]
+    {
+        restore_console_on_panic();
+        let stop = tx.clone();
+        if let Err(e) = crate::shutdown::on_stop_signal(move || {
+            let _ = stop.send(Ev::Terminate);
+        }) {
+            eprintln!("moulid: cannot watch for SIGTERM: {e}");
+        }
+    }
     let width = i32::try_from(display.size().0).unwrap_or(1024);
     let mut seen = BTreeSet::new();
     let inputs = scan_inputs(
@@ -1485,6 +1532,7 @@ where
                     desktop.system = *s;
                     Action::None
                 }
+                Ev::Terminate => return Ok(End::Quit),
                 Ev::WifiScanned(result) => {
                     device.shell.wifi.scanned(result);
                     Action::None
@@ -2730,6 +2778,46 @@ mod tests {
         assert_eq!(load_idle(Some(&store)), 10, "an unknown value falls back");
         assert_eq!(idle_label(0), "off");
         assert_eq!(idle_label(5), "5 min");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_panic_puts_the_console_back_before_the_message() {
+        let before = RESTORES.load(Ordering::SeqCst);
+        restore_console_on_panic();
+        let r = std::panic::catch_unwind(|| panic!("a deliberate test panic"));
+        assert!(r.is_err());
+        assert!(
+            RESTORES.load(Ordering::SeqCst) > before,
+            "the hook restored the console"
+        );
+        // Calling it directly, repeatedly and without a saved state is harmless.
+        restore_console();
+        restore_console();
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn terminate_ends_the_desktop_cleanly() {
+        let dir = tmp("terminate");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots), tx.clone(), rx, device);
+        tx.send(Ev::Terminate).unwrap();
+        let end = run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        assert!(matches!(end, End::Quit));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
