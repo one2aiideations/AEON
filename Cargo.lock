@@ -2658,6 +2658,7 @@ version = "0.1.0"
 dependencies = [
  "mouli-apps",
  "mouli-code",
+ "mouli-crypto",
  "mouli-desk",
  "mouli-interface",
  "mouli-player",

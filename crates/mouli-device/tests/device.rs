@@ -1652,3 +1652,128 @@ fn a_broken_chain_can_be_marked_seen_but_still_counts() {
     assert!(d.shell.security.message.contains("still counts"));
     assert!(d.shell.security.score >= 70);
 }
+
+fn run_once(dir: &std::path::Path, line: &str) {
+    // Each start opens a session, so each call adds at least one record.
+    let mut d = reopen_as(
+        dir,
+        if line.starts_with("/signin") {
+            "zed"
+        } else {
+            "owner"
+        },
+    );
+    type_line(&mut d, line);
+}
+
+fn reopen_as(dir: &std::path::Path, user: &str) -> Device<Echo> {
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", user, "owner").unwrap();
+    d.keep_state_in(dir).unwrap();
+    d
+}
+
+fn reopen(dir: &std::path::Path) -> Device<Echo> {
+    reopen_as(dir, "owner")
+}
+
+fn has_checkpoint_alert(d: &Device<Echo>) -> bool {
+    d.shell
+        .security
+        .findings
+        .iter()
+        .any(|f| f.id == "checkpoint")
+}
+
+#[test]
+fn a_normal_restart_raises_no_checkpoint_alert() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    assert!(dir.path().join("checkpoint.txt").exists());
+    let d = reopen(dir.path());
+    assert!(!has_checkpoint_alert(&d));
+    drop(d);
+    assert!(!has_checkpoint_alert(&reopen(dir.path())));
+}
+
+#[test]
+fn cutting_records_off_the_log_is_caught_and_stays_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let kept: Vec<&str> = text.lines().collect();
+    assert!(kept.len() >= 2, "need records to cut: {}", kept.len());
+    // Cut two: the start itself adds a record, and an identical one would hide a cut of one.
+    // The chain still verifies after the cut; only the checkpoint knows records are missing.
+    std::fs::write(&path, format!("{}\n", kept[..kept.len() - 2].join("\n"))).unwrap();
+    let d = reopen(dir.path());
+    assert!(has_checkpoint_alert(&d));
+    drop(d);
+    // The alert is in the chain, so it is still there after the next start.
+    assert!(has_checkpoint_alert(&reopen(dir.path())));
+}
+
+#[test]
+fn swapping_in_another_valid_log_is_caught() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    for _ in 0..3 {
+        run_once(a.path(), "hello");
+        run_once(b.path(), "/signin zed viewer");
+    }
+    std::fs::copy(b.path().join("audit.log"), a.path().join("audit.log")).unwrap();
+    assert!(has_checkpoint_alert(&reopen(a.path())));
+}
+
+#[test]
+fn deleting_or_forging_the_checkpoint_is_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    let cp = dir.path().join("checkpoint.txt");
+    let good = std::fs::read_to_string(&cp).unwrap();
+    std::fs::remove_file(&cp).unwrap();
+    assert!(has_checkpoint_alert(&reopen(dir.path())));
+
+    let dir2 = tempfile::tempdir().unwrap();
+    run_once(dir2.path(), "hello");
+    run_once(dir2.path(), "hello");
+    let cp2 = dir2.path().join("checkpoint.txt");
+    let mut parts: Vec<String> = std::fs::read_to_string(&cp2)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    parts[0] = "1".into(); // claim fewer records; the tag no longer fits
+    std::fs::write(&cp2, parts.join(" ")).unwrap();
+    assert!(has_checkpoint_alert(&reopen(dir2.path())));
+    assert!(!good.is_empty());
+}
+
+#[test]
+fn the_first_start_and_an_upgrade_from_older_state_are_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    // State saved before checkpoints existed: a log, no key, no checkpoint.
+    std::fs::remove_file(dir.path().join("checkpoint.txt")).unwrap();
+    std::fs::remove_file(dir.path().join("checkpoint.key")).unwrap();
+    let d = reopen(dir.path());
+    assert!(!has_checkpoint_alert(&d));
+    assert!(dir.path().join("checkpoint.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_checkpoint_key_is_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    let mode = std::fs::metadata(dir.path().join("checkpoint.key"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0);
+}

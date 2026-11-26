@@ -40,6 +40,23 @@ pub(crate) fn assess(ws: &Workspace) -> (u8, Vec<Finding>) {
             acknowledged: false,
         });
     }
+    if let Some(r) = audit
+        .records()
+        .iter()
+        .rev()
+        .find(|r| r.action == "checkpoint.failed")
+    {
+        findings.push(Finding {
+            id: "checkpoint".into(),
+            severity: Severity::Critical,
+            title: "The audit log does not match its saved checkpoint".into(),
+            detail: format!(
+                "At start-up, {}. Someone may have edited or cut the log file. Treat the history before this record as unproven.",
+                r.subject
+            ),
+            acknowledged: false,
+        });
+    }
     let denied = audit
         .records()
         .iter()

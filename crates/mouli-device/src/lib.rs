@@ -767,8 +767,13 @@ impl<B: Backend> Device<B> {
     /// A message when the directory or an existing file cannot be read.
     pub fn keep_state_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
         let mut keeper = keep::Keeper::open(dir)?;
+        let alert = keeper.check_checkpoint(&self.ws);
         self.restore_chat(&mut keeper);
         self.keeper = Some(keeper);
+        if let Some(why) = alert {
+            // Written into the chain so the finding outlives this start.
+            self.audit_event("checkpoint.failed", &why, "alert");
+        }
         self.refresh();
         Ok(())
     }

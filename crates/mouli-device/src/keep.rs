@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 const AUDIT_FILE: &str = "audit.log";
 const PENDING_FILE: &str = "pending.txt";
+const CHECKPOINT_FILE: &str = "checkpoint.txt";
+const KEY_FILE: &str = "checkpoint.key";
 
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -173,6 +175,52 @@ pub(crate) struct Keeper {
     saved_records: usize,
     saved_pending: Vec<PendingCall>,
     saved_chat: Option<(String, Vec<Message>)>,
+    key: [u8; 32],
+    had_key: bool,
+    saved_checkpoint: usize,
+}
+
+fn to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The checkpoint tag: HMAC-SHA-256 over how many records are covered and the hash of the last
+/// one. The key is a device secret kept beside the log (mode 0600).
+fn checkpoint_tag(key: &[u8; 32], count: usize, hash: &str) -> String {
+    to_hex(&mouli_crypto::hmac::hmac_sha256(
+        key,
+        format!("mouli-audit-checkpoint|{count}|{hash}").as_bytes(),
+    ))
+}
+
+/// Reads the device key, making it from the system's random source when there is none.
+/// Returns the key and whether it already existed.
+fn load_or_make_key(dir: &Path) -> Result<([u8; 32], bool), String> {
+    let path = dir.join(KEY_FILE);
+    if let Ok(t) = fs::read_to_string(&path) {
+        if let Some(b) = mouli_crypto::from_hex(t.trim()).and_then(|v| <[u8; 32]>::try_from(v).ok())
+        {
+            return Ok((b, true));
+        }
+    }
+    let existed = path.exists();
+    let mut key = [0u8; 32];
+    std::io::Read::read_exact(
+        &mut File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?,
+        &mut key,
+    )
+    .map_err(|e| format!("/dev/urandom: {e}"))?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(to_hex(&key).as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((key, existed))
 }
 
 /// The most messages of one person's conversation that are kept.
@@ -210,12 +258,85 @@ impl Keeper {
             .iter()
             .filter_map(|l| parse_pending(l).ok())
             .collect();
+        let (key, had_key) = load_or_make_key(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             saved_records,
             saved_pending,
             saved_chat: None,
+            key,
+            had_key,
+            saved_checkpoint: 0,
         })
+    }
+
+    /// Compares the loaded log with the last checkpoint written. `None` when they agree (or
+    /// this is the first start); otherwise what is wrong. Call once, before the first save.
+    pub(crate) fn check_checkpoint(&mut self, ws: &Workspace) -> Option<String> {
+        let records = ws.audit().records();
+        let path = self.dir.join(CHECKPOINT_FILE);
+        let text = fs::read_to_string(&path).ok();
+        match text {
+            None if self.had_key && !records.is_empty() => {
+                Some("the checkpoint file is gone".to_string())
+            }
+            None => None,
+            Some(t) => {
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                let n = parts.first().and_then(|n| n.parse::<usize>().ok());
+                match (n, parts.get(1), parts.get(2)) {
+                    (Some(n), Some(h), Some(tag))
+                        if parts.len() == 3
+                            && mouli_crypto::ct_eq(
+                                checkpoint_tag(&self.key, n, h).as_bytes(),
+                                tag.as_bytes(),
+                            ) =>
+                    {
+                        self.saved_checkpoint = n;
+                        if records.len() < n {
+                            Some(format!(
+                                "the log has {} records but a checkpoint covers {n}: records were removed",
+                                records.len()
+                            ))
+                        } else if n > 0 && records[n - 1].hash != *h {
+                            Some(format!(
+                                "record {n} is not the one the checkpoint signed: history was rewritten"
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => Some("the checkpoint is damaged or was not made by this device".into()),
+                }
+            }
+        }
+    }
+
+    fn save_checkpoint(&mut self, ws: &Workspace) -> Result<(), String> {
+        let all = ws.audit().records();
+        let Some(last) = all.last() else {
+            return Ok(());
+        };
+        if self.saved_checkpoint == all.len() {
+            return Ok(());
+        }
+        let path = self.dir.join(CHECKPOINT_FILE);
+        let tmp = self.dir.join("checkpoint.tmp");
+        let line = format!(
+            "{} {} {}\n",
+            all.len(),
+            last.hash,
+            checkpoint_tag(&self.key, all.len(), &last.hash)
+        );
+        let write = || -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(line.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)
+        };
+        write().map_err(|e| format!("{}: {e}", path.display()))?;
+        self.saved_checkpoint = all.len();
+        Ok(())
     }
 
     /// The saved conversation of `user` (empty when there is none or it is damaged).
@@ -284,6 +405,7 @@ impl Keeper {
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             self.saved_records = all.len();
         }
+        self.save_checkpoint(ws)?;
         let pending = ws.export_pending();
         if pending != self.saved_pending {
             let path = self.dir.join(PENDING_FILE);
