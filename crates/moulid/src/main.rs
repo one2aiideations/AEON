@@ -11,7 +11,8 @@ use moulid::hwprobe;
 use moulid::models::{describe, discover, Found};
 use moulid::net;
 use moulid::persist::{self, Store};
-use moulid::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
+use moulid::ui::{chat_loop, pick_model_checked, Backend, Choice, End, Turn};
+use moulid::verify;
 use moulid::wifi;
 use moulid::wifi_saved;
 use moulid::{catalog, download_ui, fetch};
@@ -24,7 +25,6 @@ use std::thread::sleep;
 use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are MOULI, a helpful assistant running entirely on this computer with no internet connection. Answer clearly and concisely.";
-const REPLY_TOKENS: u32 = 512;
 /// Conversation budget for hosted models (their context is large; this keeps cost sensible).
 const HOSTED_CONTEXT_TOKENS: usize = 6_000;
 
@@ -141,6 +141,10 @@ fn finish(pid1: bool, code: u8) -> ExitCode {
 struct ServerBackend {
     port: u16,
     log: Option<(Store, String)>,
+    /// Most tokens in one answer.
+    reply_tokens: u32,
+    /// Strings that end an answer (see `moulid::reply`).
+    stop: Vec<String>,
 }
 
 impl ServerBackend {
@@ -160,7 +164,7 @@ impl Backend for ServerBackend {
         if let Some(last) = history.last() {
             self.record(last.role, &last.content);
         }
-        let answer = http::chat_messages(self.port, &turns, REPLY_TOKENS)?;
+        let answer = http::chat_messages(self.port, &turns, self.reply_tokens, &self.stop)?;
         self.record("assistant", &answer);
         Ok(answer)
     }
@@ -177,7 +181,8 @@ impl Backend for ServerBackend {
         if let Some(last) = history.last() {
             self.record(last.role, &last.content);
         }
-        let answer = http::chat_messages_stream(self.port, &turns, REPLY_TOKENS, on_piece)?;
+        let answer =
+            http::chat_messages_stream(self.port, &turns, self.reply_tokens, &self.stop, on_piece)?;
         self.record("assistant", &answer);
         Ok(answer)
     }
@@ -260,12 +265,26 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         let choice = if a.model.is_some() && models.len() == 1 {
             Choice::Model(0)
         } else {
-            match pick_model(
+            let (entries, _) = catalog::load(Path::new(catalog::CATALOG_FILE));
+            // A file the catalogue lists is checked against its size and SHA-256 before loading.
+            let mut verify_file = |m: &Found| -> Option<String> {
+                let name = m.path.file_name()?.to_string_lossy().into_owned();
+                if !verify::known(&name, &entries) {
+                    return None;
+                }
+                say(&format!("MOULI: checking {name} against the catalogue..."));
+                match verify::check(&m.path, &entries) {
+                    Ok(c) => verify::warning(&name, &c),
+                    Err(e) => Some(format!("{name} could not be read to check it: {e}")),
+                }
+            };
+            match pick_model_checked(
                 &models,
                 plan.model_budget_mb,
                 plan.ctx,
                 &mut input,
                 &mut out,
+                &mut verify_file,
             ) {
                 Ok(c) => c,
                 Err(_) => {
@@ -395,6 +414,24 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     m.name,
                     m.size_mb()
                 ));
+                if let Some(why) = m.why_not(plan.model_budget_mb, plan.ctx) {
+                    say(&format!("MOULI: warning: {} {why}", m.name));
+                }
+                // The picker already checked the file; a model named on the command line skips
+                // it, so check it here and warn (it is not refused: it was asked for by name).
+                if a.model.is_some() {
+                    let (entries, _) = catalog::load(Path::new(catalog::CATALOG_FILE));
+                    if let Some(name) = m.path.file_name().map(|n| n.to_string_lossy().into_owned())
+                    {
+                        if verify::known(&name, &entries) {
+                            say(&format!("MOULI: checking {name} against the catalogue..."));
+                            let found = verify::check(&m.path, &entries);
+                            if let Some(w) = found.ok().and_then(|c| verify::warning(&name, &c)) {
+                                say(&format!("MOULI: warning: {w}"));
+                            }
+                        }
+                    }
+                }
                 let mut child = match launch(a, &m.path, plan, pid1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -406,12 +443,19 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     }
                 };
                 say("MOULI ready");
-                // Keep about 80% of the server's context for the conversation; the rest is for
-                // the reply and for the estimate being rough.
-                let max_tokens = usize::try_from(plan.ctx).unwrap_or(2048).saturating_mul(4) / 5;
+                // The answer limit and stop strings come from the kernel command line. The
+                // conversation keeps what the answer does not need, but at most 80% of the
+                // server's context (the estimate is rough).
+                let cmdline = system::kernel_cmdline();
+                let reply_tokens = moulid::reply::reply_tokens(&cmdline, plan.ctx);
+                let ctx = usize::try_from(plan.ctx).unwrap_or(2048);
+                let max_tokens =
+                    (ctx.saturating_mul(4) / 5).min(ctx.saturating_sub(reply_tokens as usize));
                 let mut backend = ServerBackend {
                     port: a.port,
                     log: store.map(|s| (s.clone(), s.new_session())),
+                    reply_tokens,
+                    stop: moulid::reply::stops(&cmdline),
                 };
                 let text_only = cmdline_has(&system::kernel_cmdline(), "mouli.text=1");
                 let session = if text_only {

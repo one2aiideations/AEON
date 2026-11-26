@@ -11313,6 +11313,252 @@ pub mod sparse {
     }
 }
 
+pub mod chat {
+    //! Chat prompt formats: how a conversation is written into the text a model was trained on.
+    //!
+    //! A chat model expects its turns wrapped in special marker tokens (ChatML for Qwen, header
+    //! tokens for Llama 3). Sending plain text instead works badly. [`Template::detect`] picks the
+    //! format from the model file's own `tokenizer.chat_template` text (or, without one, from the
+    //! architecture) and [`Template::render`] writes the conversation in it.
+    //!
+    //! Rendering produces text that contains the marker tokens' names. Encode it with
+    //! `parse_special = true` so they become the single tokens they stand for, and with
+    //! `add_bos = false` (the Llama 3 format writes its own `<|begin_of_text|>`).
+    //!
+    //! What this does not do: it is not a general template engine and does not run the model's
+    //! Jinja text. It knows two formats. The default system lines some templates insert when none is
+    //! given (Qwen's "You are Qwen...", Llama 3.2's date lines) are not added, so the prompt is
+    //! exactly the messages passed. Tool-calling sections of the templates are not supported.
+
+    /// Who said a message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Role {
+        /// Instructions to the model.
+        System,
+        /// The person.
+        User,
+        /// The model's earlier answers.
+        Assistant,
+    }
+
+    impl Role {
+        fn word(self) -> &'static str {
+            match self {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            }
+        }
+    }
+
+    /// One turn of a conversation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Message<'a> {
+        /// Who said it.
+        pub role: Role,
+        /// What was said.
+        pub content: &'a str,
+    }
+
+    /// A chat format.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Template {
+        /// `<|im_start|>role\ncontent<|im_end|>\n` (Qwen and many others).
+        ChatMl,
+        /// `<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>` (Llama 3).
+        Llama3,
+        /// `Role: content` lines, for a model with no known format.
+        Plain,
+    }
+
+    impl Template {
+        /// Picks the format from the model's chat template text, or, when it has none, from the
+        /// architecture (`qwen2` is ChatML; anything else is plain).
+        #[must_use]
+        pub fn detect(chat_template: Option<&str>, architecture: &str) -> Template {
+            match chat_template {
+                Some(t) if t.contains("<|im_start|>") => Template::ChatMl,
+                Some(t) if t.contains("<|start_header_id|>") => Template::Llama3,
+                Some(_) => Template::Plain,
+                None if architecture == "qwen2" => Template::ChatMl,
+                None => Template::Plain,
+            }
+        }
+
+        /// The format's name.
+        #[must_use]
+        pub fn name(self) -> &'static str {
+            match self {
+                Template::ChatMl => "chatml",
+                Template::Llama3 => "llama3",
+                Template::Plain => "plain",
+            }
+        }
+
+        /// Strings that end an answer. Generation should stop when one appears and not show it.
+        #[must_use]
+        pub fn stop_strings(self) -> &'static [&'static str] {
+            match self {
+                Template::ChatMl => &["<|im_end|>"],
+                Template::Llama3 => &["<|eot_id|>"],
+                Template::Plain => &["\nUser:"],
+            }
+        }
+
+        /// Writes `messages` in this format. With `add_generation_prompt` the text ends where the
+        /// model's answer should begin.
+        #[must_use]
+        pub fn render(self, messages: &[Message<'_>], add_generation_prompt: bool) -> String {
+            let mut out = String::new();
+            match self {
+                Template::ChatMl => {
+                    for m in messages {
+                        out.push_str("<|im_start|>");
+                        out.push_str(m.role.word());
+                        out.push('\n');
+                        out.push_str(m.content);
+                        out.push_str("<|im_end|>\n");
+                    }
+                    if add_generation_prompt {
+                        out.push_str("<|im_start|>assistant\n");
+                    }
+                }
+                Template::Llama3 => {
+                    out.push_str("<|begin_of_text|>");
+                    for m in messages {
+                        out.push_str("<|start_header_id|>");
+                        out.push_str(m.role.word());
+                        out.push_str("<|end_header_id|>\n\n");
+                        // The model's own template trims each message.
+                        out.push_str(m.content.trim());
+                        out.push_str("<|eot_id|>");
+                    }
+                    if add_generation_prompt {
+                        out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+                    }
+                }
+                Template::Plain => {
+                    for m in messages {
+                        out.push_str(match m.role {
+                            Role::System => "System: ",
+                            Role::User => "User: ",
+                            Role::Assistant => "Assistant: ",
+                        });
+                        out.push_str(m.content);
+                        out.push('\n');
+                    }
+                    if add_generation_prompt {
+                        out.push_str("Assistant:");
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const CONVERSATION: [Message<'static>; 3] = [
+            Message {
+                role: Role::System,
+                content: "Be brief.",
+            },
+            Message {
+                role: Role::User,
+                content: "Hi",
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Hello.",
+            },
+        ];
+
+        #[test]
+        fn chatml_wraps_every_turn_and_ends_on_the_assistant_marker() {
+            let t = Template::ChatMl.render(&CONVERSATION, true);
+            assert_eq!(
+                t,
+                "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n"
+            );
+            // Without the generation prompt the text ends after the last turn.
+            assert!(Template::ChatMl
+                .render(&CONVERSATION, false)
+                .ends_with("Hello.<|im_end|>\n"));
+            // ChatML keeps the message text exactly, spaces and newlines included.
+            let m = [Message {
+                role: Role::User,
+                content: "  a\n",
+            }];
+            assert!(Template::ChatMl
+                .render(&m, false)
+                .contains("user\n  a\n<|im_end|>"));
+        }
+
+        #[test]
+        fn llama3_has_its_own_begin_marker_headers_and_trims_messages() {
+            let m = [
+                Message {
+                    role: Role::System,
+                    content: " Be brief. ",
+                },
+                Message {
+                    role: Role::User,
+                    content: "Hi\n",
+                },
+            ];
+            assert_eq!(
+                Template::Llama3.render(&m, true),
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            );
+        }
+
+        #[test]
+        fn plain_is_readable_and_stops_before_the_next_user_turn() {
+            assert_eq!(
+                Template::Plain.render(&CONVERSATION[1..], true),
+                "User: Hi\nAssistant: Hello.\nAssistant:"
+            );
+            assert_eq!(Template::Plain.stop_strings(), &["\nUser:"]);
+        }
+
+        #[test]
+        fn the_format_is_chosen_from_the_models_own_template_then_the_architecture() {
+            let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}";
+            let llama = "{{- bos_token }}<|start_header_id|>{{ role }}<|end_header_id|>";
+            assert_eq!(Template::detect(Some(chatml), "llama"), Template::ChatMl);
+            assert_eq!(Template::detect(Some(llama), "qwen2"), Template::Llama3);
+            assert_eq!(
+                Template::detect(Some("{{ unknown }}"), "qwen2"),
+                Template::Plain
+            );
+            assert_eq!(Template::detect(None, "qwen2"), Template::ChatMl);
+            assert_eq!(Template::detect(None, "llama"), Template::Plain);
+            assert_eq!(Template::detect(Some(""), "qwen2"), Template::Plain);
+        }
+
+        #[test]
+        fn every_format_names_itself_and_has_a_stop_string() {
+            for t in [Template::ChatMl, Template::Llama3, Template::Plain] {
+                assert!(!t.name().is_empty() && !t.stop_strings().is_empty());
+            }
+            assert_eq!(Template::ChatMl.stop_strings(), &["<|im_end|>"]);
+            assert_eq!(Template::Llama3.stop_strings(), &["<|eot_id|>"]);
+        }
+
+        #[test]
+        fn no_messages_still_renders_sensibly() {
+            assert_eq!(
+                Template::ChatMl.render(&[], true),
+                "<|im_start|>assistant\n"
+            );
+            assert_eq!(Template::ChatMl.render(&[], false), "");
+            assert_eq!(Template::Llama3.render(&[], false), "<|begin_of_text|>");
+        }
+    }
+}
+
 mod config {
     //! Model hyper-parameters read from GGUF metadata.
 

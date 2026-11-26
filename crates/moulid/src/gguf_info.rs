@@ -22,7 +22,8 @@ const MAX_ARRAY_DEPTH: u32 = 4;
 /// Maximum number of elements accepted in a single metadata array.
 const MAX_ARRAY_ELEMENTS: u64 = 16_777_216;
 /// Fixed 256 MiB overhead added by [`estimate_ram`].
-const OVERHEAD_BYTES: u64 = 256 * 1024 * 1024;
+/// Working memory the runtime needs besides the weights and the attention cache.
+pub const OVERHEAD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A summary of the parts of a GGUF header that callers usually care about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,13 +207,20 @@ pub fn parse(buf: &[u8]) -> Result<GgufInfo, GgufError> {
 /// saturating.
 #[must_use]
 pub fn estimate_ram(info: &GgufInfo, file_size: u64, ctx: u64) -> u64 {
-    let kv = info
-        .block_count
+    file_size
+        .saturating_add(cache_bytes(info, ctx))
+        .saturating_add(OVERHEAD_BYTES)
+}
+
+/// Bytes of attention cache for `ctx` tokens: 2 (K and V) x 2 bytes (f16) x layers x width x
+/// tokens. Zero when the header does not say the layers or width.
+#[must_use]
+pub fn cache_bytes(info: &GgufInfo, ctx: u64) -> u64 {
+    info.block_count
         .unwrap_or(0)
         .saturating_mul(info.embedding_length.unwrap_or(0))
         .saturating_mul(ctx)
-        .saturating_mul(4); // 2 (K and V) x 2 bytes (f16)
-    file_size.saturating_add(kv).saturating_add(OVERHEAD_BYTES)
+        .saturating_mul(4)
 }
 
 /// Return the llama.cpp file-type name for the common `general.file_type`

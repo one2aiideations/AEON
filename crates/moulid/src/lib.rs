@@ -44,6 +44,7 @@ pub mod http;
 pub mod lineedit;
 pub mod models;
 pub mod persist;
+pub mod reply;
 #[cfg(target_os = "linux")]
 pub mod shutdown;
 pub mod storage;
@@ -51,6 +52,7 @@ pub mod sysinfo;
 pub mod textwrap;
 pub mod toolloop;
 pub mod ui;
+pub mod verify;
 
 use std::path::{Path, PathBuf};
 
