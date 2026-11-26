@@ -697,7 +697,23 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
         quality: 50,
     });
     let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
+    // Saved audit chain and held approvals come back first. A damaged file never stops the boot
+    // and is never overwritten: the device then runs without saving and says so.
+    let state = data_dir.map(|d| d.join("state"));
+    let restored = state.as_deref().map(|d| mouli_device::restore(&mut ws, d));
     let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
+    match (&state, restored) {
+        (Some(dir), Some(Ok(_))) => {
+            if let Err(e) = device.keep_state_in(dir) {
+                device.shell.approvals.message = format!("Audit log is not being saved: {e}");
+            }
+        }
+        (_, Some(Err(e))) => {
+            device.shell.approvals.message =
+                format!("Saved audit log not loaded, and not being saved: {e}");
+        }
+        _ => {}
+    }
     device.attach_code(code);
     if let Some(dir) = data_dir {
         let projects = dir.join("projects");
@@ -1616,6 +1632,27 @@ mod tests {
         assert!(d.join("projects").is_dir());
         // A data disk that cannot be written is an error, not a panic.
         assert!(build_device(Some(Path::new("/proc/mouli-nonexistent"))).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_audit_chain_is_kept_on_the_data_disk_and_a_damaged_one_is_not_overwritten() {
+        let d = tmp("audit-kept");
+        {
+            let device = build_device(Some(&d)).unwrap();
+            assert!(!device.workspace().audit().records().is_empty());
+        }
+        let first = std::fs::read_to_string(d.join("state/audit.log")).unwrap();
+        let again = build_device(Some(&d)).unwrap();
+        assert!(again.workspace().audit().records().len() > first.lines().count());
+        assert_eq!(again.workspace().audit().verify(), Ok(()));
+        std::fs::write(d.join("state/audit.log"), "junk\n").unwrap();
+        let broken = build_device(Some(&d)).unwrap();
+        assert!(broken.shell.approvals.message.contains("not loaded"));
+        assert_eq!(
+            std::fs::read_to_string(d.join("state/audit.log")).unwrap(),
+            "junk\n"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
