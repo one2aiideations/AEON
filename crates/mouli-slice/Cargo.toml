@@ -11,6 +11,7 @@ name = "mouli_slice"
 path = "src/lib.rs"
 
 [dependencies]
+mouli-llm = { path = "../mouli-llm" }
 
 [lints]
 workspace = true

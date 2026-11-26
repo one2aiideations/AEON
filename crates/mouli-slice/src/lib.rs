@@ -16,8 +16,9 @@
 //!
 //! # Architecture
 //!
-//! The crate deliberately has no dependency on the inference engine.
-//! The engine implements [`ActivationSink`] and [`Scorer`].
+//! The slicing logic has no dependency on the inference engine: the engine implements
+//! [`ActivationSink`] and [`Scorer`]. Only [`gguf_slice`] reads and writes GGUF files, through
+//! `mouli-llm`.
 //!
 //! The profiling process records activation statistics. The planning
 //! process selects neurons. The slicing process transforms in-memory
@@ -27,7 +28,7 @@
 //! # Important limitations
 //!
 //! This crate does not execute a model, calibrate quantization, write
-//! GGUF files, measure inference latency, or prove generalization.
+//! GGUF files (apart from [`gguf_slice`]), measure inference latency, or prove generalization.
 //!
 //! The engine side must re-quantize sliced matrices and write the resulting
 //! GGUF file. Its `feed_forward_length` metadata must equal the number of
@@ -48,6 +49,7 @@
 //! establish a particular latency or memory improvement.
 
 pub mod gate;
+pub mod gguf_slice;
 pub mod plan;
 pub mod profile;
 pub mod report;
