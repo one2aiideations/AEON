@@ -106,12 +106,19 @@ pub fn memory_barrier() {
 #[inline(always)]
 pub fn read_cycle_counter() -> u64 {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: reading the virtual counter touches no memory and no stack (`nomem, nostack`) and
+    // has no side effects. It is only valid when the counter is readable at the privilege level
+    // this runs at (EL1 always; EL0 only if the kernel enabled it), which the integrator must
+    // ensure: on a target where it is not, the read traps.
     unsafe {
         let val: u64;
         core::arch::asm!("mrs {}, cntvct_el0", out(reg) val, options(nomem, nostack));
         val
     }
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: `rdcycle` reads a counter, touching no memory or stack and with no side effects.
+    // It is only valid when the cycle counter is accessible at this privilege level (the
+    // `mcounteren` bit set); where it is not, the instruction traps.
     unsafe {
         let val: u64;
         core::arch::asm!("rdcycle {}", out(reg) val, options(nomem, nostack));
@@ -131,6 +138,11 @@ pub fn read_cycle_counter() -> u64 {
 fn automotive_panic_handler(info: &PanicInfo) -> ! {
     // 1. Immediately drop actuator commands by signaling safe hardware state
     let emergency_reg = 0x4000_0000 as *mut u32;
+    // SAFETY: this is only sound on a target whose memory map has a writable 32-bit register at
+    // 0x4000_0000 (an assumption of this design, not something the code can check). A volatile
+    // write is used so the compiler keeps it. On a different memory map this write is undefined
+    // behaviour, so integrators must adjust the address; we are already panicking, so there is no
+    // state left to protect.
     unsafe {
         // Assert hardware emergency disconnect register if memory-mapped I/O is present
         core::ptr::write_volatile(emergency_reg, 0xDEAD_BEEF);
@@ -153,6 +165,10 @@ pub struct StaticMemoryArena<const SIZE: usize> {
     allocation_count: AtomicUsize,
 }
 
+// SAFETY: the only interior-mutable field is `storage`, and `allocate` never creates a reference
+// to it: it reserves a range by a compare-exchange on `allocated_bytes` and hands out the address.
+// Distinct calls therefore get disjoint ranges, and the counters are atomics. Whoever uses a
+// returned pointer is responsible for it being used as the range they were given.
 unsafe impl<const SIZE: usize> Sync for StaticMemoryArena<SIZE> {}
 
 impl<const SIZE: usize> StaticMemoryArena<SIZE> {
@@ -221,6 +237,12 @@ pub struct CacheAlignedSpscRing<T: Copy, const CAP: usize> {
     buffer: [UnsafeCell<MaybeUninit<T>>; CAP],
 }
 
+// SAFETY: sound only under the single-producer, single-consumer rule: at most one thread at a time
+// calls `try_push` and at most one calls `try_pop`. Then the producer writes only the slot at
+// `head` (not yet published), the consumer reads only slots below `head` (published by the
+// Release store, seen by the Acquire load), and `head` and `tail` are atomics. Nothing in the
+// types enforces the rule: two producers would write the same slot, which is a data race. `T`
+// is `Send` because values move from the producer's thread to the consumer's.
 unsafe impl<T: Copy + Send, const CAP: usize> Sync for CacheAlignedSpscRing<T, CAP> {}
 
 impl<T: Copy + Default, const CAP: usize> CacheAlignedSpscRing<T, CAP> {
@@ -254,6 +276,8 @@ impl<T: Copy + Default, const CAP: usize> CacheAlignedSpscRing<T, CAP> {
         }
 
         let idx = h & (CAP - 1);
+        // SAFETY: the check above shows head - tail < CAP, so the slot at `idx` is not one the
+        // consumer can still read; and by the single-producer rule nobody else writes it.
         unsafe {
             (*self.buffer[idx].get()).write(item);
         }
@@ -401,8 +425,6 @@ pub struct AsilLockstepSupervisor {
     lock: BoundedSpinLock,
 }
 
-unsafe impl Sync for AsilLockstepSupervisor {}
-
 impl AsilLockstepSupervisor {
     pub const fn new() -> Self {
         Self {
@@ -533,6 +555,12 @@ pub struct TimeTriggeredScheduler {
     lock: BoundedSpinLock,
 }
 
+// SAFETY: the only interior-mutable field is `tasks`. `register_task` holds `lock` and writes only
+// the slot at `task_count`, then publishes it with a SeqCst store of `task_count + 1`;
+// `run_scheduler_cycle` reads only slots below the `task_count` it loaded with Acquire, so the two
+// never touch the same slot. Sound only if at most one thread at a time calls
+// `run_scheduler_cycle` (it takes `&mut` to each slot without a lock); two concurrent cycles
+// would alias those `&mut`.
 unsafe impl Sync for TimeTriggeredScheduler {}
 
 impl TimeTriggeredScheduler {
@@ -574,6 +602,9 @@ impl TimeTriggeredScheduler {
             return Err(KernelError::StaticTableFull);
         }
 
+        // SAFETY: `lock` is held, so no other `register_task` runs; the slot at `count` is not
+        // yet published (`task_count` is still `count`), so `run_scheduler_cycle` cannot be
+        // reading it, and no other reference to this slot exists.
         let desc = unsafe { &mut *self.tasks[count].get() };
         desc.task_id = task_id;
         desc.priority = priority;
@@ -595,6 +626,9 @@ impl TimeTriggeredScheduler {
         let mut executed_count = 0;
 
         for i in 0..count {
+            // SAFETY: `i < count` and `count` was loaded with Acquire, so this slot was fully
+            // written and published; `register_task` only writes slots at or above `task_count`.
+            // The caller must not run two scheduler cycles at once (see the `Sync` impl).
             let task = unsafe { &mut *self.tasks[i].get() };
 
             if task.state == TaskState::Suspended {

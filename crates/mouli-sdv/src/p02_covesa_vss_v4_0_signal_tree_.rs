@@ -231,6 +231,10 @@ pub struct VssSignalEngine {
     lock: AtomicBool,
 }
 
+// SAFETY: the only interior-mutable field is `nodes`, and every method that touches it does so
+// between `acquire_lock` (Acquire) and `release_lock` (Release) on the same spin lock, so accesses
+// are mutually exclusive and ordered. A thread that panics while holding the lock leaves it
+// locked, and the others then spin forever.
 unsafe impl Sync for VssSignalEngine {}
 
 impl VssSignalEngine {
@@ -266,6 +270,8 @@ impl VssSignalEngine {
             return Err(CommError::RouteTableExhausted);
         }
 
+        // SAFETY: `acquire_lock` above is still held (every return path below releases it first),
+        // so no other thread has a reference into `nodes`.
         let nodes = unsafe { &mut *self.nodes.get() };
         for i in 0..count {
             if nodes[i].is_valid && nodes[i].descriptor.path_hash == descriptor.path_hash {
@@ -296,6 +302,8 @@ impl VssSignalEngine {
     ) -> Result<bool, CommError> {
         self.acquire_lock();
         let count = self.node_count.load(Ordering::Relaxed);
+        // SAFETY: the lock taken by `acquire_lock` at the top is held until `release_lock`, so
+        // this is the only reference into `nodes`.
         let nodes = unsafe { &mut *self.nodes.get() };
 
         for i in 0..count {
@@ -332,11 +340,17 @@ impl VssSignalEngine {
     pub fn read_float32(&self, path_hash: u32) -> Result<(f32, u64), CommError> {
         self.acquire_lock();
         let count = self.node_count.load(Ordering::Relaxed);
+        // SAFETY: the lock taken by `acquire_lock` at the top is held, so no writer can run while
+        // this shared reference exists.
         let nodes = unsafe { &*self.nodes.get() };
 
         for i in 0..count {
             let node = &nodes[i];
             if node.is_valid && node.descriptor.path_hash == path_hash {
+                // SAFETY: the first 8 bytes of the union are always initialised (`empty()` writes
+                // `u64_val: 0`, and every write replaces them), and every bit pattern is a valid
+                // `f32`. The value is only meaningful if this signal was written as an f32; this
+                // function does not check the descriptor's declared type.
                 let val = unsafe { node.current_value.f32_val };
                 let ts = node.timestamp_micros;
                 self.release_lock();
@@ -687,6 +701,11 @@ pub struct VirtualBusRouter {
     lock: AtomicBool,
 }
 
+// SAFETY: only sound if routes are registered before frames are routed, or at least never at the
+// same time: `register_route` holds `lock` but takes `&mut` to the whole `routes` array,
+// while `route_someip_frame` takes `&` to the whole array without the lock. Running both at once
+// would alias a `&mut` with a `&` (undefined behaviour) even though they touch different slots.
+// The counters are atomics.
 unsafe impl Sync for VirtualBusRouter {}
 
 impl VirtualBusRouter {
@@ -728,6 +747,9 @@ impl VirtualBusRouter {
             return Err(CommError::RouteTableExhausted);
         }
 
+        // SAFETY: `lock` is held, so no other registration runs. No frame may be routed while a
+        // route is being registered (see the `Sync` impl): that is a requirement on the caller,
+        // not something this function enforces.
         let routes = unsafe { &mut *self.routes.get() };
         routes[count] = SomeIpServiceRoute {
             service_id,
@@ -743,6 +765,9 @@ impl VirtualBusRouter {
 
     pub fn route_someip_frame(&self, frame: &SomeIpFrame) -> Result<(), CommError> {
         let count = self.route_count.load(Ordering::Acquire);
+        // SAFETY: this takes no lock, so it relies on the caller not registering routes at the
+        // same time (see the `Sync` impl). `count` was loaded with Acquire, so every slot below it
+        // was fully written before it was published.
         let routes = unsafe { &*self.routes.get() };
 
         for i in 0..count {
