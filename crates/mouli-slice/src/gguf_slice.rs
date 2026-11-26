@@ -8,6 +8,7 @@
 
 use mouli_llm::gguf::{parse, GgmlType, GgufWriter, Value};
 use mouli_llm::quant::dequantize_vec;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -607,8 +608,7 @@ pub fn slice_gguf(
     let k_u64 = u64::try_from(k)
         .map_err(|_| GgufSliceError::ArithmeticOverflow("kept width metadata".to_owned()))?;
 
-    let mut replacements: Vec<Replacement> =
-        Vec::with_capacity(checked_mul(layers, 3, "replacement tensor count")?);
+    let mut replacements: HashMap<String, Replacement> = HashMap::new();
 
     for layer in 0..layers {
         let indices = keep.get(layer).ok_or_else(|| {
@@ -654,14 +654,14 @@ pub fn slice_gguf(
             down_ty, &down_data, d_model, d_ff, indices, down, &down_name,
         )?;
 
-        replacements.push((gate_name, vec![d_model_u64, k_u64], gate_ty, new_gate));
-
-        replacements.push((up_name, vec![d_model_u64, k_u64], up_ty, new_up));
-
-        replacements.push((down_name, vec![k_u64, d_model_u64], new_down_ty, new_down));
+        for (name, dims, ty, data) in [
+            (gate_name, vec![d_model_u64, k_u64], gate_ty, new_gate),
+            (up_name, vec![d_model_u64, k_u64], up_ty, new_up),
+            (down_name, vec![k_u64, d_model_u64], new_down_ty, new_down),
+        ] {
+            replacements.insert(name.clone(), (name, dims, ty, data));
+        }
     }
-
-    let mut replacement_iter = replacements.into_iter();
 
     let mut writer = GgufWriter::new();
 
@@ -708,19 +708,14 @@ pub fn slice_gguf(
                 || tensor.name.ends_with(".ffn_down.weight"));
 
         if is_mlp {
-            let (name, dims, ty, data) = replacement_iter.next().ok_or_else(|| {
+            // The file's own order decides where each tensor goes (llama.cpp writes
+            // down, gate, up); the replacement is found by name.
+            let (name, dims, ty, data) = replacements.remove(&tensor.name).ok_or_else(|| {
                 GgufSliceError::UnsupportedModel(format!(
                     "missing replacement for tensor {}",
                     tensor.name
                 ))
             })?;
-
-            if name != tensor.name {
-                return Err(GgufSliceError::UnsupportedModel(format!(
-                    "replacement order mismatch: expected {}, got {name}",
-                    tensor.name
-                )));
-            }
 
             writer.add_tensor(&name, &dims, ty, data).map_err(|e| {
                 GgufSliceError::Unreadable(format!("cannot write tensor {name}: {e:?}"))
@@ -747,7 +742,7 @@ pub fn slice_gguf(
         }
     }
 
-    if replacement_iter.next().is_some() {
+    if !replacements.is_empty() {
         return Err(GgufSliceError::UnsupportedModel(
             "unused replacement tensors remain".to_owned(),
         ));
@@ -819,6 +814,11 @@ mod tests {
     }
 
     fn build_model(quantized: bool) -> Vec<u8> {
+        build_model_ordered(quantized, false)
+    }
+
+    /// `down_first` writes each layer's tensors as down, gate, up: the order llama.cpp uses.
+    fn build_model_ordered(quantized: bool, down_first: bool) -> Vec<u8> {
         let mut writer = GgufWriter::new();
         writer.set_alignment(32);
 
@@ -846,7 +846,12 @@ mod tests {
         }
 
         for layer in 0..2 {
-            for suffix in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
+            let order = if down_first {
+                ["ffn_down.weight", "ffn_gate.weight", "ffn_up.weight"]
+            } else {
+                ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]
+            };
+            for suffix in order {
                 let dimensions = if suffix == "ffn_down.weight" {
                     vec![64, 32]
                 } else {
@@ -1124,6 +1129,31 @@ mod tests {
 
         for (a, b) in original.iter().zip(actual.iter()) {
             assert!((a - b).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn a_file_that_stores_down_before_gate_and_up_is_sliced_in_its_own_order() {
+        // Real llama.cpp files write blk.N.ffn_down, ffn_gate, ffn_up; the first draft assumed
+        // gate, up, down and failed on a real model.
+        for quantized in [false, true] {
+            let file = build_model_ordered(quantized, true);
+            let source = parse_gguf(&file).unwrap();
+            let outcome = slice_gguf(&file, &selection(), DownType::F16).unwrap();
+            let output = parse_gguf(&outcome.bytes).unwrap();
+
+            let names = |g: &mouli_llm::gguf::Gguf| {
+                g.tensors()
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(&source), names(&output));
+            assert_eq!(names(&output)[2], "blk.0.ffn_down.weight");
+            assert_eq!(
+                output.tensor("blk.1.ffn_up.weight").unwrap().dims,
+                vec![32, 32]
+            );
         }
     }
 
