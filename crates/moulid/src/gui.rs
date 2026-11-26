@@ -1236,12 +1236,69 @@ impl ModelsInfo {
     }
 }
 
-/// The text at the right of the menu bar: the product name, and a reminder when requests wait for
-/// a second person's approval (the Approvals window is not on the desktop).
-fn status_text(base: &str, user: &str, model: &str, pending: usize) -> String {
+/// How fast an answer arrives, from its streamed pieces.
+///
+/// Time is counted from the first piece to the latest, so the wait before the model starts (reading
+/// the question) is not in the rate. A piece is usually one token but not always (a hosted service
+/// may send several at once), so the figure is shown as approximate.
+#[derive(Debug, Default)]
+struct Speed {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    pieces: usize,
+    /// The rate of the last finished answer.
+    finished: Option<f64>,
+}
+
+impl Speed {
+    /// Shortest time the rate is worked out over; a shorter stretch gives a meaningless figure.
+    const MIN_SECS: f64 = 0.25;
+
+    /// A piece arrived at `now`.
+    fn piece(&mut self, now: Instant) {
+        if self.first.is_none() || self.last.is_none() {
+            self.first = Some(now);
+            self.pieces = 0;
+        }
+        self.last = Some(now);
+        self.pieces += 1;
+    }
+
+    /// The rate so far (or of the answer just finished): pieces after the first, per second.
+    fn rate(&self) -> Option<f64> {
+        let (first, last) = (self.first?, self.last?);
+        let secs = last.saturating_duration_since(first).as_secs_f64();
+        (self.pieces >= 2 && secs >= Self::MIN_SECS).then(|| (self.pieces - 1) as f64 / secs)
+    }
+
+    /// The answer ended: keep its rate for the status line and start afresh.
+    fn finish(&mut self) {
+        if let Some(r) = self.rate() {
+            self.finished = Some(r);
+        }
+        self.first = None;
+        self.last = None;
+        self.pieces = 0;
+    }
+
+    /// Text for the status line: the live rate while an answer is arriving, else the last one.
+    fn label(&self) -> Option<String> {
+        self.rate()
+            .or(self.finished)
+            .map(|r| format!("~{r:.1} tok/s"))
+    }
+}
+
+/// The text at the right of the menu bar: the product name, who is signed in, the model, how fast
+/// the last answer arrived, and a reminder when requests wait for a second person's approval (the
+/// Approvals window is not on the desktop).
+fn status_text(base: &str, user: &str, model: &str, speed: Option<&str>, pending: usize) -> String {
     let mut t = format!("{base}  |  {user}");
     if !model.is_empty() {
         t.push_str(&format!("  |  {model}"));
+    }
+    if let Some(s) = speed {
+        t.push_str(&format!("  |  {s}"));
     }
     match pending {
         0 => {}
@@ -1403,6 +1460,7 @@ where
         }
     });
 
+    let mut speed = Speed::default();
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     display.present(&shape(desktop.render(&device.shell), view))?;
@@ -1479,10 +1537,12 @@ where
                 }
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
                 Ev::Piece(piece) => {
+                    speed.piece(Instant::now());
                     device.shell.chat.stream_piece(&piece);
                     Action::None
                 }
                 Ev::Reply(r) => {
+                    speed.finish();
                     let answer = on_reply(&mut device.shell, &mut history, r);
                     // A stopped answer is shown but never run as a tool call.
                     let stopped = cancel.swap(false, Ordering::SeqCst);
@@ -1770,6 +1830,7 @@ where
             &base_status,
             device.user(),
             &device.shell.chat.model,
+            speed.label().as_deref(),
             device.shell.approvals.rows.len(),
         );
         device.shell.settings.set_rows(settings_rows(
@@ -2478,18 +2539,80 @@ mod tests {
         );
     }
 
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn speed_is_counted_from_the_first_piece_not_from_the_question() {
+        let t0 = Instant::now();
+        let mut s = Speed::default();
+        assert_eq!(s.label(), None);
+        // One piece alone, or pieces within a few milliseconds, give no figure yet.
+        s.piece(at(t0, 5_000));
+        assert_eq!(s.label(), None);
+        s.piece(at(t0, 5_050));
+        assert_eq!(s.label(), None, "too short a stretch to mean anything");
+        // 11 pieces (at 5.000, 5.050, then every 100 ms to 6.000): 10 intervals in one second. The 5 s wait before is not counted.
+        for k in 2..=10u64 {
+            s.piece(at(t0, 5_000 + k * 100));
+        }
+        assert_eq!(s.label().as_deref(), Some("~10.0 tok/s"));
+    }
+
+    #[test]
+    fn a_finished_answer_keeps_its_rate_until_the_next_one_has_one() {
+        let t0 = Instant::now();
+        let mut s = Speed::default();
+        for k in 0..=10u64 {
+            s.piece(at(t0, k * 200)); // 5 per second
+        }
+        s.finish();
+        assert_eq!(
+            s.label().as_deref(),
+            Some("~5.0 tok/s"),
+            "kept after the answer"
+        );
+        // The next answer starts afresh and does not mix with the old one.
+        s.piece(at(t0, 10_000));
+        assert_eq!(
+            s.label().as_deref(),
+            Some("~5.0 tok/s"),
+            "no new figure yet"
+        );
+        for k in 1..=10u64 {
+            s.piece(at(t0, 10_000 + k * 50)); // 20 per second
+        }
+        assert_eq!(s.label().as_deref(), Some("~20.0 tok/s"));
+        // An answer with too few pieces to measure leaves the last good figure alone.
+        s.finish();
+        s.piece(at(t0, 20_000));
+        s.finish();
+        assert_eq!(s.label().as_deref(), Some("~20.0 tok/s"));
+    }
+
+    #[test]
+    fn the_status_line_shows_the_rate_between_the_model_and_the_approvals() {
+        let t = status_text("MOULI OS", "amy", "tiny", Some("~7.5 tok/s"), 2);
+        assert!(
+            t.contains("amy  |  tiny  |  ~7.5 tok/s  |  2 waiting for approval (F3)"),
+            "{t}"
+        );
+        assert!(!status_text("MOULI OS", "amy", "tiny", None, 0).contains("tok/s"));
+    }
+
     #[test]
     fn the_menu_bar_reminds_when_approvals_are_waiting() {
         assert_eq!(
-            status_text("MOULI OS", "alice", "", 0),
+            status_text("MOULI OS", "alice", "", None, 0),
             "MOULI OS  |  alice"
         );
         assert_eq!(
-            status_text("MOULI OS", "alice", "tiny", 0),
+            status_text("MOULI OS", "alice", "tiny", None, 0),
             "MOULI OS  |  alice  |  tiny"
         );
-        assert!(status_text("MOULI OS", "a", "", 1).contains("1 waiting for approval (F3)"));
-        assert!(status_text("MOULI OS", "a", "m", 3).contains("3 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", "a", "", None, 1).contains("1 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", "a", "m", None, 3).contains("3 waiting for approval (F3)"));
     }
 
     struct NoRun;
