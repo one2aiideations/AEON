@@ -2676,6 +2676,8 @@ dependencies = [
  "mouli-player",
  "mouli-screen",
  "mouli-studio",
+ "mouli-systems",
+ "serde_json",
  "tempfile",
 ]
 

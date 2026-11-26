@@ -1,6 +1,7 @@
 //! The security view, derived only from the audit chain and the approval queue. It reports what
 //! the log shows; it does not guess about anything the log does not record.
 
+use crate::rulepack;
 use mouli_interface::Workspace;
 use mouli_screen::screens::{Finding, Severity};
 
@@ -40,55 +41,20 @@ pub(crate) fn assess(ws: &Workspace) -> (u8, Vec<Finding>) {
             acknowledged: false,
         });
     }
-    if let Some(r) = audit
-        .records()
-        .iter()
-        .rev()
-        .find(|r| r.action == "checkpoint.failed")
-    {
-        findings.push(Finding {
-            id: "checkpoint".into(),
-            severity: Severity::Critical,
-            title: "The audit log does not match its saved checkpoint".into(),
-            detail: format!(
-                "At start-up, {}. Someone may have edited or cut the log file. Treat the history before this record as unproven.",
-                r.subject
-            ),
-            acknowledged: false,
-        });
-    }
-    let denied = audit
-        .records()
-        .iter()
-        .filter(|r| r.outcome.starts_with("denied") || r.outcome.starts_with("rejected"))
-        .count();
-    if denied > 0 {
-        let severity = if denied >= 5 {
-            Severity::High
-        } else {
-            Severity::Medium
-        };
-        findings.push(Finding {
-            id: "denied".into(),
-            severity,
-            title: format!("{denied} request(s) were refused by policy"),
-            detail: "Look at the Audit screen for who asked and what was refused. A burst of refusals can mean someone is probing what they may do.".into(),
-            acknowledged: false,
-        });
-    }
-    let failed = audit
-        .records()
-        .iter()
-        .filter(|r| r.outcome.starts_with("failed"))
-        .count();
-    if failed > 0 {
-        findings.push(Finding {
-            id: "failures".into(),
-            severity: Severity::Low,
-            title: format!("{failed} action(s) failed"),
-            detail: "These ended in an error rather than a refusal; see the Audit screen.".into(),
-            acknowledged: false,
-        });
+    // Findings that are rules over the audit records (see rulepack.rs).
+    let pack = rulepack::default_pack();
+    let mut pack_matches: std::collections::BTreeMap<String, usize> = Default::default();
+    if let Ok(hits) = rulepack::evaluate_pack(&pack, audit.records()) {
+        for hit in hits {
+            pack_matches.insert(hit.rule.id.to_string(), hit.count);
+            findings.push(Finding {
+                id: hit.rule.id.into(),
+                severity: hit.severity(),
+                title: hit.title(),
+                detail: hit.detail(),
+                acknowledged: false,
+            });
+        }
     }
     for user in ws.locked_out() {
         findings.push(Finding {
@@ -148,18 +114,17 @@ pub(crate) fn assess(ws: &Workspace) -> (u8, Vec<Finding>) {
     for f in &mut findings {
         f.acknowledged = acknowledged_as(audit.records(), &f.id).is_some_and(|t| t == f.title);
     }
-    let mut score: u32 = 0;
-    for f in findings
+    // Each finding that still counts gets an inherent risk from the shared scoring module; the
+    // device score combines them. Acknowledged findings stop counting unless they are critical.
+    let scores: Vec<f64> = findings
         .iter()
         .filter(|f| !f.acknowledged || f.severity == Severity::Critical)
-    {
-        score += match f.severity {
-            Severity::Low => 5,
-            Severity::Medium => 20,
-            Severity::High => 40,
-            Severity::Critical => 70,
-        };
-    }
+        .map(|f| {
+            let matches = pack_matches.get(&f.id).copied().unwrap_or(1);
+            rulepack::finding_score(f.severity, matches)
+        })
+        .collect();
+    let score = rulepack::combine(&scores).round() as u32;
     (score.min(100) as u8, findings)
 }
 

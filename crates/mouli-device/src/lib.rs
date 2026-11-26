@@ -12,6 +12,7 @@
 mod keep;
 mod patch;
 mod roles;
+mod rulepack;
 mod security;
 
 #[cfg(feature = "office")]
