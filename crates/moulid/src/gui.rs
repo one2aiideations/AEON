@@ -28,7 +28,7 @@ use mouli_screen::shell::Shell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -131,19 +131,90 @@ pub trait Display {
     /// # Errors
     /// The error from the device.
     fn present(&mut self, canvas: &Canvas) -> io::Result<()>;
+    /// Looks again at the device's size (a video mode may have changed). Returns true when the
+    /// size is now different, so the caller must lay the desktop out again.
+    fn refresh(&mut self) -> bool {
+        false
+    }
+    /// What drawing has cost so far, when the display keeps count.
+    fn stats(&self) -> Option<FrameStats> {
+        None
+    }
+}
+
+/// What drawing to the display has cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    /// Pictures shown.
+    pub frames: u64,
+    /// Rows written to the device (unchanged rows are skipped).
+    pub rows_written: u64,
+    /// Rows in all the pictures shown.
+    pub rows_total: u64,
+    /// Time spent shown, in microseconds.
+    pub micros: u64,
+    /// The slowest single picture, in microseconds.
+    pub slowest_micros: u64,
+}
+
+impl FrameStats {
+    /// One line for the log.
+    pub fn line(&self) -> String {
+        if self.frames == 0 {
+            return "screen: nothing drawn".into();
+        }
+        format!(
+            "screen: {} pictures, {:.1} ms each on average, slowest {:.1} ms, {}% of rows rewritten",
+            self.frames,
+            self.micros as f64 / self.frames as f64 / 1000.0,
+            self.slowest_micros as f64 / 1000.0,
+            (self.rows_written * 100).checked_div(self.rows_total).unwrap_or(0),
+        )
+    }
 }
 
 /// The Linux framebuffer.
 pub struct Framebuffer<W: Write + Seek> {
     out: W,
     info: FbInfo,
+    /// Where the geometry is read from when asking whether the mode changed.
+    sys: Option<PathBuf>,
+    /// The bytes believed to be on the screen (empty when unknown), so unchanged rows are skipped.
+    shown: Vec<u8>,
+    stats: FrameStats,
 }
 
 impl<W: Write + Seek> Framebuffer<W> {
     /// A framebuffer with this geometry, written through `out`.
     pub fn new(out: W, info: FbInfo) -> Self {
-        Self { out, info }
+        Self {
+            out,
+            info,
+            sys: None,
+            shown: Vec::new(),
+            stats: FrameStats::default(),
+        }
     }
+
+    /// Remembers where the geometry is described, so [`Display::refresh`] can notice a new mode.
+    #[must_use]
+    pub fn watching(mut self, sys: &Path) -> Self {
+        self.sys = Some(sys.to_path_buf());
+        self
+    }
+}
+
+/// Reads the geometry from a sysfs directory.
+fn read_geometry(sys: &Path) -> Result<FbInfo, String> {
+    let read = |name: &str| {
+        std::fs::read_to_string(sys.join(name))
+            .map_err(|e| format!("no framebuffer ({}: {e})", sys.join(name).display()))
+    };
+    parse_fb_info(
+        &read("virtual_size")?,
+        &read("stride")?,
+        &read("bits_per_pixel")?,
+    )
 }
 
 impl Framebuffer<File> {
@@ -152,20 +223,21 @@ impl Framebuffer<File> {
     /// # Errors
     /// A message when the device or its description is missing or unsuitable.
     pub fn open(device: &Path, sys: &Path) -> Result<Self, String> {
-        let read = |name: &str| {
-            std::fs::read_to_string(sys.join(name))
-                .map_err(|e| format!("no framebuffer ({}: {e})", sys.join(name).display()))
-        };
-        let info = parse_fb_info(
-            &read("virtual_size")?,
-            &read("stride")?,
-            &read("bits_per_pixel")?,
-        )?;
+        let info = read_geometry(sys)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(device)
             .map_err(|e| format!("cannot open {}: {e}", device.display()))?;
-        Ok(Self::new(file, info))
+        Ok(Self::new(file, info).watching(sys))
+    }
+}
+
+impl<W: Write + Seek> Drop for Framebuffer<W> {
+    fn drop(&mut self) {
+        // Only for the real screen (one that watches its sysfs directory).
+        if self.sys.is_some() && self.stats.frames > 0 {
+            eprintln!("moulid: {}", self.stats.line());
+        }
     }
 }
 
@@ -175,10 +247,59 @@ impl<W: Write + Seek> Display for Framebuffer<W> {
     }
 
     fn present(&mut self, canvas: &Canvas) -> io::Result<()> {
+        let started = Instant::now();
         let bytes = frame_bytes(canvas, &self.info);
-        self.out.seek(SeekFrom::Start(0))?;
-        self.out.write_all(&bytes)?;
-        self.out.flush()
+        let stride = self.info.stride;
+        let known = self.shown.len() == bytes.len();
+        let mut written = 0u64;
+        let mut y = 0;
+        while y < self.info.height {
+            let row = y * stride..(y + 1) * stride;
+            if known && self.shown[row.clone()] == bytes[row] {
+                y += 1;
+                continue;
+            }
+            // Write a run of changed rows with one seek and one write.
+            let mut end = y + 1;
+            while end < self.info.height
+                && !(known
+                    && self.shown[end * stride..(end + 1) * stride]
+                        == bytes[end * stride..(end + 1) * stride])
+            {
+                end += 1;
+            }
+            self.out.seek(SeekFrom::Start((y * stride) as u64))?;
+            self.out.write_all(&bytes[y * stride..end * stride])?;
+            written += (end - y) as u64;
+            y = end;
+        }
+        self.out.flush()?;
+        self.shown = bytes;
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.stats.frames += 1;
+        self.stats.rows_written += written;
+        self.stats.rows_total += self.info.height as u64;
+        self.stats.micros = self.stats.micros.saturating_add(micros);
+        self.stats.slowest_micros = self.stats.slowest_micros.max(micros);
+        Ok(())
+    }
+
+    fn refresh(&mut self) -> bool {
+        let Some(sys) = &self.sys else {
+            return false;
+        };
+        match read_geometry(sys) {
+            Ok(now) if now != self.info => {
+                self.info = now;
+                self.shown.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn stats(&self) -> Option<FrameStats> {
+        Some(self.stats)
     }
 }
 
@@ -641,6 +762,22 @@ fn load_view(store: Option<&crate::persist::Store>) -> ViewOpts {
 
 /// The scale that can really be used on a `w` by `h` screen: the desktop needs at least 640 by
 /// 480 of its own pixels.
+/// Fits the desktop to the display's current size. Returns the text scale in use and the desktop
+/// (the same windows, resized).
+fn relayout<D: Display>(
+    display: &D,
+    wanted_scale: usize,
+    mut desktop: Desktop,
+) -> (usize, Desktop) {
+    let (w, h) = display.size();
+    let scale = usable_scale(wanted_scale, w, h);
+    desktop.resize(
+        i32::try_from(w / scale).unwrap_or(1024),
+        i32::try_from(h / scale).unwrap_or(768),
+    );
+    (scale, desktop)
+}
+
 fn usable_scale(want: usize, w: usize, h: usize) -> usize {
     (1..=want.clamp(1, MAX_SCALE))
         .rev()
@@ -1150,8 +1287,16 @@ impl<D: Display> Session<D> {
 /// # Errors
 /// A message saying why the desktop cannot start; the text chat should be used instead.
 pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, String> {
-    let display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
+    let mut display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
+    // Something to look at while the rest starts (the disk, the model list and the input devices
+    // can take a while). A failure to draw it must not stop the desktop.
+    let splash = |d: &mut Framebuffer<File>, line: &str, pct: u32| {
+        let (w, h) = d.size();
+        let _ = d.present(&mouli_desk::splash(w, h, line, pct));
+    };
+    splash(&mut display, "Starting", 15);
     let device = build_device(data_dir)?;
+    splash(&mut display, "Looking for keyboard and mouse", 60);
     let (tx, rx) = channel();
     // A crash puts the console back first; SIGTERM and SIGHUP end the desktop the normal way.
     #[cfg(target_os = "linux")]
@@ -1201,6 +1346,7 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
         s.offset.clone(),
         Duration::from_secs(1),
     );
+    splash(&mut s.display, "Ready", 100);
     Ok(s)
 }
 
@@ -1593,6 +1739,12 @@ where
                 }
                 Ev::Status(s) => {
                     desktop.system = *s;
+                    // The status thread ticks every second: a good moment to see whether the
+                    // video mode changed.
+                    if display.refresh() {
+                        (view.scale, desktop) = relayout(&display, wanted_scale, desktop);
+                        idle.blanked = false;
+                    }
                     Action::None
                 }
                 Ev::Terminate => return Ok(End::Quit),
@@ -1995,6 +2147,110 @@ mod tests {
         assert_eq!(frame_bytes(&c, &info).len(), 2560 * 480);
     }
 
+    fn flat(w: usize, h: usize, p: u32) -> Canvas {
+        Canvas {
+            width: w,
+            height: h,
+            pixels: vec![p; w * h],
+        }
+    }
+
+    const VGA: FbInfo = FbInfo {
+        width: 640,
+        height: 480,
+        stride: 2560,
+    };
+
+    #[test]
+    fn only_changed_rows_are_written_and_the_screen_ends_up_exact() {
+        let mut fb = Framebuffer::new(Cursor::new(Vec::new()), VGA);
+        let a = flat(640, 480, 0x102030);
+        fb.present(&a).unwrap();
+        assert_eq!(
+            fb.stats().unwrap().rows_written,
+            480,
+            "first picture is whole"
+        );
+        fb.present(&a).unwrap();
+        assert_eq!(
+            fb.stats().unwrap().rows_written,
+            480,
+            "an identical picture writes nothing"
+        );
+        let mut b = a.clone();
+        for y in [10, 11, 12, 300] {
+            b.pixels[y * 640 + 5] = 0xFFFFFF;
+        }
+        fb.present(&b).unwrap();
+        assert_eq!(fb.stats().unwrap().rows_written, 480 + 4);
+        assert_eq!(
+            fb.out.get_ref(),
+            &frame_bytes(&b, &VGA),
+            "the screen is exactly the picture"
+        );
+        // A forgotten screen (new mode) is rewritten whole.
+        fb.shown.clear();
+        fb.present(&b).unwrap();
+        assert_eq!(fb.stats().unwrap().rows_written, 480 + 4 + 480);
+        let st = fb.stats().unwrap();
+        assert_eq!((st.frames, st.rows_total), (4, 4 * 480));
+        assert!(st.line().contains("4 pictures"), "{}", st.line());
+        assert_eq!(FrameStats::default().line(), "screen: nothing drawn");
+    }
+
+    #[test]
+    fn a_change_of_video_mode_is_noticed_once_and_bad_readings_are_ignored() {
+        let dir = std::env::temp_dir().join(format!("moulid-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = |size: &str, stride: &str, bits: &str| {
+            std::fs::write(dir.join("virtual_size"), size).unwrap();
+            std::fs::write(dir.join("stride"), stride).unwrap();
+            std::fs::write(dir.join("bits_per_pixel"), bits).unwrap();
+        };
+        set("640,480\n", "2560\n", "32\n");
+        let mut fb = Framebuffer::new(Cursor::new(Vec::new()), VGA).watching(&dir);
+        fb.present(&flat(640, 480, 1)).unwrap();
+        assert!(!fb.refresh(), "same mode");
+        set("1024,768\n", "4096\n", "32\n");
+        assert!(fb.refresh());
+        assert_eq!(fb.size(), (1024, 768));
+        assert!(fb.shown.is_empty(), "what was on screen is forgotten");
+        assert!(!fb.refresh(), "reported once");
+        fb.present(&flat(1024, 768, 2)).unwrap();
+        assert_eq!(fb.out.get_ref().len(), 4096 * 768);
+        set("garbage", "x", "y");
+        assert!(!fb.refresh());
+        set("1024,768\n", "4096\n", "16\n");
+        assert!(!fb.refresh(), "a mode we cannot draw is not adopted");
+        assert_eq!(fb.size(), (1024, 768));
+        // A framebuffer that was not told where to look never changes.
+        let mut plain = Framebuffer::new(Cursor::new(Vec::new()), VGA);
+        assert!(!plain.refresh());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mode_change_keeps_the_windows_and_the_text_scale_follows_the_screen() {
+        let mut fb = Framebuffer::new(Cursor::new(Vec::new()), VGA);
+        let mut d = Desktop::new(640, 480);
+        d.wm.open(Tab::Chat);
+        d.wm.open(Tab::Models);
+        fb.info = FbInfo {
+            width: 1920,
+            height: 1440,
+            stride: 7680,
+        };
+        let (scale, d) = relayout(&fb, 3, d);
+        assert_eq!(scale, 3, "a big screen allows the wanted size");
+        assert_eq!((d.width, d.height), (640, 480));
+        assert_eq!(d.wm.windows.len(), 2);
+        fb.info = VGA;
+        let (scale, d) = relayout(&fb, 3, d);
+        assert_eq!(scale, 1, "a small screen falls back");
+        assert_eq!((d.width, d.height), (640, 480));
+        assert_eq!(d.wm.windows.len(), 2);
+    }
+
     #[test]
     fn framebuffer_writes_a_whole_frame_from_the_start() {
         let info = FbInfo {
@@ -2011,7 +2267,7 @@ mod tests {
         fb.present(&c).unwrap();
         fb.present(&c).unwrap();
         assert_eq!(fb.size(), (640, 480));
-        let out = fb.out.into_inner();
+        let out = fb.out.get_ref().clone();
         assert_eq!(out.len(), 2560 * 480);
         assert_eq!(&out[0..4], &[255, 255, 255, 0]);
     }
@@ -3079,6 +3335,58 @@ mod tests {
             .unwrap();
             assert_eq!(end, want, "button {button}");
         }
+    }
+
+    /// A display whose mode changes when told to.
+    struct Modes {
+        size: (usize, usize),
+        next: Option<(usize, usize)>,
+        shots: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+    impl Display for Modes {
+        fn size(&self) -> (usize, usize) {
+            self.size
+        }
+        fn present(&mut self, c: &Canvas) -> io::Result<()> {
+            self.shots.lock().unwrap().push((c.width, c.height));
+            Ok(())
+        }
+        fn refresh(&mut self) -> bool {
+            match self.next.take() {
+                Some(n) => {
+                    self.size = n;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_video_mode_while_running_redraws_at_the_new_size() {
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let display = Modes {
+            size: (800, 600),
+            next: Some((1024, 768)),
+            shots: shots.clone(),
+        };
+        let session = Session::new(display, tx.clone(), rx, build_device(None).unwrap());
+        // Any status tick makes the loop look at the screen again.
+        tx.send(Ev::Status(Box::default())).unwrap();
+        let (t2, seen) = (tx.clone(), shots.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        run(session, Echo, "p", 1000, &ModelsInfo::only("tiny")).unwrap();
+        quitter.join().unwrap();
+        let got = shots.lock().unwrap().clone();
+        assert_eq!(got.first(), Some(&(800, 600)));
+        assert_eq!(got.last(), Some(&(1024, 768)), "{got:?}");
     }
 
     #[test]

@@ -303,6 +303,29 @@ impl WindowManager {
         }
     }
 
+    /// The screen changed size. Zoomed windows fill the new desktop, others shrink if they no
+    /// longer fit (their remembered size is trimmed too, so un-zooming cannot overflow), and every
+    /// window is pulled back into view.
+    pub fn resize(&mut self, width: i32, height: i32) {
+        self.width = width;
+        self.height = height;
+        let (max_cols, max_rows, menu_h) = (self.max_cols(), self.max_rows(), self.menu_h);
+        let ids: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
+        for w in &mut self.windows {
+            w.saved.2 = w.saved.2.min(max_cols);
+            w.saved.3 = w.saved.3.min(max_rows);
+            if w.zoomed {
+                (w.x, w.y, w.cols, w.rows) = (0, menu_h, max_cols, max_rows);
+            } else {
+                w.cols = w.cols.min(max_cols);
+                w.rows = w.rows.min(max_rows);
+            }
+        }
+        for id in ids {
+            self.clamp_into_view(id);
+        }
+    }
+
     /// Where the `n`th cascaded window goes (counting from 0). Each is 32 pixels below and to the
     /// right of the one before, as many as fit on the screen; after that the pile starts again,
     /// shifted a little so the new windows do not sit exactly on the old ones.
@@ -371,6 +394,30 @@ mod tests {
 
     fn wm() -> WindowManager {
         WindowManager::new(1024, 768, 24)
+    }
+
+    #[test]
+    fn a_smaller_screen_shrinks_and_recovers_windows() {
+        let mut m = wm();
+        let a = m.open(Tab::Chat);
+        let b = m.open(Tab::Models);
+        m.toggle_zoom(b);
+        m.move_to(a, 900, 600);
+        m.resize(640, 480);
+        for w in &m.windows {
+            let o = w.outer();
+            assert!(o.w <= 640 && o.h <= 480, "{o:?}");
+            assert!(w.x < 640 - 40 && w.y < 480 - TITLE_H, "off screen {w:?}");
+        }
+        // The zoomed window fills the new desktop; un-zooming fits it too.
+        let z = m.get(b).unwrap();
+        assert_eq!((z.x, z.y), (0, 24));
+        m.toggle_zoom(b);
+        let o = m.get(b).unwrap().outer();
+        assert!(o.w <= 640 && o.h <= 480, "{o:?}");
+        // Growing again does not enlarge what was shrunk.
+        m.resize(1920, 1080);
+        assert!(m.get(a).unwrap().cols <= 72);
     }
 
     #[test]

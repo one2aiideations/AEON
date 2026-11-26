@@ -89,6 +89,13 @@ pub struct MenuBar {
 }
 
 impl MenuBar {
+    /// The screen changed width; any open menu is closed.
+    pub fn set_width(&mut self, width: i32) {
+        self.width = width;
+        self.open = None;
+        self.hover = None;
+    }
+
     /// The standard MOULI menus for a bar `width` pixels wide.
     pub fn standard(width: i32) -> Self {
         Self {

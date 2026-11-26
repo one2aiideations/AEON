@@ -136,6 +136,21 @@ impl Desktop {
         }
     }
 
+    /// The screen changed size (a new video mode). Windows, icons and the menu bar are kept and
+    /// fitted to the new size; the pointer is moved inside it and any open dialog stays.
+    pub fn resize(&mut self, width: i32, height: i32) {
+        self.width = width;
+        self.height = height;
+        self.wm.resize(width, height);
+        self.menu.set_width(width);
+        self.pointer = (
+            self.pointer.0.clamp(0, width - 1),
+            self.pointer.1.clamp(0, height - 1),
+        );
+        self.press = None;
+        self.menu_press = false;
+    }
+
     /// Where icon `i` sits. Icons run down the right edge; when they do not all fit in one column
     /// they continue in the next column to the left.
     pub fn icon_rect(&self, i: usize) -> crate::geom::Rect {
@@ -599,6 +614,23 @@ impl Desktop {
 mod tests {
     use super::*;
     use mouli_screen::screens::{ApprovalRow, ModelRow};
+
+    #[test]
+    fn a_mode_change_keeps_windows_and_fits_the_new_screen() {
+        let (mut d, mut sh) = setup();
+        d.wm.open(Tab::Chat);
+        d.pointer = (1000, 700);
+        d.resize(800, 600);
+        assert_eq!((d.width, d.height), (800, 600));
+        assert_eq!(d.wm.windows.len(), 1);
+        assert_eq!(d.pointer, (799, 599));
+        let c = d.render(&sh);
+        assert_eq!((c.width, c.height), (800, 600));
+        d.resize(1280, 1024);
+        let c = d.render(&sh);
+        assert_eq!((c.width, c.height), (1280, 1024));
+        let _ = &mut sh;
+    }
 
     fn setup() -> (Desktop, Shell) {
         (Desktop::new(1024, 768), Shell::new())
