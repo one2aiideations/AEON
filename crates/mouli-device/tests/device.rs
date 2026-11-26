@@ -1497,3 +1497,158 @@ fn save_writes_the_last_answer_to_a_new_file_and_never_overwrites() {
         .iter()
         .any(|r| r.action == "answer.save" && r.subject == "notes.md"));
 }
+
+fn finding<'a>(d: &'a Device<Echo>, id: &str) -> Option<&'a mouli_screen::screens::Finding> {
+    d.shell.security.findings.iter().find(|f| f.id == id)
+}
+
+#[test]
+fn five_refusals_lock_a_person_out_until_an_approver_unlocks_them() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..5 {
+        type_line(&mut d, "/note.send to=bob");
+    }
+    let f = finding(&d, "lockout-gus").expect("a lockout finding");
+    assert!(f.detail.contains("/unlock gus"));
+    type_line(&mut d, "/note.read");
+    assert!(chat_texts(&d).iter().any(|(_, t)| t.contains("locked out")));
+    type_line(&mut d, "/unlock");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("Locked out: gus"));
+    // The locked person cannot unlock themselves.
+    type_line(&mut d, "/unlock gus");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("Not unlocked"));
+    assert!(finding(&d, "lockout-gus").is_some());
+    // An owner can.
+    d.switch_user("boss", "owner").unwrap();
+    type_line(&mut d, "/unlock gus");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("can act again"));
+    assert!(finding(&d, "lockout-gus").is_none());
+    d.switch_user("gus", "guest").unwrap();
+    type_line(&mut d, "/note.read");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("ran note.read"));
+}
+
+#[test]
+fn a_burst_of_refusals_between_successes_is_reported_as_an_anomaly() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..4 {
+        type_line(&mut d, "/note.send to=bob");
+        type_line(&mut d, "/note.read"); // a success in between: never locked out
+    }
+    assert!(finding(&d, "lockout-gus").is_none());
+    let f = finding(&d, "burst-gus").expect("a burst finding");
+    assert_eq!(f.severity, mouli_screen::screens::Severity::High);
+    // A calm log has none.
+    let calm = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert!(calm
+        .shell
+        .security
+        .findings
+        .iter()
+        .all(|f| !f.id.starts_with("burst")));
+}
+
+#[test]
+fn a_finding_can_be_marked_seen_and_returns_if_it_changes_or_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |dir: &std::path::Path| {
+        let mut ws = workspace();
+        mouli_device::restore(&mut ws, dir).unwrap();
+        ws.add_role(Permissions::new("guest", &["note.read"]));
+        let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+        d.keep_state_in(dir).unwrap();
+        d
+    };
+    let mut d = mk(dir.path());
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    let before = d.shell.security.score;
+    assert!(before > 0);
+    assert!(!finding(&d, "denied").unwrap().acknowledged);
+
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "denied")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+    assert!(
+        d.shell.security.score < before,
+        "a seen finding stops counting"
+    );
+    // Again: nothing new to do.
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.security.message.contains("Already"));
+    assert!(d
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .any(|r| r.action == "finding.ack"
+            && r.actor == "gus"
+            && r.subject.starts_with("denied|")));
+
+    // More refusals change what it says, so it needs a fresh look.
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    assert!(!finding(&d, "denied").unwrap().acknowledged);
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "denied")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+    drop(d);
+
+    // After a restart the acknowledgement is still there (it lives in the audit chain).
+    let d = mk(dir.path());
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+}
+
+#[test]
+fn a_broken_chain_can_be_marked_seen_but_still_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        d.on_key(Key::F(1));
+        type_line(&mut d, "hello");
+    }
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir.path()).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    let before = d.shell.security.score;
+    assert!(before >= 70);
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "audit-chain")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "audit-chain").unwrap().acknowledged);
+    assert!(d.shell.security.message.contains("still counts"));
+    assert!(d.shell.security.score >= 70);
+}

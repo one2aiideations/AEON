@@ -111,6 +111,8 @@ pub enum Action {
         /// Its password, when it has one.
         passphrase: Option<Hidden>,
     },
+    /// Mark a security finding as seen (the controller records who did it).
+    AckFinding(String),
     /// Run a fresh security scan.
     RefreshSecurity,
     /// Apply the patch under review.

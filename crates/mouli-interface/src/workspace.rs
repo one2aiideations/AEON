@@ -42,6 +42,11 @@ pub enum Reply {
     },
 }
 
+/// How many refusals in a row lock an actor out.
+pub const LOCKOUT_REFUSALS: usize = 5;
+/// How many of the latest audit records are looked at to decide a lockout.
+const LOCKOUT_LOOKBACK: usize = 500;
+
 /// A held call in a form that can be saved and restored: everything needed to run it later,
 /// once someone else approves, including who asked and in which role.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +265,14 @@ impl Workspace {
     }
 
     fn chat(&mut self, user: &str, text: &str) -> Result<Reply> {
+        if self.is_locked_out(user) {
+            let t = self.now();
+            self.audit
+                .append(t, user, "chat", "-", "denied: locked out");
+            return Err(Error::Denied(format!(
+                "{user} is locked out after {LOCKOUT_REFUSALS} refusals in a row; an approver must unlock them"
+            )));
+        }
         let mut needs = Needs::default();
         needs.caps.insert("text".into());
         let sensitive = is_sensitive(text);
@@ -311,6 +324,14 @@ impl Workspace {
         brief: bool,
     ) -> Result<Reply> {
         let t = self.now();
+        if self.is_locked_out(user) {
+            let why = format!(
+                "{user} is locked out after {LOCKOUT_REFUSALS} refusals in a row; an approver must unlock them"
+            );
+            self.audit
+                .append(t, user, &call.capability, "-", "denied: locked out");
+            return Err(Error::Denied(why));
+        }
         let spec = match self.registry.spec(&call.capability) {
             Ok(s) => s.clone(),
             Err(e) => {
@@ -585,6 +606,77 @@ impl Workspace {
     #[must_use]
     pub fn role_can(&self, role: &str, permission: &str) -> bool {
         self.roles.get(role).is_some_and(|r| r.can(permission))
+    }
+
+    /// Whether `user` has been refused [`LOCKOUT_REFUSALS`] times in a row (looking at the most
+    /// recent records only) and nobody has unlocked them since. Opening a new session does not
+    /// clear it; any request that was allowed does. Derived from the audit chain, so it survives
+    /// a restart.
+    #[must_use]
+    pub fn is_locked_out(&self, user: &str) -> bool {
+        let mut refusals = 0;
+        for r in self.audit.records().iter().rev().take(LOCKOUT_LOOKBACK) {
+            if r.action == "lockout.clear" && r.subject == user && r.outcome == "ok" {
+                return false;
+            }
+            if r.actor != user || r.action == "session.open" {
+                continue;
+            }
+            if r.outcome.starts_with("denied") {
+                refusals += 1;
+                if refusals >= LOCKOUT_REFUSALS {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Everyone who is locked out now, sorted.
+    #[must_use]
+    pub fn locked_out(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in self.audit.records().iter().rev().take(LOCKOUT_LOOKBACK) {
+            seen.insert(r.actor.clone());
+        }
+        seen.into_iter().filter(|u| self.is_locked_out(u)).collect()
+    }
+
+    /// Lets `target` act again. Only a role that can approve may do this, and never for itself.
+    /// Written to the audit chain.
+    ///
+    /// # Errors
+    /// [`Error::Denied`] for a role that cannot approve or for unlocking yourself;
+    /// [`Error::Conflict`] when `target` is not locked out.
+    pub fn clear_lockout(&mut self, by: &str, by_role: &str, target: &str) -> Result<()> {
+        let t = self.now();
+        if !self.role_can(by_role, "approve") {
+            self.audit.append(
+                t,
+                by,
+                "lockout.clear",
+                target,
+                "denied: role cannot approve",
+            );
+            return Err(Error::Denied("only an approver can unlock someone".into()));
+        }
+        if by == target {
+            self.audit.append(
+                t,
+                by,
+                "lockout.clear",
+                target,
+                "denied: cannot unlock yourself",
+            );
+            return Err(Error::Denied("you cannot unlock yourself".into()));
+        }
+        if !self.is_locked_out(target) {
+            return Err(Error::Conflict(format!("{target} is not locked out")));
+        }
+        self.audit.append(t, by, "lockout.clear", target, "ok");
+        Ok(())
     }
 
     /// The names of the defined roles, in order.
@@ -1098,5 +1190,70 @@ mod tests {
             cut.starts_with("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}...") && cut.contains("600 bytes"),
             "{cut}"
         );
+    }
+
+    #[test]
+    fn repeated_refusals_lock_an_actor_out_until_an_approver_unlocks_them() {
+        let (mut w, _) = ws(false);
+        let g = w.open_session(T, "gus", "guest").unwrap();
+        for i in 0..LOCKOUT_REFUSALS {
+            assert!(!w.is_locked_out("gus"), "not yet locked after {i}");
+            assert!(matches!(
+                w.submit(T, &g, "/note.send to=bob"),
+                Err(Error::Denied(_))
+            ));
+        }
+        assert!(w.is_locked_out("gus"));
+        assert_eq!(w.locked_out(), vec!["gus".to_string()]);
+        // Even what the guest may normally do, and chat, is refused now.
+        let e = w.submit(T, &g, "/note.read").unwrap_err();
+        assert!(e.to_string().contains("locked out"), "{e}");
+        assert!(w.submit(T, &g, "hello there").is_err());
+        // A new conversation does not help.
+        let g2 = w.open_session(T, "gus", "guest").unwrap();
+        assert!(w.submit(T, &g2, "/note.read").is_err());
+        // Others are unaffected.
+        let a = w.open_session(T, "ann", "member").unwrap();
+        assert!(w.submit(T, &a, "/note.read").is_ok());
+
+        // Only an approver may unlock, and not themselves.
+        let e = w.clear_lockout("ann", "member", "gus").unwrap_err();
+        assert!(matches!(e, Error::Denied(_)));
+        assert!(w.is_locked_out("gus"));
+        assert!(w.clear_lockout("gus", "guest", "gus").is_err());
+        assert!(matches!(
+            w.clear_lockout("boss", "manager", "ann"),
+            Err(Error::Conflict(_))
+        ));
+        w.clear_lockout("boss", "manager", "gus").unwrap();
+        assert!(!w.is_locked_out("gus"));
+        assert!(w.submit(T, &g2, "/note.read").is_ok());
+        assert!(w.audit().verify().is_ok());
+        assert!(w
+            .audit()
+            .records()
+            .iter()
+            .any(|r| r.action == "lockout.clear" && r.actor == "boss" && r.subject == "gus"));
+    }
+
+    #[test]
+    fn an_allowed_request_resets_the_count_and_the_lockout_survives_a_reload() {
+        let (mut w, _) = ws(false);
+        let g = w.open_session(T, "gus", "guest").unwrap();
+        for _ in 0..LOCKOUT_REFUSALS - 1 {
+            let _ = w.submit(T, &g, "/note.send to=bob");
+        }
+        assert!(w.submit(T, &g, "/note.read").is_ok());
+        let _ = w.submit(T, &g, "/note.send to=bob");
+        assert!(!w.is_locked_out("gus"), "the success started a new count");
+        for _ in 0..LOCKOUT_REFUSALS {
+            let _ = w.submit(T, &g, "/note.send to=bob");
+        }
+        assert!(w.is_locked_out("gus"));
+        // A restart loads the saved audit chain into a fresh workspace: still locked.
+        let records = w.audit().records().to_vec();
+        let mut empty = Workspace::new(Policy::default(), Limits::default()).unwrap();
+        empty.load_audit(records).unwrap();
+        assert!(empty.is_locked_out("gus"));
     }
 }

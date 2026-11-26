@@ -277,7 +277,7 @@ impl<B: Backend> Device<B> {
             .collect();
         t.push_str(&keys.join(", "));
         t.push_str(
-            "\nCommands: /help, /apps, /files, /save [name], /contrast on|off, /textsize 1-3, /signin <name> <role>, /<capability> name=value",
+            "\nCommands: /help, /apps, /files, /save [name], /unlock <name>, /contrast on|off, /textsize 1-3, /signin <name> <role>, /<capability> name=value",
         );
         let mine: Vec<String> = self
             .ws
@@ -308,6 +308,29 @@ impl<B: Backend> Device<B> {
         }
         self.shell.chat.messages = msgs;
         self.notice(RESTORED);
+    }
+
+    /// Marks a security finding as seen: written to the audit chain under the signed-in person's
+    /// name together with what it said, so it comes back if it changes. The broken-chain
+    /// finding can be acknowledged but keeps counting in the risk score.
+    fn acknowledge_finding(&mut self, id: &str) {
+        let Some(f) = self
+            .shell
+            .security
+            .findings
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+        else {
+            self.shell.security.message = "That finding is gone.".into();
+            return;
+        };
+        self.audit_event("finding.ack", &format!("{}|{}", f.id, f.title), "ok");
+        self.shell.security.message = if f.severity == mouli_screen::screens::Severity::Critical {
+            "Marked as seen. It still counts toward the risk until it is fixed.".into()
+        } else {
+            String::new()
+        };
     }
 
     /// Writes an event of the host (for example a screenshot) into the audit chain as the
@@ -457,6 +480,10 @@ impl<B: Backend> Device<B> {
                 ));
                 Outcome::Handled
             }
+            Action::AckFinding(id) => {
+                self.acknowledge_finding(&id);
+                Outcome::Handled
+            }
             Action::Decide { id, approve } => {
                 self.decide(&id, approve);
                 Outcome::Handled
@@ -566,6 +593,26 @@ impl<B: Backend> Device<B> {
                 return;
             }
             _ => {}
+        }
+        if let Some(rest) = text.trim().strip_prefix("/unlock") {
+            if rest.is_empty() || rest.starts_with(' ') {
+                let target = rest.trim();
+                if target.is_empty() {
+                    let who = self.ws.locked_out();
+                    self.notice(&if who.is_empty() {
+                        "Nobody is locked out.".to_string()
+                    } else {
+                        format!("Locked out: {}. Type /unlock <name>.", who.join(", "))
+                    });
+                } else {
+                    let (user, role) = (self.user.clone(), self.role.clone());
+                    match self.ws.clear_lockout(&user, &role, target) {
+                        Ok(()) => self.notice(&format!("{target} can act again.")),
+                        Err(e) => self.notice(&format!("Not unlocked: {e}")),
+                    }
+                }
+                return;
+            }
         }
         if let Some(rest) = text.trim().strip_prefix("/save") {
             if rest.is_empty() || rest.starts_with(' ') {

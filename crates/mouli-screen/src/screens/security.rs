@@ -62,6 +62,8 @@ pub struct SecurityScreen {
     pub findings: Vec<Finding>,
     /// The selection.
     pub cursor: Cursor,
+    /// A message under the list (for example why something cannot be acknowledged).
+    pub message: String,
 }
 
 impl SecurityScreen {
@@ -96,6 +98,18 @@ impl Screen for SecurityScreen {
             Key::Home => self.cursor.jump(false, len),
             Key::End => self.cursor.jump(true, len),
             Key::Char('s') => return Action::RefreshSecurity,
+            Key::Char('a') => {
+                let Some((id, seen)) = self.selected().map(|f| (f.id.clone(), f.acknowledged))
+                else {
+                    return Action::None;
+                };
+                if seen {
+                    self.message = "Already acknowledged.".into();
+                    return Action::None;
+                }
+                self.message.clear();
+                return Action::AckFinding(id);
+            }
             _ => {}
         }
         Action::None
@@ -168,6 +182,16 @@ impl Screen for SecurityScreen {
                 bg,
             );
         }
+        if !self.message.is_empty() {
+            g.text_fit(
+                inner.x + 2,
+                inner.y + 1,
+                inner.w - 4,
+                &self.message,
+                theme::WARN,
+                theme::BG,
+            );
+        }
         if let Some(f) = self.selected() {
             let dy = inner.y + 3 + list_h;
             if dy + 3 <= inner.y + inner.h {
@@ -192,7 +216,7 @@ impl Screen for SecurityScreen {
     }
 
     fn hints(&self) -> String {
-        "Up/Down choose  s scan again".into()
+        "Up/Down choose  a mark as seen  s scan again".into()
     }
 }
 
