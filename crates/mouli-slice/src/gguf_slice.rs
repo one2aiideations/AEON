@@ -370,15 +370,39 @@ fn encode_q8_0(values: &[f32]) -> Result<Vec<u8>, GgufSliceError> {
     Ok(output)
 }
 
-fn slice_down(
+/// What `slice_down` needs: the source tensor and how to cut and re-store it.
+struct DownJob<'a> {
     ty: GgmlType,
-    source: &[u8],
+    source: &'a [u8],
     d_model: usize,
     d_ff: usize,
-    keep: &[usize],
+    keep: &'a [usize],
     down: DownType,
-    name: &str,
-) -> Result<(GgmlType, Vec<u8>), GgufSliceError> {
+    name: &'a str,
+    /// Values added to the kept columns, row-major `d_model x keep.len()`.
+    correction: Option<&'a [f32]>,
+}
+
+fn slice_down(job: &DownJob<'_>) -> Result<(GgmlType, Vec<u8>), GgufSliceError> {
+    let DownJob {
+        ty,
+        source,
+        d_model,
+        d_ff,
+        keep,
+        down,
+        name,
+        correction,
+    } = *job;
+    if let Some(c) = correction {
+        if Some(c.len()) != d_model.checked_mul(keep.len()) {
+            return Err(GgufSliceError::BadPlan(format!(
+                "{name}: correction has {} values, expected {d_model} x {}",
+                c.len(),
+                keep.len()
+            )));
+        }
+    }
     let source_row_size = row_bytes(ty, d_ff, name)?;
 
     let expected = checked_mul(d_model, source_row_size, name)?;
@@ -413,14 +437,18 @@ fn slice_down(
             )));
         }
 
-        for &index in keep {
-            let value = *values.get(index).ok_or_else(|| {
+        for (column, &index) in keep.iter().enumerate() {
+            let mut value = *values.get(index).ok_or_else(|| {
                 GgufSliceError::BadPlan(format!("{name}: neuron index {index} is invalid"))
             })?;
 
+            if let Some(c) = correction {
+                value += c[row_index * keep.len() + column];
+            }
+
             if !value.is_finite() {
                 return Err(GgufSliceError::UnsupportedTensorType(format!(
-                    "{name}: non-finite dequantised value"
+                    "{name}: non-finite value after dequantising or correcting"
                 )));
             }
 
@@ -564,6 +592,26 @@ pub fn slice_gguf(
     keep: &[Vec<usize>],
     down: DownType,
 ) -> Result<SliceOutcome, GgufSliceError> {
+    slice_gguf_compensated(file, keep, down, None)
+}
+
+/// Like [`slice_gguf`], and adds `corrections[layer]` to the kept columns of each layer's down
+/// matrix before it is re-stored. Each correction is row-major `d_model x kept` (see
+/// [`crate::compensate`]). `None`, or fewer entries than layers, leaves the remaining layers as
+/// they are.
+///
+/// A correction nudges the kept weights to make up for the neurons that were removed; it does not
+/// show the sliced model is better, only that this layer's output was fitted more closely on the
+/// calibration prompts.
+///
+/// # Errors
+/// As [`slice_gguf`], and [`GgufSliceError::BadPlan`] for a correction of the wrong size.
+pub fn slice_gguf_compensated(
+    file: &[u8],
+    keep: &[Vec<usize>],
+    down: DownType,
+    corrections: Option<&[Vec<f32>]>,
+) -> Result<SliceOutcome, GgufSliceError> {
     let gguf = parse(file)
         .map_err(|e| GgufSliceError::Unreadable(format!("input parse failed: {e:?}")))?;
 
@@ -650,9 +698,16 @@ pub fn slice_gguf(
 
         let new_up = select_rows(&up_data, up_row_size, indices, &up_name)?;
 
-        let (new_down_ty, new_down) = slice_down(
-            down_ty, &down_data, d_model, d_ff, indices, down, &down_name,
-        )?;
+        let (new_down_ty, new_down) = slice_down(&DownJob {
+            ty: down_ty,
+            source: &down_data,
+            d_model,
+            d_ff,
+            keep: indices,
+            down,
+            name: &down_name,
+            correction: corrections.and_then(|c| c.get(layer)).map(Vec::as_slice),
+        })?;
 
         for (name, dims, ty, data) in [
             (gate_name, vec![d_model_u64, k_u64], gate_ty, new_gate),
@@ -1155,6 +1210,74 @@ mod tests {
                 vec![32, 32]
             );
         }
+    }
+
+    #[test]
+    fn a_correction_is_added_to_the_kept_down_weights_only() {
+        let file = build_model(false);
+        let keep = selection(); // layer 0 keeps 0..32, layer 1 keeps 32..64; k = 32, d_model = 32
+                                // Layer 0: +0.5 everywhere; layer 1: a marker on one (row, column) only.
+        let mut c0 = vec![0.5f32; 32 * 32];
+        c0[3 * 32 + 7] = 2.0;
+        let mut c1 = vec![0.0f32; 32 * 32];
+        c1[5 * 32 + 9] = -1.5;
+        let out =
+            slice_gguf_compensated(&file, &keep, DownType::F16, Some(&[c0.clone(), c1.clone()]))
+                .unwrap();
+        let plain = slice_gguf(&file, &keep, DownType::F16).unwrap();
+        for (layer, c) in [c0, c1].iter().enumerate() {
+            let name = format!("blk.{layer}.ffn_down.weight");
+            let with = decode_tensor(&out.bytes, &name);
+            let without = decode_tensor(&plain.bytes, &name);
+            assert_eq!(with.len(), 32 * 32);
+            for i in 0..with.len() {
+                let expected = without[i] + c[i];
+                assert!(
+                    (with[i] - expected).abs() <= expected.abs() / 512.0 + 0.002,
+                    "layer {layer} element {i}: {} vs {expected}",
+                    with[i]
+                );
+            }
+        }
+        // Gate and up are untouched by corrections.
+        let a = parse_gguf(&out.bytes).unwrap();
+        let b = parse_gguf(&plain.bytes).unwrap();
+        for name in ["blk.0.ffn_gate.weight", "blk.1.ffn_up.weight"] {
+            assert_eq!(
+                a.tensor_data(&out.bytes, name).unwrap(),
+                b.tensor_data(&plain.bytes, name).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_corrections_leave_those_layers_as_they_were_and_wrong_sizes_are_refused() {
+        let file = build_model(false);
+        let keep = selection();
+        let plain = slice_gguf(&file, &keep, DownType::F16).unwrap();
+        // Only layer 0 given: layer 1 must equal the uncorrected slice.
+        let one = slice_gguf_compensated(&file, &keep, DownType::F16, Some(&[vec![1.0; 32 * 32]]))
+            .unwrap();
+        assert_eq!(
+            decode_tensor(&one.bytes, "blk.1.ffn_down.weight"),
+            decode_tensor(&plain.bytes, "blk.1.ffn_down.weight")
+        );
+        assert_ne!(
+            decode_tensor(&one.bytes, "blk.0.ffn_down.weight"),
+            decode_tensor(&plain.bytes, "blk.0.ffn_down.weight")
+        );
+        let wrong = slice_gguf_compensated(&file, &keep, DownType::F16, Some(&[vec![0.0; 5]]));
+        assert!(wrong.unwrap_err().to_string().contains("correction"));
+        let nan = slice_gguf_compensated(
+            &file,
+            &keep,
+            DownType::F16,
+            Some(&[vec![f32::NAN; 32 * 32]]),
+        );
+        assert!(nan.is_err());
+        // No corrections at all is the same as the plain slice.
+        let none = slice_gguf_compensated(&file, &keep, DownType::F16, None).unwrap();
+        assert_eq!(none.bytes, plain.bytes);
     }
 
     #[test]

@@ -50,6 +50,7 @@
 
 pub mod analysis;
 pub mod closure;
+pub mod compensate;
 pub mod gate;
 pub mod gguf_slice;
 pub mod plan;
@@ -138,6 +139,10 @@ pub trait ActivationSink {
     /// # Errors
     /// A [`SliceError`] for a bad layer, length or non-finite value.
     fn observe(&mut self, layer: usize, activations: &[f32]) -> Result<(), SliceError>;
+
+    /// Called before the first token of each new prompt. Sinks that group tokens by prompt use
+    /// it; the default does nothing.
+    fn begin_prompt(&mut self) {}
 }
 
 /// Scores a model on held-out multiple-choice items.

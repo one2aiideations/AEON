@@ -152,6 +152,35 @@ fn prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, SliceErr
     Ok(ids)
 }
 
+/// Runs each prompt through the model and shows every layer's feed-forward activations to
+/// `sink` (calling [`ActivationSink::begin_prompt`] before each prompt). Returns the number of
+/// tokens read.
+///
+/// # Errors
+/// A [`SliceError`] for an empty prompt list, a prompt that is empty or too long, or an engine
+/// refusal.
+pub fn observe_prompts(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    prompts: &[String],
+    sink: &mut dyn ActivationSink,
+) -> Result<usize, SliceError> {
+    if prompts.is_empty() {
+        return Err(SliceError::EmptyInput("profiling prompts"));
+    }
+    let mut tokens_read = 0;
+    for prompt in prompts {
+        let ids = prompt_tokens(tokenizer, prompt)?;
+        let mut session = Session::new(model, ids.len().max(1)).map_err(|e| engine_error(&e))?;
+        sink.begin_prompt();
+        session
+            .prefill_observed(&ids, &mut |layer, a| sink.observe(layer, a).is_ok())
+            .map_err(|e| engine_error(&e))?;
+        tokens_read += ids.len();
+    }
+    Ok(tokens_read)
+}
+
 /// Runs each prompt through the model and records every layer's feed-forward activations.
 ///
 /// Returns the profiler and the number of tokens read. Profiling shows what the model used on
@@ -165,21 +194,9 @@ pub fn profile_prompts(
     tokenizer: &Tokenizer,
     prompts: &[String],
 ) -> Result<(Profiler, usize), SliceError> {
-    if prompts.is_empty() {
-        return Err(SliceError::EmptyInput("profiling prompts"));
-    }
     let config = model.config();
     let mut profiler = Profiler::new(config.n_layer, config.n_ff)?;
-    let mut tokens_read = 0;
-    for prompt in prompts {
-        let ids = prompt_tokens(tokenizer, prompt)?;
-        let mut session = Session::new(model, ids.len().max(1)).map_err(|e| engine_error(&e))?;
-        let sink = &mut profiler;
-        session
-            .prefill_observed(&ids, &mut |layer, a| sink.observe(layer, a).is_ok())
-            .map_err(|e| engine_error(&e))?;
-        tokens_read += ids.len();
-    }
+    let tokens_read = observe_prompts(model, tokenizer, prompts, &mut profiler)?;
     Ok((profiler, tokens_read))
 }
 

@@ -4,8 +4,12 @@
 //! mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt [--keep 0.8,0.65,0.5]
 //!             [--down q8_0|f16] [--tolerance 0.05] [--out DIR]
 //!             [--closure N] [--shots 3] [--profile-closure M]
-//!             [--score activation|weighted|saliency] [--diagnose]
+//!             [--score activation|weighted|saliency] [--diagnose] [--compensate MAX_TOKENS]
 //! ```
+//!
+//! `--compensate N` also keeps up to N tokens of calibration activations and refits the kept
+//! down-projection weights of each layer to make up for the removed neurons (see
+//! `mouli_slice::compensate`); it needs about N x 8960 x 28 x 4 bytes of memory for a 1.5B model.
 //!
 //! `--score weighted` ranks neurons by activation times the norm of their output weights (a 55D
 //! measure) and `--score saliency` by the squared version (the expected squared change of the
@@ -28,11 +32,13 @@ use mouli_slice::analysis::{
 use mouli_slice::closure::{
     decide_closure, profile_prompts_for_closure, render_closure, run_closure,
 };
+use mouli_slice::compensate::{compensate_gguf, Calibration, Tee};
 use mouli_slice::gate::{decide, MIN_ITEMS};
-use mouli_slice::gguf_slice::{round_up_to_block, slice_gguf, DownType};
+use mouli_slice::gguf_slice::{round_up_to_block, slice_gguf_compensated, DownType};
 use mouli_slice::plan::{make_plan_from_importance, Rule};
+use mouli_slice::profile::Profiler;
 use mouli_slice::report::{render, PlanSummary, RunSummary};
-use mouli_slice::run::{parse_items, profile_prompts, score_items, ModelScorer};
+use mouli_slice::run::{observe_prompts, parse_items, score_items, ModelScorer};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -49,6 +55,7 @@ struct Args {
     profile_closure: usize,
     ranking: Ranking,
     diagnose: bool,
+    compensate: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,7 +69,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt \
          [--keep 0.8,0.65,0.5] [--down q8_0|f16] [--tolerance 0.05] [--out DIR] \
-         [--closure N] [--shots 3] [--profile-closure M] [--score activation|weighted|saliency] [--diagnose]"
+         [--closure N] [--shots 3] [--profile-closure M] [--score activation|weighted|saliency] [--diagnose] [--compensate MAX_TOKENS]"
     );
     std::process::exit(2);
 }
@@ -76,6 +83,7 @@ fn parse_args() -> Args {
     let mut tolerance = 0.05;
     let (mut closure, mut shots, mut profile_closure) = (0usize, 3usize, 0usize);
     let (mut ranking, mut diagnose) = (Ranking::Activation, false);
+    let mut compensate = 0usize;
     while let Some(flag) = it.next() {
         if flag == "--diagnose" {
             diagnose = true;
@@ -108,6 +116,7 @@ fn parse_args() -> Args {
                     _ => usage(),
                 };
             }
+            "--compensate" => compensate = value.parse().unwrap_or_else(|_| usage()),
             "--closure" => closure = value.parse().unwrap_or_else(|_| usage()),
             "--shots" => shots = value.parse().unwrap_or_else(|_| usage()),
             "--profile-closure" => profile_closure = value.parse().unwrap_or_else(|_| usage()),
@@ -127,6 +136,7 @@ fn parse_args() -> Args {
         profile_closure,
         ranking,
         diagnose,
+        compensate,
     }
 }
 
@@ -188,8 +198,21 @@ fn main() -> Result<(), String> {
         println!("adding {} closure prompts to the profile", extra.len());
         prompts.extend(extra);
     }
-    let (profiler, tokens) =
-        profile_prompts(&model, &tokenizer, &prompts).map_err(|e| e.to_string())?;
+    let config = model.config();
+    let mut profiler = Profiler::new(config.n_layer, config.n_ff).map_err(|e| e.to_string())?;
+    let mut calibration = if args.compensate > 0 {
+        Some(
+            Calibration::new(config.n_layer, config.n_ff, args.compensate)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let tokens = match calibration.as_mut() {
+        Some(cal) => observe_prompts(&model, &tokenizer, &prompts, &mut Tee(&mut profiler, cal)),
+        None => observe_prompts(&model, &tokenizer, &prompts, &mut profiler),
+    }
+    .map_err(|e| e.to_string())?;
     println!(
         "profiled {tokens} tokens in {:.1}s",
         t.elapsed().as_secs_f64()
@@ -268,7 +291,25 @@ fn main() -> Result<(), String> {
             }
         }
         let t = Instant::now();
-        let sliced = slice_gguf(&file, &plan.keep, args.down).map_err(|e| e.to_string())?;
+        let corrections: Option<Vec<Vec<f32>>> = match &calibration {
+            Some(cal) => {
+                let t = Instant::now();
+                let comps =
+                    compensate_gguf(&file, cal, &plan.keep, 4).map_err(|e| e.to_string())?;
+                let applied = comps.iter().filter(|c| c.applied).count();
+                let mean_after =
+                    comps.iter().map(|c| c.error_after).sum::<f64>() / comps.len().max(1) as f64;
+                println!(
+                    "  compensation: {applied} of {} layers corrected, mean held-out error {mean_after:.3} of the removed output ({:.0}s)",
+                    comps.len(),
+                    t.elapsed().as_secs_f64()
+                );
+                Some(comps.into_iter().map(|c| c.correction).collect())
+            }
+            None => None,
+        };
+        let sliced = slice_gguf_compensated(&file, &plan.keep, args.down, corrections.as_deref())
+            .map_err(|e| e.to_string())?;
         println!(
             "keep {fraction} -> {count} of {d_ff} neurons: {} MB ({:.0}%) in {:.1}s",
             sliced.bytes_after / 1_000_000,
