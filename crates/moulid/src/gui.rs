@@ -3502,7 +3502,12 @@ mod tests {
     }
 
     fn storage_run(loaded: &str, keys: Vec<Ev>) -> std::path::PathBuf {
-        let dir = tmp("storage");
+        // Each run gets its own folder: the storage tests run in parallel and must not share one.
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = tmp(&format!(
+            "storage-{}",
+            RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(dir.join("models")).unwrap();
         std::fs::write(dir.join("models/a.gguf"), vec![1u8; 100]).unwrap();
         std::fs::write(dir.join("models/b.gguf"), vec![1u8; 50]).unwrap();

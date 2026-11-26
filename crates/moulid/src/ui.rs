@@ -133,11 +133,8 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
     }
 }
 
-/// Show the picker and read a valid choice. End of input counts as quit.
-///
-/// A model that does not fit the memory budget is not loaded straight away: the reason is shown
-/// (see [`Found::why_not`]) and the person chooses the model that does fit (`f`), loading it anyway
-/// (`y`), or going back.
+/// Show the picker and read a valid choice, with no check of the file itself (see
+/// [`pick_model_checked`]).
 ///
 /// # Errors
 /// I/O errors on the console.
@@ -147,6 +144,29 @@ pub fn pick_model<R: BufRead, W: Write>(
     ctx: u32,
     input: &mut R,
     out: &mut W,
+) -> io::Result<Choice> {
+    pick_model_checked(models, budget_mb, ctx, input, out, &mut |_| None)
+}
+
+/// Show the picker and read a valid choice. End of input counts as quit.
+///
+/// Before a model is returned, `verify` is asked about it: if it returns a problem (the file is
+/// not the one the catalogue lists, say) the person sees it and chooses between loading anyway (`y`)
+/// and going back.
+///
+/// A model that does not fit the memory budget is not loaded straight away: the reason is shown
+/// (see [`Found::why_not`]) and the person chooses the model that does fit (`f`), loading it anyway
+/// (`y`), or going back.
+///
+/// # Errors
+/// I/O errors on the console.
+pub fn pick_model_checked<R: BufRead, W: Write>(
+    models: &[Found],
+    budget_mb: u64,
+    ctx: u32,
+    input: &mut R,
+    out: &mut W,
+    verify: &mut dyn FnMut(&Found) -> Option<String>,
 ) -> io::Result<Choice> {
     write!(out, "{}", render_menu(models, budget_mb, ctx))?;
     loop {
@@ -158,7 +178,24 @@ pub fn pick_model<R: BufRead, W: Write>(
         }
         match parse_choice(&line, models.len()) {
             Some(Choice::Model(i)) => match confirm_fit(models, i, budget_mb, ctx, input, out)? {
-                Fit::Load(j) => return Ok(Choice::Model(j)),
+                Fit::Load(j) => {
+                    let Some(problem) = verify(&models[j]) else {
+                        return Ok(Choice::Model(j));
+                    };
+                    writeln!(out, "\n  {problem}")?;
+                    write!(
+                        out,
+                        "  y = load it anyway   anything else = choose again\n  > "
+                    )?;
+                    out.flush()?;
+                    let mut answer = String::new();
+                    if input.read_line(&mut answer)? == 0 {
+                        return Ok(Choice::Quit);
+                    }
+                    if answer.trim().eq_ignore_ascii_case("y") {
+                        return Ok(Choice::Model(j));
+                    }
+                }
                 Fit::Again => {}
                 Fit::Eof => return Ok(Choice::Quit),
             },
@@ -493,6 +530,45 @@ mod tests {
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("Nothing else on this machine fits"));
+    }
+
+    #[test]
+    fn a_file_that_fails_its_check_is_loaded_only_if_the_person_says_so() {
+        let ms = [model("a", 100), model("b", 100)];
+        let run = |input: &str| {
+            let mut out = Vec::new();
+            let mut asked = Vec::new();
+            let c =
+                pick_model_checked(&ms, 4000, 2048, &mut input.as_bytes(), &mut out, &mut |m| {
+                    asked.push(m.name.clone());
+                    (m.name == "b").then(|| "b is not the catalogue's copy.".to_string())
+                })
+                .unwrap();
+            (c, asked, String::from_utf8(out).unwrap())
+        };
+        // A model that passes loads with no question.
+        let (c, asked, text) = run("1\n");
+        assert_eq!((c, asked), (Choice::Model(0), vec!["a".to_string()]));
+        assert!(!text.contains("load it anyway"));
+        // One that fails is shown the problem; only y loads it.
+        let (c, _, text) = run("2\ny\n");
+        assert_eq!(c, Choice::Model(1));
+        assert!(
+            text.contains("b is not the catalogue's copy.") && text.contains("y = load it anyway"),
+            "{text}"
+        );
+        assert_eq!(
+            run("2\nn\n1\n").0,
+            Choice::Model(0),
+            "anything else goes back"
+        );
+        assert_eq!(run("2\n").0, Choice::Quit, "end of input");
+        // The plain picker never checks.
+        let mut out = Vec::new();
+        assert_eq!(
+            pick_model(&ms, 4000, 2048, &mut "2\n".as_bytes(), &mut out).unwrap(),
+            Choice::Model(1)
+        );
     }
 
     #[test]

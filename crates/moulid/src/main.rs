@@ -11,7 +11,8 @@ use moulid::hwprobe;
 use moulid::models::{describe, discover, Found};
 use moulid::net;
 use moulid::persist::{self, Store};
-use moulid::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
+use moulid::ui::{chat_loop, pick_model_checked, Backend, Choice, End, Turn};
+use moulid::verify;
 use moulid::wifi;
 use moulid::wifi_saved;
 use moulid::{catalog, download_ui, fetch};
@@ -260,12 +261,26 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
         let choice = if a.model.is_some() && models.len() == 1 {
             Choice::Model(0)
         } else {
-            match pick_model(
+            let (entries, _) = catalog::load(Path::new(catalog::CATALOG_FILE));
+            // A file the catalogue lists is checked against its size and SHA-256 before loading.
+            let mut verify_file = |m: &Found| -> Option<String> {
+                let name = m.path.file_name()?.to_string_lossy().into_owned();
+                if !verify::known(&name, &entries) {
+                    return None;
+                }
+                say(&format!("MOULI: checking {name} against the catalogue..."));
+                match verify::check(&m.path, &entries) {
+                    Ok(c) => verify::warning(&name, &c),
+                    Err(e) => Some(format!("{name} could not be read to check it: {e}")),
+                }
+            };
+            match pick_model_checked(
                 &models,
                 plan.model_budget_mb,
                 plan.ctx,
                 &mut input,
                 &mut out,
+                &mut verify_file,
             ) {
                 Ok(c) => c,
                 Err(_) => {
@@ -397,6 +412,21 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 ));
                 if let Some(why) = m.why_not(plan.model_budget_mb, plan.ctx) {
                     say(&format!("MOULI: warning: {} {why}", m.name));
+                }
+                // The picker already checked the file; a model named on the command line skips
+                // it, so check it here and warn (it is not refused: it was asked for by name).
+                if a.model.is_some() {
+                    let (entries, _) = catalog::load(Path::new(catalog::CATALOG_FILE));
+                    if let Some(name) = m.path.file_name().map(|n| n.to_string_lossy().into_owned())
+                    {
+                        if verify::known(&name, &entries) {
+                            say(&format!("MOULI: checking {name} against the catalogue..."));
+                            let found = verify::check(&m.path, &entries);
+                            if let Some(w) = found.ok().and_then(|c| verify::warning(&name, &c)) {
+                                say(&format!("MOULI: warning: {w}"));
+                            }
+                        }
+                    }
                 }
                 let mut child = match launch(a, &m.path, plan, pid1) {
                     Ok(c) => c,
