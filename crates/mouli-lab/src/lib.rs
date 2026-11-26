@@ -16,4 +16,5 @@ pub mod data;
 pub mod linalg;
 pub mod report;
 pub mod rng;
+pub mod stats;
 pub mod temporal;

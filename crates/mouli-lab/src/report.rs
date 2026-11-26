@@ -106,10 +106,41 @@ pub fn read_entries(dir: &str) -> Result<Vec<Entry>, String> {
     Ok(entries)
 }
 
-/// Aggregates the run files into markdown, with paired per-seed aetheron-minus-mlp differences.
+/// File in a run folder that says which data the runs used.
+pub const DATASET_FILE: &str = "DATASET.txt";
+
+/// Records which data the runs in `dir` used, so a report cannot be mistaken for another data set.
+pub fn write_dataset_marker(dir: &str, text: &str) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir, e))?;
+    fs::write(
+        format!("{}/{}", dir, DATASET_FILE),
+        format!("{}\n", text.trim()),
+    )
+    .map_err(|e| format!("write marker: {}", e))
+}
+
+/// Reads the marker, or says the data is unknown.
+#[must_use]
+pub fn read_dataset_marker(dir: &str) -> String {
+    fs::read_to_string(format!("{}/{}", dir, DATASET_FILE))
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "unknown (no DATASET.txt in this folder)".to_string())
+}
+
+/// Aggregates the run files in `dir` into markdown.
 pub fn aggregate(dir: &str) -> Result<String, String> {
     let entries = read_entries(dir)?;
+    Ok(render(&entries, &read_dataset_marker(dir)))
+}
+
+/// Renders entries as markdown: a table of every method, then for each strategy how Aetheron
+/// compared with the MLP seed by seed, for accuracy and for forgetting, wins and losses alike.
+#[must_use]
+pub fn render(entries: &[Entry], dataset: &str) -> String {
     let mut out = String::new();
+    out.push_str(&format!("Data: {}\n\n", dataset));
     out.push_str("| arch | strategy | n | final_avg mean±std | forgetting mean±std | pooled mean±std | transductive mean±std |\n");
     out.push_str("|---|---|---|---|---|---|---|\n");
     let mut keys: Vec<(String, String)> =
@@ -145,10 +176,12 @@ pub fn aggregate(dir: &str) -> Result<String, String> {
             tr_s
         ));
     }
-    out.push_str("\n## Paired per-seed differences (aetheron − mlp), same strategy\n\n");
+    out.push_str("\n## Aetheron compared with the MLP, seed by seed (same strategy)\n\n");
+    out.push_str("A positive difference is better for accuracy; for forgetting, lower is better. Intervals are 95% bootstrap over seeds, p-values are exact sign-flip tests; with few seeds neither can show much.\n\n");
     let mut strategies: Vec<String> = entries.iter().map(|e| e.1.clone()).collect();
     strategies.sort();
     strategies.dedup();
+    let mut any = false;
     for s in &strategies {
         let ae: Vec<&Entry> = entries
             .iter()
@@ -158,22 +191,89 @@ pub fn aggregate(dir: &str) -> Result<String, String> {
             .iter()
             .filter(|e| e.0 == "mlp" && &e.1 == s)
             .collect();
-        let mut diffs = Vec::new();
-        for a in &ae {
-            if let Some(m) = ml.iter().find(|m| m.2 == a.2) {
-                diffs.push(a.3 - m.3);
+        for (metric, higher_better, pick) in [
+            ("final accuracy", true, (|e: &Entry| e.3) as fn(&Entry) -> F),
+            ("forgetting", false, (|e: &Entry| e.4) as fn(&Entry) -> F),
+        ] {
+            let diffs: Vec<F> = ae
+                .iter()
+                .filter_map(|a| ml.iter().find(|m| m.2 == a.2).map(|m| pick(a) - pick(m)))
+                .collect();
+            if diffs.is_empty() {
+                continue;
             }
-        }
-        if !diffs.is_empty() {
-            let (m, sd) = mean_std(&diffs);
+            any = true;
+            let p = crate::stats::paired(&diffs, 20240601);
+            let ci = p
+                .ci95
+                .map_or("n/a".to_string(), |(l, h)| format!("{l:+.4} to {h:+.4}"));
+            let pv = p.p_value.map_or("n/a".to_string(), |v| format!("{v:.4}"));
             out.push_str(&format!(
-                "strategy={}: n={} mean diff = {:+.4}, std = {:.4}\n",
-                s,
-                diffs.len(),
-                m,
-                sd
+                "- **{s}, {metric}**: n={}, mean difference {:+.4}, interval {ci}, p={pv}; Aetheron better on {}, worse on {}, equal on {}. {}\n",
+                p.n,
+                p.mean,
+                if higher_better { p.wins } else { p.losses },
+                if higher_better { p.losses } else { p.wins },
+                p.ties,
+                p.describe("Aetheron", "the MLP", higher_better)
             ));
         }
     }
-    Ok(out)
+    if !any {
+        out.push_str("No seed has both an Aetheron run and an MLP run for the same strategy, so nothing can be compared.\n");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(arch: &str, strat: &str, seed: u64, acc: F, forget: F) -> Entry {
+        (arch.into(), strat.into(), seed, acc, forget, 0.5, None)
+    }
+
+    fn eight_seeds() -> Vec<Entry> {
+        let mut v = Vec::new();
+        for s in 0..8u64 {
+            let j = s as F * 0.001;
+            // Aetheron is more accurate (+0.05) but forgets more (+0.10) than the MLP.
+            v.push(e("aetheron", "none", s, 0.60 + j, 0.30 + j));
+            v.push(e("mlp", "none", s, 0.55 + j, 0.20 + j));
+        }
+        v
+    }
+
+    #[test]
+    fn the_report_states_losses_as_plainly_as_wins_and_names_the_data() {
+        let r = render(&eight_seeds(), "synthetic blobs, not MNIST");
+        assert!(r.starts_with("Data: synthetic blobs, not MNIST"), "{r}");
+        let acc = r
+            .lines()
+            .find(|l| l.contains("none, final accuracy"))
+            .unwrap();
+        assert!(acc.contains("better on 8, worse on 0"), "{acc}");
+        assert!(acc.contains("Aetheron was better than the MLP"), "{acc}");
+        let fg = r.lines().find(|l| l.contains("none, forgetting")).unwrap();
+        assert!(fg.contains("better on 0, worse on 8"), "{fg}");
+        assert!(
+            fg.contains("the MLP was better than Aetheron"),
+            "lower forgetting is better: {fg}"
+        );
+    }
+
+    #[test]
+    fn missing_pairs_and_unknown_data_are_said_not_hidden() {
+        let only_mlp = vec![e("mlp", "none", 1, 0.5, 0.1)];
+        let r = render(&only_mlp, "unknown");
+        assert!(r.contains("nothing can be compared"), "{r}");
+        let dir = std::env::temp_dir().join(format!("mouli-lab-marker-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        let _ = fs::remove_dir_all(d);
+        fs::create_dir_all(d).unwrap();
+        assert!(read_dataset_marker(d).starts_with("unknown"));
+        write_dataset_marker(d, "  MNIST (IDX files given)  ").unwrap();
+        assert_eq!(read_dataset_marker(d), "MNIST (IDX files given)");
+        let _ = fs::remove_dir_all(d);
+    }
 }
