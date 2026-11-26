@@ -4,7 +4,12 @@
 //! mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt [--keep 0.8,0.65,0.5]
 //!             [--down q8_0|f16] [--tolerance 0.05] [--out DIR]
 //!             [--closure N] [--shots 3] [--profile-closure M]
+//!             [--score activation|weighted] [--diagnose]
 //! ```
+//!
+//! `--score weighted` ranks neurons by activation times the norm of their output weights (a 55D
+//! measure) instead of activation alone; `--diagnose` prints per-layer structure and how much of
+//! each layer's contribution the plan keeps.
 //!
 //! With `--closure N` the gate is the closure test (robust score S over five shortcut conditions,
 //! N episodes each) and not plain accuracy; `--profile-closure M` also profiles M episodes per
@@ -16,12 +21,13 @@
 
 use mouli_llm::tokenizer::Tokenizer;
 use mouli_llm::{Model, Sampler, Session};
+use mouli_slice::analysis::{analyse_gguf, layer_reports, render_layers, weighted_scores};
 use mouli_slice::closure::{
     decide_closure, profile_prompts_for_closure, render_closure, run_closure,
 };
 use mouli_slice::gate::{decide, MIN_ITEMS};
 use mouli_slice::gguf_slice::{round_up_to_block, slice_gguf, DownType};
-use mouli_slice::plan::{make_plan, Rule};
+use mouli_slice::plan::{make_plan_from_importance, Rule};
 use mouli_slice::report::{render, PlanSummary, RunSummary};
 use mouli_slice::run::{parse_items, profile_prompts, score_items, ModelScorer};
 use std::path::PathBuf;
@@ -38,13 +44,15 @@ struct Args {
     closure: usize,
     shots: usize,
     profile_closure: usize,
+    weighted: bool,
+    diagnose: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt \
          [--keep 0.8,0.65,0.5] [--down q8_0|f16] [--tolerance 0.05] [--out DIR] \
-         [--closure N] [--shots 3] [--profile-closure M]"
+         [--closure N] [--shots 3] [--profile-closure M] [--score activation|weighted] [--diagnose]"
     );
     std::process::exit(2);
 }
@@ -57,7 +65,12 @@ fn parse_args() -> Args {
     let mut down = DownType::Q8_0;
     let mut tolerance = 0.05;
     let (mut closure, mut shots, mut profile_closure) = (0usize, 3usize, 0usize);
+    let (mut weighted, mut diagnose) = (false, false);
     while let Some(flag) = it.next() {
+        if flag == "--diagnose" {
+            diagnose = true;
+            continue;
+        }
         let Some(value) = it.next() else { usage() };
         match flag.as_str() {
             "--profile" => profile = Some(PathBuf::from(value)),
@@ -77,6 +90,13 @@ fn parse_args() -> Args {
                 };
             }
             "--tolerance" => tolerance = value.parse().unwrap_or_else(|_| usage()),
+            "--score" => {
+                weighted = match value.as_str() {
+                    "weighted" => true,
+                    "activation" => false,
+                    _ => usage(),
+                };
+            }
             "--closure" => closure = value.parse().unwrap_or_else(|_| usage()),
             "--shots" => shots = value.parse().unwrap_or_else(|_| usage()),
             "--profile-closure" => profile_closure = value.parse().unwrap_or_else(|_| usage()),
@@ -94,6 +114,8 @@ fn parse_args() -> Args {
         closure,
         shots,
         profile_closure,
+        weighted,
+        diagnose,
     }
 }
 
@@ -162,6 +184,30 @@ fn main() -> Result<(), String> {
         t.elapsed().as_secs_f64()
     );
 
+    let analysis = if args.weighted || args.diagnose {
+        let t = Instant::now();
+        let a = analyse_gguf(&file).map_err(|e| e.to_string())?;
+        println!("55D weight analysis in {:.1}s", t.elapsed().as_secs_f64());
+        Some(a)
+    } else {
+        None
+    };
+    let scores: Vec<Vec<f64>> = match (&analysis, args.weighted) {
+        (Some(a), true) => weighted_scores(&profiler, a).map_err(|e| e.to_string())?,
+        _ => (0..profiler.layers())
+            .map(|l| profiler.importance(l))
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?,
+    };
+    println!(
+        "ranking neurons by {}",
+        if args.weighted {
+            "activation x output weight norm"
+        } else {
+            "activation"
+        }
+    );
+
     let t = Instant::now();
     let full = score_items(&model, &tokenizer, &eval_items).map_err(|e| e.to_string())?;
     println!("scored the full model in {:.1}s", t.elapsed().as_secs_f64());
@@ -200,8 +246,15 @@ fn main() -> Result<(), String> {
             eprintln!("keep {fraction}: no valid width, skipped");
             continue;
         };
-        let plan = make_plan(&profiler, count as f64 / d_ff as f64, Rule::Uniform)
+        let plan = make_plan_from_importance(&scores, count as f64 / d_ff as f64, Rule::Uniform)
             .map_err(|e| e.to_string())?;
+        if args.diagnose {
+            if let Some(a) = &analysis {
+                let reports =
+                    layer_reports(a, &profiler, &scores, &plan).map_err(|e| e.to_string())?;
+                println!("\nkeep {fraction}:\n{}", render_layers(&reports));
+            }
+        }
         let t = Instant::now();
         let sliced = slice_gguf(&file, &plan.keep, args.down).map_err(|e| e.to_string())?;
         println!(
