@@ -48,11 +48,13 @@
 //! The crate does not measure speed. Fewer neurons do not, by themselves,
 //! establish a particular latency or memory improvement.
 
+pub mod closure;
 pub mod gate;
 pub mod gguf_slice;
 pub mod plan;
 pub mod profile;
 pub mod report;
+pub mod run;
 pub mod slice;
 
 use std::error::Error;
