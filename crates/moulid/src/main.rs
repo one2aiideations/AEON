@@ -25,7 +25,6 @@ use std::thread::sleep;
 use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are MOULI, a helpful assistant running entirely on this computer with no internet connection. Answer clearly and concisely.";
-const REPLY_TOKENS: u32 = 512;
 /// Conversation budget for hosted models (their context is large; this keeps cost sensible).
 const HOSTED_CONTEXT_TOKENS: usize = 6_000;
 
@@ -142,6 +141,10 @@ fn finish(pid1: bool, code: u8) -> ExitCode {
 struct ServerBackend {
     port: u16,
     log: Option<(Store, String)>,
+    /// Most tokens in one answer.
+    reply_tokens: u32,
+    /// Strings that end an answer (see `moulid::reply`).
+    stop: Vec<String>,
 }
 
 impl ServerBackend {
@@ -161,7 +164,7 @@ impl Backend for ServerBackend {
         if let Some(last) = history.last() {
             self.record(last.role, &last.content);
         }
-        let answer = http::chat_messages(self.port, &turns, REPLY_TOKENS)?;
+        let answer = http::chat_messages(self.port, &turns, self.reply_tokens, &self.stop)?;
         self.record("assistant", &answer);
         Ok(answer)
     }
@@ -178,7 +181,8 @@ impl Backend for ServerBackend {
         if let Some(last) = history.last() {
             self.record(last.role, &last.content);
         }
-        let answer = http::chat_messages_stream(self.port, &turns, REPLY_TOKENS, on_piece)?;
+        let answer =
+            http::chat_messages_stream(self.port, &turns, self.reply_tokens, &self.stop, on_piece)?;
         self.record("assistant", &answer);
         Ok(answer)
     }
@@ -439,12 +443,19 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     }
                 };
                 say("MOULI ready");
-                // Keep about 80% of the server's context for the conversation; the rest is for
-                // the reply and for the estimate being rough.
-                let max_tokens = usize::try_from(plan.ctx).unwrap_or(2048).saturating_mul(4) / 5;
+                // The answer limit and stop strings come from the kernel command line. The
+                // conversation keeps what the answer does not need, but at most 80% of the
+                // server's context (the estimate is rough).
+                let cmdline = system::kernel_cmdline();
+                let reply_tokens = moulid::reply::reply_tokens(&cmdline, plan.ctx);
+                let ctx = usize::try_from(plan.ctx).unwrap_or(2048);
+                let max_tokens =
+                    (ctx.saturating_mul(4) / 5).min(ctx.saturating_sub(reply_tokens as usize));
                 let mut backend = ServerBackend {
                     port: a.port,
                     log: store.map(|s| (s.clone(), s.new_session())),
+                    reply_tokens,
+                    stop: moulid::reply::stops(&cmdline),
                 };
                 let text_only = cmdline_has(&system::kernel_cmdline(), "mouli.text=1");
                 let session = if text_only {

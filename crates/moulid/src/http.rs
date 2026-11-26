@@ -133,16 +133,34 @@ pub fn chat(port: u16, prompt: &str, n_predict: u32) -> Result<String, String> {
     json_get_string(&resp, "content").ok_or_else(|| "no content in reply".into())
 }
 
+/// The `,"stop":[...]` part of a request, or nothing when there are no stop strings.
+fn stop_field(stop: &[String]) -> String {
+    if stop.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = stop
+        .iter()
+        .map(|s| format!("\"{}\"", json_escape(s)))
+        .collect();
+    format!(",\"stop\":[{}]", items.join(","))
+}
+
 /// Send a whole conversation to `/v1/chat/completions` (the server applies the model's chat
 /// template) and return the assistant's text.
-pub fn chat_messages(port: u16, turns: &[(&str, &str)], max_tokens: u32) -> Result<String, String> {
+pub fn chat_messages(
+    port: u16,
+    turns: &[(&str, &str)],
+    max_tokens: u32,
+    stop: &[String],
+) -> Result<String, String> {
     let msgs: Vec<String> = turns
         .iter()
         .map(|(r, c)| format!("{{\"role\":\"{r}\",\"content\":\"{}\"}}", json_escape(c)))
         .collect();
     let body = format!(
-        "{{\"messages\":[{}],\"max_tokens\":{max_tokens},\"temperature\":0.7,\"stream\":false}}",
-        msgs.join(",")
+        "{{\"messages\":[{}],\"max_tokens\":{max_tokens},\"temperature\":0.7,\"stream\":false{}}}",
+        msgs.join(","),
+        stop_field(stop)
     );
     let (status, resp) = request(
         port,
@@ -204,6 +222,7 @@ pub fn chat_messages_stream(
     port: u16,
     turns: &[(&str, &str)],
     max_tokens: u32,
+    stop: &[String],
     on_piece: &mut dyn FnMut(&str) -> bool,
 ) -> Result<String, String> {
     let msgs: Vec<String> = turns
@@ -211,8 +230,9 @@ pub fn chat_messages_stream(
         .map(|(r, c)| format!("{{\"role\":\"{r}\",\"content\":\"{}\"}}", json_escape(c)))
         .collect();
     let body = format!(
-        "{{\"messages\":[{}],\"max_tokens\":{max_tokens},\"temperature\":0.7,\"stream\":true}}",
-        msgs.join(",")
+        "{{\"messages\":[{}],\"max_tokens\":{max_tokens},\"temperature\":0.7,\"stream\":true{}}}",
+        msgs.join(","),
+        stop_field(stop)
     );
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let timeout = Duration::from_secs(600);
@@ -329,7 +349,7 @@ mod tests {
             .unwrap();
         });
         let mut got = Vec::new();
-        let text = chat_messages_stream(port, &[("user", "hi")], 8, &mut |p| {
+        let text = chat_messages_stream(port, &[("user", "hi")], 8, &[], &mut |p| {
             got.push(p.to_string());
             true
         })
@@ -338,7 +358,7 @@ mod tests {
         assert_eq!(text, "Hi there");
         assert_eq!(got, vec!["Hi", " there"]);
         // Nothing listening: a clear error.
-        assert!(chat_messages_stream(1, &[("user", "x")], 1, &mut |_| true).is_err());
+        assert!(chat_messages_stream(1, &[("user", "x")], 1, &[], &mut |_| true).is_err());
     }
 
     #[test]
@@ -365,6 +385,53 @@ mod tests {
         assert_eq!(parse_response("garbage"), None);
     }
 
+    /// Runs one request against a throwaway server and returns the body that was sent.
+    fn body_sent(stop: &[String], stream: bool) -> String {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 256];
+            while !got.ends_with(b"}") {
+                let n = c.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed early");
+                got.extend_from_slice(&buf[..n]);
+            }
+            let reply: &[u8] = if stream {
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n"
+            } else {
+                b"HTTP/1.0 200 OK\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"
+            };
+            c.write_all(reply).unwrap();
+            String::from_utf8(got).unwrap()
+        });
+        if stream {
+            chat_messages_stream(port, &[("user", "hi")], 40, stop, &mut |_| true).unwrap();
+        } else {
+            chat_messages(port, &[("user", "hi")], 40, stop).unwrap();
+        }
+        t.join().unwrap()
+    }
+
+    #[test]
+    fn stop_strings_are_sent_only_when_there_are_some_and_are_escaped() {
+        for stream in [false, true] {
+            let none = body_sent(&[], stream);
+            assert!(
+                !none.contains("\"stop\""),
+                "no stop key without stop strings: {none}"
+            );
+            assert!(none.contains("\"max_tokens\":40"));
+            let some = body_sent(&["END".to_string(), "a\nb\"c".to_string()], stream);
+            assert!(some.contains("\"stop\":[\"END\",\"a\\nb\\\"c\"]"), "{some}");
+            assert!(some.contains(&format!("\"stream\":{stream}")), "{some}");
+            // The body is still one JSON object, ending in a closing brace.
+            assert!(some.trim_end().ends_with('}'));
+        }
+    }
+
     #[test]
     fn chat_messages_sends_history_and_reads_reply() {
         use std::net::TcpListener;
@@ -385,7 +452,13 @@ mod tests {
             .unwrap();
             String::from_utf8(got).unwrap()
         });
-        let r = chat_messages(port, &[("system", "be brief"), ("user", "say \"hi\"")], 16).unwrap();
+        let r = chat_messages(
+            port,
+            &[("system", "be brief"), ("user", "say \"hi\"")],
+            16,
+            &[],
+        )
+        .unwrap();
         assert_eq!(r, "hi \u{e9}\n!");
         let sent = t.join().unwrap();
         assert!(sent.contains("POST /v1/chat/completions"));
