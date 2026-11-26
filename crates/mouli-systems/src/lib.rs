@@ -19343,13 +19343,15 @@ pub mod wash {
     }
 
     fn secrets(text: &str, out: &mut Vec<Span>) {
-        const KEYWORDS: [&str; 9] = [
+        const KEYWORDS: [&str; 11] = [
             "api_key",
             "api-key",
             "apikey",
             "secret",
             "password",
             "passwd",
+            "pwd",
+            "passphrase",
             "token",
             "private_key",
             "access_key",
@@ -19359,6 +19361,18 @@ pub mod wash {
         for kw in KEYWORDS {
             for (i, _) in lc.match_indices(kw) {
                 let mut j = i + kw.len();
+                // `secret_key`, `token-value`: a name continued with _ or -, but not `tokens`.
+                if matches!(b.get(j), Some(b'_' | b'-')) {
+                    while j < b.len()
+                        && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'-')
+                    {
+                        j += 1;
+                    }
+                }
+                // JSON: the name's closing quote.
+                if matches!(b.get(j), Some(b'"' | b'\'')) {
+                    j += 1;
+                }
                 while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                     j += 1;
                 }
@@ -19387,9 +19401,67 @@ pub mod wash {
                 }
             }
         }
+        // `Authorization: Bearer <token>` / `Basic <base64>`, and a bare long `Bearer <token>`.
+        let cred = |c: u8| {
+            c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+        };
+        let skip_sp = |mut j: usize| {
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            j
+        };
+        for (i, _) in lc.match_indices("authorization") {
+            let j = skip_sp(i + "authorization".len());
+            if j >= b.len() || (b[j] != b':' && b[j] != b'=') {
+                continue;
+            }
+            let mut j = skip_sp(j + 1);
+            if matches!(b.get(j), Some(b'"' | b'\'')) {
+                j += 1;
+            }
+            let word_end = (j..b.len())
+                .find(|&k| !b[k].is_ascii_alphabetic())
+                .unwrap_or(b.len());
+            if matches!(&lc[j..word_end], "bearer" | "basic" | "token")
+                && b.get(word_end) == Some(&b' ')
+            {
+                j = skip_sp(word_end);
+            }
+            let end = (j..b.len()).find(|&k| !cred(b[k])).unwrap_or(b.len());
+            if end > j {
+                out.push((Kind::Secret, j, end));
+            }
+        }
+        for (i, _) in lc.match_indices("bearer ") {
+            if i > 0 && word(b[i - 1]) {
+                continue;
+            }
+            let start = skip_sp(i + "bearer ".len());
+            let end = (start..b.len()).find(|&k| !cred(b[k])).unwrap_or(b.len());
+            if end - start >= 16 {
+                out.push((Kind::Secret, start, end));
+            }
+        }
+        // `scheme://user:password@host`: the password.
+        for (i, _) in text.match_indices("://") {
+            let start = i + 3;
+            let end = (start..b.len())
+                .find(|&k| b[k].is_ascii_whitespace() || matches!(b[k], b'/' | b'"' | b'\''))
+                .unwrap_or(b.len());
+            let authority = &text[start..end];
+            if let Some(at) = authority.rfind('@') {
+                if let Some(colon) = authority[..at].find(':') {
+                    if at > colon + 1 {
+                        out.push((Kind::Secret, start + colon + 1, start + at));
+                    }
+                }
+            }
+        }
         let is_tail = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
-        let formats: [(&str, usize); 11] = [
+        let formats: [(&str, usize); 12] = [
             ("sk-", 20),
+            ("sk_live_", 16),
             ("gsk_", 20),
             ("ghp_", 30),
             ("gho_", 30),
