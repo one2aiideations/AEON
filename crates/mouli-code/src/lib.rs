@@ -11,6 +11,8 @@
 //!   exactly.
 //! * [`repair`]: the repair loop: propose, check, try in a copy, feed back the failure, within
 //!   budgets, then shrink the fix with the minimiser.
+//! * [`repo`]: a map of what a repository defines and which files refer to which, and a ranking of
+//!   the files that matter for a question.
 //! * [`sandbox`]: running a command (the tests) in a throwaway copy of a folder, with a time limit
 //!   and an output cap. Not a security boundary: see its notes.
 //!
@@ -30,5 +32,6 @@ pub mod make;
 pub mod minimize;
 pub mod quality;
 pub mod repair;
+pub mod repo;
 pub mod sandbox;
 pub mod workspace;
