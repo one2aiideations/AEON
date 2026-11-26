@@ -618,6 +618,12 @@ impl Workspace {
         &self.audit
     }
 
+    /// Registered capabilities with their risk and required arguments, sorted by name.
+    #[must_use]
+    pub fn capability_specs(&self) -> Vec<&crate::capability::CapabilitySpec> {
+        self.registry.specs()
+    }
+
     /// Registered capabilities, sorted by name, as `(name, description)`.
     #[must_use]
     pub fn help(&self) -> Vec<(&str, &str)> {

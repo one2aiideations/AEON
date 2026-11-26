@@ -1432,3 +1432,30 @@ fn help_lists_screens_and_only_the_capabilities_the_role_may_run() {
     type_line(&mut d, "/help");
     assert!(chat_texts(&d).pop().unwrap().1.contains("/note.send"));
 }
+
+#[test]
+fn apps_and_files_commands_show_what_exists_and_what_the_role_may_do() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("reader", &["note.read"]));
+    let s = ws.open_session("acme", "zed", "owner").unwrap();
+    ws.put_artifact("acme", &s, "report.txt", "text/plain", b"v1")
+        .unwrap();
+    ws.put_artifact("acme", &s, "report.txt", "text/plain", b"version two")
+        .unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "rita", "reader").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/apps");
+    let apps = chat_texts(&d).pop().unwrap().1;
+    assert!(apps.contains("note.read  reads; you may"), "{apps}");
+    assert!(
+        apps.contains("note.send  needs approval; not for your role"),
+        "{apps}"
+    );
+    type_line(&mut d, "/files");
+    let files = chat_texts(&d).pop().unwrap().1;
+    assert!(
+        files.contains("1 file(s)") && files.contains("report.txt  v2"),
+        "{files}"
+    );
+    assert!(files.contains("11 bytes"), "{files}");
+}

@@ -213,6 +213,58 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// Every application with its capabilities, their risk, and whether this role may run them.
+    fn apps_text(&self) -> String {
+        let mut by_app: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for s in self.ws.capability_specs() {
+            let app = s.name.split('.').next().unwrap_or(&s.name);
+            let risk = match s.risk {
+                mouli_interface::Risk::Read => "reads",
+                mouli_interface::Risk::Write => "changes",
+                mouli_interface::Risk::Consequential => "needs approval",
+            };
+            let who = if self.ws.role_can(&self.role, &s.name) {
+                "you may"
+            } else {
+                "not for your role"
+            };
+            by_app
+                .entry(app)
+                .or_default()
+                .push(format!("  {}  {risk}; {who}", s.name));
+        }
+        if by_app.is_empty() {
+            return "No applications are registered.".into();
+        }
+        by_app
+            .into_iter()
+            .map(|(app, lines)| format!("{app}\n{}", lines.join("\n")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The artifact store: the newest version of each file the workspace holds.
+    fn files_text(&self) -> String {
+        let all = self.ws.artifacts().latest_of_each();
+        if all.is_empty() {
+            return "The artifact store is empty.".into();
+        }
+        let lines: Vec<String> = all
+            .iter()
+            .map(|a| {
+                format!(
+                    "  {}  v{}  {:?}  {} bytes  sha {}",
+                    a.name,
+                    a.version,
+                    a.kind,
+                    a.len,
+                    a.sha256.chars().take(12).collect::<String>()
+                )
+            })
+            .collect();
+        format!("{} file(s):\n{}", all.len(), lines.join("\n"))
+    }
+
     /// What the person can press and run: the screens with their keys, then every registered
     /// capability the signed-in role may use.
     fn help_text(&self) -> String {
@@ -222,7 +274,9 @@ impl<B: Backend> Device<B> {
             .map(|tab| format!("{} {}", tab.key_name(), tab.label()))
             .collect();
         t.push_str(&keys.join(", "));
-        t.push_str("\nCommands: /help, /signin <name> <role>, /<capability> name=value");
+        t.push_str(
+            "\nCommands: /help, /apps, /files, /signin <name> <role>, /<capability> name=value",
+        );
         let mine: Vec<String> = self
             .ws
             .help()
@@ -431,6 +485,19 @@ impl<B: Backend> Device<B> {
     }
 
     fn send(&mut self, text: &str) {
+        match text.trim() {
+            "/apps" => {
+                let t = self.apps_text();
+                self.notice(&t);
+                return;
+            }
+            "/files" => {
+                let t = self.files_text();
+                self.notice(&t);
+                return;
+            }
+            _ => {}
+        }
         if text.trim() == "/help" {
             let help = self.help_text();
             self.notice(&help);
