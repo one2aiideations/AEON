@@ -1376,3 +1376,40 @@ fn the_signin_command_and_menu_switch_the_person_without_reaching_the_model() {
     // Nothing was sent to the model: only the person's own lines and notices are on screen.
     assert!(!texts.iter().any(|(r, _)| *r == Role::Assistant));
 }
+
+#[test]
+fn each_persons_conversation_is_kept_apart_and_comes_back_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        d.on_key(Key::F(1));
+        type_line(&mut d, "alice's secret plan");
+        d.switch_user("bob", "owner").unwrap();
+        assert!(chat_texts(&d).is_empty());
+        type_line(&mut d, "bob here");
+        d.switch_user("alice", "clerk").unwrap();
+        assert!(chat_texts(&d)
+            .iter()
+            .any(|(_, t)| t.contains("secret plan")));
+        assert!(!chat_texts(&d).iter().any(|(_, t)| t.contains("bob here")));
+    }
+    // Restart: bob signs in first and sees only his own.
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "bob", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    let t = chat_texts(&d);
+    assert!(t.iter().any(|(r, x)| *r == Role::User && x == "bob here"));
+    assert!(!t.iter().any(|(_, x)| x.contains("secret")));
+    assert_eq!(t.iter().filter(|(_, x)| x.contains("restored")).count(), 1);
+    drop(d);
+    // Restoring again does not pile up notices.
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "bob", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    assert_eq!(
+        chat_texts(&d)
+            .iter()
+            .filter(|(_, x)| x.contains("restored"))
+            .count(),
+        1
+    );
+}

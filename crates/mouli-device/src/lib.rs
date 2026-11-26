@@ -49,6 +49,8 @@ pub enum Outcome {
     Host(Action),
 }
 
+const RESTORED: &str = "Earlier conversation restored. The model does not remember it.";
+
 /// The principal and role the model's tool calls run as.
 pub const AGENT_USER: &str = "agent:chat";
 /// The workspace role the host must define for [`Device::run_agent`] to work.
@@ -211,6 +213,18 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// Shows the signed-in person's saved conversation. The model does not remember it: each
+    /// start opens a new conversation in the workspace.
+    fn restore_chat(&mut self, keeper: &mut keep::Keeper) {
+        let mut msgs = keeper.load_chat(&self.user);
+        msgs.retain(|m| !(m.role == Role::Notice && m.text == RESTORED));
+        if msgs.is_empty() {
+            return;
+        }
+        self.shell.chat.messages = msgs;
+        self.notice(RESTORED);
+    }
+
     /// Signs another person in on this device (for example a second person who must approve what
     /// the first asked for). The conversation screen is cleared, a new conversation is opened
     /// for them, and the sign-in is written to the audit chain under their name.
@@ -222,10 +236,15 @@ impl<B: Backend> Device<B> {
             .ws
             .open_session(&self.tenant, user.trim(), role)
             .map_err(|e| e.to_string())?;
+        self.refresh(); // keeps the previous person's conversation before the screen is cleared
         let previous = std::mem::replace(&mut self.user, user.trim().to_string());
         self.role = role.to_string();
         self.session = id;
         self.shell.chat.clear();
+        if let Some(mut k) = self.keeper.take() {
+            self.restore_chat(&mut k);
+            self.keeper = Some(k);
+        }
         self.audit_event("signin", &format!("{role} (was {previous})"), "ok");
         self.refresh();
         Ok(())
@@ -520,7 +539,9 @@ impl<B: Backend> Device<B> {
     /// # Errors
     /// A message when the directory or an existing file cannot be read.
     pub fn keep_state_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
-        self.keeper = Some(keep::Keeper::open(dir)?);
+        let mut keeper = keep::Keeper::open(dir)?;
+        self.restore_chat(&mut keeper);
+        self.keeper = Some(keeper);
         self.refresh();
         Ok(())
     }
@@ -528,7 +549,7 @@ impl<B: Backend> Device<B> {
     /// Rebuilds the approvals, audit and security screens from the workspace.
     pub fn refresh(&mut self) {
         if let Some(k) = &mut self.keeper {
-            if let Err(e) = k.save(&self.ws) {
+            if let Err(e) = k.save(&self.ws, &self.user, &self.shell.chat.messages) {
                 self.shell.approvals.message = format!("Could not save the audit log: {e}");
             }
         }

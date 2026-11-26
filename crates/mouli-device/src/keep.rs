@@ -7,6 +7,7 @@
 use mouli_interface::audit::AuditRecord;
 use mouli_interface::workspace::PendingCall;
 use mouli_interface::Workspace;
+use mouli_screen::screens::{Message, Role};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -171,6 +172,34 @@ pub(crate) struct Keeper {
     dir: PathBuf,
     saved_records: usize,
     saved_pending: Vec<PendingCall>,
+    saved_chat: Option<(String, Vec<Message>)>,
+}
+
+/// The most messages of one person's conversation that are kept.
+const MAX_CHAT: usize = 200;
+
+fn role_char(r: Role) -> char {
+    match r {
+        Role::User => 'u',
+        Role::Assistant => 'a',
+        Role::Tool => 't',
+        Role::Notice => 'n',
+    }
+}
+
+fn char_role(c: &str) -> Option<Role> {
+    Some(match c {
+        "u" => Role::User,
+        "a" => Role::Assistant,
+        "t" => Role::Tool,
+        "n" => Role::Notice,
+        _ => return None,
+    })
+}
+
+fn chat_name(user: &str) -> String {
+    let hex: String = user.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("chat-{hex}.txt")
 }
 
 impl Keeper {
@@ -185,11 +214,62 @@ impl Keeper {
             dir: dir.to_path_buf(),
             saved_records,
             saved_pending,
+            saved_chat: None,
         })
     }
 
+    /// The saved conversation of `user` (empty when there is none or it is damaged).
+    pub(crate) fn load_chat(&mut self, user: &str) -> Vec<Message> {
+        let text = fs::read_to_string(self.dir.join(chat_name(user))).unwrap_or_default();
+        let msgs: Vec<Message> = text
+            .lines()
+            .filter_map(|l| {
+                let (r, t) = l.split_once('\t')?;
+                Some(Message {
+                    role: char_role(r)?,
+                    text: unesc(t).ok()?,
+                })
+            })
+            .collect();
+        self.saved_chat = Some((user.to_string(), msgs.clone()));
+        msgs
+    }
+
+    fn save_chat(&mut self, user: &str, msgs: &[Message]) -> Result<(), String> {
+        let from = msgs.len().saturating_sub(MAX_CHAT);
+        let msgs = &msgs[from..];
+        if self
+            .saved_chat
+            .as_ref()
+            .is_some_and(|(u, m)| u == user && m == msgs)
+        {
+            return Ok(());
+        }
+        let path = self.dir.join(chat_name(user));
+        let tmp = self.dir.join("chat.tmp");
+        let text: String = msgs
+            .iter()
+            .map(|m| format!("{}\t{}\n", role_char(m.role), esc(&m.text)))
+            .collect();
+        let write = || -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)
+        };
+        write().map_err(|e| format!("{}: {e}", path.display()))?;
+        self.saved_chat = Some((user.to_string(), msgs.to_vec()));
+        Ok(())
+    }
+
     /// Writes what is new. Returns a message if something could not be written.
-    pub(crate) fn save(&mut self, ws: &Workspace) -> Result<(), String> {
+    pub(crate) fn save(
+        &mut self,
+        ws: &Workspace,
+        user: &str,
+        chat: &[Message],
+    ) -> Result<(), String> {
+        self.save_chat(user, chat)?;
         let all = ws.audit().records();
         if all.len() > self.saved_records {
             let path = self.dir.join(AUDIT_FILE);
