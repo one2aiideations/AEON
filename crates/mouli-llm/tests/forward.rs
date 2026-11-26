@@ -680,3 +680,110 @@ fn open_from_a_file_matches_from_bytes() {
     drop(b);
     std::fs::remove_file(path).unwrap();
 }
+
+/// Every (layer, activations) the observer is shown, in order.
+fn collect_stepwise(model: &Model, toks: &[u32]) -> (Vec<(usize, Vec<f32>)>, Vec<f32>) {
+    let mut seen = Vec::new();
+    let mut s = Session::new(model, 16).unwrap();
+    let mut logits = vec![];
+    for &t in toks {
+        logits = s
+            .forward_observed(t, &mut |l, a| {
+                seen.push((l, a.to_vec()));
+                true
+            })
+            .unwrap()
+            .to_vec();
+    }
+    (seen, logits)
+}
+
+#[test]
+fn the_observer_sees_every_layer_of_every_token_and_changes_nothing() {
+    let s = Spec::llama();
+    let w = weights(&s, 8);
+    let model = Model::from_bytes(gguf(&s, &w)).unwrap();
+    let toks = [2u32, 5, 11, 0, 4];
+
+    let mut plain = Session::new(&model, 16).unwrap();
+    let mut expected = vec![];
+    for t in toks {
+        expected = plain.forward(t).unwrap().to_vec();
+    }
+
+    let (seen, logits) = collect_stepwise(&model, &toks);
+    assert_eq!(logits, expected, "observing must not change the result");
+    assert_eq!(seen.len(), toks.len() * s.n_layer);
+    for (i, (layer, a)) in seen.iter().enumerate() {
+        assert_eq!(
+            *layer,
+            i % s.n_layer,
+            "layers arrive in order for each token"
+        );
+        assert_eq!(a.len(), s.n_ff);
+        assert!(a.iter().all(|v| v.is_finite()));
+    }
+    assert!(seen.iter().any(|(_, a)| a.iter().any(|v| *v != 0.0)));
+}
+
+#[test]
+fn prefill_observed_shows_the_same_activations_as_stepwise() {
+    let s = Spec::llama();
+    let w = weights(&s, 8);
+    let model = Model::from_bytes(gguf(&s, &w)).unwrap();
+    let toks = [2u32, 5, 11, 0, 4];
+
+    let (stepwise, last) = collect_stepwise(&model, &toks);
+
+    let mut chunk: Vec<Vec<(usize, Vec<f32>)>> = vec![Vec::new(); s.n_layer];
+    let mut b = Session::new(&model, 16).unwrap();
+    let logits = b
+        .prefill_observed(&toks, &mut |l, a| {
+            chunk[l].push((l, a.to_vec()));
+            true
+        })
+        .unwrap()
+        .to_vec();
+    assert_eq!(logits.len(), last.len());
+
+    // The prefill path reaches the same activations by a different route (matrix-matrix).
+    // The chunk path visits layer by layer, so group the stepwise ones the same way.
+    for (layer, seen_here) in chunk.iter().enumerate() {
+        let step: Vec<&Vec<f32>> = stepwise
+            .iter()
+            .filter(|(l, _)| *l == layer)
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(step.len(), toks.len());
+        assert_eq!(seen_here.len(), toks.len());
+        for (token, a) in step.iter().enumerate() {
+            for (x, y) in a.iter().zip(&seen_here[token].1) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "layer {layer} token {token}: {x} vs {y}"
+                );
+            }
+        }
+    }
+
+    // A single token takes the ordinary path and is observed too.
+    let mut count = 0;
+    let mut c = Session::new(&model, 16).unwrap();
+    c.prefill_observed(&toks[..1], &mut |_, _| {
+        count += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(count, s.n_layer);
+}
+
+#[test]
+fn an_observer_that_says_stop_ends_the_pass_with_an_error() {
+    let s = Spec::llama();
+    let w = weights(&s, 8);
+    let model = Model::from_bytes(gguf(&s, &w)).unwrap();
+    let mut a = Session::new(&model, 16).unwrap();
+    assert!(a.forward_observed(3, &mut |_, _| false).is_err());
+    let mut b = Session::new(&model, 16).unwrap();
+    assert!(b.prefill_observed(&[1, 2, 3], &mut |_, _| false).is_err());
+}

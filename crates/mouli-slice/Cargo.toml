@@ -1,0 +1,17 @@
+[package]
+name = "mouli-slice"
+version = "0.1.0"
+description = "Domain-aware MLP neuron profiling, slicing, and quality gating for MOULI"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mouli_slice"
+path = "src/lib.rs"
+
+[dependencies]
+mouli-llm = { path = "../mouli-llm" }
+
+[lints]
+workspace = true

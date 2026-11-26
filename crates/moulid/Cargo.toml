@@ -22,7 +22,7 @@ mouli-device = { path = "../mouli-device" }
 mouli-apps = { path = "../mouli-apps", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "term"] }
+nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "term", "signal"] }
 
 [dev-dependencies]
 mouli-pki = { path = "../mouli-pki" }

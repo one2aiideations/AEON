@@ -15,6 +15,9 @@ mouli-screen = { path = "../mouli-screen" }
 mouli-interface = { path = "../mouli-interface" }
 mouli-code = { path = "../mouli-code" }
 mouli-apps = { path = "../mouli-apps" }
+mouli-crypto = { path = "../mouli-crypto" }
+mouli-systems = { path = "../mouli-systems", default-features = false, features = ["security"] }
+serde_json = "1"
 mouli-player = { path = "../mouli-player", optional = true }
 mouli-studio = { path = "../mouli-studio", optional = true }
 

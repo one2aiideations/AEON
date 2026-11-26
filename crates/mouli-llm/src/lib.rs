@@ -11929,6 +11929,14 @@ mod session {
     /// Tokens processed together when a prompt is read.
     const PREFILL_CHUNK: usize = 32;
 
+    /// Receives `(layer, activations)` for every token and layer: the `d_ff` values of
+    /// `silu(gate) * up`, the input of the down projection. Return `false` to stop with an error.
+    pub type Observer<'a> = &'a mut dyn FnMut(usize, &[f32]) -> bool;
+
+    fn observer_failed() -> LlmError {
+        LlmError::BadConfig("activation observer failed")
+    }
+
     /// State of one conversation with a [`Model`]: the KV cache and the next position.
     pub struct Session<'m> {
         model: &'m Model,
@@ -12034,6 +12042,24 @@ mod session {
 
         /// Process one token and return the logits for the next one.
         pub fn forward(&mut self, token: u32) -> Result<&[f32], LlmError> {
+            self.forward_inner(token, &mut None)
+        }
+
+        /// Like [`Session::forward`], and shows each layer's feed-forward activations to
+        /// `observe` (see [`Observer`]). Results are identical to `forward`.
+        pub fn forward_observed(
+            &mut self,
+            token: u32,
+            observe: Observer<'_>,
+        ) -> Result<&[f32], LlmError> {
+            self.forward_inner(token, &mut Some(observe))
+        }
+
+        fn forward_inner(
+            &mut self,
+            token: u32,
+            obs: &mut Option<Observer<'_>>,
+        ) -> Result<&[f32], LlmError> {
             let m = self.model;
             let c = m.config();
             if self.pos >= self.limit {
@@ -12118,6 +12144,11 @@ mod session {
                 m.matvec(&layer.w_gate, &self.xn, &mut self.gate)?;
                 m.matvec(&layer.w_up, &self.xn, &mut self.up)?;
                 map_op(ops::swiglu(&self.gate, &self.up, &mut self.hidden))?;
+                if let Some(o) = obs.as_deref_mut() {
+                    if !o(l, &self.hidden) {
+                        return Err(observer_failed());
+                    }
+                }
                 m.matvec(&layer.w_down, &self.hidden, &mut self.xn)?;
                 for (x, o) in self.x.iter_mut().zip(&self.xn) {
                     *x += o;
@@ -12143,6 +12174,24 @@ mod session {
         /// Tokens are taken in chunks so that every weight is read once per chunk, not once per
         /// token; the result is the same as feeding them one at a time (up to rounding).
         pub fn prefill(&mut self, tokens: &[u32]) -> Result<&[f32], LlmError> {
+            self.prefill_inner(tokens, &mut None)
+        }
+
+        /// Like [`Session::prefill`], and shows every token's feed-forward activations to
+        /// `observe` (see [`Observer`]), layer by layer. Results are identical to `prefill`.
+        pub fn prefill_observed(
+            &mut self,
+            tokens: &[u32],
+            observe: Observer<'_>,
+        ) -> Result<&[f32], LlmError> {
+            self.prefill_inner(tokens, &mut Some(observe))
+        }
+
+        fn prefill_inner(
+            &mut self,
+            tokens: &[u32],
+            obs: &mut Option<Observer<'_>>,
+        ) -> Result<&[f32], LlmError> {
             if tokens.is_empty() {
                 return Err(LlmError::BadConfig("prefill needs at least one token"));
             }
@@ -12154,9 +12203,9 @@ mod session {
             for (i, ch) in chunks.into_iter().enumerate() {
                 if ch.len() == 1 {
                     // A lone token takes the ordinary path (and a lone final token needs logits).
-                    self.forward(ch[0])?;
+                    self.forward_inner(ch[0], obs)?;
                 } else {
-                    self.forward_chunk(ch, i == last)?;
+                    self.forward_chunk(ch, i == last, obs)?;
                 }
             }
             Ok(&self.logits)
@@ -12164,7 +12213,12 @@ mod session {
 
         /// Runs `tokens` (at least two) through the network together. Logits are produced only
         /// when `want_logits` is set.
-        fn forward_chunk(&mut self, tokens: &[u32], want_logits: bool) -> Result<(), LlmError> {
+        fn forward_chunk(
+            &mut self,
+            tokens: &[u32],
+            want_logits: bool,
+            obs: &mut Option<Observer<'_>>,
+        ) -> Result<(), LlmError> {
             let m = self.model;
             let c = m.config();
             let t = tokens.len();
@@ -12278,6 +12332,11 @@ mod session {
                         &up[i * ff..(i + 1) * ff],
                         &mut hidden[i * ff..(i + 1) * ff],
                     ))?;
+                    if let Some(o) = obs.as_deref_mut() {
+                        if !o(l, &hidden[i * ff..(i + 1) * ff]) {
+                            return Err(observer_failed());
+                        }
+                    }
                 }
                 m.matmat(&layer.w_down, &hidden, t, &mut xn)?;
                 for (xv, o) in x.iter_mut().zip(&xn) {
@@ -12331,4 +12390,4 @@ mod session {
 pub use config::{Config, LlmError, RopeStyle};
 pub use model::Model;
 pub use sampler::Sampler;
-pub use session::Session;
+pub use session::{Observer, Session};

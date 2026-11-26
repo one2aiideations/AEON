@@ -1,0 +1,24 @@
+[package]
+name = "mouli-studio-suite"
+version = "0.1.0"
+description = "MOULI-STUDIO suite: documents, spreadsheets, charts, databases, presentations, PDF, images and an agent, local-first with a hash-chained audit log"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mouli_studio_suite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mouli-studio"
+path = "src/main.rs"
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false }
+png = { version = "0.17", default-features = false }
+jpeg-decoder = { version = "0.3", default-features = false }
+jpeg-encoder = { version = "0.6", default-features = false }
+
+[lints]
+workspace = true

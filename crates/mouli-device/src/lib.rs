@@ -9,8 +9,13 @@
 //! washes the text; the backend only turns a prompt into an answer.
 #![forbid(unsafe_code)]
 
+mod accounts;
+mod keep;
 mod patch;
+mod roles;
+mod rulepack;
 mod security;
+mod signin;
 
 #[cfg(feature = "office")]
 use mouli_apps::Apps;
@@ -21,7 +26,9 @@ use mouli_screen::screen::Action;
 use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, Role};
 use mouli_screen::shell::Shell;
 
+pub use keep::{restore, Restored};
 pub use patch::PatchError;
+pub use roles::{add_default_roles, CLERK, OWNER, VIEWER};
 
 /// Something that can answer a prompt with the model the workspace chose.
 pub trait Backend {
@@ -45,6 +52,8 @@ pub enum Outcome {
     Host(Action),
 }
 
+const RESTORED: &str = "Earlier conversation restored. The model does not remember it.";
+
 /// The principal and role the model's tool calls run as.
 pub const AGENT_USER: &str = "agent:chat";
 /// The workspace role the host must define for [`Device::run_agent`] to work.
@@ -61,6 +70,11 @@ pub struct Device<B: Backend> {
     role: String,
     session: String,
     patch: patch::PatchSlot,
+    keeper: Option<keep::Keeper>,
+    accounts: Option<accounts::Accounts>,
+    accounts_error: Option<String>,
+    locked: bool,
+    export_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "office")]
     apps: Option<Apps>,
     #[cfg(feature = "office")]
@@ -99,6 +113,11 @@ impl<B: Backend> Device<B> {
             role: role.into(),
             session,
             patch: patch::PatchSlot::default(),
+            keeper: None,
+            accounts: None,
+            accounts_error: None,
+            locked: false,
+            export_dir: None,
             #[cfg(feature = "office")]
             apps: None,
             #[cfg(feature = "office")]
@@ -205,6 +224,261 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// Every application with its capabilities, their risk, and whether this role may run them.
+    fn apps_text(&self) -> String {
+        let mut by_app: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for s in self.ws.capability_specs() {
+            let app = s.name.split('.').next().unwrap_or(&s.name);
+            let risk = match s.risk {
+                mouli_interface::Risk::Read => "reads",
+                mouli_interface::Risk::Write => "changes",
+                mouli_interface::Risk::Consequential => "needs approval",
+            };
+            let who = if self.ws.role_can(&self.role, &s.name) {
+                "you may"
+            } else {
+                "not for your role"
+            };
+            by_app
+                .entry(app)
+                .or_default()
+                .push(format!("  {}  {risk}; {who}", s.name));
+        }
+        if by_app.is_empty() {
+            return "No applications are registered.".into();
+        }
+        by_app
+            .into_iter()
+            .map(|(app, lines)| format!("{app}\n{}", lines.join("\n")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The artifact store: the newest version of each file the workspace holds.
+    fn files_text(&self) -> String {
+        let all = self.ws.artifacts().latest_of_each();
+        if all.is_empty() {
+            return "The artifact store is empty.".into();
+        }
+        let lines: Vec<String> = all
+            .iter()
+            .map(|a| {
+                format!(
+                    "  {}  v{}  {:?}  {} bytes  sha {}",
+                    a.name,
+                    a.version,
+                    a.kind,
+                    a.len,
+                    a.sha256.chars().take(12).collect::<String>()
+                )
+            })
+            .collect();
+        format!("{} file(s):\n{}", all.len(), lines.join("\n"))
+    }
+
+    /// What the person can press and run: the screens with their keys, then every registered
+    /// capability the signed-in role may use.
+    fn help_text(&self) -> String {
+        let mut t = String::from("Screens: ");
+        let keys: Vec<String> = mouli_screen::screen::Tab::ALL
+            .iter()
+            .map(|tab| format!("{} {}", tab.key_name(), tab.label()))
+            .collect();
+        t.push_str(&keys.join(", "));
+        t.push_str(
+            "\nCommands: /help, /apps, /files, /save [name], /unlock <name>, /contrast on|off, /textsize 1-3, /signin <name> <role>, /<capability> name=value",
+        );
+        let mine: Vec<String> = self
+            .ws
+            .help()
+            .into_iter()
+            .filter(|(name, _)| self.ws.role_can(&self.role, name))
+            .map(|(name, what)| format!("  /{name}  {what}"))
+            .collect();
+        if mine.is_empty() {
+            t.push_str("\nYour role may not run any capability.");
+        } else {
+            t.push_str(&format!(
+                "\nYou ({}) may run:\n{}",
+                self.role,
+                mine.join("\n")
+            ));
+        }
+        t
+    }
+
+    /// Shows the signed-in person's saved conversation. The model does not remember it: each
+    /// start opens a new conversation in the workspace.
+    fn restore_chat(&mut self, keeper: &mut keep::Keeper) {
+        let mut msgs = keeper.load_chat(&self.user);
+        msgs.retain(|m| !(m.role == Role::Notice && m.text == RESTORED));
+        if msgs.is_empty() {
+            return;
+        }
+        self.shell.chat.messages = msgs;
+        self.notice(RESTORED);
+    }
+
+    /// Marks a security finding as seen: written to the audit chain under the signed-in person's
+    /// name together with what it said, so it comes back if it changes. The broken-chain
+    /// finding can be acknowledged but keeps counting in the risk score.
+    fn acknowledge_finding(&mut self, id: &str) {
+        let Some(f) = self
+            .shell
+            .security
+            .findings
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+        else {
+            self.shell.security.message = "That finding is gone.".into();
+            return;
+        };
+        self.audit_event("finding.ack", &format!("{}|{}", f.id, f.title), "ok");
+        self.shell.security.message = if f.severity == mouli_screen::screens::Severity::Critical {
+            "Marked as seen. It still counts toward the risk until it is fixed.".into()
+        } else {
+            String::new()
+        };
+    }
+
+    /// Writes the evidence for one finding to a new text file in the export folder: what the
+    /// finding says, the audit records behind it, and the chain head so the file can be matched
+    /// to the log later. Writes an audit record naming the file.
+    fn export_finding(&mut self, id: &str) -> Result<String, String> {
+        let dir = self
+            .export_dir
+            .clone()
+            .ok_or("there is no data disk to save to")?;
+        let f = self
+            .shell
+            .security
+            .findings
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+            .ok_or("that finding is gone")?;
+        let text = security::evidence(&self.ws, &f, &self.user);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let slug: String =
+            f.id.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+        let (path, mut file) = (1..)
+            .find_map(|i| {
+                let p = dir.join(format!("evidence-{slug}-{i}.txt"));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&p)
+                    .ok()
+                    .map(|file| (p, file))
+            })
+            .ok_or("no free file name")?;
+        std::io::Write::write_all(&mut file, text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let shown = path.display().to_string();
+        self.audit_event("finding.export", &format!("{}|{shown}", f.id), "ok");
+        Ok(shown)
+    }
+
+    /// Writes an event of the host (for example a screenshot) into the audit chain as the
+    /// signed-in person.
+    pub fn record_event(&mut self, action: &str, subject: &str, outcome: &str) {
+        self.audit_event(action, subject, outcome);
+        self.refresh();
+    }
+
+    /// Sets the folder `/save` writes answers into (created when first used).
+    pub fn set_export_dir(&mut self, dir: &std::path::Path) {
+        self.export_dir = Some(dir.to_path_buf());
+    }
+
+    /// Writes the last answer to a new file in the export folder and says where.
+    fn save_answer(&mut self, name: Option<&str>) -> Result<String, String> {
+        let dir = self
+            .export_dir
+            .clone()
+            .ok_or("nothing can be saved: there is no data disk")?;
+        let text = self
+            .shell
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.text.clone())
+            .ok_or("there is no answer to save yet")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = match name {
+            Some(n) => {
+                let ok = !n.is_empty()
+                    && n.len() <= 64
+                    && !n.starts_with('.')
+                    && n.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+                if !ok {
+                    return Err("use letters, digits, . - _ in the name".into());
+                }
+                n.to_string()
+            }
+            None => (1..)
+                .map(|i| format!("answer-{i}.txt"))
+                .find(|f| !dir.join(f).exists())
+                .unwrap_or_default(),
+        };
+        let path = dir.join(&file);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("{file} already exists; pick another name")
+                } else {
+                    e.to_string()
+                }
+            })?;
+        std::io::Write::write_all(&mut f, text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        self.audit_event("answer.save", &file, "ok");
+        Ok(path.display().to_string())
+    }
+
+    /// Signs another person in on this device (for example a second person who must approve what
+    /// the first asked for). The conversation screen is cleared, a new conversation is opened
+    /// for them, and the sign-in is written to the audit chain under their name.
+    ///
+    /// # Errors
+    /// A message for a blank name or an unknown role; nothing changes then.
+    pub fn switch_user(&mut self, user: &str, role: &str) -> Result<(), String> {
+        let id = self
+            .ws
+            .open_session(&self.tenant, user.trim(), role)
+            .map_err(|e| e.to_string())?;
+        self.refresh(); // keeps the previous person's conversation before the screen is cleared
+        let previous = std::mem::replace(&mut self.user, user.trim().to_string());
+        self.role = role.to_string();
+        self.session = id;
+        self.shell.chat.clear();
+        if let Some(mut k) = self.keeper.take() {
+            self.restore_chat(&mut k);
+            self.keeper = Some(k);
+        }
+        self.audit_event("signin", &format!("{role} (was {previous})"), "ok");
+        self.refresh();
+        Ok(())
+    }
+
     /// The id of the conversation the device is working in.
     pub fn session(&self) -> &str {
         &self.session
@@ -222,7 +496,12 @@ impl<B: Backend> Device<B> {
 
     /// Feeds one key to the interface and carries out whatever it asked for.
     pub fn on_key(&mut self, key: Key) -> Outcome {
-        let action = self.shell.on_key(key);
+        // Locked: only the conversation takes keys, so no other screen can be reached.
+        let action = if self.locked {
+            mouli_screen::screen::Screen::on_key(&mut self.shell.chat, key)
+        } else {
+            self.shell.on_key(key)
+        };
         self.run(action)
     }
 
@@ -236,8 +515,15 @@ impl<B: Backend> Device<B> {
     }
 
     fn perform(&mut self, action: Action) -> Outcome {
+        if self.locked {
+            return self.perform_locked(action);
+        }
         match action {
             Action::None | Action::Show(_) => Outcome::Handled,
+            Action::Secret { token, text } => {
+                self.secret_entered(&token, text.expose());
+                Outcome::Handled
+            }
             Action::Quit => Outcome::Quit,
             Action::Reboot => Outcome::Reboot,
             Action::Send(text) => {
@@ -252,6 +538,26 @@ impl<B: Backend> Device<B> {
                     }
                     Err(e) => self.notice(&e.to_string()),
                 }
+                Outcome::Handled
+            }
+            Action::SwitchUser => {
+                self.notice(&format!(
+                    "Signed in as {} ({}). To work as someone else type: /signin <name> <role>   (roles: {})",
+                    self.user,
+                    self.role,
+                    self.ws.role_names().join(", ")
+                ));
+                Outcome::Handled
+            }
+            Action::AckFinding(id) => {
+                self.acknowledge_finding(&id);
+                Outcome::Handled
+            }
+            Action::ExportFinding(id) => {
+                self.shell.security.message = match self.export_finding(&id) {
+                    Ok(path) => format!("Evidence saved to {path}"),
+                    Err(e) => format!("Evidence not saved: {e}"),
+                };
                 Outcome::Handled
             }
             Action::Decide { id, approve } => {
@@ -283,7 +589,9 @@ impl<B: Backend> Device<B> {
             | Action::Wifi
             | Action::Hosted
             | Action::HardwareInfo
-            | Action::SwitchUser) => Outcome::Host(other),
+            | Action::Setting { .. }
+            | Action::WifiScan
+            | Action::WifiJoin { .. }) => Outcome::Host(other),
         }
     }
 
@@ -349,6 +657,63 @@ impl<B: Backend> Device<B> {
     }
 
     fn send(&mut self, text: &str) {
+        match text.trim() {
+            "/apps" => {
+                let t = self.apps_text();
+                self.notice(&t);
+                return;
+            }
+            "/files" => {
+                let t = self.files_text();
+                self.notice(&t);
+                return;
+            }
+            _ => {}
+        }
+        if let Some(rest) = text.trim().strip_prefix("/unlock") {
+            if rest.is_empty() || rest.starts_with(' ') {
+                let target = rest.trim();
+                if target.is_empty() {
+                    let who = self.ws.locked_out();
+                    self.notice(&if who.is_empty() {
+                        "Nobody is locked out.".to_string()
+                    } else {
+                        format!("Locked out: {}. Type /unlock <name>.", who.join(", "))
+                    });
+                } else {
+                    let (user, role) = (self.user.clone(), self.role.clone());
+                    match self.ws.clear_lockout(&user, &role, target) {
+                        Ok(()) => self.notice(&format!("{target} can act again.")),
+                        Err(e) => self.notice(&format!("Not unlocked: {e}")),
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(rest) = text.trim().strip_prefix("/save") {
+            if rest.is_empty() || rest.starts_with(' ') {
+                let name = Some(rest.trim()).filter(|n| !n.is_empty());
+                match self.save_answer(name) {
+                    Ok(path) => self.notice(&format!("Saved the last answer to {path}")),
+                    Err(e) => self.notice(&format!("Not saved: {e}")),
+                }
+                return;
+            }
+        }
+        if text.trim() == "/help" {
+            let help = self.help_text();
+            self.notice(&help);
+            return;
+        }
+        if let Some(rest) = text.strip_prefix("/signin") {
+            if rest.is_empty() || rest.starts_with(' ') {
+                self.signin_command(rest);
+                return;
+            }
+        }
+        if self.account_command(text.trim()) {
+            return;
+        }
         self.shell.chat.push(Role::User, text);
         match self.ws.submit(&self.tenant, &self.session, text) {
             Ok(Reply::Chat {
@@ -469,8 +834,36 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// Keeps the audit chain (append-only, synced) and the held approvals in `dir`, and writes
+    /// everything that is new at once. Load the saved state first with [`restore`].
+    ///
+    /// # Errors
+    /// A message when the directory or an existing file cannot be read.
+    pub fn keep_state_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let mut keeper = keep::Keeper::open(dir)?;
+        match accounts::Accounts::open(dir) {
+            Ok(a) => self.accounts = Some(a),
+            // A damaged accounts file must never open the device: it stays locked.
+            Err(e) => self.accounts_error = Some(e),
+        }
+        let alert = keeper.check_checkpoint(&self.ws);
+        self.restore_chat(&mut keeper);
+        self.keeper = Some(keeper);
+        if let Some(why) = alert {
+            // Written into the chain so the finding outlives this start.
+            self.audit_event("checkpoint.failed", &why, "alert");
+        }
+        self.refresh();
+        Ok(())
+    }
+
     /// Rebuilds the approvals, audit and security screens from the workspace.
     pub fn refresh(&mut self) {
+        if let Some(k) = &mut self.keeper {
+            if let Err(e) = k.save(&self.ws, &self.user, &self.shell.chat.messages) {
+                self.shell.approvals.message = format!("Could not save the audit log: {e}");
+            }
+        }
         let can_approve = self.ws.role_can(&self.role, "approve");
         let rows: Vec<ApprovalRow> = self
             .ws

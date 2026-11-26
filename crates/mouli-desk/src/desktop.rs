@@ -348,6 +348,8 @@ impl Desktop {
             Key::Ctrl('w') => Some(Command::CloseWindow),
             Key::Ctrl('q') => Some(Command::Quit),
             Key::Ctrl('b') => Some(Command::Open(Tab::Browser)),
+            Key::Ctrl('o') => Some(Command::Open(Tab::Settings)),
+            Key::Ctrl('e') => Some(Command::Open(Tab::Wifi)),
             Key::F(n @ 1..=12) => Tab::ALL
                 .get(usize::from(n) - 1)
                 .filter(|t| !MOVED_OUT.contains(t))
@@ -920,7 +922,7 @@ mod tests {
         let view = d.menu.title_rects()[3];
         click(&mut d, &mut s, view.x + 5, 8, 0);
         assert_eq!(d.menu.open, Some(3), "a click leaves the menu open");
-        let item = d.menu.item_rects(3)[10]; // Admin > Security
+        let item = d.menu.item_rects(3)[12]; // Admin > Security
         let a = click(&mut d, &mut s, item.x + 10, item.y + 5, 10);
         assert_eq!(a, Action::Show(Tab::Security));
         assert_eq!(d.menu.open, None);

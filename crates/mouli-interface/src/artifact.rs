@@ -186,6 +186,12 @@ impl ArtifactStore {
         self.items.get(id).map(|(a, _)| a)
     }
 
+    /// The newest version of every name, sorted by name.
+    #[must_use]
+    pub fn latest_of_each(&self) -> Vec<&Artifact> {
+        self.by_name.keys().filter_map(|n| self.latest(n)).collect()
+    }
+
     /// All versions of `name`, oldest first.
     #[must_use]
     pub fn versions(&self, name: &str) -> Vec<&Artifact> {

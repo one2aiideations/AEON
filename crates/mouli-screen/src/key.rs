@@ -67,7 +67,10 @@ impl KeyParser {
     /// Call when no more bytes are coming soon (a short pause after input): a lone Escape that
     /// was being held back is now a real Escape key, and incomplete UTF-8 is dropped.
     pub fn flush(&mut self) -> Vec<Key> {
-        self.drain(true)
+        let keys = self.drain(true);
+        // A pause ends whatever sequence was being skipped; the next key is a new one.
+        self.discarding = false;
+        keys
     }
 
     fn drain(&mut self, flush: bool) -> Vec<Key> {
@@ -359,6 +362,78 @@ mod tests {
         assert_eq!(p.feed(b"A"), vec![Key::Up]);
         assert!(p.feed(&"€".as_bytes()[..2]).is_empty());
         assert_eq!(p.feed(&"€".as_bytes()[2..]), vec![Key::Char('€')]);
+    }
+
+    /// A small deterministic random source (no dependencies, same run every time).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn random_byte_streams_never_panic_hang_or_grow_the_buffer() {
+        let mut rng = Lcg(0x4d4f554c49);
+        // Escape-heavy alphabet so sequences start, grow and break in every way.
+        let alphabet: &[u8] = b"\x1b\x1b\x1b[[O;0123456789ABCDEFPQRSHm~ \r\n\t\x7f\x08\x00\x1c";
+        for round in 0..20_000 {
+            let mut p = KeyParser::new();
+            let len = rng.below(80) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            if rng.below(4) == 0 {
+                // An escape sequence that runs past the limit.
+                bytes.extend_from_slice(b"\x1b[");
+                bytes.extend(std::iter::repeat_n(b'1', 10 + rng.below(30) as usize));
+            }
+            for _ in 0..len {
+                bytes.push(if rng.below(5) == 0 {
+                    rng.next() as u8
+                } else {
+                    alphabet[rng.below(alphabet.len() as u64) as usize]
+                });
+            }
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                let n = (rng.below(7) as usize + 1).min(rest.len());
+                p.feed(&rest[..n]);
+                rest = &rest[n..];
+                assert!(
+                    p.buf.len() <= MAX_SEQ + 8,
+                    "round {round}: buffer grew to {}",
+                    p.buf.len()
+                );
+                if rng.below(6) == 0 {
+                    p.flush();
+                    assert!(p.buf.is_empty(), "round {round}: flush left bytes behind");
+                }
+            }
+            // After a pause the parser is always ready: the next plain key comes through.
+            p.flush();
+            assert_eq!(
+                p.feed(b"a"),
+                vec![Key::Char('a')],
+                "round {round}: stuck after {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlong_sequence_cut_short_does_not_swallow_the_next_keys() {
+        let mut p = KeyParser::new();
+        p.feed(b"\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1");
+        p.flush();
+        assert_eq!(
+            p.feed(b"123"),
+            vec![Key::Char('1'), Key::Char('2'), Key::Char('3')]
+        );
     }
 
     #[test]

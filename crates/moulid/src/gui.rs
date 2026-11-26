@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -323,8 +323,16 @@ pub enum Ev {
     Mouse(MouseEvent),
     /// A key was pressed.
     Key(Key),
+    /// The model produced a piece of its answer (shown at once, before the answer is complete).
+    Piece(String),
     /// The model finished answering (or failed).
     Reply(Result<String, String>),
+    /// A Wi-Fi scan finished (or could not run).
+    WifiScanned(Result<Vec<mouli_screen::screens::WifiRow>, String>),
+    /// Joining a Wi-Fi network finished: a summary of the link, or why not.
+    WifiJoined(Result<String, String>),
+    /// The system asked the desktop to stop (SIGTERM or SIGHUP).
+    Terminate,
     /// The browser finished loading an address (or failed).
     Page {
         /// The address that was asked for.
@@ -603,6 +611,337 @@ fn time_zone_command(
     format!("Time zone set to {}.{saved}", sysinfo::zone_label(minutes))
 }
 
+/// How the desktop is shown: stronger colours, and bigger text for small or far screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewOpts {
+    /// Whether the high-contrast colours are on.
+    contrast: bool,
+    /// How many screen pixels each desktop pixel covers (1 to 3).
+    scale: usize,
+}
+
+const CONTRAST_KEY: &str = "view.contrast";
+const SCALE_KEY: &str = "view.scale";
+const MAX_SCALE: usize = 3;
+
+/// The saved view options (defaults when nothing is saved or a value is not understood).
+fn load_view(store: Option<&crate::persist::Store>) -> ViewOpts {
+    let saved = store
+        .map(crate::persist::Store::settings)
+        .unwrap_or_default();
+    ViewOpts {
+        contrast: saved.get(CONTRAST_KEY).is_some_and(|v| v == "on"),
+        scale: saved
+            .get(SCALE_KEY)
+            .and_then(|v| v.parse().ok())
+            .filter(|k| (1..=MAX_SCALE).contains(k))
+            .unwrap_or(1),
+    }
+}
+
+/// The scale that can really be used on a `w` by `h` screen: the desktop needs at least 640 by
+/// 480 of its own pixels.
+fn usable_scale(want: usize, w: usize, h: usize) -> usize {
+    (1..=want.clamp(1, MAX_SCALE))
+        .rev()
+        .find(|k| w / k >= 640 && h / k >= 480)
+        .unwrap_or(1)
+}
+
+/// The picture as it goes to the screen.
+fn shape(canvas: mouli_screen::raster::Canvas, v: ViewOpts) -> mouli_screen::raster::Canvas {
+    let c = if v.contrast {
+        canvas.high_contrast()
+    } else {
+        canvas
+    };
+    c.scaled(v.scale)
+}
+
+fn save_view(store: Option<&crate::persist::Store>, key: &str, value: &str) -> &'static str {
+    match store {
+        Some(s) => match s.set(key, value) {
+            Ok(()) => " It is kept for the next start.",
+            Err(_) => " (It could not be saved.)",
+        },
+        None => " (No MOULI-DATA disk, so it is forgotten at power-off.)",
+    }
+}
+
+/// Blanks the screen after a while without a key or the mouse, and wakes it on the next one.
+/// (There is no lock: MOULI has no password to ask for yet, so waking needs no proof.)
+#[derive(Debug, Clone, Copy)]
+struct IdleBlank {
+    timeout: Option<Duration>,
+    last_input: Instant,
+    blanked: bool,
+}
+
+impl IdleBlank {
+    fn new(minutes: u32, now: Instant) -> Self {
+        Self {
+            timeout: (minutes > 0).then(|| Duration::from_secs(u64::from(minutes) * 60)),
+            last_input: now,
+            blanked: false,
+        }
+    }
+
+    /// How long to wait for input before blanking; `None` when blanking is off or done.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        if self.blanked {
+            return None;
+        }
+        self.timeout
+            .map(|t| t.saturating_sub(now.saturating_duration_since(self.last_input)))
+    }
+
+    /// True (once) when it is time to blank the screen.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.wait(now) == Some(Duration::ZERO) {
+            self.blanked = true;
+            return true;
+        }
+        false
+    }
+
+    /// A key or the mouse. Returns true when it only woke the screen and must not act.
+    fn input(&mut self, now: Instant) -> bool {
+        self.last_input = now;
+        std::mem::replace(&mut self.blanked, false)
+    }
+}
+
+const IDLE_KEY: &str = "view.idle";
+const DEFAULT_IDLE_MIN: u32 = 10;
+
+fn load_idle(store: Option<&crate::persist::Store>) -> u32 {
+    store
+        .and_then(|s| s.settings().get(IDLE_KEY).cloned())
+        .and_then(|v| v.parse().ok())
+        .filter(|m| [0, 5, 10, 30].contains(m))
+        .unwrap_or(DEFAULT_IDLE_MIN)
+}
+
+fn idle_label(minutes: u32) -> String {
+    if minutes == 0 {
+        "off".into()
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// Writes the picture as a new PNG file `screenshot-N.png` in `dir` (created if needed) and
+/// returns its name. Never replaces an existing file.
+fn save_screenshot(canvas: &Canvas, dir: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let png = mouli_screen::raster::to_png(canvas);
+    for n in 1..10_000 {
+        let name = format!("screenshot-{n}.png");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(mut f) => {
+                return std::io::Write::write_all(&mut f, &png)
+                    .and_then(|()| f.sync_all())
+                    .map(|()| name)
+                    .map_err(|e| e.to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("too many screenshots".into())
+}
+
+/// Signal strength as 1 to 4 bars.
+fn wifi_bars(dbm: i32) -> u8 {
+    match dbm {
+        s if s >= -55 => 4,
+        s if s >= -67 => 3,
+        s if s >= -78 => 2,
+        _ => 1,
+    }
+}
+
+/// Looks for networks on the first wireless adapter and returns them for the Wi-Fi screen.
+fn wifi_scan_rows<R: Runner>(
+    r: &mut R,
+    sys_net: &Path,
+) -> Result<Vec<mouli_screen::screens::WifiRow>, String> {
+    use crate::wifi::Security;
+    use mouli_screen::screens::{WifiRow, WifiSecurity};
+    let ifaces = crate::wifi::wireless_interfaces(sys_net);
+    let iface = ifaces.first().ok_or(
+        "No Wi-Fi adapter was found. Use a network cable, or an adapter the kernel knows.",
+    )?;
+    Ok(crate::wifi::scan(r, iface, 3)?
+        .into_iter()
+        .map(|n| WifiRow {
+            bars: wifi_bars(n.signal),
+            security: match n.security {
+                Security::Open => WifiSecurity::Open,
+                Security::Personal => WifiSecurity::Password,
+                Security::Unsupported => WifiSecurity::Unsupported,
+            },
+            ssid: n.ssid,
+        })
+        .collect())
+}
+
+/// Joins `ssid` on the first adapter, gets an address, and remembers the network on the data
+/// disk. Returns the one-line summary of the link.
+fn wifi_join_network(
+    sys_net: &Path,
+    save_to: Option<&Path>,
+    ssid: &str,
+    passphrase: Option<&str>,
+) -> Result<String, String> {
+    let ifaces = crate::wifi::wireless_interfaces(sys_net);
+    let iface = ifaces.first().ok_or("No Wi-Fi adapter was found.")?;
+    let link = crate::wifi::connect(&mut crate::wifi::System, iface, ssid, passphrase)?;
+    let mut text = link.summary();
+    if let Some(root) = save_to {
+        match crate::wifi_saved::remember(root, ssid, passphrase, unix_now()) {
+            Ok(()) => text.push_str("  Saved: MOULI will join this network next time."),
+            Err(e) => text.push_str(&format!("  (could not save this network: {e})")),
+        }
+    }
+    Ok(text)
+}
+
+/// Scans on its own thread so the desktop stays alive (a scan takes seconds).
+fn spawn_wifi_scan(tx: &Sender<Ev>) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = wifi_scan_rows(&mut crate::wifi::System, Path::new(crate::net::SYS_NET));
+        let _ = tx.send(Ev::WifiScanned(result));
+    });
+}
+
+/// The rows of the Settings screen from what the desktop is running with.
+fn settings_rows(
+    view: &ViewOpts,
+    wanted_scale: usize,
+    models: &ModelsInfo,
+    offset: &AtomicI32,
+    user: &str,
+    idle_min: u32,
+) -> Vec<mouli_screen::screens::SettingRow> {
+    use mouli_screen::screens::SettingRow;
+    let row = |id: &str, label: &str, value: String, choices: &[&str], note: &str| SettingRow {
+        id: id.into(),
+        label: label.into(),
+        value,
+        choices: choices.iter().map(|c| (*c).to_string()).collect(),
+        note: note.into(),
+    };
+    vec![
+        row(
+            "contrast",
+            "High contrast",
+            if view.contrast { "on" } else { "off" }.into(),
+            &["off", "on"],
+            "Stronger colours for hard-to-see screens. Takes effect at once.",
+        ),
+        row(
+            "textsize",
+            "Text size",
+            format!("{wanted_scale}x"),
+            &["1x", "2x", "3x"],
+            "Larger text for small or far screens. Takes effect after a restart.",
+        ),
+        row(
+            "idle",
+            "Blank screen after",
+            idle_label(idle_min),
+            &["off", "5 min", "10 min", "30 min"],
+            "Blanks after no key or mouse use; any key wakes it (no lock yet: there is no password).",
+        ),
+        row(
+            "memory",
+            "Memory for a model",
+            format!("{} MB", models.budget_mb),
+            &[],
+            "Chosen from this machine's memory when it starts.",
+        ),
+        row(
+            "context",
+            "Context length",
+            format!("{} tokens", models.ctx),
+            &[],
+            "Chosen with the memory above; longer needs more memory.",
+        ),
+        row(
+            "timezone",
+            "Time zone",
+            sysinfo::zone_label(offset.load(Ordering::Relaxed)),
+            &[],
+            "Type /time.zone +05:30 (or -8, or UTC) in Chat to change it.",
+        ),
+        row(
+            "user",
+            "Signed in as",
+            user.to_string(),
+            &[],
+            "Type /signin <name> <role> in Chat to switch.",
+        ),
+    ]
+}
+
+/// Handles `/contrast [on|off]`. Returns the notice to show.
+fn contrast_command(
+    arg: &str,
+    view: &mut ViewOpts,
+    store: Option<&crate::persist::Store>,
+) -> String {
+    match arg.trim() {
+        "" => format!(
+            "High contrast is {}. Type /contrast on or /contrast off.",
+            if view.contrast { "on" } else { "off" }
+        ),
+        a @ ("on" | "off") => {
+            view.contrast = a == "on";
+            let saved = save_view(store, CONTRAST_KEY, a);
+            format!("High contrast {a}.{saved}")
+        }
+        _ => "Type /contrast on or /contrast off.".into(),
+    }
+}
+
+/// Handles `/textsize [1|2|3]`. The size applies from the next start. Returns the notice.
+fn text_size_command(
+    arg: &str,
+    view: &ViewOpts,
+    screen: (usize, usize),
+    store: Option<&crate::persist::Store>,
+) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return format!(
+            "Text size is {}x (in use: {}x). Type /textsize 1, 2 or 3; it applies after a restart.",
+            view.scale,
+            usable_scale(view.scale, screen.0, screen.1)
+        );
+    }
+    let Some(k) = arg
+        .parse::<usize>()
+        .ok()
+        .filter(|k| (1..=MAX_SCALE).contains(k))
+    else {
+        return "Type /textsize 1, 2 or 3.".into();
+    };
+    let usable = usable_scale(k, screen.0, screen.1);
+    let saved = save_view(store, SCALE_KEY, &k.to_string());
+    let limit = if usable < k {
+        format!(" This screen is too small for {k}x; {usable}x will be used.")
+    } else {
+        String::new()
+    };
+    format!("Text size {k}x applies after a restart.{limit}{saved}")
+}
+
 // ------------------------------------------------------------------ console
 
 /// Keeps typed characters from being echoed onto the framebuffer console while the desktop is
@@ -612,12 +951,52 @@ struct TtyGuard {
     saved: Option<nix::sys::termios::Termios>,
 }
 
+/// The terminal settings to put back, kept where a panic hook can reach them.
+#[cfg(target_os = "linux")]
+static SAVED_TTY: std::sync::Mutex<Option<nix::sys::termios::Termios>> =
+    std::sync::Mutex::new(None);
+
+/// How many times the console was restored (the guard, or the panic hook).
+#[cfg(target_os = "linux")]
+static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Puts the terminal back as it was and shows the cursor. Safe to call more than once and from
+/// any thread; does nothing to settings it never saved.
+#[cfg(target_os = "linux")]
+pub fn restore_console() {
+    use nix::sys::termios::{tcflush, tcsetattr, FlushArg, SetArg};
+    RESTORES.fetch_add(1, Ordering::SeqCst);
+    let stdin = std::io::stdin();
+    let _ = tcflush(&stdin, FlushArg::TCIFLUSH);
+    let saved = SAVED_TTY.lock().map(|g| g.clone()).unwrap_or(None);
+    if let Some(t) = &saved {
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, t);
+    }
+    let _ = write!(std::io::stdout(), "\x1b[?25h\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+}
+
+/// Makes a crash put the console back before the panic message is printed, so the message can be
+/// read and the keyboard still echoes. (The release build aborts on panic, which skips every
+/// destructor; this hook is what runs instead.)
+#[cfg(target_os = "linux")]
+pub fn restore_console_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_console();
+        previous(info);
+    }));
+}
+
 #[cfg(target_os = "linux")]
 impl TtyGuard {
     fn new() -> Self {
         use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
         let stdin = std::io::stdin();
         let saved = tcgetattr(&stdin).ok();
+        if let Ok(mut slot) = SAVED_TTY.lock() {
+            slot.clone_from(&saved);
+        }
         if let Some(t) = &saved {
             let mut raw = t.clone();
             raw.local_flags
@@ -634,14 +1013,8 @@ impl TtyGuard {
 #[cfg(target_os = "linux")]
 impl Drop for TtyGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{tcflush, tcsetattr, FlushArg, SetArg};
-        let stdin = std::io::stdin();
-        let _ = tcflush(&stdin, FlushArg::TCIFLUSH);
-        if let Some(t) = &self.saved {
-            let _ = tcsetattr(&stdin, SetArg::TCSANOW, t);
-        }
-        let _ = write!(std::io::stdout(), "\x1b[?25h\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
+        let _ = &self.saved;
+        restore_console();
     }
 }
 
@@ -684,7 +1057,7 @@ const USER: &str = "owner";
 pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> {
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
-    ws.add_role(Permissions::new("owner", &["*"]));
+    mouli_device::add_default_roles(&mut ws);
     // What the model may do when it uses tools: the Code tools only. Changes still need approval.
     ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
@@ -697,9 +1070,29 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
         quality: 50,
     });
     let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
+    // Saved audit chain and held approvals come back first. A damaged file never stops the boot
+    // and is never overwritten: the device then runs without saving and says so.
+    let state = data_dir.map(|d| d.join("state"));
+    let restored = state.as_deref().map(|d| mouli_device::restore(&mut ws, d));
     let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
+    match (&state, restored) {
+        (Some(dir), Some(Ok(_))) => {
+            if let Err(e) = device.keep_state_in(dir) {
+                device.shell.approvals.message = format!("Audit log is not being saved: {e}");
+            }
+            // With accounts set up (or an accounts file that cannot be read) nobody is signed in
+            // until they give a passphrase.
+            device.lock();
+        }
+        (_, Some(Err(e))) => {
+            device.shell.approvals.message =
+                format!("Saved audit log not loaded, and not being saved: {e}");
+        }
+        _ => {}
+    }
     device.attach_code(code);
     if let Some(dir) = data_dir {
+        device.set_export_dir(&dir.join("exports"));
         let projects = dir.join("projects");
         std::fs::create_dir_all(&projects).map_err(|e| fail(&e))?;
         // A project that cannot be opened leaves the Code window empty; that is not fatal.
@@ -760,6 +1153,17 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     let display = Framebuffer::open(Path::new(FB_DEVICE), Path::new(FB_SYS))?;
     let device = build_device(data_dir)?;
     let (tx, rx) = channel();
+    // A crash puts the console back first; SIGTERM and SIGHUP end the desktop the normal way.
+    #[cfg(target_os = "linux")]
+    {
+        restore_console_on_panic();
+        let stop = tx.clone();
+        if let Err(e) = crate::shutdown::on_stop_signal(move || {
+            let _ = stop.send(Ev::Terminate);
+        }) {
+            eprintln!("moulid: cannot watch for SIGTERM: {e}");
+        }
+    }
     let width = i32::try_from(display.size().0).unwrap_or(1024);
     let mut seen = BTreeSet::new();
     let inputs = scan_inputs(
@@ -834,12 +1238,17 @@ impl ModelsInfo {
 
 /// The text at the right of the menu bar: the product name, and a reminder when requests wait for
 /// a second person's approval (the Approvals window is not on the desktop).
-fn status_text(base: &str, pending: usize) -> String {
-    match pending {
-        0 => base.to_string(),
-        1 => format!("{base}  |  1 waiting for approval (F3)"),
-        n => format!("{base}  |  {n} waiting for approval (F3)"),
+fn status_text(base: &str, user: &str, model: &str, pending: usize) -> String {
+    let mut t = format!("{base}  |  {user}");
+    if !model.is_empty() {
+        t.push_str(&format!("  |  {model}"));
     }
+    match pending {
+        0 => {}
+        1 => t.push_str("  |  1 waiting for approval (F3)"),
+        n => t.push_str(&format!("  |  {n} waiting for approval (F3)")),
+    }
+    t
 }
 
 /// Fills the Models window and the chat title from `info`.
@@ -897,9 +1306,15 @@ where
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
+    let mut view = load_view(settings.as_ref());
+    let mut idle_min = load_idle(settings.as_ref());
+    let mut idle = IdleBlank::new(idle_min, Instant::now());
+    let mut wanted_scale = view.scale;
+    let scale = usable_scale(view.scale, w, h);
+    view.scale = scale;
     let mut desktop = Desktop::new(
-        i32::try_from(w).unwrap_or(1024),
-        i32::try_from(h).unwrap_or(768),
+        i32::try_from(w / scale).unwrap_or(1024),
+        i32::try_from(h / scale).unwrap_or(768),
     );
     let base_status = if saving {
         "MOULI OS".to_string()
@@ -908,6 +1323,14 @@ where
     };
     desktop.status = base_status.clone();
     show_models(&mut device.shell, models);
+    device.shell.settings.set_rows(settings_rows(
+        &view,
+        wanted_scale,
+        models,
+        &offset,
+        device.user(),
+        idle_min,
+    ));
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
         device.shell.chat.push(
@@ -957,10 +1380,24 @@ where
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
     let reply_tx = tx.clone();
     let reply_tx_pages = tx.clone();
+    // Ctrl-C while the model is answering sets this; the answer thread then stops reading.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = cancel.clone();
+    let piece_tx = tx.clone();
     std::thread::spawn(move || {
         let mut backend = backend;
         while let Ok(turns) = req_rx.recv() {
-            if reply_tx.send(Ev::Reply(backend.reply(&turns))).is_err() {
+            let answer = backend.reply_streaming(&turns, &mut |piece| {
+                piece_tx.send(Ev::Piece(piece.to_string())).is_ok()
+                    && !thread_cancel.load(Ordering::SeqCst)
+            });
+            let answer = match answer {
+                Ok(text) if thread_cancel.load(Ordering::SeqCst) => {
+                    Ok(format!("{text}\n[stopped]"))
+                }
+                other => other,
+            };
+            if reply_tx.send(Ev::Reply(answer)).is_err() {
                 break;
             }
         }
@@ -968,7 +1405,7 @@ where
 
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    display.present(&desktop.render(&device.shell))?;
+    display.present(&shape(desktop.render(&device.shell), view))?;
     loop {
         let mut batch = Vec::new();
         if device.shell.preview.wants_ticks() || device.shell.browser.view.wants_ticks() {
@@ -978,8 +1415,24 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let a = device.shell.preview.tick();
                     let b = device.shell.browser.view.tick();
-                    if a || b {
-                        display.present(&desktop.render(&device.shell))?;
+                    if (a || b) && !idle.blanked {
+                        display.present(&shape(desktop.render(&device.shell), view))?;
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(End::Eof),
+            }
+        } else if let Some(wait) = idle.wait(Instant::now()) {
+            match rx.recv_timeout(wait) {
+                Ok(first) => batch.push(first),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if idle.due(Instant::now()) {
+                        let (bw, bh) = display.size();
+                        display.present(&Canvas {
+                            width: bw,
+                            height: bh,
+                            pixels: vec![0; bw * bh],
+                        })?;
                     }
                     continue;
                 }
@@ -998,11 +1451,42 @@ where
             }
         }
         for ev in batch {
+            if matches!(ev, Ev::Key(_) | Ev::Mouse(_)) && idle.input(Instant::now()) {
+                continue; // this key or movement only woke the screen
+            }
             let action = match ev {
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
+                Ev::Key(Key::Ctrl('p')) => {
+                    let note = match &data_root {
+                        Some(root) => {
+                            let picture = shape(desktop.render(&device.shell), view);
+                            match save_screenshot(&picture, &root.join("exports")) {
+                                Ok(name) => {
+                                    device.record_event("screenshot.save", &name, "ok");
+                                    format!("Screenshot saved as exports/{name}")
+                                }
+                                Err(e) => format!("Screenshot not saved: {e}"),
+                            }
+                        }
+                        None => "Screenshot not saved: there is no data disk.".into(),
+                    };
+                    device.shell.chat.push(Role::Notice, &note);
+                    Action::None
+                }
+                Ev::Key(Key::Ctrl('c')) if device.shell.chat.busy => {
+                    cancel.store(true, Ordering::SeqCst);
+                    Action::None
+                }
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
+                Ev::Piece(piece) => {
+                    device.shell.chat.stream_piece(&piece);
+                    Action::None
+                }
                 Ev::Reply(r) => {
                     let answer = on_reply(&mut device.shell, &mut history, r);
+                    // A stopped answer is shown but never run as a tool call.
+                    let stopped = cancel.swap(false, Ordering::SeqCst);
+                    let answer = answer.filter(|_| !stopped);
                     if let Some(text) = answer {
                         graph.assistant_message(&text, &model_name, unix_now());
                         let known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
@@ -1051,6 +1535,15 @@ where
                     desktop.system = *s;
                     Action::None
                 }
+                Ev::Terminate => return Ok(End::Quit),
+                Ev::WifiScanned(result) => {
+                    device.shell.wifi.scanned(result);
+                    Action::None
+                }
+                Ev::WifiJoined(result) => {
+                    device.shell.wifi.joined(result);
+                    Action::None
+                }
                 Ev::Page { requested, result } => {
                     match result {
                         Ok(l) => device
@@ -1072,6 +1565,31 @@ where
                     if tab == Tab::Storage {
                         refresh_storage(&mut device.shell, data_root.as_deref());
                     }
+                    if tab == Tab::Wifi && device.shell.wifi.wants_first_scan() {
+                        spawn_wifi_scan(&tx);
+                    }
+                }
+                Action::Wifi => {
+                    desktop.open(&mut device.shell, Tab::Wifi);
+                    if device.shell.wifi.wants_first_scan() {
+                        spawn_wifi_scan(&tx);
+                    }
+                }
+                Action::WifiScan => spawn_wifi_scan(&tx),
+                Action::WifiJoin { ssid, passphrase } => {
+                    let tx = tx.clone();
+                    let save_to = data_root.clone();
+                    std::thread::spawn(move || {
+                        let result = wifi_join_network(
+                            Path::new(crate::net::SYS_NET),
+                            save_to.as_deref(),
+                            &ssid,
+                            passphrase
+                                .as_ref()
+                                .map(mouli_screen::screen::Hidden::expose),
+                        );
+                        let _ = tx.send(Ev::WifiJoined(result));
+                    });
                 }
                 Action::Navigate(url) => {
                     let tx = reply_tx_pages.clone();
@@ -1105,6 +1623,58 @@ where
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/time.zone".len()..].to_string();
                     let note = time_zone_command(&arg, &offset, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
+                Action::Setting { id, value } => {
+                    let note = match id.as_str() {
+                        "contrast" => contrast_command(&value, &mut view, settings.as_ref()),
+                        "textsize" => {
+                            let k = value.trim_end_matches('x').to_string();
+                            if let Ok(n) = k.parse::<usize>() {
+                                wanted_scale = n;
+                            }
+                            let (sw, sh) = display.size();
+                            text_size_command(&k, &view, (sw, sh), settings.as_ref())
+                        }
+                        "idle" => {
+                            let m = value.trim_end_matches(" min");
+                            match (m == "off", m.parse::<u32>()) {
+                                (true, _) | (_, Ok(0 | 5 | 10 | 30)) => {
+                                    idle_min = m.parse().unwrap_or(0);
+                                    idle = IdleBlank::new(idle_min, Instant::now());
+                                    let saved = save_view(
+                                        settings.as_ref(),
+                                        IDLE_KEY,
+                                        &idle_min.to_string(),
+                                    );
+                                    format!("Screen blanking: {}.{saved}", idle_label(idle_min))
+                                }
+                                _ => "Choose off, 5, 10 or 30 minutes.".into(),
+                            }
+                        }
+                        _ => "That setting cannot be changed here.".into(),
+                    };
+                    device.shell.settings.message = note;
+                }
+                Action::Send(text) if text.trim_start().starts_with("/contrast") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/contrast".len()..].to_string();
+                    let note = contrast_command(&arg, &mut view, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
+                Action::Send(text) if text.trim_start().starts_with("/textsize") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/textsize".len()..].to_string();
+                    let (sw, sh) = display.size();
+                    if let Some(k) = arg
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|k| (1..=MAX_SCALE).contains(k))
+                    {
+                        wanted_scale = k;
+                    }
+                    let note = text_size_command(&arg, &view, (sw, sh), settings.as_ref());
                     device.shell.chat.push(Role::Notice, &note);
                 }
                 Action::Send(text) if text.trim_start().starts_with("/graph") => {
@@ -1196,8 +1766,23 @@ where
                 }
             }
         }
-        desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
-        display.present(&desktop.render(&device.shell))?;
+        desktop.status = status_text(
+            &base_status,
+            device.user(),
+            &device.shell.chat.model,
+            device.shell.approvals.rows.len(),
+        );
+        device.shell.settings.set_rows(settings_rows(
+            &view,
+            wanted_scale,
+            models,
+            &offset,
+            device.user(),
+            idle_min,
+        ));
+        if !idle.blanked {
+            display.present(&shape(desktop.render(&device.shell), view))?;
+        }
     }
 }
 
@@ -1255,7 +1840,7 @@ fn on_reply(
     shell.chat.busy = false;
     match reply {
         Ok(text) => {
-            shell.chat.push(Role::Assistant, &text);
+            shell.chat.finish_answer(&text);
             history.push(Turn {
                 role: "assistant",
                 content: text.clone(),
@@ -1263,6 +1848,7 @@ fn on_reply(
             Some(text)
         }
         Err(e) => {
+            shell.chat.streaming = false;
             if history.last().is_some_and(|t| t.role == "user") {
                 history.pop();
             }
@@ -1620,6 +2206,27 @@ mod tests {
     }
 
     #[test]
+    fn the_audit_chain_is_kept_on_the_data_disk_and_a_damaged_one_is_not_overwritten() {
+        let d = tmp("audit-kept");
+        {
+            let device = build_device(Some(&d)).unwrap();
+            assert!(!device.workspace().audit().records().is_empty());
+        }
+        let first = std::fs::read_to_string(d.join("state/audit.log")).unwrap();
+        let again = build_device(Some(&d)).unwrap();
+        assert!(again.workspace().audit().records().len() > first.lines().count());
+        assert_eq!(again.workspace().audit().verify(), Ok(()));
+        std::fs::write(d.join("state/audit.log"), "junk\n").unwrap();
+        let broken = build_device(Some(&d)).unwrap();
+        assert!(broken.shell.approvals.message.contains("not loaded"));
+        assert_eq!(
+            std::fs::read_to_string(d.join("state/audit.log")).unwrap(),
+            "junk\n"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn the_moved_out_applications_do_not_open() {
         let dir = tmp("movedout");
         let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1873,9 +2480,16 @@ mod tests {
 
     #[test]
     fn the_menu_bar_reminds_when_approvals_are_waiting() {
-        assert_eq!(status_text("MOULI OS", 0), "MOULI OS");
-        assert!(status_text("MOULI OS", 1).contains("1 waiting for approval (F3)"));
-        assert!(status_text("MOULI OS", 3).contains("3 waiting for approval (F3)"));
+        assert_eq!(
+            status_text("MOULI OS", "alice", "", 0),
+            "MOULI OS  |  alice"
+        );
+        assert_eq!(
+            status_text("MOULI OS", "alice", "tiny", 0),
+            "MOULI OS  |  alice  |  tiny"
+        );
+        assert!(status_text("MOULI OS", "a", "", 1).contains("1 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", "a", "m", 3).contains("3 waiting for approval (F3)"));
     }
 
     struct NoRun;
@@ -1926,6 +2540,318 @@ mod tests {
         drop(rx);
         std::thread::sleep(Duration::from_millis(100));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn contrast_and_text_size_commands_validate_save_and_reload() {
+        let dir = tmp("view");
+        let store = crate::persist::Store::open(&dir).unwrap();
+        let mut v = load_view(Some(&store));
+        assert_eq!(
+            v,
+            ViewOpts {
+                contrast: false,
+                scale: 1
+            }
+        );
+        assert!(contrast_command("", &mut v, Some(&store)).contains("off"));
+        assert!(contrast_command("loud", &mut v, Some(&store)).contains("on or"));
+        assert!(!v.contrast);
+        assert!(contrast_command("on", &mut v, Some(&store)).contains("kept"));
+        assert!(v.contrast);
+        assert!(text_size_command("2", &v, (1024, 768), Some(&store)).contains("restart"));
+        assert!(text_size_command("9", &v, (1024, 768), Some(&store)).contains("1, 2 or 3"));
+        // Too small a screen for 3x is said plainly.
+        assert!(text_size_command("3", &v, (1024, 768), Some(&store)).contains("too small"));
+        assert!(text_size_command("2", &v, (1024, 768), None).contains("forgotten"));
+        // 3x was saved last; it is read back, and what can really be used is clamped.
+        let again = load_view(Some(&store));
+        assert!(again.contrast);
+        assert_eq!(again.scale, 3);
+        assert_eq!(usable_scale(3, 1024, 768), 1);
+        assert_eq!(usable_scale(2, 1280, 960), 2);
+        assert_eq!(usable_scale(3, 1920, 1440), 3);
+        assert_eq!(usable_scale(2, 1920, 1080), 2);
+        assert_eq!(usable_scale(0, 1920, 1080), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_screen_shows_the_real_values_and_changes_contrast() {
+        let dir = tmp("settings-screen");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        session.settings = Some(crate::persist::Store::open(&dir).unwrap());
+        // ^O opens Settings; Enter changes the first row (High contrast) to on; ^Q quits.
+        for e in [
+            Ev::Key(Key::Ctrl('o')),
+            Ev::Key(Key::Enter),
+            Ev::Key(Key::Ctrl('q')),
+        ] {
+            tx.send(e).unwrap();
+        }
+        run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        let saved = crate::persist::Store::open(&dir).unwrap().settings();
+        assert_eq!(saved.get(CONTRAST_KEY).map(String::as_str), Some("on"));
+        // The last picture was drawn in high contrast: pure black and pure white are present.
+        let last = shots.lock().unwrap().last().unwrap().clone();
+        assert!(last.pixels.contains(&0x000000) && last.pixels.contains(&0xFFFFFF));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_rows_report_what_is_running() {
+        let off = AtomicI32::new(330);
+        let m = ModelsInfo::only("tiny");
+        let rows = settings_rows(
+            &ViewOpts {
+                contrast: true,
+                scale: 1,
+            },
+            2,
+            &m,
+            &off,
+            "owner",
+            10,
+        );
+        let get = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(get("contrast").value, "on");
+        assert_eq!(get("textsize").value, "2x");
+        assert_eq!(get("idle").value, "10 min");
+        assert_eq!(get("idle").choices.len(), 4);
+        assert!(get("memory").choices.is_empty());
+        assert!(
+            get("timezone").value.contains("5:30"),
+            "{}",
+            get("timezone").value
+        );
+        assert_eq!(get("user").value, "owner");
+    }
+
+    /// A supplicant that is already running and sees three networks.
+    struct SeesThree(std::path::PathBuf);
+    impl Runner for SeesThree {
+        fn run(&mut self, _cmd: &str, args: &[&str]) -> Option<String> {
+            if args.contains(&"scan_results") {
+                Some(
+                    "bssid / frequency / signal level / flags / ssid\n\
+                     aa:bb:cc:dd:ee:01\t2412\t-70\t[ESS]\tCafe\n\
+                     aa:bb:cc:dd:ee:02\t2412\t-50\t[WPA2-PSK-CCMP][ESS]\tHome\n\
+                     aa:bb:cc:dd:ee:03\t2412\t-60\t[SAE][ESS]\tCorp\n"
+                        .into(),
+                )
+            } else {
+                Some(String::new())
+            }
+        }
+        fn pause(&mut self, _: Duration) {}
+        fn conf_dir(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    #[test]
+    fn a_scan_becomes_rows_and_a_missing_adapter_is_explained() {
+        use mouli_screen::screens::WifiSecurity;
+        let dir = tmp("wifi-scan");
+        let sys = dir.join("sys-net");
+        std::fs::create_dir_all(sys.join("wlan0/wireless")).unwrap();
+        std::fs::create_dir_all(sys.join("eth0")).unwrap();
+        let rows = wifi_scan_rows(&mut SeesThree(dir.clone()), &sys).unwrap();
+        let got: Vec<(&str, u8, WifiSecurity)> = rows
+            .iter()
+            .map(|r| (r.ssid.as_str(), r.bars, r.security))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Home", 4, WifiSecurity::Password),
+                ("Corp", 3, WifiSecurity::Unsupported),
+                ("Cafe", 2, WifiSecurity::Open),
+            ]
+        );
+        std::fs::remove_dir_all(sys.join("wlan0")).unwrap();
+        let e = wifi_scan_rows(&mut SeesThree(dir.clone()), &sys).unwrap_err();
+        assert!(e.contains("No Wi-Fi adapter"), "{e}");
+        assert!(wifi_join_network(&sys, None, "Home", Some("password1")).is_err());
+        assert_eq!(wifi_bars(-40), 4);
+        assert_eq!(wifi_bars(-90), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn screenshots_are_new_png_files_and_never_replace_one() {
+        let dir = tmp("shots");
+        let c = Canvas {
+            width: 3,
+            height: 2,
+            pixels: vec![0xFF0000, 0x00FF00, 0x0000FF, 0, 0xFFFFFF, 0x123456],
+        };
+        let a = save_screenshot(&c, &dir.join("exports")).unwrap();
+        let b = save_screenshot(&c, &dir.join("exports")).unwrap();
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("screenshot-1.png", "screenshot-2.png")
+        );
+        let bytes = std::fs::read(dir.join("exports/screenshot-1.png")).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(bytes, mouli_screen::raster::to_png(&c));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_p_saves_a_screenshot_and_audits_it() {
+        let dir = tmp("shot-key");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        session.data_root = Some(dir.clone());
+        tx.send(Ev::Key(Key::Ctrl('p'))).unwrap();
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        let png = std::fs::read(dir.join("exports/screenshot-1.png")).unwrap();
+        assert_eq!(&png[1..4], b"PNG");
+        let log = std::fs::read_to_string(dir.join("state/audit.log")).unwrap();
+        assert!(log.contains("screenshot.save"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_screen_blanks_after_the_idle_time_and_the_waking_key_does_not_act() {
+        let t0 = Instant::now();
+        let mut i = IdleBlank::new(5, t0);
+        assert_eq!(i.wait(t0), Some(Duration::from_secs(300)));
+        assert_eq!(
+            i.wait(t0 + Duration::from_secs(100)),
+            Some(Duration::from_secs(200))
+        );
+        assert!(!i.due(t0 + Duration::from_secs(299)));
+        assert!(i.due(t0 + Duration::from_secs(300)));
+        assert!(i.blanked);
+        // It blanks once, and waits for input (no timer) while blank.
+        assert!(!i.due(t0 + Duration::from_secs(400)));
+        assert_eq!(i.wait(t0 + Duration::from_secs(400)), None);
+        // The first input wakes it and is swallowed; the next acts and restarts the timer.
+        assert!(i.input(t0 + Duration::from_secs(500)));
+        assert!(!i.blanked);
+        assert!(!i.input(t0 + Duration::from_secs(501)));
+        assert_eq!(
+            i.wait(t0 + Duration::from_secs(501)),
+            Some(Duration::from_secs(300))
+        );
+        // Off never blanks.
+        let off = IdleBlank::new(0, t0);
+        assert_eq!(off.wait(t0 + Duration::from_secs(99999)), None);
+    }
+
+    #[test]
+    fn the_idle_setting_defaults_validates_and_reloads() {
+        let dir = tmp("idle");
+        let store = crate::persist::Store::open(&dir).unwrap();
+        assert_eq!(load_idle(Some(&store)), 10);
+        assert_eq!(load_idle(None), 10);
+        store.set(IDLE_KEY, "30").unwrap();
+        assert_eq!(load_idle(Some(&store)), 30);
+        store.set(IDLE_KEY, "0").unwrap();
+        assert_eq!(load_idle(Some(&store)), 0);
+        store.set(IDLE_KEY, "7").unwrap();
+        assert_eq!(load_idle(Some(&store)), 10, "an unknown value falls back");
+        assert_eq!(idle_label(0), "off");
+        assert_eq!(idle_label(5), "5 min");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_panic_puts_the_console_back_before_the_message() {
+        let before = RESTORES.load(Ordering::SeqCst);
+        restore_console_on_panic();
+        let r = std::panic::catch_unwind(|| panic!("a deliberate test panic"));
+        assert!(r.is_err());
+        assert!(
+            RESTORES.load(Ordering::SeqCst) > before,
+            "the hook restored the console"
+        );
+        // Calling it directly, repeatedly and without a saved state is harmless.
+        restore_console();
+        restore_console();
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn terminate_ends_the_desktop_cleanly() {
+        let dir = tmp("terminate");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots), tx.clone(), rx, device);
+        tx.send(Ev::Terminate).unwrap();
+        let end = run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        assert!(matches!(end, End::Quit));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shaping_the_picture_scales_and_recolours() {
+        let c = mouli_screen::raster::Canvas {
+            width: 2,
+            height: 1,
+            pixels: vec![
+                mouli_screen::grid::theme::BG.0,
+                mouli_screen::grid::theme::TEXT.0,
+            ],
+        };
+        let plain = shape(
+            c.clone(),
+            ViewOpts {
+                contrast: false,
+                scale: 1,
+            },
+        );
+        assert_eq!(plain, c);
+        let big = shape(
+            c,
+            ViewOpts {
+                contrast: true,
+                scale: 2,
+            },
+        );
+        assert_eq!((big.width, big.height), (4, 2));
+        assert_eq!(big.pixels[0], 0);
+        assert_eq!(big.pixels[3], 0xFFFFFF);
     }
 
     #[test]
@@ -2161,6 +3087,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let got = seen.lock().unwrap().clone();
         (got, Shots(shots))
+    }
+
+    /// Streams "tick " pieces until told to stop (the first question), then answers briefly.
+    struct Endless {
+        stopped: std::sync::Arc<AtomicBool>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Backend for Endless {
+        fn reply(&mut self, _: &[Turn]) -> Result<String, String> {
+            Ok("done".into())
+        }
+        fn reply_streaming(
+            &mut self,
+            _: &[Turn],
+            on_piece: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<String, String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                on_piece("fine");
+                return Ok("fine".into());
+            }
+            let mut text = String::new();
+            for _ in 0..2000 {
+                text.push_str("tick ");
+                if !on_piece("tick ") {
+                    self.stopped.store(true, Ordering::SeqCst);
+                    return Ok(text);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(text)
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_a_streaming_answer_and_the_next_question_still_works() {
+        let dir = tmp("cancel");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        for e in keys_for("first\n") {
+            tx.send(e).unwrap();
+        }
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (st, ca, t2) = (stopped.clone(), calls.clone(), tx.clone());
+        let driver = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            // Let some pieces arrive, then stop the answer.
+            while ca.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            t2.send(Ev::Key(Key::Ctrl('c'))).unwrap();
+            while !st.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            for e in keys_for("second\n") {
+                t2.send(e).unwrap();
+            }
+            while ca.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        run(
+            session,
+            Endless {
+                stopped: stopped.clone(),
+                calls: calls.clone(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        driver.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the backend was told to stop"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the second question was answered"
+        );
     }
 
     #[test]

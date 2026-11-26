@@ -24,6 +24,29 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; HASH_LEN] {
     outer.finalize().into()
 }
 
+/// PBKDF2 with HMAC-SHA-256 (RFC 8018), one 32-byte block: stretches a passphrase so that trying
+/// guesses against a stolen file is slow.
+///
+/// `None` when `rounds` is zero. Cost is `rounds` HMAC calls; 200 000 is a sensible floor for a
+/// passphrase check on a laptop. It does not make a short or common passphrase safe.
+#[must_use]
+pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], rounds: u32) -> Option<[u8; HASH_LEN]> {
+    if rounds == 0 {
+        return None;
+    }
+    let mut first = salt.to_vec();
+    first.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &first);
+    let mut out = u;
+    for _ in 1..rounds {
+        u = hmac_sha256(password, &u);
+        for (o, x) in out.iter_mut().zip(&u) {
+            *o ^= x;
+        }
+    }
+    Some(out)
+}
+
 /// HKDF-Extract: a pseudorandom key from `ikm`. An empty `salt` means a string of zeros.
 #[must_use]
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; HASH_LEN] {
@@ -75,6 +98,42 @@ pub fn expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pbkdf2_sha256_matches_the_published_vectors() {
+        // PBKDF2-HMAC-SHA256, password "password", salt "salt".
+        for (rounds, expected) in [
+            (
+                1,
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+            ),
+            (
+                2,
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+            ),
+            (
+                4096,
+                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            ),
+        ] {
+            let got = pbkdf2_sha256(b"password", b"salt", rounds).unwrap();
+            assert_eq!(
+                got.to_vec(),
+                crate::from_hex(expected).unwrap(),
+                "rounds {rounds}"
+            );
+        }
+    }
+
+    #[test]
+    fn pbkdf2_sha256_depends_on_every_input_and_refuses_zero_rounds() {
+        let base = pbkdf2_sha256(b"pw", b"salt", 3).unwrap();
+        assert_ne!(base, pbkdf2_sha256(b"pw2", b"salt", 3).unwrap());
+        assert_ne!(base, pbkdf2_sha256(b"pw", b"salt2", 3).unwrap());
+        assert_ne!(base, pbkdf2_sha256(b"pw", b"salt", 4).unwrap());
+        assert_eq!(base, pbkdf2_sha256(b"pw", b"salt", 3).unwrap());
+        assert!(pbkdf2_sha256(b"pw", b"salt", 0).is_none());
+    }
     use crate::from_hex;
 
     fn hx(s: &str) -> Vec<u8> {

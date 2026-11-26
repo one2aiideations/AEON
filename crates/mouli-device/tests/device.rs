@@ -1240,3 +1240,967 @@ fn the_agent_cannot_act_when_the_host_defined_no_agent_role() {
     d.open_project(dir.path()).unwrap();
     assert!(d.run_agent("/code.files").contains("cannot act"));
 }
+
+#[test]
+fn held_approvals_and_the_audit_chain_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut ws = workspace();
+        mouli_device::restore(&mut ws, dir.path()).unwrap();
+        let alice = ws.open_session("acme", "alice", "clerk").unwrap();
+        ws.submit("acme", &alice, "/note.send to=bob").unwrap();
+        let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        type_line(&mut d, "hello");
+    }
+    // The device is gone; start again from the files alone.
+    let mut ws = workspace();
+    let r = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(r.chain_ok);
+    assert_eq!(r.pending, 1);
+    assert!(r.records >= 3);
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert_eq!(d.shell.approvals.rows[0].requester, "alice");
+    // Deciding it runs the original call and empties the saved queue.
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.approvals.rows.is_empty());
+    let saved = std::fs::read_to_string(dir.path().join("pending.txt")).unwrap();
+    assert!(saved.is_empty());
+    // The file only grew, and still verifies after a second restart.
+    let mut ws = workspace();
+    let r2 = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(r2.chain_ok && r2.records > r.records && r2.pending == 0);
+}
+
+#[test]
+fn an_edited_audit_file_loads_but_raises_the_security_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        type_line(&mut d, "hello");
+    }
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let mut ws = workspace();
+    let r = mouli_device::restore(&mut ws, dir.path()).unwrap();
+    assert!(!r.chain_ok);
+    let d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert!(d
+        .shell
+        .security
+        .findings
+        .iter()
+        .any(|f| f.id == "audit-chain"));
+}
+
+#[test]
+fn a_damaged_state_file_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("audit.log"), "garbage\n").unwrap();
+    let mut ws = workspace();
+    let e = mouli_device::restore(&mut ws, dir.path()).unwrap_err();
+    assert!(e.contains("audit.log line 1"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("audit.log")).unwrap(),
+        "garbage\n"
+    );
+}
+
+#[test]
+fn default_roles_split_asking_from_deciding() {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    mouli_device::add_default_roles(&mut ws);
+    assert!(ws.role_can(mouli_device::OWNER, "approve"));
+    assert!(ws.role_can(mouli_device::CLERK, "code.propose"));
+    assert!(!ws.role_can(mouli_device::CLERK, "code.apply"));
+    assert!(!ws.role_can(mouli_device::CLERK, "approve"));
+    assert!(ws.role_can(mouli_device::VIEWER, "code.read"));
+    assert!(!ws.role_can(mouli_device::VIEWER, "code.propose"));
+}
+
+#[test]
+fn a_second_person_signs_in_on_the_same_device_and_approves() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("viewer", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert!(!d.shell.approvals.rows[0].can_decide);
+
+    // Bad sign-ins change nothing.
+    assert!(d.switch_user("  ", "owner").is_err());
+    assert!(d.switch_user("bob", "nonsense").is_err());
+    assert_eq!(d.user(), "alice");
+
+    d.switch_user("bob", "owner").unwrap();
+    assert_eq!(d.user(), "bob");
+    assert!(d.shell.chat.messages.is_empty());
+    assert!(d.shell.approvals.rows[0].can_decide);
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.approvals.rows.is_empty());
+    let a = d.workspace().audit();
+    assert!(a.verify().is_ok());
+    assert!(a
+        .records()
+        .iter()
+        .any(|r| r.action == "signin" && r.actor == "bob" && r.subject.contains("was alice")));
+    assert!(a
+        .records()
+        .iter()
+        .any(|r| r.action == "approve" && r.actor == "bob"));
+}
+
+#[test]
+fn the_signin_command_and_menu_switch_the_person_without_reaching_the_model() {
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    assert_eq!(d.run(Action::SwitchUser), Outcome::Handled);
+    let notice = chat_texts(&d).pop().unwrap().1;
+    assert!(notice.contains("alice") && notice.contains("owner"));
+
+    type_line(&mut d, "/signin bob owner");
+    assert_eq!(d.user(), "bob");
+    type_line(&mut d, "/signin bob");
+    type_line(&mut d, "/signin eve wizard");
+    assert_eq!(d.user(), "bob");
+    let texts = chat_texts(&d);
+    assert!(texts.iter().any(|(_, t)| t.contains("Usage: /signin")));
+    assert!(texts.iter().any(|(_, t)| t.contains("Could not sign in")));
+    // Nothing was sent to the model: only the person's own lines and notices are on screen.
+    assert!(!texts.iter().any(|(r, _)| *r == Role::Assistant));
+}
+
+#[test]
+fn each_persons_conversation_is_kept_apart_and_comes_back_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        d.on_key(Key::F(1));
+        type_line(&mut d, "alice's secret plan");
+        d.switch_user("bob", "owner").unwrap();
+        assert!(chat_texts(&d).is_empty());
+        type_line(&mut d, "bob here");
+        d.switch_user("alice", "clerk").unwrap();
+        assert!(chat_texts(&d)
+            .iter()
+            .any(|(_, t)| t.contains("secret plan")));
+        assert!(!chat_texts(&d).iter().any(|(_, t)| t.contains("bob here")));
+    }
+    // Restart: bob signs in first and sees only his own.
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "bob", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    let t = chat_texts(&d);
+    assert!(t.iter().any(|(r, x)| *r == Role::User && x == "bob here"));
+    assert!(!t.iter().any(|(_, x)| x.contains("secret")));
+    assert_eq!(t.iter().filter(|(_, x)| x.contains("restored")).count(), 1);
+    drop(d);
+    // Restoring again does not pile up notices.
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "bob", "owner").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    assert_eq!(
+        chat_texts(&d)
+            .iter()
+            .filter(|(_, x)| x.contains("restored"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn help_lists_screens_and_only_the_capabilities_the_role_may_run() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("reader", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "rita", "reader").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/help");
+    let help = chat_texts(&d).pop().unwrap().1;
+    assert!(help.contains("Chat") && help.contains("Audit"), "{help}");
+    assert!(
+        help.contains("/note.read") && !help.contains("/note.send"),
+        "{help}"
+    );
+    assert!(help.contains("/signin"));
+    d.switch_user("olga", "owner").unwrap();
+    type_line(&mut d, "/help");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("/note.send"));
+}
+
+#[test]
+fn apps_and_files_commands_show_what_exists_and_what_the_role_may_do() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("reader", &["note.read"]));
+    let s = ws.open_session("acme", "zed", "owner").unwrap();
+    ws.put_artifact("acme", &s, "report.txt", "text/plain", b"v1")
+        .unwrap();
+    ws.put_artifact("acme", &s, "report.txt", "text/plain", b"version two")
+        .unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "rita", "reader").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/apps");
+    let apps = chat_texts(&d).pop().unwrap().1;
+    assert!(apps.contains("note.read  reads; you may"), "{apps}");
+    assert!(
+        apps.contains("note.send  needs approval; not for your role"),
+        "{apps}"
+    );
+    type_line(&mut d, "/files");
+    let files = chat_texts(&d).pop().unwrap().1;
+    assert!(
+        files.contains("1 file(s)") && files.contains("report.txt  v2"),
+        "{files}"
+    );
+    assert!(files.contains("11 bytes"), "{files}");
+}
+
+#[test]
+fn save_writes_the_last_answer_to_a_new_file_and_never_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/save");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("no data disk"));
+    d.set_export_dir(&dir.path().join("exports"));
+    type_line(&mut d, "/save");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("no answer"));
+
+    type_line(&mut d, "first question");
+    type_line(&mut d, "second question");
+    type_line(&mut d, "/save");
+    let a1 = std::fs::read_to_string(dir.path().join("exports/answer-1.txt")).unwrap();
+    assert!(a1.contains("second question"), "{a1}");
+    type_line(&mut d, "/save");
+    assert!(dir.path().join("exports/answer-2.txt").exists());
+    type_line(&mut d, "/save notes.md");
+    assert!(dir.path().join("exports/notes.md").exists());
+    type_line(&mut d, "/save notes.md");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("already exists"));
+    for bad in ["../x", ".hidden", "a b/c", "x/y"] {
+        type_line(&mut d, &format!("/save {bad}"));
+        assert!(
+            chat_texts(&d).pop().unwrap().1.contains("Not saved"),
+            "{bad}"
+        );
+    }
+    assert!(!dir.path().join("x").exists());
+    assert!(d
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .any(|r| r.action == "answer.save" && r.subject == "notes.md"));
+}
+
+fn finding<'a>(d: &'a Device<Echo>, id: &str) -> Option<&'a mouli_screen::screens::Finding> {
+    d.shell.security.findings.iter().find(|f| f.id == id)
+}
+
+#[test]
+fn five_refusals_lock_a_person_out_until_an_approver_unlocks_them() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..5 {
+        type_line(&mut d, "/note.send to=bob");
+    }
+    let f = finding(&d, "lockout-gus").expect("a lockout finding");
+    assert!(f.detail.contains("/unlock gus"));
+    type_line(&mut d, "/note.read");
+    assert!(chat_texts(&d).iter().any(|(_, t)| t.contains("locked out")));
+    type_line(&mut d, "/unlock");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("Locked out: gus"));
+    // The locked person cannot unlock themselves.
+    type_line(&mut d, "/unlock gus");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("Not unlocked"));
+    assert!(finding(&d, "lockout-gus").is_some());
+    // An owner can.
+    d.switch_user("boss", "owner").unwrap();
+    type_line(&mut d, "/unlock gus");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("can act again"));
+    assert!(finding(&d, "lockout-gus").is_none());
+    d.switch_user("gus", "guest").unwrap();
+    type_line(&mut d, "/note.read");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("ran note.read"));
+}
+
+#[test]
+fn a_burst_of_refusals_between_successes_is_reported_as_an_anomaly() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..4 {
+        type_line(&mut d, "/note.send to=bob");
+        type_line(&mut d, "/note.read"); // a success in between: never locked out
+    }
+    assert!(finding(&d, "lockout-gus").is_none());
+    let f = finding(&d, "burst-gus").expect("a burst finding");
+    assert_eq!(f.severity, mouli_screen::screens::Severity::High);
+    // A calm log has none.
+    let calm = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert!(calm
+        .shell
+        .security
+        .findings
+        .iter()
+        .all(|f| !f.id.starts_with("burst")));
+}
+
+#[test]
+fn a_finding_can_be_marked_seen_and_returns_if_it_changes_or_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |dir: &std::path::Path| {
+        let mut ws = workspace();
+        mouli_device::restore(&mut ws, dir).unwrap();
+        ws.add_role(Permissions::new("guest", &["note.read"]));
+        let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+        d.keep_state_in(dir).unwrap();
+        d
+    };
+    let mut d = mk(dir.path());
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    let before = d.shell.security.score;
+    assert!(before > 0);
+    assert!(!finding(&d, "denied").unwrap().acknowledged);
+
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "denied")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+    assert!(
+        d.shell.security.score < before,
+        "a seen finding stops counting"
+    );
+    // Again: nothing new to do.
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.security.message.contains("Already"));
+    assert!(d
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .any(|r| r.action == "finding.ack"
+            && r.actor == "gus"
+            && r.subject.starts_with("denied|")));
+
+    // More refusals change what it says, so it needs a fresh look.
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    assert!(!finding(&d, "denied").unwrap().acknowledged);
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "denied")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+    drop(d);
+
+    // After a restart the acknowledgement is still there (it lives in the audit chain).
+    let d = mk(dir.path());
+    assert!(finding(&d, "denied").unwrap().acknowledged);
+}
+
+#[test]
+fn a_broken_chain_can_be_marked_seen_but_still_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+        d.keep_state_in(dir.path()).unwrap();
+        d.on_key(Key::F(1));
+        type_line(&mut d, "hello");
+    }
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir.path()).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
+    let before = d.shell.security.score;
+    assert!(before >= 70);
+    d.on_key(Key::F(5));
+    let at = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "audit-chain")
+        .unwrap();
+    d.shell.security.cursor.selected = at;
+    d.on_key(Key::Char('a'));
+    assert!(finding(&d, "audit-chain").unwrap().acknowledged);
+    assert!(d.shell.security.message.contains("still counts"));
+    assert!(d.shell.security.score >= 70);
+}
+
+fn run_once(dir: &std::path::Path, line: &str) {
+    // Each start opens a session, so each call adds at least one record.
+    let mut d = reopen_as(
+        dir,
+        if line.starts_with("/signin") {
+            "zed"
+        } else {
+            "owner"
+        },
+    );
+    type_line(&mut d, line);
+}
+
+fn reopen_as(dir: &std::path::Path, user: &str) -> Device<Echo> {
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", user, "owner").unwrap();
+    d.keep_state_in(dir).unwrap();
+    d
+}
+
+fn reopen(dir: &std::path::Path) -> Device<Echo> {
+    reopen_as(dir, "owner")
+}
+
+fn has_checkpoint_alert(d: &Device<Echo>) -> bool {
+    d.shell
+        .security
+        .findings
+        .iter()
+        .any(|f| f.id == "checkpoint")
+}
+
+#[test]
+fn a_normal_restart_raises_no_checkpoint_alert() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    assert!(dir.path().join("checkpoint.txt").exists());
+    let d = reopen(dir.path());
+    assert!(!has_checkpoint_alert(&d));
+    drop(d);
+    assert!(!has_checkpoint_alert(&reopen(dir.path())));
+}
+
+#[test]
+fn cutting_records_off_the_log_is_caught_and_stays_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let kept: Vec<&str> = text.lines().collect();
+    assert!(kept.len() >= 2, "need records to cut: {}", kept.len());
+    // Cut two: the start itself adds a record, and an identical one would hide a cut of one.
+    // The chain still verifies after the cut; only the checkpoint knows records are missing.
+    std::fs::write(&path, format!("{}\n", kept[..kept.len() - 2].join("\n"))).unwrap();
+    let d = reopen(dir.path());
+    assert!(has_checkpoint_alert(&d));
+    drop(d);
+    // The alert is in the chain, so it is still there after the next start.
+    assert!(has_checkpoint_alert(&reopen(dir.path())));
+}
+
+#[test]
+fn swapping_in_another_valid_log_is_caught() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    for _ in 0..3 {
+        run_once(a.path(), "hello");
+        run_once(b.path(), "/signin zed viewer");
+    }
+    std::fs::copy(b.path().join("audit.log"), a.path().join("audit.log")).unwrap();
+    assert!(has_checkpoint_alert(&reopen(a.path())));
+}
+
+#[test]
+fn deleting_or_forging_the_checkpoint_is_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    let cp = dir.path().join("checkpoint.txt");
+    let good = std::fs::read_to_string(&cp).unwrap();
+    std::fs::remove_file(&cp).unwrap();
+    assert!(has_checkpoint_alert(&reopen(dir.path())));
+
+    let dir2 = tempfile::tempdir().unwrap();
+    run_once(dir2.path(), "hello");
+    run_once(dir2.path(), "hello");
+    let cp2 = dir2.path().join("checkpoint.txt");
+    let mut parts: Vec<String> = std::fs::read_to_string(&cp2)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    parts[0] = "1".into(); // claim fewer records; the tag no longer fits
+    std::fs::write(&cp2, parts.join(" ")).unwrap();
+    assert!(has_checkpoint_alert(&reopen(dir2.path())));
+    assert!(!good.is_empty());
+}
+
+#[test]
+fn the_first_start_and_an_upgrade_from_older_state_are_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    // State saved before checkpoints existed: a log, no key, no checkpoint.
+    std::fs::remove_file(dir.path().join("checkpoint.txt")).unwrap();
+    std::fs::remove_file(dir.path().join("checkpoint.key")).unwrap();
+    let d = reopen(dir.path());
+    assert!(!has_checkpoint_alert(&d));
+    assert!(dir.path().join("checkpoint.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_checkpoint_key_is_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    let mode = std::fs::metadata(dir.path().join("checkpoint.key"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0);
+}
+
+fn gus_with_refusals(n: usize) -> Device<Echo> {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..n {
+        type_line(&mut d, "/note.send to=bob");
+    }
+    d
+}
+
+#[test]
+fn e_on_the_security_screen_saves_the_evidence_for_a_finding() {
+    let out = tempfile::tempdir().unwrap();
+    let mut d = gus_with_refusals(5);
+    d.set_export_dir(out.path());
+    d.on_key(Key::F(5));
+    let i = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.shell.security.cursor.selected = i;
+    d.on_key(Key::Char('e'));
+    let msg = d.shell.security.message.clone();
+    assert!(msg.starts_with("Evidence saved to "), "{msg}");
+    let file = out.path().join("evidence-lockout-gus-1.txt");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("finding:   lockout-gus (high)"));
+    assert!(text.contains("chain check: every record matches"));
+    // The five refusals are in it, and nothing from other people.
+    assert_eq!(text.matches("\tgus\t").count(), 5, "{text}");
+    assert!(text.contains("chain head: ") && !text.contains("(empty)"));
+    // The export is itself audited, and a second one gets a new file.
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "finding.export" && r.target.starts_with("lockout-gus|")));
+    d.on_key(Key::F(5));
+    d.shell.security.cursor.selected = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.on_key(Key::Char('e'));
+    assert!(out.path().join("evidence-lockout-gus-2.txt").exists());
+}
+
+#[test]
+fn evidence_says_so_when_there_is_nowhere_to_save() {
+    let mut d = gus_with_refusals(2);
+    d.on_key(Key::F(5));
+    d.on_key(Key::Char('e'));
+    assert!(d
+        .shell
+        .security
+        .message
+        .starts_with("Evidence not saved: there is no data disk"));
+}
+
+#[test]
+fn evidence_for_a_broken_chain_reports_the_break() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut d = reopen(dir.path());
+    d.set_export_dir(out.path());
+    d.on_key(Key::F(5));
+    let i = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "audit-chain")
+        .unwrap();
+    d.shell.security.cursor.selected = i;
+    d.on_key(Key::Char('e'));
+    let text = std::fs::read_to_string(out.path().join("evidence-audit-chain-1.txt")).unwrap();
+    assert!(text.contains("chain check: BROKEN at record 1"), "{text}");
+}
+
+#[test]
+fn a_locked_out_person_cannot_clear_the_lockout_with_their_own_host_actions() {
+    let out = tempfile::tempdir().unwrap();
+    let mut d = gus_with_refusals(5);
+    d.set_export_dir(out.path());
+    d.record_event("screenshot.save", "shot.png", "ok");
+    d.on_key(Key::F(5));
+    d.shell.security.cursor.selected = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.on_key(Key::Char('a'));
+    d.on_key(Key::Char('e'));
+    assert!(finding(&d, "lockout-gus").is_some());
+}
+
+// ---- accounts: passphrase sign-in and administration ----
+
+const OWNER_PASS: &str = "correct horse battery";
+
+fn last_note(d: &Device<Echo>) -> String {
+    chat_texts(d).pop().map(|m| m.1).unwrap_or_default()
+}
+
+/// A device on `dir` with one owner account (`owner`), then restarted so it is locked.
+fn locked_device(dir: &std::path::Path) -> Device<Echo> {
+    {
+        let mut d = reopen(dir);
+        d.on_key(Key::F(1));
+        type_line(&mut d, "/passwd");
+        type_line(&mut d, OWNER_PASS);
+        assert!(last_note(&d).starts_with("Saved."), "{}", last_note(&d));
+    }
+    let mut d = reopen(dir);
+    d.lock();
+    d
+}
+
+fn sign_in(d: &mut Device<Echo>, name: &str, pass: &str) {
+    type_line(d, &format!("/signin {name}"));
+    type_line(d, pass);
+}
+
+fn audit_has(d: &Device<Echo>, action: &str, outcome_starts: &str) -> bool {
+    d.shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == action && r.outcome.starts_with(outcome_starts))
+}
+
+#[test]
+fn without_accounts_the_device_is_open_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = reopen(dir.path());
+    d.on_key(Key::F(1));
+    assert!(!d.has_accounts());
+    d.lock(); // nothing to lock against
+    assert!(!d.is_locked());
+    type_line(&mut d, "/signin amy clerk");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+}
+
+#[test]
+fn the_first_account_is_set_up_by_the_owner_and_then_the_device_starts_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    assert!(d.has_accounts() && d.is_locked());
+    // Locked: a message does not reach the model, and other screens cannot be opened.
+    type_line(&mut d, "hello");
+    assert!(chat_texts(&d).iter().all(|(_, t)| !t.contains("you said")));
+    assert!(last_note(&d).starts_with("Locked."), "{}", last_note(&d));
+    d.on_key(Key::F(3));
+    assert_eq!(d.shell.active, Tab::Chat, "no other screen is reachable");
+    assert_eq!(
+        d.run(Action::Call {
+            capability: "note.read".into(),
+            args: vec![]
+        }),
+        Outcome::Handled
+    );
+    assert!(last_note(&d).starts_with("Locked."));
+    // The right passphrase signs in with the account's role.
+    sign_in(&mut d, "owner", OWNER_PASS);
+    assert!(!d.is_locked());
+    assert!(
+        last_note(&d).contains("Signed in as owner (owner)"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(audit_has(&d, "signin", "ok"));
+    type_line(&mut d, "hello");
+    assert!(chat_texts(&d).iter().any(|(_, t)| t.contains("you said")));
+}
+
+#[test]
+fn a_wrong_passphrase_or_a_name_nobody_has_is_refused_and_audited_without_telling_which() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", "not the passphrase");
+    let wrong = last_note(&d);
+    sign_in(&mut d, "ghost", OWNER_PASS);
+    assert_eq!(last_note(&d), wrong, "the same message for both");
+    assert!(wrong.contains("Wrong passphrase, or there is no such account"));
+    assert!(d.is_locked());
+    assert!(audit_has(&d, "signin", "denied: wrong passphrase"));
+}
+
+#[test]
+fn the_passphrase_is_never_shown_stored_in_the_chat_or_written_anywhere_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    sign_in(&mut d, "owner", "wrong passphrase 123");
+    for (_, text) in chat_texts(&d) {
+        assert!(
+            !text.contains("correct horse") && !text.contains("wrong passphrase 123"),
+            "{text}"
+        );
+    }
+    for row in &d.shell.audit.rows {
+        let all = format!(
+            "{} {} {} {}",
+            row.actor, row.action, row.target, row.outcome
+        );
+        assert!(
+            !all.contains("correct horse") && !all.contains("wrong passphrase 123"),
+            "{all}"
+        );
+    }
+    // Nothing on the data disk holds it either: not the accounts file, not the chat, not the log.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("correct horse") && !text.contains("wrong passphrase 123"),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn once_accounts_exist_nobody_can_choose_their_own_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    type_line(&mut d, "/signin mallory owner");
+    assert!(
+        last_note(&d).starts_with("Type /signin <name>"),
+        "{}",
+        last_note(&d)
+    );
+    // An administrator adds amy as a clerk; amy signs in as a clerk, whatever she types.
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "amy long passphrase");
+    assert!(last_note(&d).starts_with("Saved."), "{}", last_note(&d));
+    sign_in(&mut d, "amy", "amy long passphrase");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+    // A clerk cannot manage accounts: refused and audited.
+    for cmd in [
+        "/adduser bob clerk",
+        "/users",
+        "/setrole amy owner",
+        "/deluser owner",
+        "/resetpass owner",
+    ] {
+        type_line(&mut d, cmd);
+        assert!(
+            last_note(&d).starts_with("Not allowed"),
+            "{cmd}: {}",
+            last_note(&d)
+        );
+    }
+    assert!(audit_has(&d, "accounts.admin", "denied"));
+    type_line(&mut d, "/passwd");
+    assert!(
+        d.shell.chat.is_secret(),
+        "a clerk can change their own passphrase"
+    );
+}
+
+#[test]
+fn five_wrong_passphrases_lock_the_name_out_until_an_approver_unlocks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    for _ in 0..5 {
+        sign_in(&mut d, "owner", "nope nope nope");
+    }
+    // Even the right passphrase cannot be tried now: no hidden entry is offered at all.
+    type_line(&mut d, "/signin owner");
+    assert!(last_note(&d).contains("locked out"), "{}", last_note(&d));
+    assert!(!d.shell.chat.is_secret());
+    assert!(d.is_locked());
+    // The restart does not clear it (it lives in the audit chain).
+    let mut d = reopen(dir.path());
+    d.lock();
+    type_line(&mut d, "/signin owner");
+    assert!(last_note(&d).contains("locked out"), "{}", last_note(&d));
+    assert!(!d.shell.chat.is_secret());
+}
+
+#[test]
+fn administration_adds_changes_resets_and_removes_accounts_and_keeps_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "short");
+    assert!(last_note(&d).starts_with("Not saved"), "{}", last_note(&d));
+    type_line(&mut d, "/adduser amy nosuchrole");
+    assert!(
+        last_note(&d).contains("There is no role"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/adduser bad!name clerk");
+    assert!(last_note(&d).starts_with("Names use"), "{}", last_note(&d));
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "amy long passphrase");
+    type_line(&mut d, "/adduser amy clerk");
+    assert!(
+        last_note(&d).contains("already has an account"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/users");
+    let list = last_note(&d);
+    assert!(
+        list.contains("amy  clerk") && list.contains("owner  owner"),
+        "{list}"
+    );
+    type_line(&mut d, "/resetpass amy");
+    type_line(&mut d, "a new long passphrase");
+    type_line(&mut d, "/setrole amy owner");
+    assert!(
+        last_note(&d).contains("now has the owner role"),
+        "{}",
+        last_note(&d)
+    );
+    // The last owner is protected; with a second owner the first can be removed.
+    type_line(&mut d, "/setrole amy clerk");
+    type_line(&mut d, "/setrole owner clerk");
+    assert!(
+        last_note(&d).starts_with("Not changed"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/deluser owner");
+    assert!(
+        last_note(&d).starts_with("Not removed"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/deluser ghost");
+    assert!(
+        last_note(&d).starts_with("Not removed"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(
+        audit_has(&d, "account.add", "ok")
+            && audit_has(&d, "passphrase.reset", "ok")
+            && audit_has(&d, "account.role", "ok")
+    );
+    // The reset passphrase works and the old one does not; changes survive a restart.
+    let mut d = reopen(dir.path());
+    d.lock();
+    sign_in(&mut d, "amy", "amy long passphrase");
+    assert!(d.is_locked(), "the old passphrase no longer works");
+    sign_in(&mut d, "amy", "a new long passphrase");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+}
+
+#[test]
+fn a_damaged_accounts_file_keeps_the_device_locked_and_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(locked_device(dir.path()));
+    let path = dir.path().join("users.txt");
+    std::fs::write(&path, "garbage that is not an account\n").unwrap();
+    let mut d = reopen(dir.path());
+    assert!(
+        d.has_accounts(),
+        "a file that cannot be read counts as accounts"
+    );
+    d.lock();
+    assert!(d.is_locked());
+    assert!(
+        last_note(&d).contains("cannot be read"),
+        "{}",
+        last_note(&d)
+    );
+    sign_in(&mut d, "owner", OWNER_PASS);
+    assert!(d.is_locked());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "garbage that is not an account\n"
+    );
+}
+
+#[test]
+fn only_someone_who_can_administer_may_set_up_the_first_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir.path()).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "amy", "clerk").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/passwd");
+    assert!(
+        last_note(&d).starts_with("Not allowed"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(!d.shell.chat.is_secret());
+    assert!(!dir.path().join("users.txt").exists());
+}

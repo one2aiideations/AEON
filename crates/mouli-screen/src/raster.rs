@@ -60,6 +60,72 @@ impl Canvas {
         }
     }
 
+    /// A high-contrast copy: the interface colours become strong ones (black ground, white
+    /// text, saturated accents, a vivid selection bar) and every other pixel, such as the
+    /// edge of a letter or a picture, has its channels stretched so darks go black and lights
+    /// go bright.
+    #[must_use]
+    pub fn high_contrast(&self) -> Canvas {
+        use crate::grid::theme;
+        let table = [
+            (theme::BG.0, 0x000000),
+            (theme::PANEL.0, 0x000000),
+            (theme::SELECT.0, 0x0047AB),
+            (theme::TEXT.0, 0xFFFFFF),
+            (theme::DIM.0, 0xE0E0E0),
+            (theme::ACCENT.0, 0x66E0FF),
+            (theme::OK.0, 0x33FF66),
+            (theme::WARN.0, 0xFFE600),
+            (theme::BAD.0, 0xFF6666),
+        ];
+        let stretch = |v: u32| -> u32 {
+            match v {
+                0..=0x3F => 0,
+                0xB0..=0xFF => 0xFF,
+                v => (v - 0x40) * 0xFF / (0xB0 - 0x40),
+            }
+        };
+        let pixels = self
+            .pixels
+            .iter()
+            .map(|&p| {
+                let p = p & 0x00FF_FFFF;
+                if let Some((_, to)) = table.iter().find(|(from, _)| *from == p) {
+                    return *to;
+                }
+                (stretch(p >> 16 & 0xFF) << 16) | (stretch(p >> 8 & 0xFF) << 8) | stretch(p & 0xFF)
+            })
+            .collect();
+        Canvas {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+
+    /// Every pixel repeated `k` times across and down (larger text for small or far screens).
+    /// `k` of 0 or 1 gives an unchanged copy.
+    #[must_use]
+    pub fn scaled(&self, k: usize) -> Canvas {
+        let k = k.max(1);
+        if k == 1 {
+            return self.clone();
+        }
+        let (w, h) = (self.width * k, self.height * k);
+        let mut pixels = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row = &self.pixels[(y / k) * self.width..(y / k + 1) * self.width];
+            for x in 0..w {
+                pixels.push(row[x / k]);
+            }
+        }
+        Canvas {
+            width: w,
+            height: h,
+            pixels,
+        }
+    }
+
     /// The picture as 32-bit little-endian `XRGB8888` bytes (blue, green, red, unused), the
     /// layout of most firmware framebuffers.
     pub fn to_xrgb8888(&self) -> Vec<u8> {
@@ -343,6 +409,48 @@ pub fn to_png(canvas: &Canvas) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::grid::{theme, Color};
+
+    #[test]
+    fn high_contrast_maps_interface_colours_and_stretches_the_rest() {
+        let c = Canvas {
+            width: 5,
+            height: 1,
+            pixels: vec![
+                theme::BG.0,
+                theme::TEXT.0,
+                theme::SELECT.0,
+                0x808080,
+                0x20_30_F0,
+            ],
+        };
+        let h = c.high_contrast();
+        assert_eq!(h.pixels[0], 0x000000);
+        assert_eq!(h.pixels[1], 0xFFFFFF);
+        assert_eq!(h.pixels[2], 0x0047AB);
+        // Mid grey is pushed apart from black and white but stays in between.
+        let mid = h.pixels[3] & 0xFF;
+        assert!(mid > 0 && mid < 0xFF);
+        assert_eq!(h.pixels[3], (mid << 16) | (mid << 8) | mid);
+        assert_eq!(h.pixels[4], 0x0000FF);
+        // Text on the background is now far apart in brightness.
+        assert!(h.pixels[1] - h.pixels[0] > c.pixels[1] - c.pixels[0]);
+    }
+
+    #[test]
+    fn scaling_repeats_pixels_and_one_is_a_copy() {
+        let c = Canvas {
+            width: 2,
+            height: 2,
+            pixels: vec![1, 2, 3, 4],
+        };
+        assert_eq!(c.scaled(1), c);
+        assert_eq!(c.scaled(0), c);
+        let s = c.scaled(2);
+        assert_eq!((s.width, s.height), (4, 4));
+        assert_eq!(s.pixels[..4], [1, 1, 2, 2]);
+        assert_eq!(s.pixels[4..8], [1, 1, 2, 2]);
+        assert_eq!(s.pixels[8..12], [3, 3, 4, 4]);
+    }
 
     #[test]
     fn checksum_known_vectors() {

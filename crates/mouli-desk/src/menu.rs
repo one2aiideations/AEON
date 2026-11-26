@@ -128,6 +128,8 @@ impl MenuBar {
                         item("Storage", "F11", Command::Open(Tab::Storage)),
                         item("Preview", "F12", Command::Open(Tab::Preview)),
                         item("Browser", "^B", Command::Open(Tab::Browser)),
+                        item("Settings", "^O", Command::Open(Tab::Settings)),
+                        item("Wi-Fi", "^E", Command::Open(Tab::Wifi)),
                         SEP,
                         item("Admin", "", Command::Nothing),
                         item("Approvals", "F3", Command::Open(Tab::Approvals)),

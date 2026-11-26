@@ -30,6 +30,12 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - Preview window (F12): renders HTML, Markdown and text with MOULI's own web engine (HTML, CSS with flexbox, grid and floats, PNG, JPEG and GIF pictures, and a JavaScript interpreter for page scripts). No other browser engine is used.
 - Browser window (Ctrl+B): address bar, history, links, forms that use GET, style sheets, scripts and pictures. A page on the internet cannot make the browser load anything from this computer or the local network. A reading view and a summary by the assistant are available; page text reaches the model marked as data.
 - Storage window (F11): what is on the data disk, free space, and removing a model.
+- Accounts and passphrase sign-in (new in 1.6): with a MOULI-DATA partition, the owner types /passwd to set a passphrase; from then on the desktop starts locked and only /signin <name> works. The passphrase is typed in a hidden line (shown as stars, never kept in the chat, the audit log or any file); the file on the data disk keeps only a salted, stretched check of it, readable by its owner only. A person's role comes from their account, not from what they type. The owner adds accounts with /adduser <name> <role>, changes roles with /setrole, removes accounts with /deluser, resets passphrases with /resetpass and lists accounts with /users; the last owner cannot be removed or demoted. Five wrong passphrases lock a name out until someone who can approve types /unlock <name>. If every owner forgets their passphrase, the file users.txt on the data disk has to be removed by hand.
+- Security window (new in 1.6): findings come from rules over the audit log and are scored together; repeated refusals lock a person out; bursts of refusals are flagged; a finding can be marked as seen (written to the audit log, kept across restarts); evidence for a finding can be saved to a file (key e); an audit checkpoint (HMAC-SHA-256 with a key kept beside the log) reports a log that was cut, swapped or rewritten.
+- The audit chain, held approvals and each person's conversation are kept on the MOULI-DATA partition and restored at the next start; a damaged file is refused and never overwritten.
+- More windows (new in 1.6): Settings (Ctrl+O: contrast and text size), Wi-Fi (Ctrl+E: scan, choose, hidden password, join), audit search (/ in the Audit window), chat commands /help, /apps, /files and /save, answers that stream in as they are produced and stop with Ctrl+C, a screenshot with Ctrl+P (PNG on the data disk), idle screen blanking, and /contrast and /textsize.
+- Removing private details before text leaves the computer now also catches JSON passwords and keys, Authorization headers, passwords in addresses and more key formats.
+- The desktop puts the console back if it crashes and shuts down cleanly on the terminate signal.
 - Faster local inference: matrix products use several threads and cores (about 2.8 tokens per second when generating with the 1B model on the author's build machine, up from 0.29; other computers will differ).
 - Text chat with commands /models, /clear and /quit when the desktop is not used.
 - Optional MOULI-DATA partition that keeps the last model used and the chat logs.
@@ -42,21 +48,22 @@ Licences of all parts are listed in 05-Licensing/LICENSE.txt.
 - The screen is checked with a virtual display under BIOS and UEFI.
 - The desktop was tested in QEMU with a virtual screen, keyboard and mouse: it drew, took typed text, answered through the model and followed mouse movement.
 - The text chat (version 1.0) was reported working by the author on one 2017 MacBook Air with a Qwen model. The desktop has NOT yet been tried on a real PC.
-- It has NOT been tested with real Wi-Fi radios, or for speed and memory with a full-size model.
+- Version 1.6: the image was rebuilt and booted in QEMU (BIOS) to the model menu, with a screenshot check that the screen shows output. The new windows, the account commands and the locked start were tested by automated tests of the controller and the screens, not by looking at them on a real screen or typing on a real keyboard.
+- It has NOT been tested with real Wi-Fi radios (the Wi-Fi window was tested with a fake scanner only), or for speed and memory with a full-size model.
 
 ## Known limitations
 
 - In the desktop the Chat, Code, Approvals, Audit and Security windows are connected to the governed workspace (policy, approvals, audit chain). Sheet, Studio, Player and CRM are not part of this image. There is no video player or sound.
 - The browser and preview engine are new and have only been tested against test pages, not on real PCs. Many real web sites will not display correctly: POST forms, cookies, downloads, tabs, WebP and SVG pictures, JavaScript generators and Symbol are not supported, and Date uses UTC only.
-- Choosing a model is still done in the text menu before the desktop starts.
+- Choosing a model is still done in the text menu before the desktop starts. There is no Users window: accounts are managed with chat commands.
 - Downloading was tested over real HTTPS from inside the virtual machine (a 807 MB model, hash checked) but not yet on a real PC or over Wi-Fi. Only Hugging Face servers are allowed; there is no custom address option yet. Check each model's licence (the Qwen 3B model is non-commercial).
 - Touchpads and Bluetooth are NEW and have not been tried on real hardware: only generated finger events and a virtual setup were tested. The pointer scale on a touchpad is learned, so the first sweep across the pad may overshoot. Bluetooth needs an adapter whose firmware is built in or included (CSR and Intel adapters work; many Broadcom and some Realtek ones need a firmware file that is not in this image). Keyboards that ask you to type a code, headsets and audio are not supported. The keyboard layout is US.
 - CPU inference only. No GPU acceleration. The CPU must support AVX2 (2013 or newer).
 - Secure Boot must be off. There is no installer: it runs from the stick and keeps nothing unless a MOULI-DATA partition is present.
 - US keyboard layout only.
-- Wi-Fi: no WPA3-only, enterprise or hidden networks; networks are not remembered after a restart; Broadcom chips are not supported.
-- The program that starts the system does not handle the terminate signal and does not clean up orphaned processes.
-- Chat logs and Bluetooth pairings on the MOULI-DATA partition are stored as plain text. A saved API key is stored encrypted, but its strength depends on the passphrase you choose.
+- Wi-Fi: no WPA3-only, enterprise or hidden networks; Broadcom chips are not supported. Networks you join in the Wi-Fi window are remembered on the data disk; this was tested with fakes only.
+- The terminate signal is now handled, but not yet tried against a real shutdown on a framebuffer. Orphaned processes are still not cleaned up.
+- Sign-in locks the desktop's controls, but a desktop window that was already open can still show its contents, and someone who can read the data disk can try passphrases offline against the stored checks. Chat logs and Bluetooth pairings on the MOULI-DATA partition are stored as plain text. A saved API key is stored encrypted, but its strength depends on the passphrase you choose.
 
 ## Upgrading
 

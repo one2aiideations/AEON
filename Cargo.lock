@@ -2212,7 +2212,7 @@ dependencies = [
  "byteorder-lite",
  "moxcms",
  "num-traits",
- "png",
+ "png 0.18.1",
 ]
 
 [[package]]
@@ -2328,6 +2328,18 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
 
 [[package]]
 name = "js-sys"
@@ -2658,11 +2670,14 @@ version = "0.1.0"
 dependencies = [
  "mouli-apps",
  "mouli-code",
+ "mouli-crypto",
  "mouli-desk",
  "mouli-interface",
  "mouli-player",
  "mouli-screen",
  "mouli-studio",
+ "mouli-systems",
+ "serde_json",
  "tempfile",
 ]
 
@@ -2803,10 +2818,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-slice"
+version = "0.1.0"
+dependencies = [
+ "mouli-llm",
+]
+
+[[package]]
 name = "mouli-studio"
 version = "0.1.0"
 dependencies = [
  "mouli-sheet",
+]
+
+[[package]]
+name = "mouli-studio-suite"
+version = "0.1.0"
+dependencies = [
+ "jpeg-decoder",
+ "jpeg-encoder",
+ "miniz_oxide 0.8.9",
+ "png 0.17.16",
 ]
 
 [[package]]
@@ -3477,6 +3509,19 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "png"
+version = "0.17.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
+dependencies = [
+ "bitflags 1.3.2",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
@@ -3964,7 +4009,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

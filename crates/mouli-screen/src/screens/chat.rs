@@ -2,7 +2,7 @@
 
 use crate::grid::{theme, wrap, Color, Grid, Rect};
 use crate::key::Key;
-use crate::screen::{Action, Screen};
+use crate::screen::{Action, Hidden, Screen};
 use std::cell::Cell;
 
 /// Who a message is from.
@@ -46,10 +46,15 @@ pub struct Chat {
     max_scroll: Cell<usize>,
     /// True while the model is answering (the input is held back).
     pub busy: bool,
+    /// True while the last message is an answer that is still arriving piece by piece.
+    pub streaming: bool,
     /// The loaded model's name, shown above the transcript.
     pub model: String,
     /// A status line (for example "context nearly full").
     pub status: String,
+    /// While set, the input is hidden entry: what was asked for (`token`) and what to show
+    /// (`prompt`).
+    secret: Option<(String, String)>,
 }
 
 fn label(role: Role) -> (&'static str, Color) {
@@ -74,15 +79,93 @@ impl Chat {
         self.scroll = 0;
     }
 
+    /// Adds a piece of an answer that is still arriving: it extends the answer being shown, or
+    /// starts one.
+    pub fn stream_piece(&mut self, piece: &str) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.text.push_str(piece);
+                self.scroll = 0;
+                return;
+            }
+        }
+        self.push(Role::Assistant, piece);
+        self.streaming = true;
+    }
+
+    /// Ends an answer with its final text: replaces what was streamed, or adds it when nothing
+    /// was streamed.
+    pub fn finish_answer(&mut self, text: &str) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.text = text.to_string();
+            }
+            self.streaming = false;
+            self.scroll = 0;
+        } else {
+            self.push(Role::Assistant, text);
+        }
+    }
+
     /// Forgets the conversation (the input line is kept).
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.streaming = false;
         self.scroll = 0;
     }
 
-    /// The text being typed.
+    /// The text being typed (empty during hidden entry, so a passphrase can never be read back
+    /// as a draft).
     pub fn input(&self) -> String {
+        if self.secret.is_some() {
+            return String::new();
+        }
         self.input.iter().collect()
+    }
+
+    /// Asks for a hidden line (a passphrase): what is typed shows as `*`, is not kept in the
+    /// conversation, and comes back as [`Action::Secret`] with `token` when Enter is pressed. Esc
+    /// cancels. Anything already typed is dropped.
+    pub fn begin_secret(&mut self, token: &str, prompt: &str) {
+        self.input.clear();
+        self.cursor = 0;
+        self.secret = Some((token.to_string(), prompt.to_string()));
+    }
+
+    /// True while a hidden line is being asked for.
+    #[must_use]
+    pub fn is_secret(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    fn secret_key(&mut self, key: Key) -> Action {
+        match key {
+            Key::Char(c) if !c.is_control() => {
+                if self.input.len() < MAX_INPUT {
+                    self.input.push(c);
+                }
+            }
+            Key::Backspace => {
+                self.input.pop();
+            }
+            Key::Esc => {
+                self.input.clear();
+                self.secret = None;
+            }
+            Key::Enter => {
+                if let Some((token, _)) = self.secret.take() {
+                    let text: String = std::mem::take(&mut self.input).into_iter().collect();
+                    self.cursor = 0;
+                    return Action::Secret {
+                        token,
+                        text: Hidden::from(text.as_str()),
+                    };
+                }
+            }
+            _ => {}
+        }
+        self.cursor = self.input.len();
+        Action::None
     }
 
     /// Replaces the input line (for example to restore a draft).
@@ -115,7 +198,7 @@ impl Chat {
             }
             out.push((String::new(), colour, String::new()));
         }
-        if self.busy {
+        if self.busy && !self.streaming {
             out.push(("mouli".to_string(), theme::OK, "thinking...".to_string()));
         }
         out
@@ -124,6 +207,9 @@ impl Chat {
 
 impl Screen for Chat {
     fn on_key(&mut self, key: Key) -> Action {
+        if self.secret.is_some() {
+            return self.secret_key(key);
+        }
         match key {
             Key::Char(c) if !c.is_control() => {
                 if self.input.len() < MAX_INPUT {
@@ -216,8 +302,10 @@ impl Screen for Chat {
         let box_rect = Rect::new(inner.x, inner.y + view_h, inner.w, 3);
         g.boxed(
             box_rect,
-            if self.busy {
-                Some("waiting for the model")
+            if let Some((_, prompt)) = &self.secret {
+                Some(prompt.as_str())
+            } else if self.busy {
+                Some("waiting for the model - Ctrl-C stops it")
             } else {
                 None
             },
@@ -227,7 +315,11 @@ impl Screen for Chat {
         let field_w = inner.w.saturating_sub(5);
         let (first, cursor_col) = window(self.cursor, self.input.len(), field_w);
         g.text(inner.x + 1, box_rect.y + 1, ">", theme::ACCENT, theme::BG);
-        let shown: String = self.input.iter().skip(first).take(field_w).collect();
+        let shown: String = if self.secret.is_some() {
+            "*".repeat(self.input.iter().skip(first).take(field_w).count())
+        } else {
+            self.input.iter().skip(first).take(field_w).collect()
+        };
         g.text(inner.x + 3, box_rect.y + 1, &shown, theme::TEXT, theme::BG);
         if !self.busy {
             let c = self.input.get(self.cursor).copied().unwrap_or(' ');
@@ -252,6 +344,12 @@ impl Screen for Chat {
     }
 
     fn hints(&self) -> String {
+        if self.secret.is_some() {
+            return "Typing is hidden  Enter confirm  Esc cancel".into();
+        }
+        if self.busy {
+            return "Ctrl-C stop the answer  Up/PgUp scroll  F2 models".into();
+        }
         "Enter send  Up/PgUp scroll  Ctrl-L new chat  F2 models".into()
     }
 }
@@ -351,6 +449,26 @@ mod tests {
     }
 
     #[test]
+    fn pieces_extend_one_answer_and_the_final_text_replaces_them() {
+        let mut c = Chat::default();
+        c.push(Role::User, "hi");
+        c.busy = true;
+        c.stream_piece("Hel");
+        c.stream_piece("lo");
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[1].text, "Hello");
+        assert!(c.streaming);
+        assert!(c.hints().contains("Ctrl-C"));
+        c.finish_answer("Hello there");
+        assert!(!c.streaming);
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[1].text, "Hello there");
+        // Without streaming the answer is simply added.
+        c.finish_answer("Another");
+        assert_eq!(c.messages.len(), 3);
+    }
+
+    #[test]
     fn nothing_is_sent_while_the_model_is_busy() {
         let mut c = Chat::default();
         type_text(&mut c, "hi");
@@ -359,6 +477,100 @@ mod tests {
         assert_eq!(c.input(), "hi", "the draft survives");
         c.busy = false;
         assert_eq!(c.on_key(Key::Enter), Action::Send("hi".into()));
+    }
+
+    #[test]
+    fn hidden_entry_returns_the_line_with_its_token_and_keeps_it_out_of_the_conversation() {
+        let mut c = Chat::default();
+        c.push(Role::User, "earlier message");
+        c.begin_secret("signin:amy", "Passphrase for amy");
+        assert!(c.is_secret());
+        type_text(&mut c, "correct horse");
+        c.on_key(Key::Backspace);
+        type_text(&mut c, "e");
+        assert_eq!(
+            c.input(),
+            "",
+            "a passphrase can never be read back as a draft"
+        );
+        let a = c.on_key(Key::Enter);
+        match a {
+            Action::Secret { token, text } => {
+                assert_eq!(token, "signin:amy");
+                assert_eq!(text.expose(), "correct horse");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!c.is_secret());
+        assert_eq!(
+            c.messages.len(),
+            1,
+            "nothing typed was added to the conversation"
+        );
+        assert_eq!(c.input(), "");
+        // Back to normal typing.
+        type_text(&mut c, "hi");
+        assert_eq!(c.on_key(Key::Enter), Action::Send("hi".into()));
+    }
+
+    #[test]
+    fn hidden_entry_draws_stars_never_the_text() {
+        let mut c = Chat::default();
+        c.begin_secret("passwd", "New passphrase");
+        type_text(&mut c, "hunter2hunter2");
+        let t = drawn(&c, 50, 12).to_text();
+        assert!(t.contains("New passphrase"), "{t}");
+        assert!(t.contains("**************"), "{t}");
+        assert!(!t.contains("hunter"), "{t}");
+        assert!(c.hints().contains("hidden"));
+    }
+
+    #[test]
+    fn escape_cancels_hidden_entry_and_drops_what_was_typed() {
+        let mut c = Chat::default();
+        c.begin_secret("passwd", "New passphrase");
+        type_text(&mut c, "abc");
+        assert_eq!(c.on_key(Key::Esc), Action::None);
+        assert!(!c.is_secret());
+        assert_eq!(
+            c.on_key(Key::Enter),
+            Action::None,
+            "nothing is left in the input"
+        );
+        // Beginning a new entry also drops anything left over.
+        c.on_key(Key::Char('x'));
+        c.begin_secret("passwd", "again");
+        assert_eq!(
+            c.on_key(Key::Enter).clone(),
+            Action::Secret {
+                token: "passwd".into(),
+                text: Hidden::from("")
+            }
+        );
+    }
+
+    #[test]
+    fn hidden_entry_ignores_other_keys_and_caps_the_length() {
+        let mut c = Chat::default();
+        c.begin_secret("passwd", "p");
+        for k in [
+            Key::Up,
+            Key::Down,
+            Key::Left,
+            Key::PageUp,
+            Key::Ctrl('l'),
+            Key::F(2),
+        ] {
+            assert_eq!(c.on_key(k), Action::None);
+        }
+        assert!(c.is_secret());
+        for _ in 0..MAX_INPUT + 10 {
+            c.on_key(Key::Char('a'));
+        }
+        match c.on_key(Key::Enter) {
+            Action::Secret { text, .. } => assert_eq!(text.len(), MAX_INPUT),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

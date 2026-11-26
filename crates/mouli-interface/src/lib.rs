@@ -38,4 +38,4 @@ pub mod workspace;
 pub use capability::{Application, Call, CapabilitySpec, Output, Resource, Risk};
 pub use error::{Error, Result};
 pub use policy::{Policy, Role as Permissions, Verdict};
-pub use workspace::{PendingCall, Reply, Workspace};
+pub use workspace::{PendingCall, Reply, Workspace, LOCKOUT_REFUSALS};
