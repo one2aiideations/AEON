@@ -177,6 +177,7 @@ impl CameraDmaRingBuffer {
         let seq = self.frame_sequence.fetch_add(1, Ordering::SeqCst);
 
         // Commit metadata for downstream AI PPU ingestion
+        // SAFETY: `CameraDmaRingBuffer` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the frame metadata is alive.
         let metas = unsafe { &mut *self.metadata.get() };
         metas[curr_write as usize] = CameraFrameMeta {
             frame_id: seq,
@@ -202,6 +203,8 @@ impl CameraDmaRingBuffer {
         if idx == 0xFF {
             None
         } else {
+            // SAFETY: `CameraDmaRingBuffer` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the frame metadata is alive.
+            // It is only read here and the entry is `Copy`.
             let metas = unsafe { &*self.metadata.get() };
             Some(metas[idx as usize])
         }
@@ -337,6 +340,10 @@ pub struct AraComSkeleton {
     subscriber_endpoints: UnsafeCell<[u16; ARA_COM_MAX_EVENT_SUBSCRIBERS]>,
 }
 
+// SAFETY: only conditionally sound. `register_subscriber` reads `subscriber_count`, writes the slot
+// at that index, then increments, with no lock; two concurrent registrars could both write the same
+// slot and lose a subscriber. It is sound only with one registrar at a time (for example all
+// subscriptions made at start-up from one context). The other fields are atomics.
 unsafe impl Sync for AraComSkeleton {}
 
 impl AraComSkeleton {
@@ -386,6 +393,9 @@ impl AraComSkeleton {
             return Err(AraComError::SubscriberPoolFull);
         }
 
+        // SAFETY: `register_subscriber` checks the count, writes the slot at `count`, then increments, with no lock,
+        // so it is only sound with one registrar at a time (see the `Sync` impl). This is the only code that
+        // touches the endpoint table, so no reader exists.
         let endpoints = unsafe { &mut *self.subscriber_endpoints.get() };
         endpoints[count] = client_endpoint_id;
         self.subscriber_count.fetch_add(1, Ordering::SeqCst);
@@ -512,6 +522,7 @@ impl WatchdogManager {
             return Err(WdgmError::EntityNotFound);
         }
 
+        // SAFETY: `WatchdogManager` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the entity table is alive.
         let ents = unsafe { &mut *self.entities.get() };
         ents[idx] = Some(entity);
         self.entity_count.fetch_add(1, Ordering::SeqCst);
@@ -521,6 +532,7 @@ impl WatchdogManager {
     /// Evaluates supervision window (invoked periodically at 100Hz from ASIL-D timer)
     pub fn evaluate_supervision_cycle(&self) -> Result<(), WdgmError> {
         let count = self.entity_count.load(Ordering::Relaxed) as usize;
+        // SAFETY: `WatchdogManager` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the entity table is alive.
         let ents = unsafe { &mut *self.entities.get() };
 
         for i in 0..count {
