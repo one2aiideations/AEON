@@ -147,6 +147,69 @@ pub(crate) fn is_applied<B: Backend>(d: &Device<B>) -> bool {
         .is_some_and(|v| v.stage == Stage::Applied)
 }
 
+/// Longest review comment kept, in characters.
+pub const MAX_COMMENT_CHARS: usize = 500;
+
+/// Why a review comment was not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentError {
+    /// No change is under review.
+    NoChange,
+    /// The file is not part of the change under review.
+    NotInChange(String),
+    /// Line numbers start at 1.
+    BadLine,
+    /// The comment is empty.
+    Empty,
+}
+
+impl std::fmt::Display for CommentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoChange => f.write_str("no change is under review"),
+            Self::NotInChange(p) => write!(f, "{p} is not part of the change under review"),
+            Self::BadLine => f.write_str("line numbers start at 1"),
+            Self::Empty => f.write_str("the comment is empty"),
+        }
+    }
+}
+
+impl std::error::Error for CommentError {}
+
+/// Keeps a reviewer's comment on a line of a file in the change under review, in the audit trail
+/// under the reviewer's name. Control characters become spaces and the text is cut to
+/// [`MAX_COMMENT_CHARS`], so a comment cannot start a new line in the trail.
+pub(crate) fn comment<B: Backend>(
+    d: &mut Device<B>,
+    path: &str,
+    line: usize,
+    text: &str,
+) -> Result<(), CommentError> {
+    let known = {
+        let st = d.patch.state.borrow();
+        let v = st.view().ok_or(CommentError::NoChange)?;
+        v.files.iter().any(|f| f.path == path)
+    };
+    if !known {
+        return Err(CommentError::NotInChange(clean_label(path)));
+    }
+    if line == 0 {
+        return Err(CommentError::BadLine);
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Err(CommentError::Empty);
+    }
+    let body: String = words
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_COMMENT_CHARS)
+        .collect();
+    d.audit_event("patch.comment", &format!("{path}:{line} {body}"), "ok");
+    Ok(())
+}
+
 pub(crate) fn apply<B: Backend>(d: &mut Device<B>) {
     let was_applied = is_applied(d);
     if d.patch.gated {

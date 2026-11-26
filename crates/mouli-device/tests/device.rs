@@ -2303,3 +2303,50 @@ fn a_change_applied_after_a_second_persons_approval_names_its_proposer() {
         "{rows:?}"
     );
 }
+
+#[test]
+fn review_comments_on_lines_are_kept_in_the_audit_trail_under_the_reviewer() {
+    use mouli_device::CommentError;
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 2, "why +50?"),
+        Err(CommentError::NoChange)
+    );
+    d.propose_patch_by(dir.path(), &diff, "user").unwrap();
+    d.comment_on_patch("src/tax.rs", 2, "rounds half up,\n  please add a test")
+        .unwrap();
+    assert_eq!(
+        d.comment_on_patch("src/other.rs", 1, "x"),
+        Err(CommentError::NotInChange("src/other.rs".into()))
+    );
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 0, "x"),
+        Err(CommentError::BadLine)
+    );
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 1, " \n\t "),
+        Err(CommentError::Empty)
+    );
+    let long = "y".repeat(2000);
+    d.comment_on_patch("src/tax.rs", 3, &long).unwrap();
+    d.on_key(Key::F(1)); // refresh the audit rows
+    let rows: Vec<_> = d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .filter(|r| r.action == "patch.comment")
+        .collect();
+    assert_eq!(rows.len(), 2, "refused comments leave no trace");
+    assert_eq!(rows[0].actor, "owner");
+    assert_eq!(
+        rows[0].target,
+        "src/tax.rs:2 rounds half up, please add a test"
+    );
+    assert_eq!(
+        rows[1].target.chars().count(),
+        "src/tax.rs:3 ".len() + mouli_device::MAX_COMMENT_CHARS
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}

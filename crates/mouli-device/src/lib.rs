@@ -27,7 +27,7 @@ use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, Role};
 use mouli_screen::shell::Shell;
 
 pub use keep::{restore, Restored};
-pub use patch::PatchError;
+pub use patch::{CommentError, PatchError, MAX_COMMENT_CHARS};
 pub use roles::{add_default_roles, CLERK, OWNER, VIEWER};
 
 /// Something that can answer a prompt with the model the workspace chose.
@@ -1030,6 +1030,21 @@ impl<B: Backend> Device<B> {
         proposer: &str,
     ) -> Result<(), PatchError> {
         patch::propose(self, root, diff, proposer)
+    }
+
+    /// Keeps a comment on one line of a file in the change under review, in the audit trail under
+    /// the signed-in person's name.
+    ///
+    /// # Errors
+    /// [`CommentError`] when nothing is under review, the file is not part of the change, the
+    /// line is 0, or the text is empty.
+    pub fn comment_on_patch(
+        &mut self,
+        path: &str,
+        line: usize,
+        text: &str,
+    ) -> Result<(), CommentError> {
+        patch::comment(self, path, line, text)
     }
 
     fn apply_patch(&mut self) {
