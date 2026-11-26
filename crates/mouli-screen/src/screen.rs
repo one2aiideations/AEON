@@ -113,6 +113,8 @@ pub enum Action {
     },
     /// Mark a security finding as seen (the controller records who did it).
     AckFinding(String),
+    /// Write the evidence for a security finding to a file.
+    ExportFinding(String),
     /// Run a fresh security scan.
     RefreshSecurity,
     /// Apply the patch under review.

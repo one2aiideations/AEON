@@ -333,6 +333,54 @@ impl<B: Backend> Device<B> {
         };
     }
 
+    /// Writes the evidence for one finding to a new text file in the export folder: what the
+    /// finding says, the audit records behind it, and the chain head so the file can be matched
+    /// to the log later. Writes an audit record naming the file.
+    fn export_finding(&mut self, id: &str) -> Result<String, String> {
+        let dir = self
+            .export_dir
+            .clone()
+            .ok_or("there is no data disk to save to")?;
+        let f = self
+            .shell
+            .security
+            .findings
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+            .ok_or("that finding is gone")?;
+        let text = security::evidence(&self.ws, &f, &self.user);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let slug: String =
+            f.id.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+        let (path, mut file) = (1..)
+            .find_map(|i| {
+                let p = dir.join(format!("evidence-{slug}-{i}.txt"));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&p)
+                    .ok()
+                    .map(|file| (p, file))
+            })
+            .ok_or("no free file name")?;
+        std::io::Write::write_all(&mut file, text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let shown = path.display().to_string();
+        self.audit_event("finding.export", &format!("{}|{shown}", f.id), "ok");
+        Ok(shown)
+    }
+
     /// Writes an event of the host (for example a screenshot) into the audit chain as the
     /// signed-in person.
     pub fn record_event(&mut self, action: &str, subject: &str, outcome: &str) {
@@ -482,6 +530,13 @@ impl<B: Backend> Device<B> {
             }
             Action::AckFinding(id) => {
                 self.acknowledge_finding(&id);
+                Outcome::Handled
+            }
+            Action::ExportFinding(id) => {
+                self.shell.security.message = match self.export_finding(&id) {
+                    Ok(path) => format!("Evidence saved to {path}"),
+                    Err(e) => format!("Evidence not saved: {e}"),
+                };
                 Outcome::Handled
             }
             Action::Decide { id, approve } => {

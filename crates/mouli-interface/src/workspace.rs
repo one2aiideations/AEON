@@ -126,6 +126,21 @@ pub struct Workspace {
     vault: Vault,
 }
 
+/// Events the host writes about its own actions (a saved screenshot, a seen finding). They are
+/// not requests to the policy, so they neither count as refusals nor clear a lockout.
+fn is_host_event(action: &str) -> bool {
+    [
+        "finding.",
+        "answer.",
+        "screenshot.",
+        "checkpoint.",
+        "patch.",
+        "signin",
+    ]
+    .iter()
+    .any(|p| action.starts_with(p))
+}
+
 impl Workspace {
     /// Create a workspace.
     ///
@@ -619,7 +634,7 @@ impl Workspace {
             if r.action == "lockout.clear" && r.subject == user && r.outcome == "ok" {
                 return false;
             }
-            if r.actor != user || r.action == "session.open" {
+            if r.actor != user || r.action == "session.open" || is_host_event(&r.action) {
                 continue;
             }
             if r.outcome.starts_with("denied") {

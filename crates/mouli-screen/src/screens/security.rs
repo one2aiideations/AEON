@@ -98,6 +98,13 @@ impl Screen for SecurityScreen {
             Key::Home => self.cursor.jump(false, len),
             Key::End => self.cursor.jump(true, len),
             Key::Char('s') => return Action::RefreshSecurity,
+            Key::Char('e') => {
+                let Some(id) = self.selected().map(|f| f.id.clone()) else {
+                    return Action::None;
+                };
+                self.message.clear();
+                return Action::ExportFinding(id);
+            }
             Key::Char('a') => {
                 let Some((id, seen)) = self.selected().map(|f| (f.id.clone(), f.acknowledged))
                 else {
@@ -216,7 +223,7 @@ impl Screen for SecurityScreen {
     }
 
     fn hints(&self) -> String {
-        "Up/Down choose  a mark as seen  s scan again".into()
+        "Up/Down choose  a mark as seen  e save evidence  s scan again".into()
     }
 }
 

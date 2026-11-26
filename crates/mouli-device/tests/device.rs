@@ -1777,3 +1777,113 @@ fn the_checkpoint_key_is_private_to_the_owner() {
         .mode();
     assert_eq!(mode & 0o077, 0);
 }
+
+fn gus_with_refusals(n: usize) -> Device<Echo> {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..n {
+        type_line(&mut d, "/note.send to=bob");
+    }
+    d
+}
+
+#[test]
+fn e_on_the_security_screen_saves_the_evidence_for_a_finding() {
+    let out = tempfile::tempdir().unwrap();
+    let mut d = gus_with_refusals(5);
+    d.set_export_dir(out.path());
+    d.on_key(Key::F(5));
+    let i = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.shell.security.cursor.selected = i;
+    d.on_key(Key::Char('e'));
+    let msg = d.shell.security.message.clone();
+    assert!(msg.starts_with("Evidence saved to "), "{msg}");
+    let file = out.path().join("evidence-lockout-gus-1.txt");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("finding:   lockout-gus (high)"));
+    assert!(text.contains("chain check: every record matches"));
+    // The five refusals are in it, and nothing from other people.
+    assert_eq!(text.matches("\tgus\t").count(), 5, "{text}");
+    assert!(text.contains("chain head: ") && !text.contains("(empty)"));
+    // The export is itself audited, and a second one gets a new file.
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "finding.export" && r.target.starts_with("lockout-gus|")));
+    d.on_key(Key::F(5));
+    d.shell.security.cursor.selected = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.on_key(Key::Char('e'));
+    assert!(out.path().join("evidence-lockout-gus-2.txt").exists());
+}
+
+#[test]
+fn evidence_says_so_when_there_is_nowhere_to_save() {
+    let mut d = gus_with_refusals(2);
+    d.on_key(Key::F(5));
+    d.on_key(Key::Char('e'));
+    assert!(d
+        .shell
+        .security
+        .message
+        .starts_with("Evidence not saved: there is no data disk"));
+}
+
+#[test]
+fn evidence_for_a_broken_chain_reports_the_break() {
+    let dir = tempfile::tempdir().unwrap();
+    run_once(dir.path(), "hello");
+    run_once(dir.path(), "hello");
+    let path = dir.path().join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("\towner\t", "\tmallory\t", 1)).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut d = reopen(dir.path());
+    d.set_export_dir(out.path());
+    d.on_key(Key::F(5));
+    let i = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "audit-chain")
+        .unwrap();
+    d.shell.security.cursor.selected = i;
+    d.on_key(Key::Char('e'));
+    let text = std::fs::read_to_string(out.path().join("evidence-audit-chain-1.txt")).unwrap();
+    assert!(text.contains("chain check: BROKEN at record 1"), "{text}");
+}
+
+#[test]
+fn a_locked_out_person_cannot_clear_the_lockout_with_their_own_host_actions() {
+    let out = tempfile::tempdir().unwrap();
+    let mut d = gus_with_refusals(5);
+    d.set_export_dir(out.path());
+    d.record_event("screenshot.save", "shot.png", "ok");
+    d.on_key(Key::F(5));
+    d.shell.security.cursor.selected = d
+        .shell
+        .security
+        .findings
+        .iter()
+        .position(|f| f.id == "lockout-gus")
+        .unwrap();
+    d.on_key(Key::Char('a'));
+    d.on_key(Key::Char('e'));
+    assert!(finding(&d, "lockout-gus").is_some());
+}

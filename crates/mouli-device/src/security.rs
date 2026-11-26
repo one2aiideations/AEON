@@ -162,3 +162,70 @@ pub(crate) fn assess(ws: &Workspace) -> (u8, Vec<Finding>) {
     }
     (score.min(100) as u8, findings)
 }
+
+/// A plain-text evidence file for one finding: the finding, the audit records that led to it,
+/// and the head of the chain at the time.
+pub(crate) fn evidence(ws: &Workspace, f: &Finding, by: &str) -> String {
+    let records = ws.audit().records();
+    let id = f.id.as_str();
+    let related = |r: &mouli_interface::audit::AuditRecord| -> bool {
+        if let Some(actor) = id
+            .strip_prefix("lockout-")
+            .or_else(|| id.strip_prefix("burst-"))
+        {
+            r.actor == actor && (r.outcome.starts_with("denied") || r.action == "lockout.clear")
+        } else {
+            match id {
+                "denied" => r.outcome.starts_with("denied") || r.outcome.starts_with("rejected"),
+                "failures" => r.outcome.starts_with("failed"),
+                "checkpoint" => r.action == "checkpoint.failed",
+                "approvals" => r.action.contains("approv"),
+                _ => false,
+            }
+        }
+    };
+    let mut picked: Vec<&mouli_interface::audit::AuditRecord> =
+        records.iter().filter(|r| related(r)).collect();
+    // A finding with no obvious rows (the broken chain, say) gets the last few records.
+    let general = picked.is_empty();
+    if general {
+        picked = records.iter().rev().take(20).rev().collect();
+    }
+    let mut out = String::new();
+    out.push_str("MOULI evidence for a security finding\n");
+    out.push_str(&format!("finding:   {} ({})\n", f.id, f.severity.label()));
+    out.push_str(&format!("title:     {}\n", f.title));
+    out.push_str(&format!("detail:    {}\n", f.detail));
+    out.push_str(&format!("exported by: {by}\n"));
+    out.push_str(&format!("records in the log: {}\n", records.len()));
+    out.push_str(&format!(
+        "chain head: {}\n",
+        records.last().map_or("(empty)", |r| r.hash.as_str())
+    ));
+    out.push_str(&match ws.audit().verify() {
+        Ok(()) => "chain check: every record matches the one before it\n".to_string(),
+        Err(i) => format!("chain check: BROKEN at record {}\n", i + 1),
+    });
+    out.push_str(&format!(
+        "\n{} ({} records)\nseq\ttick\tactor\taction\tsubject\toutcome\thash\n",
+        if general {
+            "the last records"
+        } else {
+            "records behind this finding"
+        },
+        picked.len()
+    ));
+    for r in picked {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            r.seq + 1,
+            r.tick,
+            r.actor,
+            r.action,
+            r.subject.replace(['\n', '\t'], " "),
+            r.outcome,
+            r.hash
+        ));
+    }
+    out
+}
