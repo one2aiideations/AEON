@@ -3,6 +3,49 @@
 use crate::grid::{Grid, Rect};
 use crate::key::Key;
 
+/// Text that must never be printed: Debug shows only its length. Used for passwords.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Hidden(String);
+
+impl Hidden {
+    /// Number of characters.
+    pub fn len(&self) -> usize {
+        self.0.chars().count()
+    }
+
+    /// True when empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Adds a character.
+    pub fn push(&mut self, c: char) {
+        self.0.push(c);
+    }
+
+    /// Removes the last character.
+    pub fn pop(&mut self) {
+        self.0.pop();
+    }
+
+    /// The text, for the one place that needs it (handing it to the host).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Hidden {
+    fn from(s: &str) -> Self {
+        Hidden(s.to_string())
+    }
+}
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hidden({} chars)", self.len())
+    }
+}
+
 /// What a screen asks the rest of MOULI to do. The screens never act themselves: they report
 /// what the person chose, and the controller (which owns the model, the policy and the disk)
 /// carries it out and updates the screens' data.
@@ -59,6 +102,15 @@ pub enum Action {
         /// The value chosen.
         value: String,
     },
+    /// Look for Wi-Fi networks.
+    WifiScan,
+    /// Join a Wi-Fi network (the host does it and reports back).
+    WifiJoin {
+        /// The network's name.
+        ssid: String,
+        /// Its password, when it has one.
+        passphrase: Option<Hidden>,
+    },
     /// Run a fresh security scan.
     RefreshSecurity,
     /// Apply the patch under review.
@@ -100,11 +152,13 @@ pub enum Tab {
     Browser,
     /// How the screen looks and what the machine is set up with.
     Settings,
+    /// Joining a Wi-Fi network.
+    Wifi,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 14] = [
+    pub const ALL: [Tab; 15] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -119,6 +173,7 @@ impl Tab {
         Tab::Preview,
         Tab::Browser,
         Tab::Settings,
+        Tab::Wifi,
     ];
 
     /// The name shown in the tab bar.
@@ -138,6 +193,7 @@ impl Tab {
             Tab::Preview => "Preview",
             Tab::Browser => "Browser",
             Tab::Settings => "Settings",
+            Tab::Wifi => "Wi-Fi",
         }
     }
 
@@ -146,6 +202,7 @@ impl Tab {
         match self {
             Tab::Browser => Key::Ctrl('b'),
             Tab::Settings => Key::Ctrl('o'),
+            Tab::Wifi => Key::Ctrl('e'),
             t => Key::F(t as u8 + 1),
         }
     }
@@ -155,6 +212,7 @@ impl Tab {
         match self {
             Tab::Browser => "^B".into(),
             Tab::Settings => "^O".into(),
+            Tab::Wifi => "^E".into(),
             t => format!("F{}", t as u8 + 1),
         }
     }
@@ -235,7 +293,8 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 14);
+        assert_eq!(Tab::ALL.len(), 15);
+        assert_eq!(Tab::Wifi.key(), Key::Ctrl('e'));
         assert_eq!(Tab::Settings.key(), Key::Ctrl('o'));
         assert_eq!(Tab::Settings.key_name(), "^O");
         assert_eq!(Tab::Browser.key(), Key::Ctrl('b'));
@@ -261,7 +320,8 @@ mod tests {
                 "Storage",
                 "Preview",
                 "Browser",
-                "Settings"
+                "Settings",
+                "Wi-Fi"
             ]
         );
     }

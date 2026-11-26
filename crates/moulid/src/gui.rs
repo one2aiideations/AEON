@@ -327,6 +327,10 @@ pub enum Ev {
     Piece(String),
     /// The model finished answering (or failed).
     Reply(Result<String, String>),
+    /// A Wi-Fi scan finished (or could not run).
+    WifiScanned(Result<Vec<mouli_screen::screens::WifiRow>, String>),
+    /// Joining a Wi-Fi network finished: a summary of the link, or why not.
+    WifiJoined(Result<String, String>),
     /// The browser finished loading an address (or failed).
     Page {
         /// The address that was asked for.
@@ -660,6 +664,71 @@ fn save_view(store: Option<&crate::persist::Store>, key: &str, value: &str) -> &
         },
         None => " (No MOULI-DATA disk, so it is forgotten at power-off.)",
     }
+}
+
+/// Signal strength as 1 to 4 bars.
+fn wifi_bars(dbm: i32) -> u8 {
+    match dbm {
+        s if s >= -55 => 4,
+        s if s >= -67 => 3,
+        s if s >= -78 => 2,
+        _ => 1,
+    }
+}
+
+/// Looks for networks on the first wireless adapter and returns them for the Wi-Fi screen.
+fn wifi_scan_rows<R: Runner>(
+    r: &mut R,
+    sys_net: &Path,
+) -> Result<Vec<mouli_screen::screens::WifiRow>, String> {
+    use crate::wifi::Security;
+    use mouli_screen::screens::{WifiRow, WifiSecurity};
+    let ifaces = crate::wifi::wireless_interfaces(sys_net);
+    let iface = ifaces.first().ok_or(
+        "No Wi-Fi adapter was found. Use a network cable, or an adapter the kernel knows.",
+    )?;
+    Ok(crate::wifi::scan(r, iface, 3)?
+        .into_iter()
+        .map(|n| WifiRow {
+            bars: wifi_bars(n.signal),
+            security: match n.security {
+                Security::Open => WifiSecurity::Open,
+                Security::Personal => WifiSecurity::Password,
+                Security::Unsupported => WifiSecurity::Unsupported,
+            },
+            ssid: n.ssid,
+        })
+        .collect())
+}
+
+/// Joins `ssid` on the first adapter, gets an address, and remembers the network on the data
+/// disk. Returns the one-line summary of the link.
+fn wifi_join_network(
+    sys_net: &Path,
+    save_to: Option<&Path>,
+    ssid: &str,
+    passphrase: Option<&str>,
+) -> Result<String, String> {
+    let ifaces = crate::wifi::wireless_interfaces(sys_net);
+    let iface = ifaces.first().ok_or("No Wi-Fi adapter was found.")?;
+    let link = crate::wifi::connect(&mut crate::wifi::System, iface, ssid, passphrase)?;
+    let mut text = link.summary();
+    if let Some(root) = save_to {
+        match crate::wifi_saved::remember(root, ssid, passphrase, unix_now()) {
+            Ok(()) => text.push_str("  Saved: MOULI will join this network next time."),
+            Err(e) => text.push_str(&format!("  (could not save this network: {e})")),
+        }
+    }
+    Ok(text)
+}
+
+/// Scans on its own thread so the desktop stays alive (a scan takes seconds).
+fn spawn_wifi_scan(tx: &Sender<Ev>) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = wifi_scan_rows(&mut crate::wifi::System, Path::new(crate::net::SYS_NET));
+        let _ = tx.send(Ev::WifiScanned(result));
+    });
 }
 
 /// The rows of the Settings screen from what the desktop is running with.
@@ -1282,6 +1351,14 @@ where
                     desktop.system = *s;
                     Action::None
                 }
+                Ev::WifiScanned(result) => {
+                    device.shell.wifi.scanned(result);
+                    Action::None
+                }
+                Ev::WifiJoined(result) => {
+                    device.shell.wifi.joined(result);
+                    Action::None
+                }
                 Ev::Page { requested, result } => {
                     match result {
                         Ok(l) => device
@@ -1303,6 +1380,31 @@ where
                     if tab == Tab::Storage {
                         refresh_storage(&mut device.shell, data_root.as_deref());
                     }
+                    if tab == Tab::Wifi && device.shell.wifi.wants_first_scan() {
+                        spawn_wifi_scan(&tx);
+                    }
+                }
+                Action::Wifi => {
+                    desktop.open(&mut device.shell, Tab::Wifi);
+                    if device.shell.wifi.wants_first_scan() {
+                        spawn_wifi_scan(&tx);
+                    }
+                }
+                Action::WifiScan => spawn_wifi_scan(&tx),
+                Action::WifiJoin { ssid, passphrase } => {
+                    let tx = tx.clone();
+                    let save_to = data_root.clone();
+                    std::thread::spawn(move || {
+                        let result = wifi_join_network(
+                            Path::new(crate::net::SYS_NET),
+                            save_to.as_deref(),
+                            &ssid,
+                            passphrase
+                                .as_ref()
+                                .map(mouli_screen::screen::Hidden::expose),
+                        );
+                        let _ = tx.send(Ev::WifiJoined(result));
+                    });
                 }
                 Action::Navigate(url) => {
                     let tx = reply_tx_pages.clone();
@@ -2329,6 +2431,57 @@ mod tests {
             get("timezone").value
         );
         assert_eq!(get("user").value, "owner");
+    }
+
+    /// A supplicant that is already running and sees three networks.
+    struct SeesThree(std::path::PathBuf);
+    impl Runner for SeesThree {
+        fn run(&mut self, _cmd: &str, args: &[&str]) -> Option<String> {
+            if args.contains(&"scan_results") {
+                Some(
+                    "bssid / frequency / signal level / flags / ssid\n\
+                     aa:bb:cc:dd:ee:01\t2412\t-70\t[ESS]\tCafe\n\
+                     aa:bb:cc:dd:ee:02\t2412\t-50\t[WPA2-PSK-CCMP][ESS]\tHome\n\
+                     aa:bb:cc:dd:ee:03\t2412\t-60\t[SAE][ESS]\tCorp\n"
+                        .into(),
+                )
+            } else {
+                Some(String::new())
+            }
+        }
+        fn pause(&mut self, _: Duration) {}
+        fn conf_dir(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    #[test]
+    fn a_scan_becomes_rows_and_a_missing_adapter_is_explained() {
+        use mouli_screen::screens::WifiSecurity;
+        let dir = tmp("wifi-scan");
+        let sys = dir.join("sys-net");
+        std::fs::create_dir_all(sys.join("wlan0/wireless")).unwrap();
+        std::fs::create_dir_all(sys.join("eth0")).unwrap();
+        let rows = wifi_scan_rows(&mut SeesThree(dir.clone()), &sys).unwrap();
+        let got: Vec<(&str, u8, WifiSecurity)> = rows
+            .iter()
+            .map(|r| (r.ssid.as_str(), r.bars, r.security))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Home", 4, WifiSecurity::Password),
+                ("Corp", 3, WifiSecurity::Unsupported),
+                ("Cafe", 2, WifiSecurity::Open),
+            ]
+        );
+        std::fs::remove_dir_all(sys.join("wlan0")).unwrap();
+        let e = wifi_scan_rows(&mut SeesThree(dir.clone()), &sys).unwrap_err();
+        assert!(e.contains("No Wi-Fi adapter"), "{e}");
+        assert!(wifi_join_network(&sys, None, "Home", Some("password1")).is_err());
+        assert_eq!(wifi_bars(-40), 4);
+        assert_eq!(wifi_bars(-90), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

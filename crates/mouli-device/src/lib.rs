@@ -479,7 +479,9 @@ impl<B: Backend> Device<B> {
             | Action::Wifi
             | Action::Hosted
             | Action::HardwareInfo
-            | Action::Setting { .. }) => Outcome::Host(other),
+            | Action::Setting { .. }
+            | Action::WifiScan
+            | Action::WifiJoin { .. }) => Outcome::Host(other),
         }
     }
 

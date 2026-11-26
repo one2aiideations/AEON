@@ -5,7 +5,7 @@ use crate::key::Key;
 use crate::screen::{Action, Screen, Tab};
 use crate::screens::{
     Approvals, Audit, BrowserScreen, Chat, EditorScreen, ModelPicker, PlayerScreen, PreviewScreen,
-    Review, SecurityScreen, SettingsScreen, SheetScreen, StorageScreen, StudioScreen,
+    Review, SecurityScreen, SettingsScreen, SheetScreen, StorageScreen, StudioScreen, WifiScreen,
 };
 
 /// The whole interface.
@@ -39,6 +39,8 @@ pub struct Shell {
     pub browser: BrowserScreen,
     /// The settings.
     pub settings: SettingsScreen,
+    /// Joining Wi-Fi.
+    pub wifi: WifiScreen,
     /// Which screen is showing.
     pub active: Tab,
     /// Text on the right of the header (for example the clock or the network name).
@@ -62,6 +64,7 @@ impl Default for Shell {
             preview: PreviewScreen::default(),
             browser: BrowserScreen::default(),
             settings: SettingsScreen::default(),
+            wifi: WifiScreen::default(),
             active: Tab::Models,
             status: String::new(),
         }
@@ -91,6 +94,7 @@ impl Shell {
             Tab::Preview => &self.preview,
             Tab::Browser => &self.browser,
             Tab::Settings => &self.settings,
+            Tab::Wifi => &self.wifi,
         }
     }
 
@@ -111,6 +115,7 @@ impl Shell {
             Tab::Preview => &mut self.preview,
             Tab::Browser => &mut self.browser,
             Tab::Settings => &mut self.settings,
+            Tab::Wifi => &mut self.wifi,
         }
     }
 

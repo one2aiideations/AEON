@@ -180,7 +180,7 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Storage) => &DISK,
             Some(Tab::Preview) => &CODE,
             Some(Tab::Browser) => &BROWSER,
-            Some(Tab::Settings) => &CODE,
+            Some(Tab::Settings) | Some(Tab::Wifi) => &CODE,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;

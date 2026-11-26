@@ -14,6 +14,7 @@ pub mod settings;
 pub mod sheet;
 pub mod storage;
 pub mod studio;
+pub mod wifi;
 
 pub use approvals::{ApprovalRow, Approvals};
 pub use audit::{Audit, AuditRow, Chain, Filter};
@@ -29,3 +30,4 @@ pub use settings::{SettingRow, SettingsScreen};
 pub use sheet::{cell_label, SheetCell, SheetScreen};
 pub use storage::{size_text, StorageKind, StorageRow, StorageScreen};
 pub use studio::{StudioBlock, StudioScreen};
+pub use wifi::{WifiPhase, WifiRow, WifiScreen, WifiSecurity};
