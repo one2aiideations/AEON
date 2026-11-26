@@ -8,7 +8,8 @@ publish.workspace = true
 
 [dependencies]
 mouli-http = { path = "../mouli-http" }
-mouli-gateway = { path = "../mouli-gateway" }
+mouli-crypto = { path = "../mouli-crypto" }
+mouli-systems = { path = "../mouli-systems", default-features = false }
 
 [dev-dependencies]
 mouli-pki = { path = "../mouli-pki" }

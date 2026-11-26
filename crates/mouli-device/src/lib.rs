@@ -12,6 +12,7 @@
 mod patch;
 mod security;
 
+#[cfg(feature = "office")]
 use mouli_apps::Apps;
 use mouli_interface::routing::Route;
 use mouli_interface::{Reply, Workspace};
@@ -38,9 +39,16 @@ pub enum Outcome {
     Handled,
     /// Power off.
     Quit,
+    /// Restart.
+    Reboot,
     /// A request only the host can carry out (loading a model, Wi-Fi, hardware report...).
     Host(Action),
 }
+
+/// The principal and role the model's tool calls run as.
+pub const AGENT_USER: &str = "agent:chat";
+/// The workspace role the host must define for [`Device::run_agent`] to work.
+pub const AGENT_ROLE: &str = "agent";
 
 /// The screens, the workspace and the signed-in person.
 pub struct Device<B: Backend> {
@@ -53,11 +61,16 @@ pub struct Device<B: Backend> {
     role: String,
     session: String,
     patch: patch::PatchSlot,
+    #[cfg(feature = "office")]
     apps: Option<Apps>,
+    #[cfg(feature = "office")]
     store: Option<AppStore>,
+    #[cfg(feature = "office")]
     player: Option<mouli_apps::SharedPlayer>,
+    agent: Option<String>,
 }
 
+#[cfg(feature = "office")]
 /// Where the applications are saved, and what was last written there.
 struct AppStore {
     dir: std::path::PathBuf,
@@ -86,14 +99,19 @@ impl<B: Backend> Device<B> {
             role: role.into(),
             session,
             patch: patch::PatchSlot::default(),
+            #[cfg(feature = "office")]
             apps: None,
+            #[cfg(feature = "office")]
             store: None,
+            #[cfg(feature = "office")]
             player: None,
+            agent: None,
         };
         d.refresh();
         Ok(d)
     }
 
+    #[cfg(feature = "office")]
     /// Connects the applications whose capabilities are registered in the workspace, so the Sheet
     /// and Studio screens show their real state.
     pub fn attach_apps(&mut self, apps: Apps) {
@@ -101,6 +119,7 @@ impl<B: Backend> Device<B> {
         self.refresh();
     }
 
+    #[cfg(feature = "office")]
     /// Connects the player registered in the workspace (see `mouli_apps::register_player`), so the
     /// Player screen shows its real state and its keys control it through the governed gate.
     pub fn attach_player(&mut self, player: mouli_apps::SharedPlayer) {
@@ -108,6 +127,7 @@ impl<B: Backend> Device<B> {
         self.refresh();
     }
 
+    #[cfg(feature = "office")]
     /// Passes on what the player's backend reported (the video ended, an error, the position ...).
     /// The host calls this as events arrive from mpv or from the YouTube page.
     pub fn player_event(&mut self, event: mouli_player::Event) {
@@ -136,6 +156,7 @@ impl<B: Backend> Device<B> {
         Ok(())
     }
 
+    #[cfg(feature = "office")]
     /// Keeps the applications' data in `dir`: loads what is there now, then saves after every
     /// change. Call after [`Device::attach_apps`].
     ///
@@ -161,6 +182,7 @@ impl<B: Backend> Device<B> {
         Ok(())
     }
 
+    #[cfg(feature = "office")]
     /// Writes the applications' data if it changed since the last save.
     fn save_apps(&mut self) {
         let (Some(apps), Some(store)) = (&self.apps, &mut self.store) else {
@@ -217,6 +239,7 @@ impl<B: Backend> Device<B> {
         match action {
             Action::None | Action::Show(_) => Outcome::Handled,
             Action::Quit => Outcome::Quit,
+            Action::Reboot => Outcome::Reboot,
             Action::Send(text) => {
                 self.send(&text);
                 Outcome::Handled
@@ -254,6 +277,9 @@ impl<B: Backend> Device<B> {
             }
             other @ (Action::ChooseModel(_)
             | Action::RescanModels
+            | Action::RescanStorage
+            | Action::Navigate(_)
+            | Action::DeleteStorage(_)
             | Action::Wifi
             | Action::Hosted
             | Action::HardwareInfo
@@ -263,6 +289,63 @@ impl<B: Backend> Device<B> {
 
     fn notice(&mut self, text: &str) {
         self.shell.chat.push(Role::Notice, text);
+    }
+
+    /// Runs a tool call made by the model in Chat, and returns the text the model should see.
+    ///
+    /// The model acts as its own principal, `agent:chat`, with the workspace role `agent`, never as
+    /// the person: the same policy, approvals and audit apply, and a change that needs approval is
+    /// held for the *person* to decide (four-eyes would refuse the person approving their own
+    /// request). What happened is also shown in the conversation.
+    pub fn run_agent(&mut self, command: &str) -> String {
+        let session = match self.agent.clone() {
+            Some(s) => s,
+            None => match self.ws.open_session(&self.tenant, AGENT_USER, AGENT_ROLE) {
+                Ok(s) => {
+                    self.agent = Some(s.clone());
+                    s
+                }
+                Err(e) => {
+                    let text = format!("The agent cannot act: {e}");
+                    self.notice(&text);
+                    return text;
+                }
+            },
+        };
+        let shown: String = command.chars().take(160).collect();
+        self.notice(&format!("Agent: {shown}"));
+        let text = match self.ws.submit(&self.tenant, &session, command) {
+            Ok(Reply::Done(out)) => {
+                self.shell.chat.push(Role::Tool, &out.text);
+                out.text
+            }
+            Ok(Reply::AwaitingApproval { id }) => {
+                let text = format!(
+                    "The change is held for the person's approval ({id}); it has not been made. Tell them to review it under F3."
+                );
+                self.notice(&format!(
+                    "The agent's request is waiting for your approval ({id}). Press F3 to review it."
+                ));
+                text
+            }
+            Ok(Reply::Refused { by }) => {
+                let text = format!("Refused by {by}.");
+                self.notice(&text);
+                text
+            }
+            Ok(Reply::Chat { .. }) => {
+                let text = "That is not a tool.".to_string();
+                self.notice(&text);
+                text
+            }
+            Err(e) => {
+                let text = e.to_string();
+                self.notice(&text);
+                text
+            }
+        };
+        self.refresh();
+        text
     }
 
     fn send(&mut self, text: &str) {
@@ -313,6 +396,7 @@ impl<B: Backend> Device<B> {
 
     /// Runs a capability a screen asked for, through the same gate as the chat.
     fn call(&mut self, capability: &str, args: Vec<(String, String)>) {
+        #[cfg(feature = "office")]
         if capability.starts_with("player.") && self.player.is_none() {
             self.app_message(capability, "The player is not connected.");
             return;
@@ -442,12 +526,16 @@ impl<B: Backend> Device<B> {
 
         let (score, findings) = security::assess(&self.ws);
         self.shell.security.set(score, findings);
-        self.save_apps();
-        self.refresh_apps();
-        self.refresh_player();
+        #[cfg(feature = "office")]
+        {
+            self.save_apps();
+            self.refresh_apps();
+            self.refresh_player();
+        }
         patch::sync(self);
     }
 
+    #[cfg(feature = "office")]
     /// Copies the player's state into its screen.
     fn refresh_player(&mut self) {
         use mouli_screen::screens::{PlayerRow, PlayerView};
@@ -478,6 +566,7 @@ impl<B: Backend> Device<B> {
         });
     }
 
+    #[cfg(feature = "office")]
     /// Copies the applications' state into their screens.
     fn refresh_apps(&mut self) {
         use mouli_screen::screens::sheet::{MAX_COLS, MAX_ROWS};

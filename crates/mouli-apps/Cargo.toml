@@ -6,13 +6,18 @@ license.workspace = true
 publish.workspace = true
 description = "MOULI-APPS: adapters that turn the application crates (Sheet, Studio, CRM, Code) into governed capabilities of the main interface"
 
+[features]
+# The office applications (Sheet, Studio, Player, CRM). They are out of the OS for now: the code is
+# kept and tested with `--all-features`, but the OS image is built without them.
+office = ["dep:mouli-crm", "dep:mouli-player", "dep:mouli-sheet", "dep:mouli-studio"]
+
 [dependencies]
 mouli-code = { path = "../mouli-code" }
-mouli-crm = { path = "../mouli-crm" }
 mouli-interface = { path = "../mouli-interface" }
-mouli-player = { path = "../mouli-player" }
-mouli-sheet = { path = "../mouli-sheet" }
-mouli-studio = { path = "../mouli-studio" }
+mouli-crm = { path = "../mouli-crm", optional = true }
+mouli-player = { path = "../mouli-player", optional = true }
+mouli-sheet = { path = "../mouli-sheet", optional = true }
+mouli-studio = { path = "../mouli-studio", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

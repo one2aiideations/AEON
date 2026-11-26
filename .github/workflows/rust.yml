@@ -53,7 +53,13 @@ jobs:
           path: rustfmt.patch
       - name: Clippy
         if: always()
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy -p moulid -p mouli-device -p mouli-apps -p mouli-hosted -p mouli-web --all-targets -- -D warnings
       - name: Tests
         if: always()
-        run: cargo test --workspace
+        # All features keeps the office applications (out of the OS for now) tested; the second
+        # run is the configuration the OS image is built with.
+        run: |
+          cargo test --workspace --all-features
+          cargo test -p moulid -p mouli-device -p mouli-apps -p mouli-hosted -p mouli-web

@@ -1,7 +1,7 @@
 //! Delegating permission decisions to the enterprise authority (`mouli-auth`).
 
-use mouli_auth::policy::{Request, Resource};
-use mouli_auth::Authority;
+use mouli_systems::auth::policy::{Request, Resource};
+use mouli_systems::auth::Authority;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -96,9 +96,9 @@ mod tests {
     use crate::leads::LeadInput;
     use crate::model::{Money, Stage};
     use crate::{Config, Crm, Ctx, Error, Outcome};
-    use mouli_auth::org::Level;
-    use mouli_auth::policy::{Effect, Rule};
-    use mouli_auth::principal::Kind;
+    use mouli_systems::auth::org::Level;
+    use mouli_systems::auth::policy::{Effect, Rule};
+    use mouli_systems::auth::principal::Kind;
 
     fn rule(id: &str, effect: Effect, role: &str, action: &str) -> Rule {
         Rule {
@@ -140,7 +140,7 @@ mod tests {
             ("rep-close", "crm.opportunity.close", 100_000),
         ] {
             let mut r = rule(id, Effect::Allow, "rep", action);
-            r.conditions = vec![mouli_auth::policy::Cond::AmountAtMost(max)];
+            r.conditions = vec![mouli_systems::auth::policy::Cond::AmountAtMost(max)];
             a.add_rule(r, 1).unwrap();
         }
         let a = Arc::new(Mutex::new(a));

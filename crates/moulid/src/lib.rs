@@ -6,7 +6,7 @@
 //! (or `--selftest`) it sends one prompt, prints the reply and powers off.
 //!
 //! The inference server is still an external HTTP process (llama-server
-//! compatible `/health` and `/completion`); it is replaced by `mouli-engine`
+//! compatible `/health` and `/completion`); it is to be replaced by `mouli-llm`
 //! once that can run a full model.
 //!
 //! Wired networking ([`net`]) is brought up with DHCP from the local network; nothing contacts the
@@ -22,34 +22,33 @@
 //! Ported from the retired C `userspace/aeond`.
 #![forbid(unsafe_code)]
 
+// The system-related modules live in `mouli-utility`; they stay reachable here under the same names.
+pub use mouli_utility::{
+    bluetooth, civil_time, clocksync, fslabel, hwprobe, hwreport, known_networks, net,
+    partition_table, procparse, sntp, system, wifi, wifi_saved,
+};
 pub mod args;
 pub mod backoff;
 pub mod banner;
-pub mod bluetooth;
-pub mod civil_time;
-pub mod clocksync;
+pub mod browse;
+pub mod catalog;
 pub mod context;
+pub mod datagraph;
 pub mod download_plan;
-pub mod fslabel;
+pub mod download_ui;
+pub mod fetch;
 pub mod gguf_info;
 pub mod gui;
 pub mod hosted;
 pub mod http;
-pub mod hwprobe;
-pub mod hwreport;
-pub mod known_networks;
 pub mod lineedit;
 pub mod models;
-pub mod net;
-pub mod partition_table;
 pub mod persist;
-pub mod procparse;
-pub mod sntp;
-pub mod system;
+pub mod storage;
+pub mod sysinfo;
 pub mod textwrap;
+pub mod toolloop;
 pub mod ui;
-pub mod wifi;
-pub mod wifi_saved;
 
 use std::path::{Path, PathBuf};
 

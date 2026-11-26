@@ -7,6 +7,7 @@ publish.workspace = true
 description = "MOULI-SCREEN: the on-device screens (chat, models, approvals, audit, security, code review, sheet, studio, code editor) as dependency-free Rust state machines drawn into a character-cell grid"
 
 [dependencies]
+mouli-web = { path = "../mouli-web" }
 
 [lints]
 workspace = true

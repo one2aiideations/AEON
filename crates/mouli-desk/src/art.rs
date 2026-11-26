@@ -40,6 +40,26 @@ pub const ICON_PALETTE: [(char, u32); 8] = [
 /// 16 by 16 icon pictures, drawn at twice their size.
 pub type Icon = [&'static str; 16];
 
+/// The browser: a globe.
+pub const BROWSER: Icon = [
+    "................",
+    "....kkkkkkkk....",
+    "..kkbbbwbbbbkk..",
+    ".kbbbobwbbbobbk.",
+    ".kbooobwbbooobk.",
+    ".kbooobwbbbobbk.",
+    "kbbbbbbwbbbbbbbk",
+    "kwwwwwwwwwwwwwwk",
+    "kbbbbbbwbbbbbbbk",
+    ".kbbbooowbbbbbk.",
+    ".kbbbooowbbbbbk.",
+    ".kbbbbobwbbbbbk.",
+    "..kkbbbwbbbbkk..",
+    "....kkkkkkkk....",
+    "................",
+    "................",
+];
+
 /// The hard disk.
 pub const DISK: Icon = [
     "................",

@@ -14,20 +14,15 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `moulid` | Init (PID 1), console, networking, Wi-Fi, persistence, inference-server supervisor |
-| `mouli-hw` | Hardware probe and run plan |
+| `mouli-utility` | The system-related functions in one crate: network, Wi-Fi and Bluetooth, time (dates, network time), hardware probe and run plan, `/proc` parsers, filesystem labels and partition tables, power off and restart, terminal prompts |
 | `mouli-update` | Signed OS updates, A/B slots, boot counting and rollback |
-| `mouli-sched` | CPU/iGPU/dGPU/NPU placement with thermal-aware migration |
-| `mouli-store` | Durable system state: key-value map with a checksummed log |
-| `mouli-mesh` | Device mesh: node health, fault-tolerant dispatch, file sync |
 | `mouli-sdv` | Experimental software-defined-vehicle development environment (not safety-certified) |
 
 ## Models and inference
 
 | Crate | Purpose |
 |---|---|
-| `mouli-gguf`, `mouli-quant`, `mouli-tokenizer` | GGUF reading and writing, dequantisation, tokenizers |
-| `mouli-tensor`, `mouli-model`, `mouli-engine`, `mouli-llm` | Tensors, model index, CPU kernels, llama-family forward pass |
-| `mouli-compress` | Weight analysis and compression planning |
+| `mouli-llm` | The model engine in one crate: GGUF reader and writer (`gguf`), dequantisation (`quant`), tokenizer, tensors, weight storage with cache, expert store and block sources (`weights`), CPU kernels and the forward pass, the theory layer (`theory`: robust score, gap law, calibration, cascade, TIES merge), weight analysis (`compress`) and selective-loading plans (`sparse`: hot expert sets, neuron slicing, memory tiers) |
 | `mouli-hosted` | Hosted-model chat client (streaming) over MOULI's own HTTPS |
 | `mouli-http`, `mouli-tls`, `mouli-pki`, `mouli-crypto` | Own HTTP/1.1 client, TLS 1.3 client, X.509 verification, crypto primitives |
 
@@ -36,17 +31,13 @@ runs `moulid`'s own console.
 | Crate | Purpose |
 |---|---|
 | `mouli-interface` | The governed workspace: sessions, intents, policy, approvals, data washing, routing, audit |
-| `mouli-gateway` | Local socket protocol so other programs and agents can use the workspace |
-| `mouli-auth` | Tenants, principals, deny-by-default policy, maker-checker approvals |
-| `mouli-gate`, `mouli-identity` | Permission gate for AI actions; DIDs, signed frames, human-presence checks |
 | `mouli-apps` | Sheet, Studio, CRM and Code as governed capabilities |
 | `mouli-sheet`, `mouli-studio` | Spreadsheet core; documents (the other engines are fail-closed stubs) |
 | `mouli-crm` | CRM domain: leads, pipeline with approvals, cases, renewals, consent |
 | `mouli-code` | Unified-diff engine, patch policy, atomic apply and exact rollback |
 | `mouli-project` | Project management: tasks, dependencies, critical path, kanban |
-| `mouli-mail`, `mouli-web`, `mouli-comms` | Mail server, browser agent layer, encrypted messaging |
+| `mouli-mail`, `mouli-web` | Mail server, browser agent layer |
 | `mouli-biz`, `mouli-business`, `mouli-ops`, `mouli-data`, `mouli-system` | Business, operations, data and control-centre applications |
-| `mouli-security` | Detection rules, anomaly scoring, cases and evidence |
 
 ## Screens and desktop
 
@@ -62,10 +53,9 @@ runs `moulid`'s own console.
 
 | Crate | Purpose |
 |---|---|
-| `mouli-agents`, `mouli-orchestra`, `mouli-forge` | Scheduled agents, multi-agent orchestration, versioned agent manifests |
-| `mouli-runtime`, `mouli-core`, `mouli-adapters`, `mouli-topstar` | Agent loop, kernel objects, TOPSTAR adapters and domain model |
-| `mouli-memory`, `mouli-agentmem` | Local retrieval; agent-memory primitives (provenance, decay, replication, audit journal) |
-| `mouli-cognition`, `mouli-neuro`, `mouli-theory` | Cognitive primitives, spiking runtime, theory layer |
+| `mouli-agentic` | Everything about agents in one crate: object model and event bus (`kernel`), local retrieval, knowledge graph and ontology (`memory`), agent-memory primitives (`agentmem`), cognitive primitives (`cognition`), multi-agent control plane (`orchestra`), scheduled jobs (`jobs`), the agent loop (`runtime`) sibling-system adapters and the AI data graph (`graph`: conversations, messages, models, files, tool calls and approvals as typed, timed nodes and edges, saved as an append-only log) |
+| `mouli-systems` | The platform services in one crate: model gateway (`gateway`), identity (`identity`, `auth`), security (`security`, `gate`), scheduler (`sched`), system state (`store`), integrations (`topstar`, `comms`, `mesh`), monitoring (`monitor`), billing (`billing`), bring-your-own-key vault (`keys`), data washing with GDPR and DPDP profiles (`wash`) and privacy duties (`privacy`) |
+| `mouli-forge`, `mouli-neuro` | Versioned agent manifests, spiking runtime |
 | `mouli-lab` | Aetheron research harness with gradient checks (no real-data results yet) |
 
 ## Product specifications (no code yet)

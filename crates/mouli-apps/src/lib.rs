@@ -7,24 +7,37 @@
 #![forbid(unsafe_code)]
 
 mod code;
+#[cfg(feature = "office")]
 mod crm;
+#[cfg(feature = "office")]
 mod player;
+#[cfg(feature = "office")]
 mod sheet;
+#[cfg(feature = "office")]
 mod store;
+#[cfg(feature = "office")]
 mod studio;
 
 use mouli_interface::{Result, Workspace};
+#[cfg(feature = "office")]
 use std::cell::RefCell;
+#[cfg(feature = "office")]
 use std::rc::Rc;
 
 pub use code::{ChangedFile, CodeApp, CodeState, PatchError, SharedCode, Stage, View, NOT_ALLOWED};
+#[cfg(feature = "office")]
 pub use crm::{Clock, CrmApp, SharedCrm};
+#[cfg(feature = "office")]
 pub use player::{PlayerApp, SharedPlayer};
+#[cfg(feature = "office")]
 pub use sheet::{range_text, SharedBook, SheetApp};
+#[cfg(feature = "office")]
 pub use store::{parse_workbook, workbook_text};
+#[cfg(feature = "office")]
 pub use studio::{SharedDoc, StudioApp};
 
 /// The state of the applications, shared with the screens.
+#[cfg(feature = "office")]
 #[derive(Clone)]
 pub struct Apps {
     /// The workbook the Sheet application edits.
@@ -37,6 +50,7 @@ pub struct Apps {
 ///
 /// # Errors
 /// The registry's error when a capability name is taken.
+#[cfg(feature = "office")]
 pub fn register(ws: &mut Workspace) -> Result<Apps> {
     let apps = Apps {
         book: Rc::new(RefCell::new(mouli_sheet::Workbook::new())),
@@ -52,6 +66,7 @@ pub fn register(ws: &mut Workspace) -> Result<Apps> {
 ///
 /// # Errors
 /// The registry's error when a capability name is taken.
+#[cfg(feature = "office")]
 pub fn register_crm(ws: &mut Workspace, tenant: &str, clock: Clock) -> Result<SharedCrm> {
     let crm = CrmApp::new_crm();
     ws.register_app(Box::new(CrmApp::new(crm.clone(), tenant, clock)))?;
@@ -73,6 +88,7 @@ pub fn register_code(ws: &mut Workspace) -> Result<SharedCode> {
 ///
 /// # Errors
 /// The registry's error when a capability name is taken.
+#[cfg(feature = "office")]
 pub fn register_player(
     ws: &mut Workspace,
     backend: Box<dyn mouli_player::Backend>,

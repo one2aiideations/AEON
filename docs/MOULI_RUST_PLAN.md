@@ -29,7 +29,7 @@ small enough to port early, before the engine grows on top of it. (Line counts m
    differential test: the same inputs go through the C version (called through the C interface) and
    the Rust version, and the outputs must be identical. Only then is the C module removed, and
    removal is confirmed with the owner before any file is deleted.
-2. **Order.** (a) Cargo workspace and CI; (b) `mouli-hw` and moulid, because the image needs them and
+2. **Order.** (a) Cargo workspace and CI; (b) `mouli-utility::hw` and moulid, because the image needs them and
    they are small; (c) `core/` modules, bottom-up (tensor, buffer, storage, cache, expert store,
    transformer compute, then the gate and identity modules); (d) the engine E1+ written in Rust from
    the start.
@@ -53,7 +53,7 @@ small enough to port early, before the engine grows on top of it. (Line counts m
 
 ## Effect on other plans
 
-- Engine milestones E1–E6: written in Rust (`mouli-gguf`, `mouli-tokenizer`, `mouli-engine`,
+- Engine milestones E1–E6: written in Rust (`mouli-llm::gguf`, `mouli-llm::tokenizer`, `mouli-llm::kernels`,
   `mouli-vulkan`); SIMD via `core::arch` behind runtime detection.
 - Model services (PR 3), agents (PR 4), chat UI glue (PR 5): Rust.
 - Kernel track K1: Rust, `no_std`.

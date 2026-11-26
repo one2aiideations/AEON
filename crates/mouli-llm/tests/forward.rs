@@ -1,7 +1,7 @@
 //! The forward pass against an independent naive implementation, on tiny synthetic models.
 
-use mouli_gguf::types::GgmlType;
-use mouli_gguf::{GgufWriter, Value};
+use mouli_llm::gguf::types::GgmlType;
+use mouli_llm::gguf::{GgufWriter, Value};
 use mouli_llm::{LlmError, Model, Sampler, Session};
 
 #[derive(Clone)]

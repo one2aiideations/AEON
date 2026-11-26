@@ -4,6 +4,26 @@
 
 This folder is the detailed product guide and implementation acceptance reference for **MOULI-WEB**. The linked master specification remains the normative source for detailed requirements. This README expands navigation, domain ownership, end-to-end workflow expectations, integration rules and verification criteria; it does not replace or silently amend the source prompt.
 
+## What exists today
+
+The crate is the rendering and scripting engine behind the Preview window, plus the assistant-side
+page tools. The rest of this README is the wider product guide; this section is the honest status.
+
+| Part | Status |
+|---|---|
+| HTML tokenizer and document tree | Done, with tree editing for scripts. |
+| CSS: selectors, `@media`, cascade, `calc`, `var`, colours | Done for the common subset. |
+| Layout: block, inline, flex, grid (tracks, `fr`, `repeat`, `auto-fill`, spans, placement), tables, lists, positioning | Done, with floats (`left`/`right`, `clear`; text wraps around them) except that floats do not escape a plain container. Grid areas and `rowspan` are **not** done. |
+| Pictures: PNG, JPEG (baseline and progressive), GIF (first frame) | Done. WebP, SVG and animation are not. |
+| Browser: address bar, history, links, forms (GET), style sheets, scripts, pictures | Done in the Browser window (Ctrl-B). A page on the internet cannot redirect the browser, or pull style sheets, scripts or pictures, from this machine or the local network (checked by address; a public name that resolves to a private address is not caught). POST forms, cookies, downloads and tabs are not done. |
+| JavaScript: syntax of modern scripts, closures, classes, destructuring, exceptions, timers | Done, with step, depth, object and size limits. `Map`, `Set`, `Promise`, regular expressions, `Date` (UTC only) and `async`/`await` exist (`await` runs the event loop until the promise settles, so the caller does not continue meanwhile). No generators or `Symbol` yet. |
+| `document`, elements, events (with bubbling), `classList`, `style`, `innerHTML`, selectors | Done. No network, storage or `eval`. |
+| Markdown preview | Done. |
+| Tabs, bookmarks, publishing, MCP discovery | Not started; see the sections below. |
+
+Everything is tested in `cargo test -p mouli-web`; display tests live in `mouli-screen`. Testing so far
+is in QEMU only, not on real hardware.
+
 ## 1. Mission and product boundary
 
 Provide an AI-native web operating environment combining visual website authoring, browsing intelligence, website understanding and compilation, agent-native interaction, publishing and reusable web capabilities.

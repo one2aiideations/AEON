@@ -1,7 +1,7 @@
 [package]
 name = "mouli-llm"
 version = "0.1.0"
-description = "MOULI CPU forward pass for llama-family GGUF models (RMSNorm, RoPE, grouped-query attention, SwiGLU, KV cache, sampler)"
+description = "MOULI-LLM: the model engine in one crate: GGUF, dequantisation, tokenizer, tensors, weight storage, CPU kernels, forward pass, theory layer, weight analysis and selective-loading plans"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -10,6 +10,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-mouli-gguf = { path = "../mouli-gguf" }
-mouli-quant = { path = "../mouli-quant" }
-mouli-engine = { path = "../mouli-engine" }
+memmap2 = "0.9"

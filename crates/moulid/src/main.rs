@@ -1,7 +1,7 @@
 //! moulid entry point. See the library docs.
 #![forbid(unsafe_code)]
 
-use mouli_hw::{Hw, Plan};
+use mouli_utility::hw::{Hw, Plan};
 use moulid::args::{Args, DEFAULT_MODEL_DIR};
 use moulid::bluetooth;
 use moulid::clocksync;
@@ -14,6 +14,7 @@ use moulid::persist::{self, Store};
 use moulid::ui::{chat_loop, pick_model, Backend, Choice, End, Turn};
 use moulid::wifi;
 use moulid::wifi_saved;
+use moulid::{catalog, download_ui, fetch};
 use moulid::{cmdline_has, find_model, http, system};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -105,6 +106,21 @@ fn launch(a: &Args, model: &Path, plan: &Plan, pid1: bool) -> Result<Child, Stri
 fn stop(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Unmounts the data disk and restarts the machine (when running as PID 1).
+fn restart(pid1: bool) -> ExitCode {
+    if pid1 {
+        if let Some(root) = DATA_ROOT.get() {
+            persist::unmount(root);
+        }
+        say("MOULI: restarting");
+        say(&system::reboot());
+        loop {
+            sleep(Duration::from_secs(3600));
+        }
+    }
+    ExitCode::from(0)
 }
 
 fn finish(pid1: bool, code: u8) -> ExitCode {
@@ -261,6 +277,31 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 }
                 continue;
             }
+            Choice::Download => {
+                let Some(st) = store else {
+                    say("MOULI: downloading needs a MOULI-DATA disk to keep the model on (see the installation guide).");
+                    continue;
+                };
+                let (entries, warning) = catalog::load(Path::new(catalog::CATALOG_FILE));
+                if let Some(w) = warning {
+                    say(&format!("MOULI: {w}"));
+                }
+                match fetch::HttpFetcher::system() {
+                    Ok(fetcher) => {
+                        let _ = download_ui::flow(
+                            &mut input,
+                            &mut out,
+                            &fetcher,
+                            &fetch::Policy::production(),
+                            &entries,
+                            &st.root().join("models"),
+                            plan.model_budget_mb,
+                        );
+                    }
+                    Err(e) => say(&format!("MOULI: {e}")),
+                }
+                continue;
+            }
             Choice::Bluetooth => {
                 if let Some(s) = store {
                     if let Err(e) =
@@ -317,6 +358,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 );
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}
+                    Ok(End::Reboot) => return restart(pid1),
                     Ok(End::Quit | End::SwitchModel) => return finish(pid1, 0),
                     Ok(End::Eof) | Err(_) => {
                         if !pid1 {
@@ -370,7 +412,24 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     }
                 };
                 let end = match session {
-                    Some(s) => gui::run(s, backend, SYSTEM_PROMPT, max_tokens, &m.name),
+                    Some(s) => {
+                        let info = gui::ModelsInfo {
+                            rows: models
+                                .iter()
+                                .map(|f| mouli_screen::screens::ModelRow {
+                                    name: f.name.clone(),
+                                    size_mb: f.size_mb(),
+                                    arch: f.arch.clone(),
+                                    needs_mb: f.needs_mb(plan.ctx),
+                                    fits: f.fits(plan.model_budget_mb, plan.ctx),
+                                })
+                                .collect(),
+                            budget_mb: plan.model_budget_mb,
+                            ctx: plan.ctx,
+                            loaded: m.name.clone(),
+                        };
+                        gui::run(s, backend, SYSTEM_PROMPT, max_tokens, &info)
+                    }
                     None => chat_loop(
                         &mut backend,
                         &mut input,
@@ -382,6 +441,7 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                 stop(&mut child);
                 match end {
                     Ok(End::SwitchModel) if a.model.is_none() => {}
+                    Ok(End::Reboot) => return restart(pid1),
                     Ok(End::Quit | End::SwitchModel) => return finish(pid1, 0),
                     Ok(End::Eof) | Err(_) => {
                         if !pid1 {
@@ -438,7 +498,12 @@ fn main() -> ExitCode {
     if cmdline_has(&system::kernel_cmdline(), "mouli.selftest=1") {
         args.selftest = true;
     }
-    say(&moulid::banner::banner(moulid::VERSION));
+    if moulid::banner::use_color(&system::kernel_cmdline()) {
+        say(&moulid::banner::palette_sequence());
+        say(&moulid::banner::banner_color(moulid::VERSION));
+    } else {
+        say(&moulid::banner::banner(moulid::VERSION));
+    }
     say(&format!(
         "MOULI {} - AI-native OS{}",
         moulid::VERSION,

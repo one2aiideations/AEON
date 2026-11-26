@@ -22,3 +22,4 @@ pub mod screens;
 pub mod shell;
 pub mod syntax;
 pub mod typeface;
+pub mod webview;

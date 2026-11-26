@@ -9,22 +9,29 @@
 //! device) [`start`] returns an error and `moulid` keeps the text chat. A pointing device that
 //! reports absolute positions (some touchpads and touchscreens) is not used; a USB or PS/2 mouse is.
 
+use crate::datagraph::Recorder;
+use crate::sysinfo::{self, Collector, SysEnv};
+use crate::toolloop;
 use crate::ui::{trim_history, Backend, End, Turn};
+use crate::wifi::Runner;
 use mouli_desk::desktop::Desktop;
 use mouli_desk::input::{EvdevDecoder, MouseEvent, TouchpadDecoder};
+use mouli_desk::status::SystemStatus;
 use mouli_device::{Backend as DeviceBackend, Device, Outcome};
 use mouli_interface::routing::{ModelEntry, Route};
 use mouli_interface::{Permissions, Policy, Workspace};
 use mouli_screen::key::Key;
 use mouli_screen::raster::Canvas;
 use mouli_screen::screen::{Action, Tab};
-use mouli_screen::screens::Role;
+use mouli_screen::screens::{ModelRow, Role};
 use mouli_screen::shell::Shell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The framebuffer device.
@@ -310,12 +317,21 @@ impl KeyDecoder {
 pub enum Ev {
     /// An input device appeared after the desktop started (the message names it).
     NewInput(String),
+    /// The system area of the menu bar has new content (clock, network, Bluetooth, battery).
+    Status(Box<SystemStatus>),
     /// The mouse did something.
     Mouse(MouseEvent),
     /// A key was pressed.
     Key(Key),
     /// The model finished answering (or failed).
     Reply(Result<String, String>),
+    /// The browser finished loading an address (or failed).
+    Page {
+        /// The address that was asked for.
+        requested: String,
+        /// The page, or why it could not be loaded.
+        result: Result<crate::browse::Loaded, String>,
+    },
 }
 
 /// What an input device can be used for, from the kernel's capability words.
@@ -531,6 +547,62 @@ pub fn watch_inputs(
     });
 }
 
+/// Starts a thread that gathers the system status every `tick` and sends it on `tx` whenever it
+/// changed. `offset_min` is the UTC offset in minutes, shared with the desktop so that
+/// `/time.zone` takes effect at once. The thread stops when the receiver is gone.
+pub fn spawn_status<R: Runner + Send + 'static>(
+    mut runner: R,
+    env: SysEnv,
+    tx: Sender<Ev>,
+    offset_min: Arc<AtomicI32>,
+    tick: Duration,
+) {
+    std::thread::spawn(move || {
+        let mut collector = Collector::new(env);
+        let mut last: Option<SystemStatus> = None;
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+            let s = collector.status(&mut runner, now, offset_min.load(Ordering::Relaxed));
+            if last.as_ref() != Some(&s) {
+                if tx.send(Ev::Status(Box::new(s.clone()))).is_err() {
+                    return;
+                }
+                last = Some(s);
+            }
+            std::thread::sleep(tick);
+        }
+    });
+}
+
+/// Handles `/time.zone`: shows or sets the UTC offset used by the clock. Returns the notice to show.
+fn time_zone_command(
+    arg: &str,
+    offset: &AtomicI32,
+    store: Option<&crate::persist::Store>,
+) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return format!(
+            "The clock shows {}. To change it, type /time.zone +05:30 (or -8, or UTC).",
+            sysinfo::zone_label(offset.load(Ordering::Relaxed))
+        );
+    }
+    let Some(minutes) = sysinfo::parse_offset(arg) else {
+        return "That is not a time zone. Examples: /time.zone +05:30, /time.zone -8, /time.zone UTC (from -12:00 to +14:00).".into();
+    };
+    offset.store(minutes, Ordering::Relaxed);
+    let saved = match store {
+        Some(s) => match s.set(sysinfo::OFFSET_KEY, &minutes.to_string()) {
+            Ok(()) => " It is kept for the next start.",
+            Err(_) => " (It could not be saved.)",
+        },
+        None => " (No MOULI-DATA disk, so it is forgotten at power-off.)",
+    };
+    format!("Time zone set to {}.{saved}", sysinfo::zone_label(minutes))
+}
+
 // ------------------------------------------------------------------ console
 
 /// Keeps typed characters from being echoed onto the framebuffer console while the desktop is
@@ -585,21 +657,6 @@ impl TtyGuard {
 
 // ------------------------------------------------------------------- the loop
 
-/// What the Player window uses: there is no video player in this image, so it says so instead of
-/// pretending to play.
-struct NoVideo;
-
-impl mouli_player::Backend for NoVideo {
-    fn load(&mut self, _: &mouli_player::Source) -> Result<(), String> {
-        Err("There is no video player in this image yet.".into())
-    }
-    fn pause(&mut self, _: bool) {}
-    fn seek(&mut self, _: u32) {}
-    fn set_volume(&mut self, _: u8) {}
-    fn set_speed(&mut self, _: u16) {}
-    fn stop(&mut self) {}
-}
-
 /// The device's own model route is not used: the desktop talks to the model on its own thread
 /// (so the screen stays alive while it thinks) and keeps the conversation itself.
 pub struct NoRoute;
@@ -614,12 +671,13 @@ impl DeviceBackend for NoRoute {
 const TENANT: &str = "local";
 const USER: &str = "owner";
 
-/// Builds the governed workspace with the Sheet, Studio, Code and Player applications, and the
+/// Builds the governed workspace with the Code application (with its agent approvals), and the
 /// device that connects the screens to it.
 ///
-/// With `data_dir` (the MOULI-DATA partition) the sheet and document are saved under
-/// `<data_dir>/apps` after every change and the Code window opens `<data_dir>/projects`.
-/// Without it nothing is saved.
+/// Sheet, Studio, Player and the CRM are left out of this version on purpose; their code is kept
+/// for later versions (see `MOVED_OUT` in the desktop).
+///
+/// With `data_dir` (the MOULI-DATA partition) the Code window opens `<data_dir>/projects`.
 ///
 /// # Errors
 /// A message when the workspace cannot be set up.
@@ -627,6 +685,8 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
     ws.add_role(Permissions::new("owner", &["*"]));
+    // What the model may do when it uses tools: the Code tools only. Changes still need approval.
+    ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
         id: "local".into(),
         provider: "local".into(),
@@ -636,17 +696,10 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
         cost_per_1k: 0,
         quality: 50,
     });
-    let apps = mouli_apps::register(&mut ws).map_err(|e| fail(&e))?;
     let code = mouli_apps::register_code(&mut ws).map_err(|e| fail(&e))?;
-    let player = mouli_apps::register_player(&mut ws, Box::new(NoVideo)).map_err(|e| fail(&e))?;
     let mut device = Device::new(ws, NoRoute, TENANT, USER, "owner").map_err(|e| fail(&e))?;
-    device.attach_apps(apps);
     device.attach_code(code);
-    device.attach_player(player);
     if let Some(dir) = data_dir {
-        let apps_dir = dir.join("apps");
-        std::fs::create_dir_all(&apps_dir).map_err(|e| fail(&e))?;
-        device.keep_apps_in(&apps_dir)?;
         let projects = dir.join("projects");
         std::fs::create_dir_all(&projects).map_err(|e| fail(&e))?;
         // A project that cannot be opened leaves the Code window empty; that is not fatal.
@@ -663,6 +716,17 @@ pub struct Session<D: Display> {
     device: Device<NoRoute>,
     saving: bool,
     inputs: InputSummary,
+    offset: Arc<AtomicI32>,
+    settings: Option<crate::persist::Store>,
+    graph: Recorder,
+    data_root: Option<std::path::PathBuf>,
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before it).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl<D: Display> Session<D> {
@@ -675,6 +739,10 @@ impl<D: Display> Session<D> {
             device,
             saving: false,
             inputs: InputSummary::default(),
+            offset: Arc::new(AtomicI32::new(0)),
+            settings: None,
+            graph: Recorder::in_memory(unix_now()),
+            data_root: None,
         }
     }
 
@@ -705,10 +773,88 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
         return Err("no keyboard, mouse or touchpad found in /dev/input".into());
     }
     watch_inputs(INPUT_DIR.into(), INPUT_SYS.into(), width, tx.clone(), seen);
-    let mut s = Session::new(display, tx, rx, device);
+    let mut s = Session::new(display, tx.clone(), rx, device);
     s.saving = data_dir.is_some();
     s.inputs = inputs;
+    s.settings = data_dir.and_then(|d| crate::persist::Store::open(d).ok());
+    if let Some(d) = data_dir {
+        s.graph = Recorder::open(d, unix_now());
+        s.data_root = Some(d.to_path_buf());
+    }
+    if let Some(m) = s
+        .settings
+        .as_ref()
+        .and_then(|st| st.settings().get(sysinfo::OFFSET_KEY).cloned())
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|m| (sysinfo::MIN_OFFSET..=sysinfo::MAX_OFFSET).contains(m))
+    {
+        s.offset.store(m, Ordering::Relaxed);
+    }
+    spawn_status(
+        crate::wifi::System,
+        SysEnv::real(),
+        tx,
+        s.offset.clone(),
+        Duration::from_secs(1),
+    );
     Ok(s)
+}
+
+/// The models the Models window shows, and which one is loaded.
+#[derive(Debug, Clone, Default)]
+pub struct ModelsInfo {
+    /// Every model found on the machine.
+    pub rows: Vec<ModelRow>,
+    /// Memory a model may use, in MB.
+    pub budget_mb: u64,
+    /// The planned context length.
+    pub ctx: u32,
+    /// The name of the model that is loaded.
+    pub loaded: String,
+}
+
+impl ModelsInfo {
+    /// A list with only the loaded model (when the others are not known).
+    #[must_use]
+    pub fn only(name: &str) -> Self {
+        Self {
+            rows: vec![ModelRow {
+                name: name.into(),
+                size_mb: 0,
+                arch: None,
+                needs_mb: 0,
+                fits: true,
+            }],
+            budget_mb: 0,
+            ctx: 0,
+            loaded: name.into(),
+        }
+    }
+}
+
+/// The text at the right of the menu bar: the product name, and a reminder when requests wait for
+/// a second person's approval (the Approvals window is not on the desktop).
+fn status_text(base: &str, pending: usize) -> String {
+    match pending {
+        0 => base.to_string(),
+        1 => format!("{base}  |  1 waiting for approval (F3)"),
+        n => format!("{base}  |  {n} waiting for approval (F3)"),
+    }
+}
+
+/// Fills the Models window and the chat title from `info`.
+fn show_models(shell: &mut Shell, info: &ModelsInfo) {
+    shell.models.rows = info.rows.clone();
+    shell.models.budget_mb = info.budget_mb;
+    shell.models.ctx = info.ctx;
+    if let Some(i) = info.rows.iter().position(|r| r.name == info.loaded) {
+        shell.models.cursor.selected = i;
+    }
+    shell.models.message = format!(
+        "Loaded: {}. To switch, restart and pick another.",
+        info.loaded
+    );
+    shell.chat.model = info.loaded.clone();
 }
 
 fn fresh(system_prompt: &str) -> Vec<Turn> {
@@ -721,7 +867,7 @@ fn fresh(system_prompt: &str) -> Vec<Turn> {
 /// Runs the desktop until the person shuts down.
 ///
 /// The Chat window talks to the model on its own thread, so the desktop stays responsive while it
-/// thinks. Sheet, Studio, Code, Player, Approvals, Audit and Security run through the governed
+/// thinks. Code, Approvals, Audit and Security run through the governed
 /// workspace of the device.
 ///
 /// # Errors
@@ -731,7 +877,7 @@ pub fn run<B, D>(
     backend: B,
     system_prompt: &str,
     max_tokens: usize,
-    model_name: &str,
+    models: &ModelsInfo,
 ) -> io::Result<End>
 where
     B: Backend + Send + 'static,
@@ -744,6 +890,10 @@ where
         mut device,
         saving,
         inputs,
+        offset,
+        settings,
+        mut graph,
+        data_root,
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
@@ -751,24 +901,62 @@ where
         i32::try_from(w).unwrap_or(1024),
         i32::try_from(h).unwrap_or(768),
     );
-    desktop.status = if saving {
-        "MOULI OS".into()
+    let base_status = if saving {
+        "MOULI OS".to_string()
     } else {
-        "MOULI OS - nothing is saved (no MOULI-DATA disk)".into()
+        "MOULI OS - nothing is saved (no MOULI-DATA disk)".to_string()
     };
-    device.shell.chat.model = model_name.into();
+    desktop.status = base_status.clone();
+    show_models(&mut device.shell, models);
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
         device.shell.chat.push(
             Role::Notice,
-            "No mouse or touchpad found. Plug in a USB mouse, or use the keyboard: F1 to F10 open windows, Ctrl+Q shuts down.",
+            "No mouse or touchpad found. Plug in a USB mouse, or use the keyboard: F1 opens Chat, F2 Models, F9 Code, Ctrl+Q shuts down.",
         );
     }
     device.shell.chat.push(Role::Notice, &inputs.line());
-    let mut history = fresh(system_prompt);
+    let commands: Vec<String> = device
+        .workspace()
+        .help()
+        .iter()
+        .map(|(name, _)| format!("/{name}"))
+        .take(14)
+        .collect();
+    if !commands.is_empty() {
+        device.shell.chat.push(
+            Role::Notice,
+            &format!(
+                "Commands you can type here (the apps run them through the governed gate): {} ...",
+                commands.join(", ")
+            ),
+        );
+    }
+    let tool_names: Vec<String> = device
+        .workspace()
+        .help()
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    let system_text = {
+        let extra = toolloop::tool_prompt(&device.workspace().help());
+        if extra.is_empty() {
+            system_prompt.to_string()
+        } else {
+            format!("{system_prompt}\n\n{extra}")
+        }
+    };
+    let mut steps = 0usize;
+    if let Some(w) = graph.warning.take() {
+        device.shell.chat.push(Role::Notice, &w);
+    }
+    let model_name = models.loaded.clone();
+    refresh_storage(&mut device.shell, data_root.as_deref());
+    let mut history = fresh(&system_text);
 
     let (req_tx, req_rx) = channel::<Vec<Turn>>();
     let reply_tx = tx.clone();
+    let reply_tx_pages = tx.clone();
     std::thread::spawn(move || {
         let mut backend = backend;
         while let Ok(turns) = req_rx.recv() {
@@ -782,10 +970,27 @@ where
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     display.present(&desktop.render(&device.shell))?;
     loop {
-        let Ok(first) = rx.recv() else {
-            return Ok(End::Eof);
-        };
-        let mut batch = vec![first];
+        let mut batch = Vec::new();
+        if device.shell.preview.wants_ticks() || device.shell.browser.view.wants_ticks() {
+            // A page with timers: wake up often enough to run them.
+            match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(first) => batch.push(first),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let a = device.shell.preview.tick();
+                    let b = device.shell.browser.view.tick();
+                    if a || b {
+                        display.present(&desktop.render(&device.shell))?;
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(End::Eof),
+            }
+        } else {
+            let Ok(first) = rx.recv() else {
+                return Ok(End::Eof);
+            };
+            batch.push(first);
+        }
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
             if batch.len() >= 256 {
@@ -797,20 +1002,153 @@ where
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
                 Ev::Key(k) => desktop.on_key(&mut device.shell, k),
                 Ev::Reply(r) => {
-                    on_reply(&mut device.shell, &mut history, r);
+                    let answer = on_reply(&mut device.shell, &mut history, r);
+                    if let Some(text) = answer {
+                        graph.assistant_message(&text, &model_name, unix_now());
+                        let known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+                        if let Some(command) = toolloop::parse_tool_call(&text, &known) {
+                            if steps >= toolloop::MAX_STEPS {
+                                device.shell.chat.push(
+                                    Role::Notice,
+                                    "The model asked for more tools than allowed for one question; stopped.",
+                                );
+                            } else {
+                                steps += 1;
+                                let held_before: Vec<String> = device
+                                    .shell
+                                    .approvals
+                                    .rows
+                                    .iter()
+                                    .map(|r| r.id.clone())
+                                    .collect();
+                                let output = device.run_agent(&command);
+                                let now = unix_now();
+                                graph.tool_call(mouli_device::AGENT_USER, &command, &output, now);
+                                for row in &device.shell.approvals.rows {
+                                    if !held_before.contains(&row.id) {
+                                        graph.approval_held(&row.id, &row.capability, now);
+                                    }
+                                }
+                                history.push(Turn {
+                                    role: "user",
+                                    content: toolloop::result_turn(&command, &output),
+                                });
+                                trim_history(&mut history, max_tokens);
+                                device.shell.chat.busy = true;
+                                if req_tx.send(history.clone()).is_err() {
+                                    device.shell.chat.busy = false;
+                                }
+                            }
+                        }
+                    }
                     Action::None
                 }
                 Ev::NewInput(text) => {
                     device.shell.chat.push(Role::Notice, &text);
                     Action::None
                 }
+                Ev::Status(s) => {
+                    desktop.system = *s;
+                    Action::None
+                }
+                Ev::Page { requested, result } => {
+                    match result {
+                        Ok(l) => device
+                            .shell
+                            .browser
+                            .loaded_with(&requested, &l.url, l.html, l.images),
+                        Err(m) => {
+                            let page = crate::browse::error_page(&requested, &m);
+                            device.shell.browser.failed(&requested, &m, page);
+                        }
+                    }
+                    Action::None
+                }
             };
             match action {
                 Action::None => {}
-                Action::Show(tab) => desktop.open(&mut device.shell, tab),
+                Action::Show(tab) => {
+                    desktop.open(&mut device.shell, tab);
+                    if tab == Tab::Storage {
+                        refresh_storage(&mut device.shell, data_root.as_deref());
+                    }
+                }
+                Action::Navigate(url) => {
+                    let tx = reply_tx_pages.clone();
+                    std::thread::spawn(move || {
+                        let result = match crate::fetch::HttpFetcher::system() {
+                            Ok(f) => crate::browse::load(&f, &url),
+                            Err(e) => Err(e),
+                        };
+                        let _ = tx.send(Ev::Page {
+                            requested: url,
+                            result,
+                        });
+                    });
+                }
+                Action::RescanStorage => {
+                    refresh_storage(&mut device.shell, data_root.as_deref());
+                    device.shell.storage.message = "Looked at the disk again.".into();
+                }
+                Action::DeleteStorage(i) => {
+                    let message = delete_stored_model(
+                        &mut device.shell,
+                        data_root.as_deref(),
+                        i,
+                        &model_name,
+                        &mut graph,
+                    );
+                    refresh_storage(&mut device.shell, data_root.as_deref());
+                    device.shell.storage.message = message;
+                }
+                Action::Send(text) if text.trim_start().starts_with("/time.zone") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/time.zone".len()..].to_string();
+                    let note = time_zone_command(&arg, &offset, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
+                Action::Send(text) if text.trim_start().starts_with("/graph") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/graph".len()..].trim().to_string();
+                    let note = if let Some(path) = arg.strip_prefix(".file") {
+                        graph.describe_file(path.trim())
+                    } else if arg == ".forget" {
+                        graph.forget(unix_now())
+                    } else if arg.is_empty() {
+                        graph.describe_recent()
+                    } else {
+                        "Use /graph (recent activity), /graph.file PATH (history of a file) or /graph.forget (erase the record).".to_string()
+                    };
+                    device.shell.chat.push(Role::Notice, &note);
+                }
+                Action::Send(text) if text.trim_start().starts_with('/') => {
+                    // A command for an application: carried out through the governed workspace
+                    // (policy, approvals, audit), not sent to the model.
+                    let before = device.shell.chat.messages.len();
+                    device.run(Action::Send(text.clone()));
+                    let output = device.shell.chat.messages[before..]
+                        .iter()
+                        .filter(|m| m.role != Role::User)
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    graph.tool_call("owner", &text, &output, unix_now());
+                }
                 Action::Send(text) => {
+                    // A page summary asked for in the browser is answered in the Chat window.
+                    let from_browser = text.starts_with("Summarise this web page");
+                    if from_browser {
+                        if device.shell.chat.busy {
+                            device.shell.browser.status =
+                                "The assistant is busy; try again in a moment.".into();
+                        } else {
+                            desktop.open(&mut device.shell, Tab::Chat);
+                        }
+                    }
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
+                        graph.user_message(&text, unix_now());
+                        steps = 0;
                         history.push(Turn {
                             role: "user",
                             content: text,
@@ -829,32 +1167,100 @@ where
                 Action::NewConversation => {
                     if !device.shell.chat.busy {
                         device.run(Action::NewConversation);
-                        history = fresh(system_prompt);
+                        history = fresh(&system_text);
+                        steps = 0;
+                        graph.new_conversation(unix_now());
                     }
                 }
-                other => match device.run(other) {
+                other => {
+                    let decision = if let Action::Decide { id, approve } = &other {
+                        Some((id.clone(), *approve))
+                    } else {
+                        None
+                    };
+                    let outcome = device.run(other);
+                    if let Some((id, approve)) = decision {
+                        if !device.shell.approvals.rows.iter().any(|r| r.id == id) {
+                            graph.approval_decided(&id, approve, "owner", unix_now());
+                        }
+                    }
+                    match outcome {
                     Outcome::Quit => return Ok(End::Quit),
+                    Outcome::Reboot => return Ok(End::Reboot),
                     Outcome::Handled => {}
                     Outcome::Host(_) => device.shell.chat.push(
                         Role::Notice,
                         "That is not available in the desktop yet; restart with mouli.text=1 for the text menu.",
                     ),
-                },
+                    }
+                }
             }
         }
+        desktop.status = status_text(&base_status, device.shell.approvals.rows.len());
         display.present(&desktop.render(&device.shell))?;
     }
 }
 
-fn on_reply(shell: &mut Shell, history: &mut Vec<Turn>, reply: Result<String, String>) {
+/// Fills the Storage window from the data disk (or shows that there is none).
+fn refresh_storage(shell: &mut Shell, root: Option<&Path>) {
+    match root {
+        Some(r) => {
+            let s = crate::storage::scan(r);
+            shell.storage.set(s.rows, s.free, s.total, "MOULI-DATA");
+        }
+        None => shell.storage.set(Vec::new(), None, None, ""),
+    }
+}
+
+/// Removes the model the person chose in the Storage window, unless it is the one in use.
+/// Returns the message to show.
+fn delete_stored_model(
+    shell: &mut Shell,
+    root: Option<&Path>,
+    index: usize,
+    loaded: &str,
+    graph: &mut Recorder,
+) -> String {
+    let Some(root) = root else {
+        return "There is no data disk.".into();
+    };
+    let Some(row) = shell.storage.rows.get(index).cloned() else {
+        return "That row is not on the list any more.".into();
+    };
+    let stem = row
+        .name
+        .rsplit_once('.')
+        .map_or(row.name.as_str(), |(s, _)| s);
+    if !loaded.is_empty() && (row.name == loaded || stem == loaded) {
+        return format!("{} is the model in use; load another one first.", row.name);
+    }
+    match crate::storage::remove_model(root, &row) {
+        crate::storage::Removal::Removed(name, bytes) => {
+            graph.model_removed(&name, unix_now());
+            format!(
+                "Removed {name} and freed {}.",
+                mouli_screen::screens::size_text(bytes)
+            )
+        }
+        crate::storage::Removal::Refused(why) => why,
+    }
+}
+
+/// Records the model's reply; returns its text when it answered.
+fn on_reply(
+    shell: &mut Shell,
+    history: &mut Vec<Turn>,
+    reply: Result<String, String>,
+) -> Option<String> {
     shell.chat.busy = false;
     match reply {
         Ok(text) => {
             shell.chat.push(Role::Assistant, &text);
             history.push(Turn {
                 role: "assistant",
-                content: text,
+                content: text.clone(),
             });
+            Some(text)
         }
         Err(e) => {
             if history.last().is_some_and(|t| t.role == "user") {
@@ -863,6 +1269,7 @@ fn on_reply(shell: &mut Shell, history: &mut Vec<Turn>, reply: Result<String, St
             shell
                 .chat
                 .push(Role::Notice, &format!("The model could not answer: {e}"));
+            None
         }
     }
 }
@@ -1156,7 +1563,7 @@ mod tests {
             }
             t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
         });
-        let end = run(session, Echo, "be nice", 10_000, "tiny").unwrap();
+        let end = run(session, Echo, "be nice", 10_000, &ModelsInfo::only("tiny")).unwrap();
         quitter.join().unwrap();
         assert_eq!(end, End::Quit);
         let n = shots.lock().unwrap().len();
@@ -1206,37 +1613,27 @@ mod tests {
         std::fs::create_dir_all(d.join("projects")).unwrap();
         std::fs::write(d.join("projects/hello.txt"), "hi\n").unwrap();
         assert!(build_device(Some(&d)).is_ok());
-        assert!(d.join("apps").is_dir() && d.join("projects").is_dir());
+        assert!(d.join("projects").is_dir());
         // A data disk that cannot be written is an error, not a panic.
         assert!(build_device(Some(Path::new("/proc/mouli-nonexistent"))).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn a_sheet_cell_typed_in_the_desktop_is_saved_on_the_data_disk() {
-        let dir = tmp("sheet");
+    fn the_moved_out_applications_do_not_open() {
+        let dir = tmp("movedout");
         let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = channel();
         let device = build_device(Some(&dir)).unwrap();
         let session = Session::new(Shots(shots), tx.clone(), rx, device);
-        tx.send(Ev::Key(Key::F(7))).unwrap();
-        for e in keys_for("424242\n") {
-            tx.send(e).unwrap();
+        for n in [7u8, 8, 10] {
+            tx.send(Ev::Key(Key::F(n))).unwrap();
         }
         tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
-        let end = run(session, Echo, "sys", 1000, "tiny").unwrap();
+        let end = run(session, Echo, "sys", 1000, &ModelsInfo::only("tiny")).unwrap();
         assert_eq!(end, End::Quit);
-        let saved = std::fs::read_to_string(dir.join("apps/sheet.mouli")).unwrap();
-        assert!(saved.contains("424242"), "saved sheet: {saved}");
+        assert!(!dir.join("apps").exists(), "no sheet or document is kept");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_player_says_plainly_that_it_cannot_play() {
-        use mouli_player::Backend as _;
-        let mut b = NoVideo;
-        let src = mouli_player::source::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
-        assert!(b.load(&src).unwrap_err().contains("no video player"));
     }
 
     #[test]
@@ -1337,5 +1734,713 @@ mod tests {
         let again = scan_inputs(&dev, &sys, 1280, &tx, &mut seen);
         assert_eq!(again, InputSummary::default(), "not opened twice");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Backend for Counting {
+        fn reply(&mut self, _: &[Turn]) -> Result<String, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("model answer".into())
+        }
+    }
+
+    #[test]
+    fn the_models_window_lists_the_models_and_says_which_is_loaded() {
+        let mut shell = Shell::new();
+        let info = ModelsInfo {
+            rows: vec![
+                ModelRow {
+                    name: "small".into(),
+                    size_mb: 800,
+                    arch: Some("llama".into()),
+                    needs_mb: 1000,
+                    fits: true,
+                },
+                ModelRow {
+                    name: "big".into(),
+                    size_mb: 4000,
+                    arch: None,
+                    needs_mb: 5000,
+                    fits: false,
+                },
+            ],
+            budget_mb: 3000,
+            ctx: 2048,
+            loaded: "big".into(),
+        };
+        show_models(&mut shell, &info);
+        assert_eq!(shell.models.rows.len(), 2);
+        assert_eq!(
+            shell.models.selected().unwrap().name,
+            "big",
+            "the loaded model is selected"
+        );
+        assert_eq!((shell.models.budget_mb, shell.models.ctx), (3000, 2048));
+        assert!(shell.models.message.contains("Loaded: big"));
+        assert_eq!(shell.chat.model, "big");
+        // With only a name known, there is still one row.
+        show_models(&mut shell, &ModelsInfo::only("x"));
+        assert_eq!(shell.models.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_slash_command_in_the_chat_runs_the_application_and_never_reaches_the_model() {
+        let dir = tmp("slash");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots), tx.clone(), rx, device);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("/code.status\n") {
+            tx.send(e).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let end = run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        assert_eq!(end, End::Quit);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the model was not asked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_text_still_goes_to_the_model() {
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Shots(shots.clone()),
+            tx.clone(),
+            rx,
+            build_device(None).unwrap(),
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("hello there\n") {
+            tx.send(e).unwrap();
+        }
+        let t2 = tx.clone();
+        let seen = shots.clone();
+        let quitter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_chat_models_and_code_are_registered_in_this_version() {
+        let mut d = build_device(None).unwrap();
+        let names: Vec<String> = d
+            .workspace()
+            .help()
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "code.status"), "{names:?}");
+        for gone in ["crm.", "sheet.", "studio.", "player."] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(gone)),
+                "{gone} moved out: {names:?}"
+            );
+        }
+        d.run(Action::Send("/crm.lead.list".into()));
+        assert_eq!(
+            d.shell.chat.messages.last().unwrap().role,
+            Role::Notice,
+            "an unknown command is explained, not sent to the model"
+        );
+    }
+
+    #[test]
+    fn the_menu_bar_reminds_when_approvals_are_waiting() {
+        assert_eq!(status_text("MOULI OS", 0), "MOULI OS");
+        assert!(status_text("MOULI OS", 1).contains("1 waiting for approval (F3)"));
+        assert!(status_text("MOULI OS", 3).contains("3 waiting for approval (F3)"));
+    }
+
+    struct NoRun;
+    impl Runner for NoRun {
+        fn run(&mut self, _: &str, _: &[&str]) -> Option<String> {
+            None
+        }
+        fn pause(&mut self, _: Duration) {}
+    }
+
+    fn next_status(rx: &Receiver<Ev>) -> Box<SystemStatus> {
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a status arrives")
+            {
+                Ev::Status(s) => return s,
+                _ => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn the_status_thread_reports_the_clock_and_follows_a_new_zone() {
+        let root = tmp("statusthread");
+        let env = SysEnv {
+            sys_net: root.join("net"),
+            sys_bt: root.join("bt"),
+            power: root.join("power"),
+            dbus_socket: root.join("none"),
+        };
+        let (tx, rx) = channel();
+        let offset = Arc::new(AtomicI32::new(0));
+        spawn_status(NoRun, env, tx, offset.clone(), Duration::from_millis(10));
+        let first = next_status(&rx);
+        assert_eq!(first.zone, "UTC");
+        assert_eq!(first.time.len(), 5, "HH:MM: {}", first.time);
+        offset.store(330, Ordering::Relaxed);
+        let mut zone = String::new();
+        for _ in 0..200 {
+            zone = next_status(&rx).zone;
+            if zone == "UTC+05:30" {
+                break;
+            }
+        }
+        assert_eq!(zone, "UTC+05:30");
+        // Unchanged status is not sent again and the thread ends when the receiver is gone.
+        drop(rx);
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_time_zone_command_validates_shows_and_saves() {
+        let offset = AtomicI32::new(0);
+        let dir = tmp("tz");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::persist::Store::open(&dir).unwrap();
+        assert!(time_zone_command("", &offset, Some(&store)).contains("shows UTC"));
+        let ok = time_zone_command(" +05:30 ", &offset, Some(&store));
+        assert!(ok.contains("UTC+05:30") && ok.contains("kept"), "{ok}");
+        assert_eq!(offset.load(Ordering::Relaxed), 330);
+        assert_eq!(
+            store
+                .settings()
+                .get(sysinfo::OFFSET_KEY)
+                .map(String::as_str),
+            Some("330")
+        );
+        assert!(time_zone_command("", &offset, Some(&store)).contains("UTC+05:30"));
+        for bad in ["+99", "x", "+5:99", "1e9", "UTC+25"] {
+            let msg = time_zone_command(bad, &offset, Some(&store));
+            assert!(msg.contains("not a time zone"), "{bad}: {msg}");
+            assert_eq!(offset.load(Ordering::Relaxed), 330, "{bad} changes nothing");
+        }
+        let no_disk = time_zone_command("-8", &offset, None);
+        assert!(no_disk.contains("forgotten at power-off"), "{no_disk}");
+        assert_eq!(offset.load(Ordering::Relaxed), -480);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typing_time_zone_in_the_chat_sets_the_zone_and_keeps_it_on_the_data_disk() {
+        let dir = tmp("tzchat");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.settings = crate::persist::Store::open(&dir).ok();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for e in keys_for("/time.zone +05:30\n") {
+            tx.send(e).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let end = run(
+            session,
+            Counting(calls.clone()),
+            "sys",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        assert_eq!(end, End::Quit);
+        let saved = crate::persist::Store::open(&dir).unwrap().settings();
+        assert_eq!(
+            saved.get(sysinfo::OFFSET_KEY).map(String::as_str),
+            Some("330")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the model was not asked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn click_at(tx: &Sender<Ev>, from: &mut (i32, i32), to: (i32, i32)) {
+        use mouli_desk::input::Button;
+        tx.send(Ev::Mouse(MouseEvent::Move {
+            dx: to.0 - from.0,
+            dy: to.1 - from.1,
+        }))
+        .unwrap();
+        tx.send(Ev::Mouse(MouseEvent::Down(Button::Left))).unwrap();
+        tx.send(Ev::Mouse(MouseEvent::Up(Button::Left))).unwrap();
+        *from = to;
+    }
+
+    #[test]
+    fn the_power_button_shuts_down_or_restarts_through_the_event_loop() {
+        use mouli_desk::desktop::Desktop;
+        use mouli_desk::status::{layout, StatusItem};
+        for (button, want) in [(0usize, End::Quit), (1, End::Reboot)] {
+            let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (tx, rx) = channel();
+            let session = Session::new(Shots(shots), tx.clone(), rx, build_device(None).unwrap());
+            // The same desktop the loop builds (the test display is 800 by 600) tells where to click.
+            let mut d = Desktop::new(800, 600);
+            let power = layout(800, &d.system)
+                .into_iter()
+                .find(|(i, _)| *i == StatusItem::Power)
+                .unwrap()
+                .1;
+            d.show_power_dialog();
+            let (_, rects) = d.alert_layout(&d.alert.clone().unwrap());
+            let mut at = (400, 300);
+            click_at(&tx, &mut at, (power.x + power.w / 2, 8));
+            click_at(&tx, &mut at, (rects[button].x + 10, rects[button].y + 10));
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let end = run(
+                session,
+                Counting(calls),
+                "sys",
+                1000,
+                &ModelsInfo::only("t"),
+            )
+            .unwrap();
+            assert_eq!(end, want, "button {button}");
+        }
+    }
+
+    #[test]
+    fn a_status_event_reaches_the_menu_bar() {
+        use mouli_desk::status::{Bluetooth, NetKind, Network};
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Shots(shots.clone()),
+            tx.clone(),
+            rx,
+            build_device(None).unwrap(),
+        );
+        // Quit after the status event has been drawn.
+        let s = SystemStatus {
+            time: "08:15".into(),
+            date: "Thu 26 Nov".into(),
+            zone: "UTC".into(),
+            network: Network {
+                kind: NetKind::Wifi,
+                name: "N".into(),
+                bars: 4,
+            },
+            bluetooth: Bluetooth::On,
+            battery: None,
+        };
+        tx.send(Ev::Status(Box::new(s))).unwrap();
+        let t2 = tx.clone();
+        let seen = shots.clone();
+        let quitter = std::thread::spawn(move || {
+            // Quit once the picture with the new status has been drawn (start, then the status).
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls),
+            "sys",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        // The first picture (before the status) and the last (after it) differ in the system area.
+        let pics = shots.lock().unwrap();
+        assert!(
+            pics.len() >= 2,
+            "drawn at start and after the batch: {}",
+            pics.len()
+        );
+        let (first, last) = (&pics[0], &pics[pics.len() - 1]);
+        let left = mouli_desk::status::left_edge(
+            800,
+            &SystemStatus {
+                time: "08:15".into(),
+                date: "Thu 26 Nov".into(),
+                zone: "UTC".into(),
+                network: Network {
+                    kind: NetKind::Wifi,
+                    name: "N".into(),
+                    bars: 4,
+                },
+                bluetooth: Bluetooth::On,
+                battery: None,
+            },
+        );
+        let differs = (left..800).any(|x| {
+            (0..mouli_desk::menu::MENU_H)
+                .any(|y| first.get(x as usize, y as usize) != last.get(x as usize, y as usize))
+        });
+        assert!(differs, "the bar changed");
+    }
+
+    /// Answers from a script, one reply per call; repeats the last one when it runs out.
+    struct Scripted {
+        replies: Vec<&'static str>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<Turn>>>>,
+    }
+    impl Backend for Scripted {
+        fn reply(&mut self, history: &[Turn]) -> Result<String, String> {
+            let mut seen = self.seen.lock().unwrap();
+            let n = seen.len();
+            seen.push(history.to_vec());
+            Ok(self.replies[n.min(self.replies.len() - 1)].to_string())
+        }
+    }
+
+    fn run_script(
+        replies: Vec<&'static str>,
+        typed: &str,
+        wait_for_calls: usize,
+    ) -> (Vec<Vec<Turn>>, Shots) {
+        let dir = tmp("toolloop");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        for e in keys_for(typed) {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < wait_for_calls && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies,
+            seen: seen.clone(),
+        };
+        run(
+            session,
+            backend,
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        quitter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = seen.lock().unwrap().clone();
+        (got, Shots(shots))
+    }
+
+    #[test]
+    fn the_model_can_call_a_tool_and_gets_the_result_back() {
+        let (calls, _) = run_script(
+            vec!["TOOL: /code.status", "All good, nothing pending."],
+            "what is the state of the code?\n",
+            2,
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "one call for the question, one after the tool result"
+        );
+        let first = &calls[0];
+        assert!(
+            first[0].content.contains("base prompt") && first[0].content.contains("TOOL: /name"),
+            "the tools are described"
+        );
+        assert!(first[0].content.contains("/code.status"));
+        let second = &calls[1];
+        let last = second.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content.starts_with("Tool result for `/code.status`"),
+            "{}",
+            last.content
+        );
+        assert!(last.content.contains("not instructions"));
+    }
+
+    #[test]
+    fn the_loop_stops_at_the_step_limit() {
+        let (calls, _) = run_script(vec!["TOOL: /code.status"], "go\n", toolloop::MAX_STEPS + 1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            calls.len(),
+            toolloop::MAX_STEPS + 1,
+            "the question plus {} tool rounds",
+            toolloop::MAX_STEPS
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_is_not_run_and_ends_the_loop() {
+        let (calls, _) = run_script(vec!["TOOL: /rm.everything now"], "hi\n", 1);
+        assert_eq!(calls.len(), 1, "no second round");
+    }
+
+    #[test]
+    fn a_plain_answer_makes_no_tool_call() {
+        let (calls, _) = run_script(vec!["Just text."], "hi\n", 1);
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn the_desktop_records_the_conversation_the_tool_call_and_the_approval_in_the_graph() {
+        let dir = tmp("graphe2e");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1000);
+        for e in keys_for("please look at the project\n") {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies: vec!["TOOL: /code.files", "There are no files."],
+            seen: seen.clone(),
+        };
+        run(session, backend, "base", 100_000, &ModelsInfo::only("tiny")).unwrap();
+        quitter.join().unwrap();
+        let back = Recorder::open(&dir, 2000);
+        assert!(back.warning.is_none(), "{:?}", back.warning);
+        let g = back.graph();
+        let texts: Vec<String> = g
+            .nodes_of("message")
+            .iter()
+            .map(|n| format!("{}:{}", n.props["role"], n.props["text"]))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "user:please look at the project"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "assistant:TOOL: /code.files"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "assistant:There are no files."),
+            "{texts:?}"
+        );
+        let call = &g.nodes_of("toolcall")[0];
+        assert_eq!(call.props["tool"], "code.files");
+        let by = g.out_edges(call.id, Some("run_by"))[0].to;
+        assert_eq!(g.get(by).unwrap().key, "agent:chat");
+        assert!(g.find("model", "tiny").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_graph_commands_show_and_erase_the_record() {
+        let dir = tmp("graphcmd");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1);
+        for line in [
+            "/code.files\n",
+            "/graph\n",
+            "/graph.file nothing.rs\n",
+            "/graph.forget\n",
+            "/graph.what\n",
+        ] {
+            for e in keys_for(line) {
+                tx.send(e).unwrap();
+            }
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls.clone()),
+            "s",
+            1000,
+            &ModelsInfo::only("t"),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "none of these reach the model"
+        );
+        assert!(
+            !dir.join(crate::datagraph::LOG_NAME).exists(),
+            "forgotten at the end"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_agent_change_is_recorded_as_a_held_approval_linked_to_its_file() {
+        let dir = tmp("graphapproval");
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        std::fs::write(dir.join("projects/a.txt"), "old\n").unwrap();
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.graph = Recorder::open(&dir, 1000);
+        for e in keys_for("change a.txt\n") {
+            tx.send(e).unwrap();
+        }
+        let (seen2, t2) = (seen.clone(), tx.clone());
+        let quitter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen2.lock().unwrap().len() < 3 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            t2.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        });
+        let backend = Scripted {
+            replies: vec![
+                "TOOL: /code.edit path=a.txt text=new",
+                "TOOL: /code.apply",
+                "It is waiting for your approval.",
+            ],
+            seen: seen.clone(),
+        };
+        run(session, backend, "base", 100_000, &ModelsInfo::only("tiny")).unwrap();
+        quitter.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("projects/a.txt")).unwrap(),
+            "old\n",
+            "nothing written without approval"
+        );
+        let back = Recorder::open(&dir, 2000);
+        let g = back.graph();
+        let apr = &g.nodes_of("approval")[0];
+        assert_eq!(apr.props["capability"], "code.apply");
+        assert_eq!(apr.props["status"], "waiting");
+        let call = g.in_edges(apr.id, Some("held_for"))[0].from;
+        assert_eq!(g.get(call).unwrap().props["tool"], "code.apply");
+        let file = g.find("file", "a.txt").unwrap();
+        assert_eq!(g.in_edges(file.id, Some("touched"))[0].props["how"], "edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn storage_run(loaded: &str, keys: Vec<Ev>) -> std::path::PathBuf {
+        let dir = tmp("storage");
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(dir.join("models/a.gguf"), vec![1u8; 100]).unwrap();
+        std::fs::write(dir.join("models/b.gguf"), vec![1u8; 50]).unwrap();
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots), tx.clone(), rx, device);
+        session.data_root = Some(dir.clone());
+        session.graph = Recorder::open(&dir, 1);
+        for k in keys {
+            tx.send(k).unwrap();
+        }
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run(
+            session,
+            Counting(calls),
+            "s",
+            1000,
+            &ModelsInfo::only(loaded),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_storage_window_removes_a_model_after_two_presses_and_records_it() {
+        let dir = storage_run(
+            "other",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('d')),
+            ],
+        );
+        assert!(
+            !dir.join("models/a.gguf").exists(),
+            "the largest model, first in the list, was removed"
+        );
+        assert!(dir.join("models/b.gguf").exists());
+        let back = Recorder::open(&dir, 9);
+        assert_eq!(
+            back.graph().find("model", "a.gguf").unwrap().props["status"],
+            "removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_press_or_the_wrong_keys_remove_nothing() {
+        let dir = storage_run(
+            "other",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Down),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('x')),
+                Ev::Key(Key::Esc),
+                Ev::Key(Key::Char('r')),
+            ],
+        );
+        assert!(dir.join("models/a.gguf").exists() && dir.join("models/b.gguf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_model_in_use_cannot_be_removed() {
+        let dir = storage_run(
+            "a",
+            vec![
+                Ev::Key(Key::F(11)),
+                Ev::Key(Key::Char('d')),
+                Ev::Key(Key::Char('d')),
+            ],
+        );
+        assert!(dir.join("models/a.gguf").exists(), "a is the loaded model");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

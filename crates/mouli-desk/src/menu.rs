@@ -28,6 +28,8 @@ pub enum Command {
     CloseWindow,
     /// Shut the machine down.
     Quit,
+    /// Ask whether to restart the machine.
+    Restart,
     /// Show the window for a screen.
     Open(Tab),
     /// Enlarge or restore the front window.
@@ -106,6 +108,7 @@ impl MenuBar {
                         item("Close Window", "^W", Command::CloseWindow),
                         SEP,
                         item("Shut Down", "^Q", Command::Quit),
+                        item("Restart", "", Command::Restart),
                     ],
                 },
                 Menu {
@@ -121,14 +124,16 @@ impl MenuBar {
                     items: vec![
                         item("Chat", "F1", Command::Open(Tab::Chat)),
                         item("Models", "F2", Command::Open(Tab::Models)),
+                        item("Code", "F9", Command::Open(Tab::Editor)),
+                        item("Storage", "F11", Command::Open(Tab::Storage)),
+                        item("Preview", "F12", Command::Open(Tab::Preview)),
+                        item("Browser", "^B", Command::Open(Tab::Browser)),
+                        SEP,
+                        item("Admin", "", Command::Nothing),
                         item("Approvals", "F3", Command::Open(Tab::Approvals)),
                         item("Audit", "F4", Command::Open(Tab::Audit)),
                         item("Security", "F5", Command::Open(Tab::Security)),
                         item("Code Review", "F6", Command::Open(Tab::Review)),
-                        item("Sheet", "F7", Command::Open(Tab::Sheet)),
-                        item("Studio", "F8", Command::Open(Tab::Studio)),
-                        item("Code", "F9", Command::Open(Tab::Editor)),
-                        item("Player", "F10", Command::Open(Tab::Player)),
                     ],
                 },
                 Menu {
@@ -227,8 +232,9 @@ impl MenuBar {
     }
 
     /// Draws the bar, with the open menu's title highlighted, and `status` at the right.
-    pub fn draw_bar(&self, c: &mut Canvas, status: &str) {
+    pub fn draw_bar(&self, c: &mut Canvas, status: &str, right: i32) {
         let width = c.width as i32;
+        let right = right.min(width);
         fill(c, Rect::new(0, 0, width, MENU_H), SURFACE);
         hline(c, 0, MENU_H - 1, width, OUTLINE);
         let face = ui_medium();
@@ -244,7 +250,8 @@ impl MenuBar {
         }
         if !status.is_empty() {
             let w = text_width(face, status);
-            text(c, face, width - w - 14, y, status, ON_SURFACE_DIM);
+            let x = (right - w - 14).max(0);
+            text(c, face, x, y, status, ON_SURFACE_DIM);
         }
     }
 
@@ -358,7 +365,7 @@ mod tests {
         bar.hover = Some(1);
         for (w, h) in [(0usize, 0usize), (10, 10), (200, 100), (1024, 768)] {
             let mut c = crate::paint::canvas(w, h, 0);
-            bar.draw_bar(&mut c, "owner");
+            bar.draw_bar(&mut c, "owner", 200);
             bar.draw_dropdown(&mut c, true);
         }
     }

@@ -395,6 +395,7 @@ fn bad_diffs_and_misfits_are_reported_without_touching_anything() {
 
 // ---------------------------------------------------------------- applications
 
+#[cfg(feature = "office")]
 fn app_workspace() -> (Workspace, mouli_apps::Apps) {
     let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
     ws.add_role(Permissions::new("owner", &["*"]));
@@ -408,6 +409,7 @@ fn app_workspace() -> (Workspace, mouli_apps::Apps) {
     (ws, apps)
 }
 
+#[cfg(feature = "office")]
 fn device_with_apps(user: &str, role: &str) -> (Device<Echo>, mouli_apps::Apps) {
     let (ws, apps) = app_workspace();
     let mut d = Device::new(ws, Echo(vec![]), "acme", user, role).unwrap();
@@ -422,6 +424,7 @@ fn type_keys(d: &mut Device<Echo>, s: &str) {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn editing_a_cell_goes_through_the_gate_and_the_screen_shows_the_result() {
     let (mut d, apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(7)); // Sheet
@@ -456,6 +459,7 @@ fn editing_a_cell_goes_through_the_gate_and_the_screen_shows_the_result() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_value_with_quotes_and_spaces_is_stored_exactly_because_the_call_is_structured() {
     let (mut d, apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(7));
@@ -468,6 +472,7 @@ fn a_value_with_quotes_and_spaces_is_stored_exactly_because_the_call_is_structur
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn clearing_a_range_needs_a_second_person_and_then_updates_the_screen() {
     let (mut ws, apps) = app_workspace();
     // Alice (a clerk) fills two cells and asks to clear them: the clear is held.
@@ -510,6 +515,7 @@ fn clearing_a_range_needs_a_second_person_and_then_updates_the_screen() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_clear_asked_for_from_the_chat_by_the_owner_waits_for_someone_else() {
     let (mut d, apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(1));
@@ -528,6 +534,7 @@ fn a_clear_asked_for_from_the_chat_by_the_owner_waits_for_someone_else() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_role_without_permission_cannot_edit_and_is_told_why() {
     let (mut d, apps) = device_with_apps("vic", "viewer");
     d.on_key(Key::F(7));
@@ -549,6 +556,7 @@ fn a_role_without_permission_cannot_edit_and_is_told_why() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_bad_formula_is_shown_as_an_error_value_and_a_bad_cell_name_cannot_happen_from_the_screen() {
     let (mut d, _apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(7));
@@ -562,6 +570,7 @@ fn a_bad_formula_is_shown_as_an_error_value_and_a_bad_cell_name_cannot_happen_fr
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn studio_blocks_are_added_from_the_screen_and_shown() {
     let (mut d, apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(8));
@@ -582,6 +591,7 @@ fn studio_blocks_are_added_from_the_screen_and_shown() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn the_applications_are_also_callable_from_the_chat_with_the_same_results() {
     let (mut d, apps) = device_with_apps("owner", "owner");
     d.on_key(Key::F(1));
@@ -604,6 +614,7 @@ fn the_applications_are_also_callable_from_the_chat_with_the_same_results() {
 
 // ---------------------------------------------------------------- saving
 
+#[cfg(feature = "office")]
 fn data_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("mouli-device-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -611,6 +622,7 @@ fn data_dir(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn edits_are_saved_as_they_are_made_and_found_again_after_a_restart() {
     let dir = data_dir("restart");
     {
@@ -634,6 +646,7 @@ fn edits_are_saved_as_they_are_made_and_found_again_after_a_restart() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_refused_edit_is_not_saved() {
     let dir = data_dir("refused");
     let (mut d, _apps) = device_with_apps("viewer", "viewer");
@@ -647,6 +660,7 @@ fn a_refused_edit_is_not_saved() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_damaged_saved_file_is_reported_and_never_overwritten() {
     let dir = data_dir("damaged");
     std::fs::create_dir_all(&dir).unwrap();
@@ -664,6 +678,7 @@ fn a_damaged_saved_file_is_reported_and_never_overwritten() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn keeping_apps_without_attaching_them_is_an_error() {
     let (ws, _apps) = app_workspace();
     let mut d = Device::new(ws, Echo(vec![]), "acme", "owner", "owner").unwrap();
@@ -942,8 +957,10 @@ fn reading_a_file_in_the_editor_does_not_copy_it_into_the_conversation() {
 // ---------------------------------------------------------------- the player
 
 #[derive(Clone, Default)]
+#[cfg(feature = "office")]
 struct PlayLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
 
+#[cfg(feature = "office")]
 impl mouli_player::Backend for PlayLog {
     fn load(&mut self, s: &mouli_player::Source) -> Result<(), String> {
         self.0.borrow_mut().push(format!("load {}", s.label()));
@@ -966,6 +983,7 @@ impl mouli_player::Backend for PlayLog {
     }
 }
 
+#[cfg(feature = "office")]
 fn player_device(user: &str, role: &str) -> (Device<Echo>, PlayLog) {
     let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
     ws.add_role(Permissions::new("owner", &["*"]));
@@ -981,6 +999,7 @@ fn player_device(user: &str, role: &str) -> (Device<Echo>, PlayLog) {
     (d, log)
 }
 
+#[cfg(feature = "office")]
 fn last_load(log: &PlayLog) -> String {
     log.0
         .borrow()
@@ -991,6 +1010,7 @@ fn last_load(log: &PlayLog) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(feature = "office")]
 fn add_link(d: &mut Device<Echo>, url: &str) {
     d.on_key(Key::Char('o'));
     type_keys(d, url);
@@ -998,6 +1018,7 @@ fn add_link(d: &mut Device<Echo>, url: &str) {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_pasted_link_joins_the_queue_and_space_starts_it() {
     let (mut d, log) = player_device("owner", "owner");
     d.on_key(Key::F(10));
@@ -1024,6 +1045,7 @@ fn a_pasted_link_joins_the_queue_and_space_starts_it() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn shorts_play_one_after_another_from_the_keyboard_with_no_scrolling() {
     let (mut d, log) = player_device("owner", "owner");
     d.on_key(Key::F(10));
@@ -1056,6 +1078,7 @@ fn shorts_play_one_after_another_from_the_keyboard_with_no_scrolling() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn thumbs_down_skips_and_the_keys_change_volume_and_speed_through_the_gate() {
     let (mut d, log) = player_device("owner", "owner");
     d.on_key(Key::F(10));
@@ -1081,6 +1104,7 @@ fn thumbs_down_skips_and_the_keys_change_volume_and_speed_through_the_gate() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_viewer_cannot_control_the_player_and_is_told_why() {
     let (mut d, log) = player_device("vic", "viewer");
     d.on_key(Key::F(10));
@@ -1096,6 +1120,7 @@ fn a_viewer_cannot_control_the_player_and_is_told_why() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn a_bad_link_is_refused_with_a_reason_on_the_screen() {
     let (mut d, log) = player_device("owner", "owner");
     d.on_key(Key::F(10));
@@ -1110,6 +1135,7 @@ fn a_bad_link_is_refused_with_a_reason_on_the_screen() {
 }
 
 #[test]
+#[cfg(feature = "office")]
 fn without_a_player_the_screen_says_so() {
     let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
     d.on_key(Key::F(10));
@@ -1120,4 +1146,97 @@ fn without_a_player_the_screen_says_so() {
         d.shell.player.message
     );
     d.player_event(mouli_player::Event::Ended); // harmless
+}
+
+// ---------------------------------------------------------------- the model acting as an agent
+
+fn agent_device(dir: &tempfile::TempDir) -> Device<Echo> {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_role(Permissions::new("agent", &["code.*"]));
+    ws.add_model(model());
+    let code = mouli_apps::register_code(&mut ws).unwrap();
+    ws.register_app(Box::new(Notes)).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "owner").unwrap();
+    d.attach_code(code);
+    d.open_project(dir.path()).unwrap();
+    d
+}
+
+#[test]
+fn the_agent_can_read_but_a_change_waits_for_the_person_who_can_approve_it() {
+    let (dir, _diff, _new) = project();
+    let old = read(&dir);
+    let mut d = agent_device(&dir);
+
+    let files = d.run_agent("/code.files");
+    assert!(files.contains("src/tax.rs"), "{files}");
+    let text = d.run_agent("/code.read path=src/tax.rs");
+    assert!(text.contains(old.lines().next().unwrap()), "{text}");
+
+    // The model proposes a whole-file edit; nothing is written yet.
+    let held = d.run_agent("/code.edit path=src/tax.rs text=changed-by-the-agent");
+    assert!(!held.is_empty());
+    assert_eq!(read(&dir), old, "proposing writes nothing");
+
+    // Applying needs approval and is held; the file is still untouched.
+    let wait = d.run_agent("/code.apply");
+    assert!(wait.contains("held for the person's approval"), "{wait}");
+    assert_eq!(read(&dir), old);
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    let row = d.shell.approvals.rows[0].clone();
+    assert_eq!(row.capability, "code.apply");
+    assert_eq!(row.requester, "agent:chat");
+    assert!(
+        row.can_decide,
+        "the person may decide the agent's request: {row:?}"
+    );
+
+    // The person approves; only then is the file written.
+    d.run(Action::Decide {
+        id: row.id.clone(),
+        approve: true,
+    });
+    assert_eq!(read(&dir), "changed-by-the-agent");
+    assert!(d.shell.approvals.rows.is_empty());
+}
+
+#[test]
+fn the_person_can_refuse_what_the_agent_asked_for() {
+    let (dir, _d, _n) = project();
+    let old = read(&dir);
+    let mut d = agent_device(&dir);
+    d.run_agent("/code.edit path=src/tax.rs text=nope");
+    d.run_agent("/code.apply");
+    let id = d.shell.approvals.rows[0].id.clone();
+    d.run(Action::Decide { id, approve: false });
+    assert_eq!(read(&dir), old, "refused: nothing written");
+}
+
+#[test]
+fn the_agent_is_limited_to_the_code_tools() {
+    let (dir, _d, _n) = project();
+    let mut d = agent_device(&dir);
+    let denied = d.run_agent("/note.send to=everyone");
+    assert!(
+        denied.to_lowercase().contains("lacks permission")
+            || denied.to_lowercase().contains("denied"),
+        "{denied}"
+    );
+    let unknown = d.run_agent("/no.such.tool");
+    assert!(!unknown.is_empty());
+    assert!(d.shell.approvals.rows.is_empty(), "nothing was queued");
+}
+
+#[test]
+fn the_agent_cannot_act_when_the_host_defined_no_agent_role() {
+    let (dir, _d, _n) = project();
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    ws.add_role(Permissions::new("owner", &["*"]));
+    ws.add_model(model());
+    let code = mouli_apps::register_code(&mut ws).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "owner").unwrap();
+    d.attach_code(code);
+    d.open_project(dir.path()).unwrap();
+    assert!(d.run_agent("/code.files").contains("cannot act"));
 }

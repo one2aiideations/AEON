@@ -6,7 +6,7 @@ use crate::desktop::{Alert, Desktop};
 use crate::geom::Rect;
 use crate::paint::*;
 use crate::theme::*;
-use crate::wm::{Window, STATUS_H, TITLE_H};
+use crate::wm::{Window, CELL_H, STATUS_H, TITLE_H};
 use mouli_screen::grid::Grid;
 use mouli_screen::raster::{render_text, Canvas};
 use mouli_screen::screen::Tab;
@@ -79,10 +79,29 @@ fn draw_window(c: &mut Canvas, w: &Window, active: bool, shell: &Shell) {
 
     // The screen inside the window, in Roboto Mono.
     let k = w.content();
-    let mut grid = Grid::new(w.cols as usize, w.rows as usize);
-    let area = grid.area();
-    shell.screen(w.tab).draw(&mut grid, area);
-    blit(c, &render_text(&grid), k.x, k.y, k);
+    if w.tab == Tab::Preview {
+        // The preview is a picture, not a grid of characters.
+        fill(c, k, 0xFFFF_FFFF);
+        let text = shell.editor.text();
+        shell
+            .preview
+            .draw_pixels(c, (k.x, k.y, k.w, k.h), (shell.editor.path(), &text));
+    } else if w.tab == Tab::Browser {
+        // An address bar of characters over a picture of the page.
+        fill(c, k, 0xFFFF_FFFF);
+        let mut bar = Grid::new(w.cols as usize, 1);
+        shell.browser.draw_bar(&mut bar);
+        let bar_rect = Rect::new(k.x, k.y, k.w, CELL_H);
+        blit(c, &render_text(&bar), k.x, k.y, bar_rect);
+        shell
+            .browser
+            .draw_pixels(c, (k.x, k.y + CELL_H, k.w, k.h - CELL_H));
+    } else {
+        let mut grid = Grid::new(w.cols as usize, w.rows as usize);
+        let area = grid.area();
+        shell.screen(w.tab).draw(&mut grid, area);
+        blit(c, &render_text(&grid), k.x, k.y, k);
+    }
 
     // The strip under it: key hints, and the grow handle.
     let s = w.status_strip();
@@ -119,7 +138,7 @@ fn draw_window(c: &mut Canvas, w: &Window, active: bool, shell: &Shell) {
 }
 
 fn draw_alert(c: &mut Canvas, d: &Desktop, alert: &Alert) {
-    let (r, ok) = d.alert_rects(alert);
+    let (r, buttons) = d.alert_layout(alert);
     shadow(c, r);
     fill(c, r, SURFACE_HIGH);
     outline(c, r, OUTLINE_ACTIVE);
@@ -137,7 +156,9 @@ fn draw_alert(c: &mut Canvas, d: &Desktop, alert: &Alert) {
         };
         text(c, face, r.x + 28, r.y + 24 + i as i32 * 22, line, colour);
     }
-    button(c, ok, "OK");
+    for (rect, b) in buttons.iter().zip(&alert.buttons) {
+        button(c, *rect, b.label);
+    }
 }
 
 fn draw_icons(c: &mut Canvas, d: &Desktop) {
@@ -156,6 +177,9 @@ fn draw_icons(c: &mut Canvas, d: &Desktop) {
             Some(Tab::Studio) => &STUDIO,
             Some(Tab::Editor) => &CODE,
             Some(Tab::Player) => &PLAYER,
+            Some(Tab::Storage) => &DISK,
+            Some(Tab::Preview) => &CODE,
+            Some(Tab::Browser) => &BROWSER,
         };
         let selected = d.selected_icon == Some(i);
         let ix = r.x + (r.w - 32) / 2;
@@ -190,7 +214,9 @@ impl Desktop {
         for win in &self.wm.windows {
             draw_window(&mut c, win, Some(win.id) == front, shell);
         }
-        self.menu.draw_bar(&mut c, &self.status);
+        let right = crate::status::left_edge(self.width, &self.system);
+        self.menu.draw_bar(&mut c, &self.status, right);
+        crate::status::draw(&mut c, &self.system, self.pointer);
         self.menu.draw_dropdown(&mut c, self.wm.top().is_some());
         if let Some(alert) = &self.alert {
             draw_alert(&mut c, self, alert);

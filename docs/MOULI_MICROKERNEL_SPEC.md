@@ -67,7 +67,7 @@ Rules
 5. Resource limits (memory pages, handles, threads) are per job and enforced at creation.
 
 Mapping to MOULI's existing model
-- `mouli-core` `KernelObject` and `CapabilityRegistry` describe **AI-layer** objects (users, agents, models,
+- `mouli-agentic::kernel` `KernelObject` and `CapabilityRegistry` describe **AI-layer** objects (users, agents, models,
   capabilities). They stay in user space. A MOULI capability grants the *right to ask a service* that holds
   the kernel handle; the kernel does not know about agents or models.
 - MOULI-AUTH issues the policy that the device manager and services apply when they hand out handles.
@@ -104,7 +104,7 @@ write, map, unmap, and so on). Rules:
 
 - Fixed-priority classes with round-robin inside a class; later a deadline class for inference and audio.
 - Per-CPU run queues, wake-up IPIs, tickless idle at K4.
-- Thermal and placement hints from `mouli-sched` arrive as scheduler-handle calls from user space.
+- Thermal and placement hints from `mouli-systems::sched` arrive as scheduler-handle calls from user space.
 - Monotonic clock from TSC or HPET, calibrated at boot; wall clock supplied by a user-mode time service
   (the SNTP code in `moulid` is reused).
 
