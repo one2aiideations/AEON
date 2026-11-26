@@ -137,6 +137,57 @@ pub fn aggregate(dir: &str) -> Result<String, String> {
 
 /// Renders entries as markdown: a table of every method, then for each strategy how Aetheron
 /// compared with the MLP seed by seed, for accuracy and for forgetting, wins and losses alike.
+/// Writes the seed-by-seed comparison of arch `a` with arch `b` for one strategy, for accuracy and
+/// for forgetting. Returns whether any seed had both.
+fn compare(
+    out: &mut String,
+    entries: &[Entry],
+    strategy: &str,
+    a: (&str, &str),
+    b: (&str, &str),
+) -> bool {
+    let ae: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.0 == a.0 && e.1 == strategy)
+        .collect();
+    let be: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.0 == b.0 && e.1 == strategy)
+        .collect();
+    let mut any = false;
+    for (metric, higher_better, pick) in [
+        ("final accuracy", true, (|e: &Entry| e.3) as fn(&Entry) -> F),
+        ("forgetting", false, (|e: &Entry| e.4) as fn(&Entry) -> F),
+    ] {
+        let diffs: Vec<F> = ae
+            .iter()
+            .filter_map(|x| be.iter().find(|y| y.2 == x.2).map(|y| pick(x) - pick(y)))
+            .collect();
+        if diffs.is_empty() {
+            continue;
+        }
+        any = true;
+        let p = crate::stats::paired(&diffs, 20240601);
+        let ci = p
+            .ci95
+            .map_or("n/a".to_string(), |(l, h)| format!("{l:+.4} to {h:+.4}"));
+        let pv = p.p_value.map_or("n/a".to_string(), |v| format!("{v:.4}"));
+        out.push_str(&format!(
+            "- **{strategy}, {metric}, {} vs {}**: n={}, mean difference {:+.4}, interval {ci}, p={pv}; {} better on {}, worse on {}, equal on {}. {}\n",
+            a.1,
+            b.1,
+            p.n,
+            p.mean,
+            a.1,
+            if higher_better { p.wins } else { p.losses },
+            if higher_better { p.losses } else { p.wins },
+            p.ties,
+            p.describe(a.1, b.1, higher_better)
+        ));
+    }
+    any
+}
+
 #[must_use]
 pub fn render(entries: &[Entry], dataset: &str) -> String {
     let mut out = String::new();
@@ -183,40 +234,41 @@ pub fn render(entries: &[Entry], dataset: &str) -> String {
     strategies.dedup();
     let mut any = false;
     for s in &strategies {
-        let ae: Vec<&Entry> = entries
-            .iter()
-            .filter(|e| e.0 == "aetheron" && &e.1 == s)
-            .collect();
-        let ml: Vec<&Entry> = entries
-            .iter()
-            .filter(|e| e.0 == "mlp" && &e.1 == s)
-            .collect();
-        for (metric, higher_better, pick) in [
-            ("final accuracy", true, (|e: &Entry| e.3) as fn(&Entry) -> F),
-            ("forgetting", false, (|e: &Entry| e.4) as fn(&Entry) -> F),
-        ] {
-            let diffs: Vec<F> = ae
-                .iter()
-                .filter_map(|a| ml.iter().find(|m| m.2 == a.2).map(|m| pick(a) - pick(m)))
-                .collect();
-            if diffs.is_empty() {
-                continue;
+        any |= compare(
+            &mut out,
+            entries,
+            s,
+            ("aetheron", "Aetheron"),
+            ("mlp", "the MLP"),
+        );
+    }
+    // Ablations: each part removed, against the full model.
+    let mut ablations: Vec<String> = entries
+        .iter()
+        .map(|e| e.0.clone())
+        .filter(|a| a.starts_with("aetheron-no-"))
+        .collect();
+    ablations.sort();
+    ablations.dedup();
+    if !ablations.is_empty() {
+        out.push_str(
+            "\n## Ablations: the full Aetheron model against itself with one part removed\n\n",
+        );
+        for abl in &ablations {
+            let name = format!(
+                "Aetheron without {}",
+                abl.trim_start_matches("aetheron-no-")
+            );
+            for s in &strategies {
+                // A positive difference means the full model is better.
+                compare(
+                    &mut out,
+                    entries,
+                    s,
+                    ("aetheron", "the full model"),
+                    (abl, &name),
+                );
             }
-            any = true;
-            let p = crate::stats::paired(&diffs, 20240601);
-            let ci = p
-                .ci95
-                .map_or("n/a".to_string(), |(l, h)| format!("{l:+.4} to {h:+.4}"));
-            let pv = p.p_value.map_or("n/a".to_string(), |v| format!("{v:.4}"));
-            out.push_str(&format!(
-                "- **{s}, {metric}**: n={}, mean difference {:+.4}, interval {ci}, p={pv}; Aetheron better on {}, worse on {}, equal on {}. {}\n",
-                p.n,
-                p.mean,
-                if higher_better { p.wins } else { p.losses },
-                if higher_better { p.losses } else { p.wins },
-                p.ties,
-                p.describe("Aetheron", "the MLP", higher_better)
-            ));
         }
     }
     if !any {
@@ -275,5 +327,45 @@ mod tests {
         write_dataset_marker(d, "  MNIST (IDX files given)  ").unwrap();
         assert_eq!(read_dataset_marker(d), "MNIST (IDX files given)");
         let _ = fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod ablation_tests {
+    use super::*;
+
+    #[test]
+    fn each_ablation_is_compared_with_the_full_model_and_a_part_that_helps_is_said_to_help() {
+        let mut v: Vec<Entry> = Vec::new();
+        for s in 0..8u64 {
+            let j = s as F * 0.001;
+            let row =
+                |arch: &str, acc: F| (arch.to_string(), "none".to_string(), s, acc, 0.1, 0.5, None);
+            v.push(row("aetheron", 0.70 + j));
+            v.push(row("aetheron-no-attention", 0.60 + j)); // removing attention hurts
+            v.push(row("aetheron-no-gate", 0.70 + j)); // removing the gate changes nothing
+        }
+        let r = render(&v, "synthetic");
+        assert!(r.contains("## Ablations"), "{r}");
+        let attn = r
+            .lines()
+            .find(|l| l.contains("Aetheron without attention") && l.contains("final accuracy"))
+            .unwrap();
+        assert!(
+            attn.contains("the full model was better than Aetheron without attention"),
+            "{attn}"
+        );
+        let gate = r
+            .lines()
+            .find(|l| l.contains("Aetheron without gate") && l.contains("final accuracy"))
+            .unwrap();
+        assert!(
+            gate.contains("equal on 8") && gate.contains("No clear difference"),
+            "{gate}"
+        );
+        assert!(
+            !r.contains("no-homeostasis"),
+            "only ablations that were run are listed"
+        );
     }
 }

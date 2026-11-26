@@ -123,13 +123,20 @@ const TASKS: [(u8, u8); 5] = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)];
 fn make_learner(arch: &str, cfg: &RunCfg, seed: u64, in_dim: usize) -> Result<Bench, String> {
     let scale = cfg.lr / 0.05; // Aetheron multiplies eta_init and readout_lr by this
     match arch {
-        "aetheron" => {
-            let c = crate::aetheron_ml::AetheronMlCfg {
+        "aetheron" | "aetheron-no-attention" | "aetheron-no-gate" | "aetheron-no-homeostasis" => {
+            let mut c = crate::aetheron_ml::AetheronMlCfg {
                 in_dim,
                 eta_init: 0.05 * scale,
                 readout_lr: 0.05 * scale,
                 ..Default::default()
             };
+            match arch {
+                "aetheron-no-attention" => c.attention = false,
+                // A threshold below zero lets every activation through.
+                "aetheron-no-gate" => c.eps = -1.0,
+                "aetheron-no-homeostasis" => c.homeostatic = false,
+                _ => {}
+            }
             Ok(Bench::Aeth(crate::aetheron_ml::AetheronMlLearner::new(
                 c, seed,
             )))
@@ -140,7 +147,10 @@ fn make_learner(arch: &str, cfg: &RunCfg, seed: u64, in_dim: usize) -> Result<Be
                 in_dim, hidden, 10, seed, cfg.lr,
             )))
         }
-        other => Err(format!("unknown arch '{}' (expected aetheron|mlp)", other)),
+        other => Err(format!(
+            "unknown arch '{}' (expected one of {:?})",
+            other, ARCHES
+        )),
     }
 }
 
@@ -276,7 +286,7 @@ fn train_internal(
             .collect();
         let final_avg = per_task.iter().copied().sum::<F>() / per_task.len() as F;
         let pooled = eval_acc(learner, eval_ds, &all_cls, EvalNorm::FixedEma);
-        let trans = if arch_eff == "aetheron" {
+        let trans = if arch_eff.starts_with("aetheron") {
             Some(
                 TASKS
                     .iter()
@@ -396,7 +406,7 @@ fn train_internal(
         .sum::<F>()
         / 4.0;
     let pooled = eval_acc(learner, eval_ds, &all_cls, EvalNorm::FixedEma);
-    let transductive_final_avg = if arch_eff == "aetheron" {
+    let transductive_final_avg = if arch_eff.starts_with("aetheron") {
         Some(
             TASKS
                 .iter()
@@ -420,13 +430,25 @@ fn train_internal(
 /// them yields an honestly labelled MLP result, never a fake Aetheron one.
 fn effective_arch(arch: &str, s: Strategy) -> &'static str {
     if s == Strategy::Joint || s == Strategy::Ewc {
-        "mlp"
-    } else if arch == "aetheron" {
-        "aetheron"
-    } else {
-        "mlp"
+        return "mlp";
     }
+    ARCHES
+        .iter()
+        .find(|a| **a == arch)
+        .copied()
+        .filter(|a| a.starts_with("aetheron"))
+        .unwrap_or("mlp")
 }
+
+/// Every architecture name `run_split` understands. The `aetheron-no-*` names are ablations: the
+/// full Aetheron model with one part removed, reported under their own name.
+pub const ARCHES: [&str; 5] = [
+    "aetheron",
+    "aetheron-no-attention",
+    "aetheron-no-gate",
+    "aetheron-no-homeostasis",
+    "mlp",
+];
 
 pub fn run_split(
     arch: &str,

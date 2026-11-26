@@ -231,3 +231,30 @@ fn with_attention_off_the_query_and_key_weights_do_not_move_but_with_it_on_they_
         );
     }
 }
+
+#[test]
+fn ablation_architectures_run_and_keep_their_own_names() {
+    let tr = synthetic_blobs(300, 8, 10, 41);
+    let te = synthetic_blobs(100, 8, 10, 42);
+    let cfg = RunCfg {
+        epochs: 1,
+        batch: 32,
+        lr: 0.05,
+        ewc_lambda: 100.0,
+        mem_per_class: 5,
+    };
+    for arch in [
+        "aetheron-no-attention",
+        "aetheron-no-gate",
+        "aetheron-no-homeostasis",
+    ] {
+        let r = run_split(arch, Strategy::None, 1, &tr, &te, &cfg);
+        assert_eq!(r.arch, arch);
+        assert!(r.final_avg.is_finite());
+    }
+    // An unknown name does not silently become Aetheron.
+    assert_eq!(
+        run_split("aetheron-no-everything", Strategy::None, 1, &tr, &te, &cfg).arch,
+        "mlp"
+    );
+}
