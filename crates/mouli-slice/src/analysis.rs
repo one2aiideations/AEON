@@ -154,6 +154,63 @@ pub fn weighted_importance(activation: &[f64], out_norm: &[f64]) -> Result<Vec<f
         .collect()
 }
 
+/// Expected squared change of a layer's output if each neuron is removed:
+/// `mean(a^2) x norm(output column)^2`.
+///
+/// This is the second-order saliency of Optimal Brain Damage specialised to dropping a whole
+/// neuron, assuming neurons are uncorrelated on the profiled prompts. Squaring weights big
+/// contributors more than [`weighted_importance`] does. It ignores correlation between neurons
+/// (two near-identical neurons both look important) and says nothing about what the prompts did
+/// not cover.
+///
+/// # Errors
+/// A [`SliceError`] for different lengths, an empty layer, or a negative or non-finite value.
+pub fn saliency_importance(mean_square: &[f64], out_norm: &[f64]) -> Result<Vec<f64>, SliceError> {
+    if mean_square.is_empty() {
+        return Err(SliceError::EmptyInput("layer importance"));
+    }
+    if mean_square.len() != out_norm.len() {
+        return Err(SliceError::BadShape(
+            "mean square and output norm lengths differ",
+        ));
+    }
+    mean_square
+        .iter()
+        .zip(out_norm)
+        .map(|(m, w)| {
+            if !m.is_finite() || !w.is_finite() {
+                Err(SliceError::NonFinite("saliency input"))
+            } else if *m < 0.0 || *w < 0.0 {
+                Err(SliceError::BadParameter(
+                    "saliency inputs must not be negative",
+                ))
+            } else {
+                Ok(m * w * w)
+            }
+        })
+        .collect()
+}
+
+/// Squared-saliency scores for every layer, from a profile and a weight analysis.
+///
+/// # Errors
+/// A [`SliceError`] when the two cover different layers or neuron counts.
+pub fn saliency_scores(
+    profiler: &Profiler,
+    analysis: &[LayerAnalysis],
+) -> Result<Vec<Vec<f64>>, SliceError> {
+    if analysis.len() != profiler.layers() {
+        return Err(SliceError::BadShape(
+            "profile and weight analysis cover different layers",
+        ));
+    }
+    analysis
+        .iter()
+        .enumerate()
+        .map(|(layer, a)| saliency_importance(&profiler.mean_square(layer)?, &a.out_norm))
+        .collect()
+}
+
 /// Output-weighted importance for every layer, from a profile and a weight analysis.
 ///
 /// # Errors
@@ -433,6 +490,53 @@ mod tests {
         .unwrap();
         assert_eq!(plain.keep, vec![vec![0, 1]]);
         assert_eq!(with_weights.keep, vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn saliency_squares_both_factors() {
+        // Neuron 0: mean square 4, norm 1 -> 4. Neuron 1: mean square 1, norm 3 -> 9.
+        let s = saliency_importance(&[4.0, 1.0], &[1.0, 3.0]).unwrap();
+        assert_eq!(s, vec![4.0, 9.0]);
+        assert!(saliency_importance(&[], &[]).is_err());
+        assert!(saliency_importance(&[1.0], &[1.0, 2.0]).is_err());
+        assert!(saliency_importance(&[-1.0], &[1.0]).is_err());
+        assert!(saliency_importance(&[f64::NAN], &[1.0]).is_err());
+    }
+
+    #[test]
+    fn saliency_prefers_a_neuron_with_rare_large_activations_over_a_steady_one() {
+        // Both neurons write with the same weight norm. Neuron 0 fires steadily at 1.0
+        // (mean |a| 1.0, mean square 1.0). Neuron 1 is quiet on three tokens and fires at 3.0 on
+        // one (mean |a| 0.75, mean square 2.25). The linear score ranks neuron 0 above neuron 1;
+        // the squared score flips it, because a rare large write changes the output more than its
+        // average suggests.
+        let mut p = Profiler::new(1, 2).unwrap();
+        for spiky in [0.0f32, 0.0, 3.0, 0.0] {
+            p.observe(0, &[1.0, spiky]).unwrap();
+        }
+        let norms = [1.0, 1.0];
+        let linear = weighted_importance(&p.importance(0).unwrap(), &norms).unwrap();
+        let squared = saliency_importance(&p.mean_square(0).unwrap(), &norms).unwrap();
+        assert!(linear[0] > linear[1], "linear: {linear:?}");
+        assert!(squared[1] > squared[0], "squared: {squared:?}");
+    }
+
+    #[test]
+    fn saliency_scores_follow_the_profile_and_the_weights() {
+        let file = model(|_, _, n| (n + 1) as f32, varied);
+        let analysis = analyse_gguf(&file).unwrap();
+        let profiler = profiled();
+        let scores = saliency_scores(&profiler, &analysis).unwrap();
+        for layer_scores in &scores {
+            // Dead neurons score zero; live ones score mean-square x norm squared.
+            assert!(layer_scores[..D_FF / 2].iter().all(|v| *v == 0.0));
+            let n = D_FF - 1;
+            let a = (n + 1) as f64;
+            let norm = (n + 1) as f64 * (D_MODEL as f64).sqrt();
+            let expected = a * a * norm * norm;
+            assert!((layer_scores[n] - expected).abs() < 1e-3 * expected);
+        }
+        assert!(saliency_scores(&profiler, &analysis[..1]).is_err());
     }
 
     #[test]

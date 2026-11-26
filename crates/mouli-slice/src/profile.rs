@@ -127,6 +127,25 @@ impl Profiler {
             .collect())
     }
 
+    /// Returns the mean squared activation for each neuron (zero where nothing was observed).
+    ///
+    /// This is the second moment the profiler keeps; its square root is [`Profiler::rms`].
+    ///
+    /// # Errors
+    /// [`SliceError::LayerOutOfRange`] for a bad layer.
+    pub fn mean_square(&self, layer: usize) -> Result<Vec<f64>, SliceError> {
+        self.check_layer(layer)?;
+
+        let tokens = self.token_count[layer];
+        if tokens == 0 {
+            return Ok(vec![0.0; self.d_ff]);
+        }
+
+        let divisor = tokens as f64;
+
+        Ok(self.sum_sq[layer].iter().map(|sum| sum / divisor).collect())
+    }
+
     /// Returns the root-mean-square activation for each neuron.
     ///
     /// Neurons in a layer with no observations return zero. This is the
@@ -407,6 +426,24 @@ mod tests {
         assert!((rms[0] - (12.5f64).sqrt()).abs() < 1e-12);
         assert_eq!(rms[1], 0.0);
         assert!(profiler.rms(5).is_err());
+    }
+
+    #[test]
+    fn mean_square_is_the_square_of_rms() {
+        let mut profiler = Profiler::new(1, 2).unwrap();
+        profiler.observe(0, &[3.0, 1.0]).unwrap();
+        profiler.observe(0, &[-4.0, 0.0]).unwrap();
+        let ms = profiler.mean_square(0).unwrap();
+        let rms = profiler.rms(0).unwrap();
+        assert!((ms[0] - 12.5).abs() < 1e-12 && (ms[1] - 0.5).abs() < 1e-12);
+        for (m, r) in ms.iter().zip(&rms) {
+            assert!((m - r * r).abs() < 1e-12);
+        }
+        assert!(profiler.mean_square(3).is_err());
+        assert_eq!(
+            Profiler::new(1, 2).unwrap().mean_square(0).unwrap(),
+            vec![0.0; 2]
+        );
     }
 
     #[test]

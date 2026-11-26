@@ -4,11 +4,12 @@
 //! mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt [--keep 0.8,0.65,0.5]
 //!             [--down q8_0|f16] [--tolerance 0.05] [--out DIR]
 //!             [--closure N] [--shots 3] [--profile-closure M]
-//!             [--score activation|weighted] [--diagnose]
+//!             [--score activation|weighted|saliency] [--diagnose]
 //! ```
 //!
 //! `--score weighted` ranks neurons by activation times the norm of their output weights (a 55D
-//! measure) instead of activation alone; `--diagnose` prints per-layer structure and how much of
+//! measure) and `--score saliency` by the squared version (the expected squared change of the
+//! layer output if the neuron is removed), instead of activation alone; `--diagnose` prints per-layer structure and how much of
 //! each layer's contribution the plan keeps.
 //!
 //! With `--closure N` the gate is the closure test (robust score S over five shortcut conditions,
@@ -21,7 +22,9 @@
 
 use mouli_llm::tokenizer::Tokenizer;
 use mouli_llm::{Model, Sampler, Session};
-use mouli_slice::analysis::{analyse_gguf, layer_reports, render_layers, weighted_scores};
+use mouli_slice::analysis::{
+    analyse_gguf, layer_reports, render_layers, saliency_scores, weighted_scores,
+};
 use mouli_slice::closure::{
     decide_closure, profile_prompts_for_closure, render_closure, run_closure,
 };
@@ -44,15 +47,22 @@ struct Args {
     closure: usize,
     shots: usize,
     profile_closure: usize,
-    weighted: bool,
+    ranking: Ranking,
     diagnose: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ranking {
+    Activation,
+    Weighted,
+    Saliency,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: mouli-slice MODEL.gguf --profile PROFILE.txt --eval EVAL.txt \
          [--keep 0.8,0.65,0.5] [--down q8_0|f16] [--tolerance 0.05] [--out DIR] \
-         [--closure N] [--shots 3] [--profile-closure M] [--score activation|weighted] [--diagnose]"
+         [--closure N] [--shots 3] [--profile-closure M] [--score activation|weighted|saliency] [--diagnose]"
     );
     std::process::exit(2);
 }
@@ -65,7 +75,7 @@ fn parse_args() -> Args {
     let mut down = DownType::Q8_0;
     let mut tolerance = 0.05;
     let (mut closure, mut shots, mut profile_closure) = (0usize, 3usize, 0usize);
-    let (mut weighted, mut diagnose) = (false, false);
+    let (mut ranking, mut diagnose) = (Ranking::Activation, false);
     while let Some(flag) = it.next() {
         if flag == "--diagnose" {
             diagnose = true;
@@ -91,9 +101,10 @@ fn parse_args() -> Args {
             }
             "--tolerance" => tolerance = value.parse().unwrap_or_else(|_| usage()),
             "--score" => {
-                weighted = match value.as_str() {
-                    "weighted" => true,
-                    "activation" => false,
+                ranking = match value.as_str() {
+                    "weighted" => Ranking::Weighted,
+                    "saliency" => Ranking::Saliency,
+                    "activation" => Ranking::Activation,
                     _ => usage(),
                 };
             }
@@ -114,7 +125,7 @@ fn parse_args() -> Args {
         closure,
         shots,
         profile_closure,
-        weighted,
+        ranking,
         diagnose,
     }
 }
@@ -184,7 +195,7 @@ fn main() -> Result<(), String> {
         t.elapsed().as_secs_f64()
     );
 
-    let analysis = if args.weighted || args.diagnose {
+    let analysis = if args.ranking != Ranking::Activation || args.diagnose {
         let t = Instant::now();
         let a = analyse_gguf(&file).map_err(|e| e.to_string())?;
         println!("55D weight analysis in {:.1}s", t.elapsed().as_secs_f64());
@@ -192,8 +203,9 @@ fn main() -> Result<(), String> {
     } else {
         None
     };
-    let scores: Vec<Vec<f64>> = match (&analysis, args.weighted) {
-        (Some(a), true) => weighted_scores(&profiler, a).map_err(|e| e.to_string())?,
+    let scores: Vec<Vec<f64>> = match (&analysis, args.ranking) {
+        (Some(a), Ranking::Weighted) => weighted_scores(&profiler, a).map_err(|e| e.to_string())?,
+        (Some(a), Ranking::Saliency) => saliency_scores(&profiler, a).map_err(|e| e.to_string())?,
         _ => (0..profiler.layers())
             .map(|l| profiler.importance(l))
             .collect::<Result<_, _>>()
@@ -201,7 +213,7 @@ fn main() -> Result<(), String> {
     };
     println!(
         "ranking neurons by {}",
-        if args.weighted {
+        if args.ranking == Ranking::Weighted {
             "activation x output weight norm"
         } else {
             "activation"
