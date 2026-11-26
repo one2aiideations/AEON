@@ -317,6 +317,8 @@ impl LocalCostmap {
         {
             core::hint::spin_loop();
         }
+        // SAFETY: the spin lock acquired just above is held until its release at the end of this function (no early
+        // return in between), so this is the only reference to the grid.
         let grid = unsafe { &mut *self.grid.get() };
         for row in grid.iter_mut() {
             row.fill(0);
@@ -334,6 +336,8 @@ impl LocalCostmap {
             core::hint::spin_loop();
         }
 
+        // SAFETY: the spin lock acquired just above is held until its release at the end of this function (no early
+        // return in between), so this is the only reference to the grid.
         let grid = unsafe { &mut *self.grid.get() };
         let total_radius = radius_m + inflation_m;
 
@@ -373,6 +377,8 @@ impl LocalCostmap {
             return 0; // Point is outside current local map bounds
         }
 
+        // SAFETY: `LocalCostmap` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the grid is alive.
+        // This takes no lock, so it must not run at the same time as the locked writers above.
         let grid = unsafe { &*self.grid.get() };
         grid[r as usize][c as usize]
     }
@@ -481,6 +487,8 @@ impl ModelPredictiveController {
         } else {
             mu
         };
+        // SAFETY: `ModelPredictiveController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the friction value is alive.
+        // The reference is used for one store and ends.
         let ptr = unsafe { &mut *self.road_friction_mu.get() };
         *ptr = mu_clamped;
     }
@@ -524,6 +532,8 @@ impl ModelPredictiveController {
         accel_mps2: f32,
         steer_rad: f32,
     ) -> bool {
+        // SAFETY: `ModelPredictiveController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the friction value is alive.
+        // This reads a `Copy` `f32` by value.
         let mu = unsafe { *self.road_friction_mu.get() };
         let max_total_accel = mu * GRAVITY_MPS2;
 
@@ -582,7 +592,11 @@ impl ModelPredictiveController {
         let (raw_accel, raw_steer) = self.qp_solver.solve(f_accel, f_steer)?;
 
         // 4. Rate-Limiting Actuator Enforcements
+        // SAFETY: `ModelPredictiveController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the last steering command is alive.
+        // This reads a `Copy` `f32` by value.
         let prev_steer = unsafe { *self.last_steer_rad.get() };
+        // SAFETY: `ModelPredictiveController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the last acceleration command is alive.
+        // This reads a `Copy` `f32` by value.
         let prev_accel = unsafe { *self.last_accel_mps2.get() };
 
         let max_steer_delta = VEHICLE_MAX_STEER_RATE_RAD_S * MPC_TIME_STEP_SEC;
@@ -605,6 +619,8 @@ impl ModelPredictiveController {
         };
 
         // Cache persistent state
+        // SAFETY: `ModelPredictiveController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the cached commands is alive.
+        // These are two separate cells, each written once by value.
         unsafe {
             *self.last_steer_rad.get() = clamped_steer;
             *self.last_accel_mps2.get() = final_accel;
@@ -677,6 +693,8 @@ impl RealTimeMotionPlanner {
             maneuver_time_s,
         )?;
 
+        // SAFETY: `RealTimeMotionPlanner` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the active trajectory is alive.
+        // The reference is used to fill the trajectory and ends with this function.
         let traj = unsafe { &mut *self.active_trajectory.get() };
         let dt = maneuver_time_s / (MAX_TRAJECTORY_WAYPOINTS as f32);
 
@@ -728,6 +746,8 @@ impl RealTimeMotionPlanner {
         &self,
         current: &VehicleState,
     ) -> Result<MpcControlOutput, MotionPlanningError> {
+        // SAFETY: `RealTimeMotionPlanner` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the active trajectory is alive.
+        // It is only read here, by `compute_control`, and no writer runs meanwhile.
         let traj = unsafe { &*self.active_trajectory.get() };
         self.mpc.compute_control(current, traj)
     }
