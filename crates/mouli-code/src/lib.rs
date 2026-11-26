@@ -9,10 +9,12 @@
 //! * [`budget`]: hard limits on iterations, model calls and repair attempts.
 //! * [`workspace`]: applying a checked patch to a real directory atomically, and undoing it
 //!   exactly.
+//! * [`repair`]: the repair loop: propose, check, try in a copy, feed back the failure, within
+//!   budgets, then shrink the fix with the minimiser.
 //! * [`sandbox`]: running a command (the tests) in a throwaway copy of a folder, with a time limit
 //!   and an output cap. Not a security boundary: see its notes.
 //!
-//! Everything except [`workspace`] and [`sandbox`] works on text held in memory and never touches
+//! Everything except [`workspace`], [`sandbox`] and [`repair`] works on text held in memory and never touches
 //! the file system or runs a command, so an agent's proposed change can be checked completely
 //! before anything is written.
 //! The design follows an earlier Python prototype whose diff application, minimiser and quality
@@ -27,5 +29,6 @@ pub mod diff;
 pub mod make;
 pub mod minimize;
 pub mod quality;
+pub mod repair;
 pub mod sandbox;
 pub mod workspace;
