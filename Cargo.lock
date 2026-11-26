@@ -2677,6 +2677,7 @@ dependencies = [
 name = "mouli-hosted"
 version = "0.1.0"
 dependencies = [
+ "mouli-crypto",
  "mouli-http",
  "mouli-pki",
  "mouli-systems",
@@ -2879,7 +2880,9 @@ dependencies = [
  "mouli-llm",
  "mouli-pki",
  "mouli-screen",
+ "mouli-systems",
  "mouli-utility",
+ "mouli-web",
  "nix",
  "sha2",
 ]

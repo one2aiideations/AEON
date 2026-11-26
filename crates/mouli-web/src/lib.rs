@@ -29,11 +29,37 @@ pub mod browser;
 pub mod css;
 pub mod display;
 pub mod dom;
+#[cfg(test)]
+mod fuzz;
 pub mod gate;
 pub mod html;
 pub mod image;
 #[cfg(test)]
 mod image_fixtures;
+
+/// The test pictures as bytes (for the robustness tests).
+#[cfg(test)]
+fn image_fixtures_for_fuzz() -> Vec<Vec<u8>> {
+    use image_fixtures as fx;
+    let unhex = |s: &str| -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0))
+            .collect()
+    };
+    [
+        fx::PNG_RGB,
+        fx::PNG_RGBA,
+        fx::PNG_PAL,
+        fx::JPG_RGB,
+        fx::JPG_420,
+        fx::JPG_PROG,
+        fx::JPG_PROG444,
+        fx::GIF,
+    ]
+    .iter()
+    .map(|h| unhex(h))
+    .collect()
+}
 pub mod intents;
 pub mod interp;
 pub mod js;

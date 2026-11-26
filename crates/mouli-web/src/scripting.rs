@@ -1071,6 +1071,12 @@ impl Scripting {
     /// Parses `html`, runs its scripts and fires the load events.
     #[must_use]
     pub fn new(html: &str) -> Scripting {
+        Self::with_budget(html, 5_000_000)
+    }
+
+    /// Like [`Scripting::new`], with a smaller or larger step budget per script.
+    #[must_use]
+    pub fn with_budget(html: &str, steps: u64) -> Scripting {
         let dom = Dom::parse(html);
         let scripts = dom.inline_scripts();
         let mut interp = Interp::new();
@@ -1079,6 +1085,7 @@ impl Scripting {
             interp.epoch_ms = d.as_millis() as f64;
         }
         interp.max_depth = 48;
+        interp.step_limit = steps;
         let proto = interp.new_obj();
         let host: H = Rc::new(RefCell::new(Host {
             dom,
