@@ -718,6 +718,7 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     }
     device.attach_code(code);
     if let Some(dir) = data_dir {
+        device.set_export_dir(&dir.join("exports"));
         let projects = dir.join("projects");
         std::fs::create_dir_all(&projects).map_err(|e| fail(&e))?;
         // A project that cannot be opened leaves the Code window empty; that is not fatal.

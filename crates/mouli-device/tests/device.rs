@@ -1459,3 +1459,41 @@ fn apps_and_files_commands_show_what_exists_and_what_the_role_may_do() {
     );
     assert!(files.contains("11 bytes"), "{files}");
 }
+
+#[test]
+fn save_writes_the_last_answer_to_a_new_file_and_never_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/save");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("no data disk"));
+    d.set_export_dir(&dir.path().join("exports"));
+    type_line(&mut d, "/save");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("no answer"));
+
+    type_line(&mut d, "first question");
+    type_line(&mut d, "second question");
+    type_line(&mut d, "/save");
+    let a1 = std::fs::read_to_string(dir.path().join("exports/answer-1.txt")).unwrap();
+    assert!(a1.contains("second question"), "{a1}");
+    type_line(&mut d, "/save");
+    assert!(dir.path().join("exports/answer-2.txt").exists());
+    type_line(&mut d, "/save notes.md");
+    assert!(dir.path().join("exports/notes.md").exists());
+    type_line(&mut d, "/save notes.md");
+    assert!(chat_texts(&d).pop().unwrap().1.contains("already exists"));
+    for bad in ["../x", ".hidden", "a b/c", "x/y"] {
+        type_line(&mut d, &format!("/save {bad}"));
+        assert!(
+            chat_texts(&d).pop().unwrap().1.contains("Not saved"),
+            "{bad}"
+        );
+    }
+    assert!(!dir.path().join("x").exists());
+    assert!(d
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .any(|r| r.action == "answer.save" && r.subject == "notes.md"));
+}

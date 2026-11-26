@@ -68,6 +68,7 @@ pub struct Device<B: Backend> {
     session: String,
     patch: patch::PatchSlot,
     keeper: Option<keep::Keeper>,
+    export_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "office")]
     apps: Option<Apps>,
     #[cfg(feature = "office")]
@@ -107,6 +108,7 @@ impl<B: Backend> Device<B> {
             session,
             patch: patch::PatchSlot::default(),
             keeper: None,
+            export_dir: None,
             #[cfg(feature = "office")]
             apps: None,
             #[cfg(feature = "office")]
@@ -275,7 +277,7 @@ impl<B: Backend> Device<B> {
             .collect();
         t.push_str(&keys.join(", "));
         t.push_str(
-            "\nCommands: /help, /apps, /files, /signin <name> <role>, /<capability> name=value",
+            "\nCommands: /help, /apps, /files, /save [name], /signin <name> <role>, /<capability> name=value",
         );
         let mine: Vec<String> = self
             .ws
@@ -306,6 +308,63 @@ impl<B: Backend> Device<B> {
         }
         self.shell.chat.messages = msgs;
         self.notice(RESTORED);
+    }
+
+    /// Sets the folder `/save` writes answers into (created when first used).
+    pub fn set_export_dir(&mut self, dir: &std::path::Path) {
+        self.export_dir = Some(dir.to_path_buf());
+    }
+
+    /// Writes the last answer to a new file in the export folder and says where.
+    fn save_answer(&mut self, name: Option<&str>) -> Result<String, String> {
+        let dir = self
+            .export_dir
+            .clone()
+            .ok_or("nothing can be saved: there is no data disk")?;
+        let text = self
+            .shell
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.text.clone())
+            .ok_or("there is no answer to save yet")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = match name {
+            Some(n) => {
+                let ok = !n.is_empty()
+                    && n.len() <= 64
+                    && !n.starts_with('.')
+                    && n.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+                if !ok {
+                    return Err("use letters, digits, . - _ in the name".into());
+                }
+                n.to_string()
+            }
+            None => (1..)
+                .map(|i| format!("answer-{i}.txt"))
+                .find(|f| !dir.join(f).exists())
+                .unwrap_or_default(),
+        };
+        let path = dir.join(&file);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("{file} already exists; pick another name")
+                } else {
+                    e.to_string()
+                }
+            })?;
+        std::io::Write::write_all(&mut f, text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        self.audit_event("answer.save", &file, "ok");
+        Ok(path.display().to_string())
     }
 
     /// Signs another person in on this device (for example a second person who must approve what
@@ -497,6 +556,16 @@ impl<B: Backend> Device<B> {
                 return;
             }
             _ => {}
+        }
+        if let Some(rest) = text.trim().strip_prefix("/save") {
+            if rest.is_empty() || rest.starts_with(' ') {
+                let name = Some(rest.trim()).filter(|n| !n.is_empty());
+                match self.save_answer(name) {
+                    Ok(path) => self.notice(&format!("Saved the last answer to {path}")),
+                    Err(e) => self.notice(&format!("Not saved: {e}")),
+                }
+                return;
+            }
         }
         if text.trim() == "/help" {
             let help = self.help_text();
