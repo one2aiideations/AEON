@@ -164,6 +164,23 @@ impl Backend for ServerBackend {
         self.record("assistant", &answer);
         Ok(answer)
     }
+
+    fn reply_streaming(
+        &mut self,
+        history: &[Turn],
+        on_piece: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        let turns: Vec<(&str, &str)> = history
+            .iter()
+            .map(|t| (t.role, t.content.as_str()))
+            .collect();
+        if let Some(last) = history.last() {
+            self.record(last.role, &last.content);
+        }
+        let answer = http::chat_messages_stream(self.port, &turns, REPLY_TOKENS, on_piece)?;
+        self.record("assistant", &answer);
+        Ok(answer)
+    }
 }
 
 fn selftest(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> ExitCode {
