@@ -70,6 +70,7 @@ pub(crate) fn sync<B: Backend>(d: &mut Device<B>) {
                     added: f.added,
                     removed: f.removed,
                     diff: f.diff.clone(),
+                    skipped: f.skipped.clone(),
                 })
                 .collect();
             let checks = v
@@ -80,7 +81,7 @@ pub(crate) fn sync<B: Backend>(d: &mut Device<B>) {
                     passed: *passed,
                 })
                 .collect();
-            d.shell.review.set(&v.summary, files, checks);
+            d.shell.review.update(&v.summary, files, checks);
             d.shell.review.state = screen_state(v.stage);
         }
         None => d.shell.review.set("", vec![], vec![]),
@@ -208,6 +209,21 @@ pub(crate) fn comment<B: Backend>(
         .collect();
     d.audit_event("patch.comment", &format!("{path}:{line} {body}"), "ok");
     Ok(())
+}
+
+pub(crate) fn set_hunk<B: Backend>(d: &mut Device<B>, file: usize, hunk: usize, keep: bool) {
+    let result = d.patch.state.borrow_mut().set_hunk(file, hunk, keep);
+    match result {
+        Ok(()) => {
+            let what = if keep { "keep" } else { "skip" };
+            d.audit_event(
+                "patch.hunk",
+                &format!("{what} file {file} hunk {hunk}"),
+                "ok",
+            );
+        }
+        Err(m) => d.shell.review.message = m,
+    }
 }
 
 pub(crate) fn apply<B: Backend>(d: &mut Device<B>) {

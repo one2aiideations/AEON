@@ -577,6 +577,10 @@ impl<B: Backend> Device<B> {
                 self.rollback_patch();
                 Outcome::Handled
             }
+            Action::SetHunk { file, hunk, keep } => {
+                patch::set_hunk(self, file, hunk, keep);
+                Outcome::Handled
+            }
             Action::RejectPatch => {
                 self.reject_patch();
                 Outcome::Handled

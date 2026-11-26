@@ -2350,3 +2350,58 @@ fn review_comments_on_lines_are_kept_in_the_audit_trail_under_the_reviewer() {
     );
     assert_eq!(d.shell.audit.chain, Chain::Verified);
 }
+
+#[test]
+fn skipping_a_hunk_from_the_review_screen_writes_only_the_rest_and_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let mut old = String::from("fn f() {\n");
+    for i in 1..=28 {
+        old.push_str(&format!("    let v{i} = {i};\n"));
+    }
+    old.push_str("}\n");
+    std::fs::write(dir.path().join("src/long.rs"), &old).unwrap();
+    let new = old
+        .replace("let v3 = 3;", "let v3 = 33;")
+        .replace("let v25 = 25;", "let v25 = 250;");
+    let patch = make_patch("src/long.rs", Some(&old), Some(&new), 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(patch.hunks.len(), 2);
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.propose_patch(dir.path(), &render(&[patch])).unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Tab); // second hunk
+    d.on_key(Key::Char(' ')); // skip it
+    assert_eq!(d.shell.review.files[0].skipped, [false, true]);
+    assert_eq!(d.shell.review.hunk, 1, "the place is kept after the reload");
+    assert!(
+        d.shell.review.summary.contains("1 of 2 hunks"),
+        "{}",
+        d.shell.review.summary
+    );
+    d.on_key(Key::Char('a'));
+    let written = std::fs::read_to_string(dir.path().join("src/long.rs")).unwrap();
+    assert!(
+        written.contains("v3 = 33") && written.contains("v25 = 25;") && !written.contains("250")
+    );
+    d.on_key(Key::F(1));
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "patch.hunk" && r.target == "skip file 0 hunk 1"));
+    // Skipping after applying is refused.
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char(' '));
+    assert!(
+        d.shell
+            .review
+            .message
+            .contains("before the change is applied"),
+        "{}",
+        d.shell.review.message
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}

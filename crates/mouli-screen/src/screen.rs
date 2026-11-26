@@ -130,6 +130,15 @@ pub enum Action {
     RollbackPatch,
     /// Throw the patch away.
     RejectPatch,
+    /// Keep or skip one hunk of one file of the change under review.
+    SetHunk {
+        /// Index of the file.
+        file: usize,
+        /// Index of the hunk in that file.
+        hunk: usize,
+        /// True to keep it, false to skip it.
+        keep: bool,
+    },
 }
 
 /// The screens, in the order of the tab bar.

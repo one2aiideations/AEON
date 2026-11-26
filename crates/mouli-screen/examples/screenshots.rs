@@ -174,6 +174,7 @@ fn main() -> std::io::Result<()> {
                 path: "crates/mouli-ops/src/sales.rs".into(),
                 added: 4,
                 removed: 2,
+                skipped: vec![false],
                 diff: diff(&[
                     "--- a/crates/mouli-ops/src/sales.rs",
                     "+++ b/crates/mouli-ops/src/sales.rs",
@@ -191,6 +192,7 @@ fn main() -> std::io::Result<()> {
                 path: "crates/mouli-ops/tests/tax.rs".into(),
                 added: 12,
                 removed: 0,
+                skipped: vec![false],
                 diff: diff(&[
                     "+++ b/crates/mouli-ops/tests/tax.rs",
                     "+#[test]",

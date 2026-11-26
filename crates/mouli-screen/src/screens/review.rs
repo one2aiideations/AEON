@@ -41,6 +41,8 @@ pub struct FileChange {
     pub removed: usize,
     /// The diff text of this file (unified format, one line per element).
     pub diff: Vec<String>,
+    /// For each hunk in order, whether the reviewer skipped it.
+    pub skipped: Vec<bool>,
 }
 
 /// A check that ran on the result (tests, quality rules).
@@ -71,6 +73,8 @@ pub struct Review {
     pub message: String,
     /// Whether the diff is shown as old and new side by side (when the screen is wide enough).
     pub side_by_side: bool,
+    /// The hunk chosen in the selected file (for keeping or skipping).
+    pub hunk: usize,
 }
 
 /// Narrowest screen (in columns) that can show old and new side by side.
@@ -172,7 +176,55 @@ impl Review {
         self.state = PatchState::Proposed;
         self.cursor = Cursor::default();
         self.scroll = 0;
+        self.hunk = 0;
         self.message.clear();
+    }
+
+    /// Reloads the same change after a hunk was kept or skipped, keeping the selected file, hunk
+    /// and scroll when the files are the same ones. Otherwise it is a new change and starts over.
+    pub fn update(&mut self, summary: &str, files: Vec<FileChange>, checks: Vec<Check>) {
+        let same = files.len() == self.files.len()
+            && files.iter().zip(&self.files).all(|(a, b)| a.path == b.path);
+        let (cursor, hunk, scroll) = (self.cursor, self.hunk, self.scroll);
+        self.set(summary, files, checks);
+        if same {
+            self.cursor = cursor;
+            self.hunk = hunk;
+            self.scroll = scroll;
+        }
+    }
+
+    /// Positions of the hunk headers in the selected file's diff.
+    fn hunk_starts(&self) -> Vec<usize> {
+        self.selected().map_or_else(Vec::new, |f| {
+            f.diff
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with("@@"))
+                .map(|(i, _)| i)
+                .collect()
+        })
+    }
+
+    fn toggle_hunk(&mut self) -> Action {
+        if self.state != PatchState::Proposed {
+            self.message = "Hunks can only be chosen before the change is applied.".into();
+            return Action::None;
+        }
+        let Some(f) = self.selected() else {
+            return Action::None;
+        };
+        let n = self.hunk_starts().len();
+        if n == 0 || self.hunk >= n {
+            return Action::None;
+        }
+        let skipped = f.skipped.get(self.hunk).copied().unwrap_or(false);
+        self.message.clear();
+        Action::SetHunk {
+            file: self.cursor.selected,
+            hunk: self.hunk,
+            keep: skipped,
+        }
     }
 
     /// Records what the controller did.
@@ -299,13 +351,23 @@ impl Screen for Review {
             Key::Up | Key::Char('k') => {
                 self.cursor.step(-1, len);
                 self.scroll = 0;
+                self.hunk = 0;
             }
             Key::Down | Key::Char('j') => {
                 self.cursor.step(1, len);
                 self.scroll = 0;
+                self.hunk = 0;
             }
             Key::PageDown => self.scroll = (self.scroll + 8).min(self.max_scroll()),
             Key::PageUp => self.scroll = self.scroll.saturating_sub(8),
+            Key::Tab => {
+                let starts = self.hunk_starts();
+                if !starts.is_empty() {
+                    self.hunk = (self.hunk + 1) % starts.len();
+                    self.scroll = starts[self.hunk].min(self.max_scroll());
+                }
+            }
+            Key::Char(' ') => return self.toggle_hunk(),
             Key::Char('s') => {
                 self.side_by_side = !self.side_by_side;
                 self.scroll = 0;
@@ -399,13 +461,29 @@ impl Screen for Review {
             if self.side_by_side && inner.w >= SIDE_BY_SIDE_MIN_WIDTH {
                 self.draw_side(g, inner, dy, rows, f);
             } else {
-                for (i, line) in f.diff.iter().skip(self.scroll).take(rows).enumerate() {
+                let starts = self.hunk_starts();
+                for (i, line) in f.diff.iter().enumerate().skip(self.scroll).take(rows) {
+                    // Which hunk this line belongs to (none before the first header).
+                    let h = starts.iter().rposition(|&st| st <= i);
+                    let skipped = h.is_some_and(|h| f.skipped.get(h).copied().unwrap_or(false));
+                    let (text, col) = if starts.contains(&i) {
+                        let cur = h == Some(self.hunk);
+                        let mark = if skipped { "[ ]" } else { "[x]" };
+                        (
+                            format!("{}{mark} {line}", if cur { ">" } else { " " }),
+                            if skipped { theme::DIM } else { theme::ACCENT },
+                        )
+                    } else if skipped {
+                        (line.clone(), theme::DIM)
+                    } else {
+                        (line.clone(), diff_colour(line))
+                    };
                     g.text_fit(
                         inner.x + 2,
-                        dy + 1 + i,
+                        dy + 1 + (i - self.scroll),
                         inner.w.saturating_sub(4),
-                        line,
-                        diff_colour(line),
+                        &text,
+                        col,
                         theme::BG,
                     );
                 }
@@ -424,7 +502,7 @@ impl Screen for Review {
     }
 
     fn hints(&self) -> String {
-        "Up/Down file  PgUp/PgDn scroll  s side by side  a apply  u undo  x reject".into()
+        "Up/Down file  Tab hunk  Space keep/skip  s side by side  a apply  u undo  x reject".into()
     }
 }
 
@@ -449,6 +527,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            skipped: vec![false],
         }
     }
 
@@ -681,5 +760,80 @@ mod tests {
                 drawn(&r, w, h);
             }
         }
+    }
+
+    fn two_hunk_file() -> FileChange {
+        FileChange {
+            path: "src/long.rs".into(),
+            added: 2,
+            removed: 2,
+            diff: lines(&[
+                "--- a/src/long.rs",
+                "+++ b/src/long.rs",
+                "@@ -1,3 +1,3 @@",
+                "-first old",
+                "+first new",
+                "@@ -20,3 +20,3 @@",
+                "-second old",
+                "+second new",
+            ]),
+            skipped: vec![false, false],
+        }
+    }
+
+    #[test]
+    fn tab_picks_a_hunk_and_space_asks_to_skip_or_keep_it() {
+        let mut r = Review::default();
+        r.set("two hunks", vec![two_hunk_file()], ok_checks());
+        assert_eq!(
+            r.on_key(Key::Char(' ')),
+            Action::SetHunk {
+                file: 0,
+                hunk: 0,
+                keep: false
+            }
+        );
+        r.on_key(Key::Tab);
+        assert_eq!(r.hunk, 1);
+        r.files[0].skipped = vec![false, true];
+        assert_eq!(
+            r.on_key(Key::Char(' ')),
+            Action::SetHunk {
+                file: 0,
+                hunk: 1,
+                keep: true
+            },
+            "a skipped hunk is asked to be kept"
+        );
+        r.on_key(Key::Tab);
+        assert_eq!(r.hunk, 0, "wraps around");
+        // After applying, choosing is refused with a reason.
+        r.set_state(PatchState::Applied);
+        assert_eq!(r.on_key(Key::Char(' ')), Action::None);
+        assert!(r.message.contains("before the change is applied"));
+        // No hunks, no action.
+        let mut none = Review::default();
+        assert_eq!(none.on_key(Key::Char(' ')), Action::None);
+        assert_eq!(none.on_key(Key::Tab), Action::None);
+    }
+
+    #[test]
+    fn skipped_hunks_are_marked_and_dimmed_and_update_keeps_the_place() {
+        let mut r = Review::default();
+        r.set("two hunks", vec![two_hunk_file()], ok_checks());
+        r.on_key(Key::Tab);
+        let mut f = two_hunk_file();
+        f.skipped = vec![false, true];
+        r.update("two hunks", vec![f], ok_checks());
+        assert_eq!(r.hunk, 1, "same files: the place is kept");
+        r.scroll = 0; // Tab had scrolled to the chosen hunk
+        let t = drawn(&r, 80, 24);
+        assert!(t.contains("[x] @@ -1,3"), "{t}");
+        assert!(t.contains(">[ ] @@ -20,3"), "{t}");
+        // A different change starts over.
+        let mut other = two_hunk_file();
+        other.path = "src/other.rs".into();
+        r.update("another", vec![other], ok_checks());
+        assert_eq!(r.hunk, 0);
     }
 }
