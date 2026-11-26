@@ -2804,6 +2804,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouli-slice"
+version = "0.1.0"
+
+[[package]]
 name = "mouli-studio"
 version = "0.1.0"
 dependencies = [
