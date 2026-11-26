@@ -9,7 +9,7 @@
 //! device) [`start`] returns an error and `moulid` keeps the text chat. A pointing device that
 //! reports absolute positions (some touchpads and touchscreens) is not used; a USB or PS/2 mouse is.
 
-use crate::datagraph::Recorder;
+use crate::datagraph::{self, Recorder};
 use crate::sysinfo::{self, Collector, SysEnv};
 use crate::toolloop;
 use crate::ui::{trim_history, Backend, End, Turn};
@@ -1740,16 +1740,13 @@ where
                 Action::Send(text) if text.trim_start().starts_with("/graph") => {
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/graph".len()..].trim().to_string();
-                    let note = if let Some(path) = arg.strip_prefix(".file") {
-                        graph.describe_file(path.trim())
-                    } else if arg == ".forget" {
-                        graph.forget(unix_now())
-                    } else if arg.is_empty() {
-                        graph.describe_recent()
-                    } else {
-                        "Use /graph (recent activity), /graph.file PATH (history of a file) or /graph.forget (erase the record).".to_string()
-                    };
-                    device.shell.chat.push(Role::Notice, &note);
+                    let user = device.user().to_string();
+                    let policy = datagraph::policy_for(&|p| device.may(p));
+                    let reply = datagraph::command(&mut graph, &policy, &user, &arg, unix_now());
+                    if let Some((action, subject)) = &reply.refused {
+                        device.record_event(action, subject, "denied");
+                    }
+                    device.shell.chat.push(Role::Notice, &reply.text);
                 }
                 Action::Send(text) if text.trim_start().starts_with('/') => {
                     // A command for an application: carried out through the governed workspace
@@ -1762,7 +1759,8 @@ where
                         .map(|m| m.text.as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    graph.tool_call("owner", &text, &output, unix_now());
+                    graph.set_actor(device.user());
+                    graph.tool_call(device.user(), &text, &output, unix_now());
                 }
                 Action::Send(text) => {
                     // A page summary asked for in the browser is answered in the Chat window.
@@ -1777,6 +1775,7 @@ where
                     }
                     if !device.shell.chat.busy {
                         device.shell.chat.push(Role::User, &text);
+                        graph.set_actor(device.user());
                         graph.user_message(&text, unix_now());
                         steps = 0;
                         history.push(Turn {
@@ -1811,7 +1810,7 @@ where
                     let outcome = device.run(other);
                     if let Some((id, approve)) = decision {
                         if !device.shell.approvals.rows.iter().any(|r| r.id == id) {
-                            graph.approval_decided(&id, approve, "owner", unix_now());
+                            graph.approval_decided(&id, approve, device.user(), unix_now());
                         }
                     }
                     match outcome {

@@ -2491,3 +2491,26 @@ fn the_queue_is_bounded() {
     }
     assert!(d.queue_patch_by(dir.path(), &diff, "m").is_err());
 }
+
+#[test]
+fn only_the_owner_may_read_or_erase_the_activity_record_by_default() {
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert_eq!((d.role(), d.user()), ("owner", "owner"));
+    assert!(
+        d.may("memory.read") && d.may("memory.forget"),
+        "the owner holds every permission"
+    );
+    d.switch_user("cleo", "clerk").unwrap();
+    assert_eq!(d.role(), "clerk");
+    assert!(!d.may("memory.read") && !d.may("memory.forget"));
+    // A refused attempt can be written to the audit trail by the host.
+    d.record_event("graph.erase", "cleo needs memory.forget", "denied");
+    d.on_key(Key::F(1));
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "graph.erase" && r.outcome == "denied"));
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}

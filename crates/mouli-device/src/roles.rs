@@ -28,3 +28,20 @@ pub fn add_default_roles(ws: &mut Workspace) {
         &["code.status", "code.files", "code.read"],
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mouli_interface::Policy;
+
+    #[test]
+    fn the_default_roles_keep_the_activity_record_to_the_owner() {
+        let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+        add_default_roles(&mut ws);
+        for p in ["memory.read", "memory.forget"] {
+            assert!(ws.role_can(OWNER, p), "owner {p}");
+            assert!(!ws.role_can(CLERK, p), "clerk {p}");
+            assert!(!ws.role_can(VIEWER, p), "viewer {p}");
+        }
+    }
+}
