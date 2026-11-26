@@ -113,6 +113,13 @@ pub enum Action {
     },
     /// Mark a security finding as seen (the controller records who did it).
     AckFinding(String),
+    /// A line typed in hidden mode (a passphrase). `token` says what it was asked for.
+    Secret {
+        /// What the controller asked for (for example `signin:amy`).
+        token: String,
+        /// What was typed; never printed or stored by the screen.
+        text: Hidden,
+    },
     /// Write the evidence for a security finding to a file.
     ExportFinding(String),
     /// Run a fresh security scan.

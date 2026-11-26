@@ -1887,3 +1887,320 @@ fn a_locked_out_person_cannot_clear_the_lockout_with_their_own_host_actions() {
     d.on_key(Key::Char('e'));
     assert!(finding(&d, "lockout-gus").is_some());
 }
+
+// ---- accounts: passphrase sign-in and administration ----
+
+const OWNER_PASS: &str = "correct horse battery";
+
+fn last_note(d: &Device<Echo>) -> String {
+    chat_texts(d).pop().map(|m| m.1).unwrap_or_default()
+}
+
+/// A device on `dir` with one owner account (`owner`), then restarted so it is locked.
+fn locked_device(dir: &std::path::Path) -> Device<Echo> {
+    {
+        let mut d = reopen(dir);
+        d.on_key(Key::F(1));
+        type_line(&mut d, "/passwd");
+        type_line(&mut d, OWNER_PASS);
+        assert!(last_note(&d).starts_with("Saved."), "{}", last_note(&d));
+    }
+    let mut d = reopen(dir);
+    d.lock();
+    d
+}
+
+fn sign_in(d: &mut Device<Echo>, name: &str, pass: &str) {
+    type_line(d, &format!("/signin {name}"));
+    type_line(d, pass);
+}
+
+fn audit_has(d: &Device<Echo>, action: &str, outcome_starts: &str) -> bool {
+    d.shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == action && r.outcome.starts_with(outcome_starts))
+}
+
+#[test]
+fn without_accounts_the_device_is_open_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = reopen(dir.path());
+    d.on_key(Key::F(1));
+    assert!(!d.has_accounts());
+    d.lock(); // nothing to lock against
+    assert!(!d.is_locked());
+    type_line(&mut d, "/signin amy clerk");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+}
+
+#[test]
+fn the_first_account_is_set_up_by_the_owner_and_then_the_device_starts_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    assert!(d.has_accounts() && d.is_locked());
+    // Locked: a message does not reach the model, and other screens cannot be opened.
+    type_line(&mut d, "hello");
+    assert!(chat_texts(&d).iter().all(|(_, t)| !t.contains("you said")));
+    assert!(last_note(&d).starts_with("Locked."), "{}", last_note(&d));
+    d.on_key(Key::F(3));
+    assert_eq!(d.shell.active, Tab::Chat, "no other screen is reachable");
+    assert_eq!(
+        d.run(Action::Call {
+            capability: "note.read".into(),
+            args: vec![]
+        }),
+        Outcome::Handled
+    );
+    assert!(last_note(&d).starts_with("Locked."));
+    // The right passphrase signs in with the account's role.
+    sign_in(&mut d, "owner", OWNER_PASS);
+    assert!(!d.is_locked());
+    assert!(
+        last_note(&d).contains("Signed in as owner (owner)"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(audit_has(&d, "signin", "ok"));
+    type_line(&mut d, "hello");
+    assert!(chat_texts(&d).iter().any(|(_, t)| t.contains("you said")));
+}
+
+#[test]
+fn a_wrong_passphrase_or_a_name_nobody_has_is_refused_and_audited_without_telling_which() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", "not the passphrase");
+    let wrong = last_note(&d);
+    sign_in(&mut d, "ghost", OWNER_PASS);
+    assert_eq!(last_note(&d), wrong, "the same message for both");
+    assert!(wrong.contains("Wrong passphrase, or there is no such account"));
+    assert!(d.is_locked());
+    assert!(audit_has(&d, "signin", "denied: wrong passphrase"));
+}
+
+#[test]
+fn the_passphrase_is_never_shown_stored_in_the_chat_or_written_anywhere_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    sign_in(&mut d, "owner", "wrong passphrase 123");
+    for (_, text) in chat_texts(&d) {
+        assert!(
+            !text.contains("correct horse") && !text.contains("wrong passphrase 123"),
+            "{text}"
+        );
+    }
+    for row in &d.shell.audit.rows {
+        let all = format!(
+            "{} {} {} {}",
+            row.actor, row.action, row.target, row.outcome
+        );
+        assert!(
+            !all.contains("correct horse") && !all.contains("wrong passphrase 123"),
+            "{all}"
+        );
+    }
+    // Nothing on the data disk holds it either: not the accounts file, not the chat, not the log.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("correct horse") && !text.contains("wrong passphrase 123"),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn once_accounts_exist_nobody_can_choose_their_own_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    type_line(&mut d, "/signin mallory owner");
+    assert!(
+        last_note(&d).starts_with("Type /signin <name>"),
+        "{}",
+        last_note(&d)
+    );
+    // An administrator adds amy as a clerk; amy signs in as a clerk, whatever she types.
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "amy long passphrase");
+    assert!(last_note(&d).starts_with("Saved."), "{}", last_note(&d));
+    sign_in(&mut d, "amy", "amy long passphrase");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+    // A clerk cannot manage accounts: refused and audited.
+    for cmd in [
+        "/adduser bob clerk",
+        "/users",
+        "/setrole amy owner",
+        "/deluser owner",
+        "/resetpass owner",
+    ] {
+        type_line(&mut d, cmd);
+        assert!(
+            last_note(&d).starts_with("Not allowed"),
+            "{cmd}: {}",
+            last_note(&d)
+        );
+    }
+    assert!(audit_has(&d, "accounts.admin", "denied"));
+    type_line(&mut d, "/passwd");
+    assert!(
+        d.shell.chat.is_secret(),
+        "a clerk can change their own passphrase"
+    );
+}
+
+#[test]
+fn five_wrong_passphrases_lock_the_name_out_until_an_approver_unlocks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    for _ in 0..5 {
+        sign_in(&mut d, "owner", "nope nope nope");
+    }
+    // Even the right passphrase cannot be tried now: no hidden entry is offered at all.
+    type_line(&mut d, "/signin owner");
+    assert!(last_note(&d).contains("locked out"), "{}", last_note(&d));
+    assert!(!d.shell.chat.is_secret());
+    assert!(d.is_locked());
+    // The restart does not clear it (it lives in the audit chain).
+    let mut d = reopen(dir.path());
+    d.lock();
+    type_line(&mut d, "/signin owner");
+    assert!(last_note(&d).contains("locked out"), "{}", last_note(&d));
+    assert!(!d.shell.chat.is_secret());
+}
+
+#[test]
+fn administration_adds_changes_resets_and_removes_accounts_and_keeps_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = locked_device(dir.path());
+    sign_in(&mut d, "owner", OWNER_PASS);
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "short");
+    assert!(last_note(&d).starts_with("Not saved"), "{}", last_note(&d));
+    type_line(&mut d, "/adduser amy nosuchrole");
+    assert!(
+        last_note(&d).contains("There is no role"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/adduser bad!name clerk");
+    assert!(last_note(&d).starts_with("Names use"), "{}", last_note(&d));
+    type_line(&mut d, "/adduser amy clerk");
+    type_line(&mut d, "amy long passphrase");
+    type_line(&mut d, "/adduser amy clerk");
+    assert!(
+        last_note(&d).contains("already has an account"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/users");
+    let list = last_note(&d);
+    assert!(
+        list.contains("amy  clerk") && list.contains("owner  owner"),
+        "{list}"
+    );
+    type_line(&mut d, "/resetpass amy");
+    type_line(&mut d, "a new long passphrase");
+    type_line(&mut d, "/setrole amy owner");
+    assert!(
+        last_note(&d).contains("now has the owner role"),
+        "{}",
+        last_note(&d)
+    );
+    // The last owner is protected; with a second owner the first can be removed.
+    type_line(&mut d, "/setrole amy clerk");
+    type_line(&mut d, "/setrole owner clerk");
+    assert!(
+        last_note(&d).starts_with("Not changed"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/deluser owner");
+    assert!(
+        last_note(&d).starts_with("Not removed"),
+        "{}",
+        last_note(&d)
+    );
+    type_line(&mut d, "/deluser ghost");
+    assert!(
+        last_note(&d).starts_with("Not removed"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(
+        audit_has(&d, "account.add", "ok")
+            && audit_has(&d, "passphrase.reset", "ok")
+            && audit_has(&d, "account.role", "ok")
+    );
+    // The reset passphrase works and the old one does not; changes survive a restart.
+    let mut d = reopen(dir.path());
+    d.lock();
+    sign_in(&mut d, "amy", "amy long passphrase");
+    assert!(d.is_locked(), "the old passphrase no longer works");
+    sign_in(&mut d, "amy", "a new long passphrase");
+    assert!(
+        last_note(&d).contains("Signed in as amy (clerk)"),
+        "{}",
+        last_note(&d)
+    );
+}
+
+#[test]
+fn a_damaged_accounts_file_keeps_the_device_locked_and_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(locked_device(dir.path()));
+    let path = dir.path().join("users.txt");
+    std::fs::write(&path, "garbage that is not an account\n").unwrap();
+    let mut d = reopen(dir.path());
+    assert!(
+        d.has_accounts(),
+        "a file that cannot be read counts as accounts"
+    );
+    d.lock();
+    assert!(d.is_locked());
+    assert!(
+        last_note(&d).contains("cannot be read"),
+        "{}",
+        last_note(&d)
+    );
+    sign_in(&mut d, "owner", OWNER_PASS);
+    assert!(d.is_locked());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "garbage that is not an account\n"
+    );
+}
+
+#[test]
+fn only_someone_who_can_administer_may_set_up_the_first_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir.path()).unwrap();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "amy", "clerk").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/passwd");
+    assert!(
+        last_note(&d).starts_with("Not allowed"),
+        "{}",
+        last_note(&d)
+    );
+    assert!(!d.shell.chat.is_secret());
+    assert!(!dir.path().join("users.txt").exists());
+}

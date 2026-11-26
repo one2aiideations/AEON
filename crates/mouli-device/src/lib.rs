@@ -9,11 +9,13 @@
 //! washes the text; the backend only turns a prompt into an answer.
 #![forbid(unsafe_code)]
 
+mod accounts;
 mod keep;
 mod patch;
 mod roles;
 mod rulepack;
 mod security;
+mod signin;
 
 #[cfg(feature = "office")]
 use mouli_apps::Apps;
@@ -69,6 +71,9 @@ pub struct Device<B: Backend> {
     session: String,
     patch: patch::PatchSlot,
     keeper: Option<keep::Keeper>,
+    accounts: Option<accounts::Accounts>,
+    accounts_error: Option<String>,
+    locked: bool,
     export_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "office")]
     apps: Option<Apps>,
@@ -109,6 +114,9 @@ impl<B: Backend> Device<B> {
             session,
             patch: patch::PatchSlot::default(),
             keeper: None,
+            accounts: None,
+            accounts_error: None,
+            locked: false,
             export_dir: None,
             #[cfg(feature = "office")]
             apps: None,
@@ -488,7 +496,12 @@ impl<B: Backend> Device<B> {
 
     /// Feeds one key to the interface and carries out whatever it asked for.
     pub fn on_key(&mut self, key: Key) -> Outcome {
-        let action = self.shell.on_key(key);
+        // Locked: only the conversation takes keys, so no other screen can be reached.
+        let action = if self.locked {
+            mouli_screen::screen::Screen::on_key(&mut self.shell.chat, key)
+        } else {
+            self.shell.on_key(key)
+        };
         self.run(action)
     }
 
@@ -502,8 +515,15 @@ impl<B: Backend> Device<B> {
     }
 
     fn perform(&mut self, action: Action) -> Outcome {
+        if self.locked {
+            return self.perform_locked(action);
+        }
         match action {
             Action::None | Action::Show(_) => Outcome::Handled,
+            Action::Secret { token, text } => {
+                self.secret_entered(&token, text.expose());
+                Outcome::Handled
+            }
             Action::Quit => Outcome::Quit,
             Action::Reboot => Outcome::Reboot,
             Action::Send(text) => {
@@ -686,14 +706,12 @@ impl<B: Backend> Device<B> {
             return;
         }
         if let Some(rest) = text.strip_prefix("/signin") {
-            let mut w = rest.split_whitespace();
-            match (w.next(), w.next(), w.next()) {
-                (Some(name), Some(role), None) => match self.switch_user(name, role) {
-                    Ok(()) => self.notice(&format!("Signed in as {name} ({role}).")),
-                    Err(e) => self.notice(&format!("Could not sign in: {e}")),
-                },
-                _ => self.notice("Usage: /signin <name> <role>"),
+            if rest.is_empty() || rest.starts_with(' ') {
+                self.signin_command(rest);
+                return;
             }
+        }
+        if self.account_command(text.trim()) {
             return;
         }
         self.shell.chat.push(Role::User, text);
@@ -823,6 +841,11 @@ impl<B: Backend> Device<B> {
     /// A message when the directory or an existing file cannot be read.
     pub fn keep_state_in(&mut self, dir: &std::path::Path) -> Result<(), String> {
         let mut keeper = keep::Keeper::open(dir)?;
+        match accounts::Accounts::open(dir) {
+            Ok(a) => self.accounts = Some(a),
+            // A damaged accounts file must never open the device: it stays locked.
+            Err(e) => self.accounts_error = Some(e),
+        }
         let alert = keeper.check_checkpoint(&self.ws);
         self.restore_chat(&mut keeper);
         self.keeper = Some(keeper);

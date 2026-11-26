@@ -1080,6 +1080,9 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
             if let Err(e) = device.keep_state_in(dir) {
                 device.shell.approvals.message = format!("Audit log is not being saved: {e}");
             }
+            // With accounts set up (or an accounts file that cannot be read) nobody is signed in
+            // until they give a passphrase.
+            device.lock();
         }
         (_, Some(Err(e))) => {
             device.shell.approvals.message =

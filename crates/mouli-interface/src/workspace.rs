@@ -634,7 +634,10 @@ impl Workspace {
             if r.action == "lockout.clear" && r.subject == user && r.outcome == "ok" {
                 return false;
             }
-            if r.actor != user || r.action == "session.open" || is_host_event(&r.action) {
+            // Host events neither count nor clear, except a refused one (a wrong passphrase at
+            // sign-in is a refusal like any other).
+            let host = is_host_event(&r.action) && !r.outcome.starts_with("denied");
+            if r.actor != user || r.action == "session.open" || host {
                 continue;
             }
             if r.outcome.starts_with("denied") {
