@@ -605,6 +605,115 @@ fn time_zone_command(
     format!("Time zone set to {}.{saved}", sysinfo::zone_label(minutes))
 }
 
+/// How the desktop is shown: stronger colours, and bigger text for small or far screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewOpts {
+    /// Whether the high-contrast colours are on.
+    contrast: bool,
+    /// How many screen pixels each desktop pixel covers (1 to 3).
+    scale: usize,
+}
+
+const CONTRAST_KEY: &str = "view.contrast";
+const SCALE_KEY: &str = "view.scale";
+const MAX_SCALE: usize = 3;
+
+/// The saved view options (defaults when nothing is saved or a value is not understood).
+fn load_view(store: Option<&crate::persist::Store>) -> ViewOpts {
+    let saved = store
+        .map(crate::persist::Store::settings)
+        .unwrap_or_default();
+    ViewOpts {
+        contrast: saved.get(CONTRAST_KEY).is_some_and(|v| v == "on"),
+        scale: saved
+            .get(SCALE_KEY)
+            .and_then(|v| v.parse().ok())
+            .filter(|k| (1..=MAX_SCALE).contains(k))
+            .unwrap_or(1),
+    }
+}
+
+/// The scale that can really be used on a `w` by `h` screen: the desktop needs at least 640 by
+/// 480 of its own pixels.
+fn usable_scale(want: usize, w: usize, h: usize) -> usize {
+    (1..=want.clamp(1, MAX_SCALE))
+        .rev()
+        .find(|k| w / k >= 640 && h / k >= 480)
+        .unwrap_or(1)
+}
+
+/// The picture as it goes to the screen.
+fn shape(canvas: mouli_screen::raster::Canvas, v: ViewOpts) -> mouli_screen::raster::Canvas {
+    let c = if v.contrast {
+        canvas.high_contrast()
+    } else {
+        canvas
+    };
+    c.scaled(v.scale)
+}
+
+fn save_view(store: Option<&crate::persist::Store>, key: &str, value: &str) -> &'static str {
+    match store {
+        Some(s) => match s.set(key, value) {
+            Ok(()) => " It is kept for the next start.",
+            Err(_) => " (It could not be saved.)",
+        },
+        None => " (No MOULI-DATA disk, so it is forgotten at power-off.)",
+    }
+}
+
+/// Handles `/contrast [on|off]`. Returns the notice to show.
+fn contrast_command(
+    arg: &str,
+    view: &mut ViewOpts,
+    store: Option<&crate::persist::Store>,
+) -> String {
+    match arg.trim() {
+        "" => format!(
+            "High contrast is {}. Type /contrast on or /contrast off.",
+            if view.contrast { "on" } else { "off" }
+        ),
+        a @ ("on" | "off") => {
+            view.contrast = a == "on";
+            let saved = save_view(store, CONTRAST_KEY, a);
+            format!("High contrast {a}.{saved}")
+        }
+        _ => "Type /contrast on or /contrast off.".into(),
+    }
+}
+
+/// Handles `/textsize [1|2|3]`. The size applies from the next start. Returns the notice.
+fn text_size_command(
+    arg: &str,
+    view: &ViewOpts,
+    screen: (usize, usize),
+    store: Option<&crate::persist::Store>,
+) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return format!(
+            "Text size is {}x (in use: {}x). Type /textsize 1, 2 or 3; it applies after a restart.",
+            view.scale,
+            usable_scale(view.scale, screen.0, screen.1)
+        );
+    }
+    let Some(k) = arg
+        .parse::<usize>()
+        .ok()
+        .filter(|k| (1..=MAX_SCALE).contains(k))
+    else {
+        return "Type /textsize 1, 2 or 3.".into();
+    };
+    let usable = usable_scale(k, screen.0, screen.1);
+    let saved = save_view(store, SCALE_KEY, &k.to_string());
+    let limit = if usable < k {
+        format!(" This screen is too small for {k}x; {usable}x will be used.")
+    } else {
+        String::new()
+    };
+    format!("Text size {k}x applies after a restart.{limit}{saved}")
+}
+
 // ------------------------------------------------------------------ console
 
 /// Keeps typed characters from being echoed onto the framebuffer console while the desktop is
@@ -921,9 +1030,12 @@ where
     } = session;
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
+    let mut view = load_view(settings.as_ref());
+    let scale = usable_scale(view.scale, w, h);
+    view.scale = scale;
     let mut desktop = Desktop::new(
-        i32::try_from(w).unwrap_or(1024),
-        i32::try_from(h).unwrap_or(768),
+        i32::try_from(w / scale).unwrap_or(1024),
+        i32::try_from(h / scale).unwrap_or(768),
     );
     let base_status = if saving {
         "MOULI OS".to_string()
@@ -1006,7 +1118,7 @@ where
 
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    display.present(&desktop.render(&device.shell))?;
+    display.present(&shape(desktop.render(&device.shell), view))?;
     loop {
         let mut batch = Vec::new();
         if device.shell.preview.wants_ticks() || device.shell.browser.view.wants_ticks() {
@@ -1017,7 +1129,7 @@ where
                     let a = device.shell.preview.tick();
                     let b = device.shell.browser.view.tick();
                     if a || b {
-                        display.present(&desktop.render(&device.shell))?;
+                        display.present(&shape(desktop.render(&device.shell), view))?;
                     }
                     continue;
                 }
@@ -1156,6 +1268,19 @@ where
                     let note = time_zone_command(&arg, &offset, settings.as_ref());
                     device.shell.chat.push(Role::Notice, &note);
                 }
+                Action::Send(text) if text.trim_start().starts_with("/contrast") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/contrast".len()..].to_string();
+                    let note = contrast_command(&arg, &mut view, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
+                Action::Send(text) if text.trim_start().starts_with("/textsize") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/textsize".len()..].to_string();
+                    let (sw, sh) = display.size();
+                    let note = text_size_command(&arg, &view, (sw, sh), settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
+                }
                 Action::Send(text) if text.trim_start().starts_with("/graph") => {
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/graph".len()..].trim().to_string();
@@ -1251,7 +1376,7 @@ where
             &device.shell.chat.model,
             device.shell.approvals.rows.len(),
         );
-        display.present(&desktop.render(&device.shell))?;
+        display.present(&shape(desktop.render(&device.shell), view))?;
     }
 }
 
@@ -2009,6 +2134,70 @@ mod tests {
         drop(rx);
         std::thread::sleep(Duration::from_millis(100));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn contrast_and_text_size_commands_validate_save_and_reload() {
+        let dir = tmp("view");
+        let store = crate::persist::Store::open(&dir).unwrap();
+        let mut v = load_view(Some(&store));
+        assert_eq!(
+            v,
+            ViewOpts {
+                contrast: false,
+                scale: 1
+            }
+        );
+        assert!(contrast_command("", &mut v, Some(&store)).contains("off"));
+        assert!(contrast_command("loud", &mut v, Some(&store)).contains("on or"));
+        assert!(!v.contrast);
+        assert!(contrast_command("on", &mut v, Some(&store)).contains("kept"));
+        assert!(v.contrast);
+        assert!(text_size_command("2", &v, (1024, 768), Some(&store)).contains("restart"));
+        assert!(text_size_command("9", &v, (1024, 768), Some(&store)).contains("1, 2 or 3"));
+        // Too small a screen for 3x is said plainly.
+        assert!(text_size_command("3", &v, (1024, 768), Some(&store)).contains("too small"));
+        assert!(text_size_command("2", &v, (1024, 768), None).contains("forgotten"));
+        // 3x was saved last; it is read back, and what can really be used is clamped.
+        let again = load_view(Some(&store));
+        assert!(again.contrast);
+        assert_eq!(again.scale, 3);
+        assert_eq!(usable_scale(3, 1024, 768), 1);
+        assert_eq!(usable_scale(2, 1280, 960), 2);
+        assert_eq!(usable_scale(3, 1920, 1440), 3);
+        assert_eq!(usable_scale(2, 1920, 1080), 2);
+        assert_eq!(usable_scale(0, 1920, 1080), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shaping_the_picture_scales_and_recolours() {
+        let c = mouli_screen::raster::Canvas {
+            width: 2,
+            height: 1,
+            pixels: vec![
+                mouli_screen::grid::theme::BG.0,
+                mouli_screen::grid::theme::TEXT.0,
+            ],
+        };
+        let plain = shape(
+            c.clone(),
+            ViewOpts {
+                contrast: false,
+                scale: 1,
+            },
+        );
+        assert_eq!(plain, c);
+        let big = shape(
+            c,
+            ViewOpts {
+                contrast: true,
+                scale: 2,
+            },
+        );
+        assert_eq!((big.width, big.height), (4, 2));
+        assert_eq!(big.pixels[0], 0);
+        assert_eq!(big.pixels[3], 0xFFFFFF);
     }
 
     #[test]

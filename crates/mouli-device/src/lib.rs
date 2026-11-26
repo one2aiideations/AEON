@@ -277,7 +277,7 @@ impl<B: Backend> Device<B> {
             .collect();
         t.push_str(&keys.join(", "));
         t.push_str(
-            "\nCommands: /help, /apps, /files, /save [name], /signin <name> <role>, /<capability> name=value",
+            "\nCommands: /help, /apps, /files, /save [name], /contrast on|off, /textsize 1-3, /signin <name> <role>, /<capability> name=value",
         );
         let mine: Vec<String> = self
             .ws
