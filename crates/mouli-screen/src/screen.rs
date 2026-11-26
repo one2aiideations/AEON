@@ -130,6 +130,8 @@ pub enum Action {
     RollbackPatch,
     /// Throw the patch away.
     RejectPatch,
+    /// Bring up the next waiting change, once this one is dealt with.
+    NextPatch,
     /// Keep or skip one hunk of one file of the change under review.
     SetHunk {
         /// Index of the file.

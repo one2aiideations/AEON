@@ -75,6 +75,8 @@ pub struct Review {
     pub side_by_side: bool,
     /// The hunk chosen in the selected file (for keeping or skipping).
     pub hunk: usize,
+    /// How many other proposed changes are waiting their turn.
+    pub waiting: usize,
 }
 
 /// Narrowest screen (in columns) that can show old and new side by side.
@@ -204,6 +206,19 @@ impl Review {
                 .map(|(i, _)| i)
                 .collect()
         })
+    }
+
+    fn next_change(&mut self) -> Action {
+        if self.waiting == 0 {
+            self.message = "No other change is waiting.".into();
+            return Action::None;
+        }
+        if !self.files.is_empty() && self.state == PatchState::Proposed {
+            self.message = "Apply or reject this change before the next one.".into();
+            return Action::None;
+        }
+        self.message.clear();
+        Action::NextPatch
     }
 
     fn toggle_hunk(&mut self) -> Action {
@@ -368,6 +383,7 @@ impl Screen for Review {
                 }
             }
             Key::Char(' ') => return self.toggle_hunk(),
+            Key::Char('n') => return self.next_change(),
             Key::Char('s') => {
                 self.side_by_side = !self.side_by_side;
                 self.scroll = 0;
@@ -381,7 +397,15 @@ impl Screen for Review {
     }
 
     fn draw(&self, g: &mut Grid, area: Rect) {
-        let title = format!("Code review  {}", self.state.label());
+        let title = if self.waiting > 0 {
+            format!(
+                "Code review  {}  ({} waiting)",
+                self.state.label(),
+                self.waiting
+            )
+        } else {
+            format!("Code review  {}", self.state.label())
+        };
         g.boxed(area, Some(&title), theme::ACCENT, theme::BG);
         let inner = area.inset(1);
         if inner.w < 30 || inner.h < 6 {
@@ -502,7 +526,7 @@ impl Screen for Review {
     }
 
     fn hints(&self) -> String {
-        "Up/Down file  Tab hunk  Space keep/skip  s side by side  a apply  u undo  x reject".into()
+        "Up/Down file  Tab hunk  Space keep/skip  s side  a apply  u undo  x reject  n next".into()
     }
 }
 
@@ -835,5 +859,26 @@ mod tests {
         other.path = "src/other.rs".into();
         r.update("another", vec![other], ok_checks());
         assert_eq!(r.hunk, 0);
+    }
+
+    #[test]
+    fn n_brings_up_the_next_change_only_when_this_one_is_dealt_with() {
+        let mut r = loaded(ok_checks());
+        assert_eq!(r.on_key(Key::Char('n')), Action::None);
+        assert!(r.message.contains("No other change"));
+        r.waiting = 2;
+        assert_eq!(r.on_key(Key::Char('n')), Action::None);
+        assert!(r.message.contains("Apply or reject"), "{}", r.message);
+        assert!(drawn(&r, 80, 24).contains("(2 waiting)"));
+        r.set_state(PatchState::Rejected);
+        assert_eq!(r.on_key(Key::Char('n')), Action::NextPatch);
+        r.set_state(PatchState::Applied);
+        assert_eq!(r.on_key(Key::Char('n')), Action::NextPatch);
+        // With nothing loaded, the next one can be brought up.
+        let mut empty = Review {
+            waiting: 1,
+            ..Review::default()
+        };
+        assert_eq!(empty.on_key(Key::Char('n')), Action::NextPatch);
     }
 }

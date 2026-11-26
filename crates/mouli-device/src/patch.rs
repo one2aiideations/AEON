@@ -20,7 +20,14 @@ pub(crate) struct PatchSlot {
     shown: u64,
     /// Who proposed the current change (a model name, or `user`), as given when it was proposed.
     proposer: String,
+    /// Changes waiting their turn: (folder, diff text, who proposed it).
+    queue: std::collections::VecDeque<(std::path::PathBuf, String, String)>,
+    /// A message to show after the screen reloads (a reload clears messages).
+    notice: String,
 }
+
+/// Most changes that may wait at once.
+pub const MAX_QUEUE: usize = 20;
 
 impl Default for PatchSlot {
     fn default() -> Self {
@@ -29,6 +36,8 @@ impl Default for PatchSlot {
             gated: false,
             shown: 0,
             proposer: String::new(),
+            queue: std::collections::VecDeque::new(),
+            notice: String::new(),
         }
     }
 }
@@ -40,6 +49,8 @@ impl PatchSlot {
             gated: true,
             shown: 0,
             proposer: String::new(),
+            queue: std::collections::VecDeque::new(),
+            notice: String::new(),
         }
     }
 }
@@ -53,8 +64,17 @@ const fn screen_state(s: Stage) -> PatchState {
     }
 }
 
-/// Copies the state into the review screen when it has changed since the last copy.
+/// Brings the review screen up to date with the state.
 pub(crate) fn sync<B: Backend>(d: &mut Device<B>) {
+    reload(d);
+    d.shell.review.waiting = d.patch.queue.len();
+    if !d.patch.notice.is_empty() {
+        d.shell.review.message = std::mem::take(&mut d.patch.notice);
+    }
+}
+
+/// Copies the state into the review screen when it has changed since the last copy.
+fn reload<B: Backend>(d: &mut Device<B>) {
     let st = d.patch.state.borrow();
     if st.version() == d.patch.shown {
         return;
@@ -209,6 +229,72 @@ pub(crate) fn comment<B: Backend>(
         .collect();
     d.audit_event("patch.comment", &format!("{path}:{line} {body}"), "ok");
     Ok(())
+}
+
+/// Whether a change is under review that still needs a decision.
+fn busy<B: Backend>(d: &Device<B>) -> bool {
+    d.patch
+        .state
+        .borrow()
+        .view()
+        .is_some_and(|v| v.stage == Stage::Proposed)
+}
+
+/// Puts a change under review now if none is waiting for a decision, otherwise at the back of
+/// the queue. Returns how many are waiting after this call.
+///
+/// # Errors
+/// [`PatchError`] when it is reviewed now and cannot be, or a message in
+/// [`PatchError::Files`] when the queue is full.
+pub(crate) fn queue<B: Backend>(
+    d: &mut Device<B>,
+    root: &Path,
+    text: &str,
+    proposer: &str,
+) -> Result<usize, PatchError> {
+    if !busy(d) {
+        propose(d, root, text, proposer)?;
+        return Ok(d.patch.queue.len());
+    }
+    if d.patch.queue.len() >= MAX_QUEUE {
+        return Err(PatchError::Files(format!(
+            "{MAX_QUEUE} changes are already waiting"
+        )));
+    }
+    let label = clean_label(proposer);
+    d.patch
+        .queue
+        .push_back((root.to_path_buf(), text.to_string(), label.clone()));
+    d.audit_event(
+        "patch.queue",
+        &format!("waiting, proposed by {label}"),
+        "ok",
+    );
+    d.shell.review.waiting = d.patch.queue.len();
+    Ok(d.patch.queue.len())
+}
+
+/// Brings up the next waiting change. One that no longer fits the files is dropped with a
+/// message and the one after it is tried.
+pub(crate) fn next<B: Backend>(d: &mut Device<B>) {
+    if busy(d) {
+        d.shell.review.message = "Apply or reject this change before the next one.".into();
+        return;
+    }
+    while let Some((root, text, who)) = d.patch.queue.pop_front() {
+        match propose(d, &root, &text, &who) {
+            Ok(()) => {
+                d.shell.review.waiting = d.patch.queue.len();
+                return;
+            }
+            Err(e) => {
+                d.audit_event("patch.queue", "dropped", &format!("failed: {e}"));
+                d.patch.notice = format!("A waiting change was dropped: {e}");
+                d.shell.review.message = d.patch.notice.clone();
+            }
+        }
+    }
+    d.shell.review.waiting = 0;
 }
 
 pub(crate) fn set_hunk<B: Backend>(d: &mut Device<B>, file: usize, hunk: usize, keep: bool) {

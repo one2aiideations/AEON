@@ -2405,3 +2405,89 @@ fn skipping_a_hunk_from_the_review_screen_writes_only_the_rest_and_is_audited() 
     );
     assert_eq!(d.shell.audit.chain, Chain::Verified);
 }
+
+#[test]
+fn changes_queue_up_and_come_one_at_a_time_and_one_that_no_longer_fits_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let a0 = "fn a() -> i32 {\n    1\n}\n";
+    let a1 = "fn a() -> i32 {\n    2\n}\n";
+    let a2 = "fn a() -> i32 {\n    3\n}\n";
+    std::fs::write(dir.path().join("src/a.rs"), a0).unwrap();
+    let diff = |old: &str, new: &str| {
+        render(&[make_patch("src/a.rs", Some(old), Some(new), 3)
+            .unwrap()
+            .unwrap()])
+    };
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    // The first (a0 -> a1) is reviewed at once; the others wait. The second (a0 -> a2) will not
+    // fit once the first is applied; the third (a1 -> a2) will.
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a0, a1), "model one")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a0, a2), "model two")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a1, a2), "model three")
+            .unwrap(),
+        2
+    );
+    d.on_key(Key::F(6));
+    assert_eq!(d.shell.review.waiting, 2);
+    // Not before this one is dealt with.
+    d.on_key(Key::Char('n'));
+    assert!(
+        d.shell.review.message.contains("Apply or reject"),
+        "{}",
+        d.shell.review.message
+    );
+    d.on_key(Key::Char('a'));
+    assert_eq!(read_a(&dir), a1);
+    d.on_key(Key::Char('n')); // "model two" (a0 -> a2) no longer fits: dropped; "model three" comes up
+    assert_eq!(d.shell.review.waiting, 0, "both were taken from the queue");
+    assert!(
+        d.shell.review.message.contains("dropped"),
+        "{}",
+        d.shell.review.message
+    );
+    assert_eq!(d.shell.review.state, PatchState::Proposed);
+    d.on_key(Key::Char('a'));
+    assert_eq!(
+        read_a(&dir),
+        a2,
+        "the third change was the one reviewed and applied"
+    );
+    d.on_key(Key::F(1));
+    let actions: Vec<_> = d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .map(|r| (r.action.as_str(), r.target.as_str()))
+        .collect();
+    assert!(
+        actions.iter().filter(|(a, _)| *a == "patch.queue").count() >= 3,
+        "{actions:?}"
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+fn read_a(dir: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap()
+}
+
+#[test]
+fn the_queue_is_bounded() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.queue_patch_by(dir.path(), &diff, "m").unwrap();
+    for _ in 0..mouli_device::MAX_QUEUE {
+        d.queue_patch_by(dir.path(), &diff, "m").unwrap();
+    }
+    assert!(d.queue_patch_by(dir.path(), &diff, "m").is_err());
+}
