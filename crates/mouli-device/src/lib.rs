@@ -280,6 +280,15 @@ impl<B: Backend> Device<B> {
                 }
                 Outcome::Handled
             }
+            Action::SwitchUser => {
+                self.notice(&format!(
+                    "Signed in as {} ({}). To work as someone else type: /signin <name> <role>   (roles: {})",
+                    self.user,
+                    self.role,
+                    self.ws.role_names().join(", ")
+                ));
+                Outcome::Handled
+            }
             Action::Decide { id, approve } => {
                 self.decide(&id, approve);
                 Outcome::Handled
@@ -308,8 +317,7 @@ impl<B: Backend> Device<B> {
             | Action::DeleteStorage(_)
             | Action::Wifi
             | Action::Hosted
-            | Action::HardwareInfo
-            | Action::SwitchUser) => Outcome::Host(other),
+            | Action::HardwareInfo) => Outcome::Host(other),
         }
     }
 
@@ -375,6 +383,17 @@ impl<B: Backend> Device<B> {
     }
 
     fn send(&mut self, text: &str) {
+        if let Some(rest) = text.strip_prefix("/signin") {
+            let mut w = rest.split_whitespace();
+            match (w.next(), w.next(), w.next()) {
+                (Some(name), Some(role), None) => match self.switch_user(name, role) {
+                    Ok(()) => self.notice(&format!("Signed in as {name} ({role}).")),
+                    Err(e) => self.notice(&format!("Could not sign in: {e}")),
+                },
+                _ => self.notice("Usage: /signin <name> <role>"),
+            }
+            return;
+        }
         self.shell.chat.push(Role::User, text);
         match self.ws.submit(&self.tenant, &self.session, text) {
             Ok(Reply::Chat {

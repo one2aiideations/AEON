@@ -1356,3 +1356,23 @@ fn a_second_person_signs_in_on_the_same_device_and_approves() {
         .iter()
         .any(|r| r.action == "approve" && r.actor == "bob"));
 }
+
+#[test]
+fn the_signin_command_and_menu_switch_the_person_without_reaching_the_model() {
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    assert_eq!(d.run(Action::SwitchUser), Outcome::Handled);
+    let notice = chat_texts(&d).pop().unwrap().1;
+    assert!(notice.contains("alice") && notice.contains("owner"));
+
+    type_line(&mut d, "/signin bob owner");
+    assert_eq!(d.user(), "bob");
+    type_line(&mut d, "/signin bob");
+    type_line(&mut d, "/signin eve wizard");
+    assert_eq!(d.user(), "bob");
+    let texts = chat_texts(&d);
+    assert!(texts.iter().any(|(_, t)| t.contains("Usage: /signin")));
+    assert!(texts.iter().any(|(_, t)| t.contains("Could not sign in")));
+    // Nothing was sent to the model: only the person's own lines and notices are on screen.
+    assert!(!texts.iter().any(|(r, _)| *r == Role::Assistant));
+}

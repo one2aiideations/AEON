@@ -587,6 +587,12 @@ impl Workspace {
         self.roles.get(role).is_some_and(|r| r.can(permission))
     }
 
+    /// The names of the defined roles, in order.
+    #[must_use]
+    pub fn role_names(&self) -> Vec<&str> {
+        self.roles.keys().map(String::as_str).collect()
+    }
+
     /// Writes an event from a part of the system outside this workspace (for example a code
     /// change applied on the device) into the same tamper-evident audit chain.
     pub fn record_event(&mut self, actor: &str, action: &str, subject: &str, outcome: &str) {

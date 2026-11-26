@@ -684,7 +684,7 @@ const USER: &str = "owner";
 pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> {
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
-    ws.add_role(Permissions::new("owner", &["*"]));
+    mouli_device::add_default_roles(&mut ws);
     // What the model may do when it uses tools: the Code tools only. Changes still need approval.
     ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
