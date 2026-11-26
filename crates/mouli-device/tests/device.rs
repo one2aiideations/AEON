@@ -1310,3 +1310,49 @@ fn a_damaged_state_file_is_refused_and_left_alone() {
         "garbage\n"
     );
 }
+
+#[test]
+fn default_roles_split_asking_from_deciding() {
+    let mut ws = Workspace::new(Policy::default(), Default::default()).unwrap();
+    mouli_device::add_default_roles(&mut ws);
+    assert!(ws.role_can(mouli_device::OWNER, "approve"));
+    assert!(ws.role_can(mouli_device::CLERK, "code.propose"));
+    assert!(!ws.role_can(mouli_device::CLERK, "code.apply"));
+    assert!(!ws.role_can(mouli_device::CLERK, "approve"));
+    assert!(ws.role_can(mouli_device::VIEWER, "code.read"));
+    assert!(!ws.role_can(mouli_device::VIEWER, "code.propose"));
+}
+
+#[test]
+fn a_second_person_signs_in_on_the_same_device_and_approves() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("viewer", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "alice", "clerk").unwrap();
+    d.on_key(Key::F(1));
+    type_line(&mut d, "/note.send to=bob");
+    assert_eq!(d.shell.approvals.rows.len(), 1);
+    assert!(!d.shell.approvals.rows[0].can_decide);
+
+    // Bad sign-ins change nothing.
+    assert!(d.switch_user("  ", "owner").is_err());
+    assert!(d.switch_user("bob", "nonsense").is_err());
+    assert_eq!(d.user(), "alice");
+
+    d.switch_user("bob", "owner").unwrap();
+    assert_eq!(d.user(), "bob");
+    assert!(d.shell.chat.messages.is_empty());
+    assert!(d.shell.approvals.rows[0].can_decide);
+    d.on_key(Key::F(3));
+    d.on_key(Key::Char('a'));
+    assert!(d.shell.approvals.rows.is_empty());
+    let a = d.workspace().audit();
+    assert!(a.verify().is_ok());
+    assert!(a
+        .records()
+        .iter()
+        .any(|r| r.action == "signin" && r.actor == "bob" && r.subject.contains("was alice")));
+    assert!(a
+        .records()
+        .iter()
+        .any(|r| r.action == "approve" && r.actor == "bob"));
+}

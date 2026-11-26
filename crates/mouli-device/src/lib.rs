@@ -11,6 +11,7 @@
 
 mod keep;
 mod patch;
+mod roles;
 mod security;
 
 #[cfg(feature = "office")]
@@ -24,6 +25,7 @@ use mouli_screen::shell::Shell;
 
 pub use keep::{restore, Restored};
 pub use patch::PatchError;
+pub use roles::{add_default_roles, CLERK, OWNER, VIEWER};
 
 /// Something that can answer a prompt with the model the workspace chose.
 pub trait Backend {
@@ -207,6 +209,26 @@ impl<B: Backend> Device<B> {
                 self.shell.studio.message = msg;
             }
         }
+    }
+
+    /// Signs another person in on this device (for example a second person who must approve what
+    /// the first asked for). The conversation screen is cleared, a new conversation is opened
+    /// for them, and the sign-in is written to the audit chain under their name.
+    ///
+    /// # Errors
+    /// A message for a blank name or an unknown role; nothing changes then.
+    pub fn switch_user(&mut self, user: &str, role: &str) -> Result<(), String> {
+        let id = self
+            .ws
+            .open_session(&self.tenant, user.trim(), role)
+            .map_err(|e| e.to_string())?;
+        let previous = std::mem::replace(&mut self.user, user.trim().to_string());
+        self.role = role.to_string();
+        self.session = id;
+        self.shell.chat.clear();
+        self.audit_event("signin", &format!("{role} (was {previous})"), "ok");
+        self.refresh();
+        Ok(())
     }
 
     /// The id of the conversation the device is working in.
