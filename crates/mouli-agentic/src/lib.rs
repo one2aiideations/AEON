@@ -11326,6 +11326,11 @@ pub mod agentmem {
         //!
         //! Records decisions and lifecycle actions without storing memory contents.
         //! This is an in-memory component, not tamper-proof or durable audit storage.
+        //!
+        //! It is not suitable as an audit file format: it has no serialisation or integrity check, a
+        //! full journal silently drops its oldest events, and `append` refuses an event whose
+        //! timestamp goes backwards (so an action could go unrecorded after a clock step). The
+        //! tests in `tests/agentmem_journal_as_audit.rs` pin these down.
 
         use std::collections::VecDeque;
 
