@@ -27,7 +27,7 @@ use mouli_screen::screens::{ApprovalRow, AuditRow, Chain, Role};
 use mouli_screen::shell::Shell;
 
 pub use keep::{restore, Restored};
-pub use patch::PatchError;
+pub use patch::{CommentError, PatchError, MAX_COMMENT_CHARS, MAX_QUEUE};
 pub use roles::{add_default_roles, CLERK, OWNER, VIEWER};
 
 /// Something that can answer a prompt with the model the workspace chose.
@@ -577,6 +577,14 @@ impl<B: Backend> Device<B> {
                 self.rollback_patch();
                 Outcome::Handled
             }
+            Action::NextPatch => {
+                patch::next(self);
+                Outcome::Handled
+            }
+            Action::SetHunk { file, hunk, keep } => {
+                patch::set_hunk(self, file, hunk, keep);
+                Outcome::Handled
+            }
             Action::RejectPatch => {
                 self.reject_patch();
                 Outcome::Handled
@@ -820,6 +828,12 @@ impl<B: Backend> Device<B> {
     }
 
     fn decide(&mut self, id: &str, approve: bool) {
+        let was_applied = patch::is_applied(self);
+        self.decide_inner(id, approve);
+        patch::note_origin(self, was_applied, "applied on approval by");
+    }
+
+    fn decide_inner(&mut self, id: &str, approve: bool) {
         match self
             .ws
             .decide(&self.tenant, id, &self.user, &self.role, approve)
@@ -1008,7 +1022,52 @@ impl<B: Backend> Device<B> {
     /// # Errors
     /// [`PatchError`] when the diff cannot be read or does not fit the files.
     pub fn propose_patch(&mut self, root: &std::path::Path, diff: &str) -> Result<(), PatchError> {
-        patch::propose(self, root, diff)
+        patch::propose(self, root, diff, "unknown")
+    }
+
+    /// Like [`Device::propose_patch`], and records who proposed the change (for example the
+    /// model's file name, or `user`) in the audit trail with the proposal and again when the
+    /// change is applied. The label is shortened and cleaned of control characters.
+    ///
+    /// # Errors
+    /// [`PatchError`] when the folder cannot be opened or the text is not an acceptable change.
+    pub fn propose_patch_by(
+        &mut self,
+        root: &std::path::Path,
+        diff: &str,
+        proposer: &str,
+    ) -> Result<(), PatchError> {
+        patch::propose(self, root, diff, proposer)
+    }
+
+    /// Puts a change under review now when none is waiting for a decision, otherwise at the back
+    /// of a queue (at most [`MAX_QUEUE`]); `n` on the review screen brings up the next one once
+    /// the current one is applied, rejected or rolled back. Returns how many are waiting.
+    ///
+    /// # Errors
+    /// [`PatchError`] when it is reviewed now and cannot be, or the queue is full.
+    pub fn queue_patch_by(
+        &mut self,
+        root: &std::path::Path,
+        diff: &str,
+        proposer: &str,
+    ) -> Result<usize, PatchError> {
+        patch::queue(self, root, diff, proposer)
+    }
+
+    /// Keeps a comment on one line of a file in the change under review, in the audit trail under
+    /// the signed-in person's name.
+    ///
+    /// # Errors
+    /// [`CommentError`] when nothing is under review, the file is not part of the change, the
+    /// line is 0, or the text is empty.
+    pub fn comment_on_patch(
+        &mut self,
+        path: &str,
+        line: usize,
+        text: &str,
+    ) -> Result<(), CommentError> {
+        patch::comment(self, path, line, text)
     }
 
     fn apply_patch(&mut self) {

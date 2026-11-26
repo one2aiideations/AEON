@@ -41,6 +41,8 @@ pub struct FileChange {
     pub removed: usize,
     /// The diff text of this file (unified format, one line per element).
     pub diff: Vec<String>,
+    /// For each hunk in order, whether the reviewer skipped it.
+    pub skipped: Vec<bool>,
 }
 
 /// A check that ran on the result (tests, quality rules).
@@ -69,6 +71,102 @@ pub struct Review {
     pub scroll: usize,
     /// A message for the person.
     pub message: String,
+    /// Whether the diff is shown as old and new side by side (when the screen is wide enough).
+    pub side_by_side: bool,
+    /// The hunk chosen in the selected file (for keeping or skipping).
+    pub hunk: usize,
+    /// How many other proposed changes are waiting their turn.
+    pub waiting: usize,
+}
+
+/// Narrowest screen (in columns) that can show old and new side by side.
+pub const SIDE_BY_SIDE_MIN_WIDTH: usize = 70;
+
+/// What a row of the side-by-side view holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A file or hunk header, shown across both sides.
+    Header,
+    /// A line that is the same on both sides.
+    Same,
+    /// A line that was changed: the old text on the left, the new on the right.
+    Changed,
+}
+
+/// One row of the side-by-side view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideRow {
+    /// What kind of row.
+    pub kind: RowKind,
+    /// The old text (without the leading `-` or space); `None` for an added line.
+    pub left: Option<String>,
+    /// The new text; `None` for a removed line.
+    pub right: Option<String>,
+}
+
+/// Turns unified-diff lines into side-by-side rows. Within a hunk a run of removed lines is
+/// paired, in order, with the run of added lines that follows it; the longer run's extra lines
+/// have nothing opposite. A file header (`---`/`+++`) is only a header before the first hunk, so
+/// a removed line whose text begins with `--` is not mistaken for one.
+#[must_use]
+pub fn side_rows(diff: &[String]) -> Vec<SideRow> {
+    let mut rows = Vec::new();
+    let mut in_hunk = false;
+    let mut removed: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let flush = |rows: &mut Vec<SideRow>, removed: &mut Vec<String>, added: &mut Vec<String>| {
+        for i in 0..removed.len().max(added.len()) {
+            rows.push(SideRow {
+                kind: RowKind::Changed,
+                left: removed.get(i).cloned(),
+                right: added.get(i).cloned(),
+            });
+        }
+        removed.clear();
+        added.clear();
+    };
+    for line in diff {
+        if line.starts_with("@@") {
+            flush(&mut rows, &mut removed, &mut added);
+            in_hunk = true;
+            rows.push(SideRow {
+                kind: RowKind::Header,
+                left: Some(line.clone()),
+                right: None,
+            });
+        } else if !in_hunk {
+            rows.push(SideRow {
+                kind: RowKind::Header,
+                left: Some(line.clone()),
+                right: None,
+            });
+        } else if let Some(t) = line.strip_prefix('-') {
+            if !added.is_empty() {
+                flush(&mut rows, &mut removed, &mut added);
+            }
+            removed.push(t.to_string());
+        } else if let Some(t) = line.strip_prefix('+') {
+            added.push(t.to_string());
+        } else if line.starts_with('\\') {
+            // "\ No newline at end of file" belongs to the line before it; show it as a note.
+            flush(&mut rows, &mut removed, &mut added);
+            rows.push(SideRow {
+                kind: RowKind::Header,
+                left: Some(line.clone()),
+                right: None,
+            });
+        } else {
+            flush(&mut rows, &mut removed, &mut added);
+            let t = line.strip_prefix(' ').unwrap_or(line).to_string();
+            rows.push(SideRow {
+                kind: RowKind::Same,
+                left: Some(t.clone()),
+                right: Some(t),
+            });
+        }
+    }
+    flush(&mut rows, &mut removed, &mut added);
+    rows
 }
 
 impl Review {
@@ -80,7 +178,68 @@ impl Review {
         self.state = PatchState::Proposed;
         self.cursor = Cursor::default();
         self.scroll = 0;
+        self.hunk = 0;
         self.message.clear();
+    }
+
+    /// Reloads the same change after a hunk was kept or skipped, keeping the selected file, hunk
+    /// and scroll when the files are the same ones. Otherwise it is a new change and starts over.
+    pub fn update(&mut self, summary: &str, files: Vec<FileChange>, checks: Vec<Check>) {
+        let same = files.len() == self.files.len()
+            && files.iter().zip(&self.files).all(|(a, b)| a.path == b.path);
+        let (cursor, hunk, scroll) = (self.cursor, self.hunk, self.scroll);
+        self.set(summary, files, checks);
+        if same {
+            self.cursor = cursor;
+            self.hunk = hunk;
+            self.scroll = scroll;
+        }
+    }
+
+    /// Positions of the hunk headers in the selected file's diff.
+    fn hunk_starts(&self) -> Vec<usize> {
+        self.selected().map_or_else(Vec::new, |f| {
+            f.diff
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with("@@"))
+                .map(|(i, _)| i)
+                .collect()
+        })
+    }
+
+    fn next_change(&mut self) -> Action {
+        if self.waiting == 0 {
+            self.message = "No other change is waiting.".into();
+            return Action::None;
+        }
+        if !self.files.is_empty() && self.state == PatchState::Proposed {
+            self.message = "Apply or reject this change before the next one.".into();
+            return Action::None;
+        }
+        self.message.clear();
+        Action::NextPatch
+    }
+
+    fn toggle_hunk(&mut self) -> Action {
+        if self.state != PatchState::Proposed {
+            self.message = "Hunks can only be chosen before the change is applied.".into();
+            return Action::None;
+        }
+        let Some(f) = self.selected() else {
+            return Action::None;
+        };
+        let n = self.hunk_starts().len();
+        if n == 0 || self.hunk >= n {
+            return Action::None;
+        }
+        let skipped = f.skipped.get(self.hunk).copied().unwrap_or(false);
+        self.message.clear();
+        Action::SetHunk {
+            file: self.cursor.selected,
+            hunk: self.hunk,
+            keep: skipped,
+        }
     }
 
     /// Records what the controller did.
@@ -99,8 +258,13 @@ impl Review {
     }
 
     fn max_scroll(&self) -> usize {
-        self.selected()
-            .map_or(0, |f| f.diff.len().saturating_sub(1))
+        self.selected().map_or(0, |f| {
+            if self.side_by_side {
+                side_rows(&f.diff).len().saturating_sub(1)
+            } else {
+                f.diff.len().saturating_sub(1)
+            }
+        })
     }
 
     fn apply(&mut self) -> Action {
@@ -139,6 +303,48 @@ impl Review {
     }
 }
 
+impl Review {
+    /// Draws old on the left and new on the right, with a divider between.
+    fn draw_side(&self, g: &mut Grid, inner: Rect, dy: usize, rows: usize, f: &FileChange) {
+        let half = (inner.w.saturating_sub(5)) / 2;
+        let lx = inner.x + 2;
+        let rx = lx + half + 1;
+        for (i, row) in side_rows(&f.diff)
+            .iter()
+            .skip(self.scroll)
+            .take(rows)
+            .enumerate()
+        {
+            let y = dy + 1 + i;
+            match row.kind {
+                RowKind::Header => {
+                    let text = row.left.as_deref().unwrap_or("");
+                    g.text_fit(
+                        lx,
+                        y,
+                        inner.w.saturating_sub(4),
+                        text,
+                        diff_colour(text),
+                        theme::BG,
+                    );
+                }
+                RowKind::Same | RowKind::Changed => {
+                    let changed = row.kind == RowKind::Changed;
+                    if let Some(t) = &row.left {
+                        let col = if changed { theme::BAD } else { theme::TEXT };
+                        g.text_fit(lx, y, half, t, col, theme::BG);
+                    }
+                    g.text(rx - 1, y, "|", theme::DIM, theme::BG);
+                    if let Some(t) = &row.right {
+                        let col = if changed { theme::OK } else { theme::TEXT };
+                        g.text_fit(rx, y, half, t, col, theme::BG);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn diff_colour(line: &str) -> Color {
     if line.starts_with("+++") || line.starts_with("---") {
         theme::DIM
@@ -160,13 +366,28 @@ impl Screen for Review {
             Key::Up | Key::Char('k') => {
                 self.cursor.step(-1, len);
                 self.scroll = 0;
+                self.hunk = 0;
             }
             Key::Down | Key::Char('j') => {
                 self.cursor.step(1, len);
                 self.scroll = 0;
+                self.hunk = 0;
             }
             Key::PageDown => self.scroll = (self.scroll + 8).min(self.max_scroll()),
             Key::PageUp => self.scroll = self.scroll.saturating_sub(8),
+            Key::Tab => {
+                let starts = self.hunk_starts();
+                if !starts.is_empty() {
+                    self.hunk = (self.hunk + 1) % starts.len();
+                    self.scroll = starts[self.hunk].min(self.max_scroll());
+                }
+            }
+            Key::Char(' ') => return self.toggle_hunk(),
+            Key::Char('n') => return self.next_change(),
+            Key::Char('s') => {
+                self.side_by_side = !self.side_by_side;
+                self.scroll = 0;
+            }
             Key::Char('a') => return self.apply(),
             Key::Char('u') => return self.rollback(),
             Key::Char('x') => return self.reject(),
@@ -176,7 +397,15 @@ impl Screen for Review {
     }
 
     fn draw(&self, g: &mut Grid, area: Rect) {
-        let title = format!("Code review  {}", self.state.label());
+        let title = if self.waiting > 0 {
+            format!(
+                "Code review  {}  ({} waiting)",
+                self.state.label(),
+                self.waiting
+            )
+        } else {
+            format!("Code review  {}", self.state.label())
+        };
         g.boxed(area, Some(&title), theme::ACCENT, theme::BG);
         let inner = area.inset(1);
         if inner.w < 30 || inner.h < 6 {
@@ -253,15 +482,35 @@ impl Screen for Review {
         );
         if let Some(f) = self.selected() {
             let rows = (end - dy).saturating_sub(2);
-            for (i, line) in f.diff.iter().skip(self.scroll).take(rows).enumerate() {
-                g.text_fit(
-                    inner.x + 2,
-                    dy + 1 + i,
-                    inner.w.saturating_sub(4),
-                    line,
-                    diff_colour(line),
-                    theme::BG,
-                );
+            if self.side_by_side && inner.w >= SIDE_BY_SIDE_MIN_WIDTH {
+                self.draw_side(g, inner, dy, rows, f);
+            } else {
+                let starts = self.hunk_starts();
+                for (i, line) in f.diff.iter().enumerate().skip(self.scroll).take(rows) {
+                    // Which hunk this line belongs to (none before the first header).
+                    let h = starts.iter().rposition(|&st| st <= i);
+                    let skipped = h.is_some_and(|h| f.skipped.get(h).copied().unwrap_or(false));
+                    let (text, col) = if starts.contains(&i) {
+                        let cur = h == Some(self.hunk);
+                        let mark = if skipped { "[ ]" } else { "[x]" };
+                        (
+                            format!("{}{mark} {line}", if cur { ">" } else { " " }),
+                            if skipped { theme::DIM } else { theme::ACCENT },
+                        )
+                    } else if skipped {
+                        (line.clone(), theme::DIM)
+                    } else {
+                        (line.clone(), diff_colour(line))
+                    };
+                    g.text_fit(
+                        inner.x + 2,
+                        dy + 1 + (i - self.scroll),
+                        inner.w.saturating_sub(4),
+                        &text,
+                        col,
+                        theme::BG,
+                    );
+                }
             }
         }
         if !self.message.is_empty() {
@@ -277,7 +526,7 @@ impl Screen for Review {
     }
 
     fn hints(&self) -> String {
-        "Up/Down file  PgUp/PgDn scroll  a apply  u undo  x reject".into()
+        "Up/Down file  Tab hunk  Space keep/skip  s side  a apply  u undo  x reject  n next".into()
     }
 }
 
@@ -302,6 +551,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            skipped: vec![false],
         }
     }
 
@@ -405,5 +655,230 @@ mod tests {
                 drawn(&r, w, h);
             }
         }
+    }
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn removed_and_added_lines_are_paired_within_a_hunk() {
+        let rows = side_rows(&lines(&[
+            "--- a/x",
+            "+++ b/x",
+            "@@ -1,4 +1,5 @@",
+            " keep",
+            "-old one",
+            "-old two",
+            "+new one",
+            "+new two",
+            "+new three",
+            " tail",
+        ]));
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| (r.kind, r.left.as_deref(), r.right.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (RowKind::Header, Some("--- a/x"), None),
+                (RowKind::Header, Some("+++ b/x"), None),
+                (RowKind::Header, Some("@@ -1,4 +1,5 @@"), None),
+                (RowKind::Same, Some("keep"), Some("keep")),
+                (RowKind::Changed, Some("old one"), Some("new one")),
+                (RowKind::Changed, Some("old two"), Some("new two")),
+                (RowKind::Changed, None, Some("new three")),
+                (RowKind::Same, Some("tail"), Some("tail")),
+            ]
+        );
+        // A pure deletion and a pure addition have nothing opposite.
+        let del = side_rows(&lines(&["@@ -1 +0,0 @@", "-gone"]));
+        assert_eq!(
+            (del[1].left.as_deref(), del[1].right.as_deref()),
+            (Some("gone"), None)
+        );
+        let add = side_rows(&lines(&["@@ -0,0 +1 @@", "+fresh"]));
+        assert_eq!(
+            (add[1].left.as_deref(), add[1].right.as_deref()),
+            (None, Some("fresh"))
+        );
+    }
+
+    #[test]
+    fn a_removed_line_that_looks_like_a_header_is_still_a_removed_line() {
+        // The text "-- comment" removed from a file shows in the diff as "--- comment".
+        let rows = side_rows(&lines(&[
+            "--- a/x",
+            "+++ b/x",
+            "@@ -1 +1 @@",
+            "--- comment",
+            "+++ added",
+        ]));
+        assert_eq!(rows[3].kind, RowKind::Changed);
+        assert_eq!(rows[3].left.as_deref(), Some("-- comment"));
+        assert_eq!(rows[3].right.as_deref(), Some("++ added"));
+        // Two hunks do not run into each other.
+        let two = side_rows(&lines(&["@@ -1 +1 @@", "-a", "@@ -9 +9 @@", "+b"]));
+        assert_eq!(two.len(), 4);
+        assert_eq!(
+            (two[1].left.as_deref(), two[1].right.as_deref()),
+            (Some("a"), None)
+        );
+        assert_eq!(
+            (two[3].left.as_deref(), two[3].right.as_deref()),
+            (None, Some("b"))
+        );
+        assert!(side_rows(&[]).is_empty());
+        // The "no newline" note is a note across both sides, not a changed line.
+        let note = side_rows(&lines(&[
+            "@@ -1 +1 @@",
+            "-a",
+            "\\ No newline at end of file",
+            "+b",
+        ]));
+        assert_eq!(note.len(), 4, "{note:?}");
+        assert_eq!(note[2].kind, RowKind::Header);
+        assert_eq!(
+            note[2].left.as_deref(),
+            Some("\\ No newline at end of file")
+        );
+    }
+
+    #[test]
+    fn s_toggles_side_by_side_and_it_draws_old_left_new_right_on_wide_screens_only() {
+        let mut r = loaded(ok_checks());
+        assert_eq!(r.on_key(Key::Char('s')), Action::None);
+        assert!(r.side_by_side);
+        let wide = drawn(&r, 100, 24);
+        let row = wide
+            .lines()
+            .find(|l| l.contains("old line"))
+            .expect("a changed row");
+        let (l, rt) = row.split_once('|').expect("a divider");
+        assert!(l.contains("old line") && !l.contains("new line"), "{row}");
+        assert!(rt.contains("new line") && !rt.contains("old line"), "{row}");
+        assert!(
+            !wide.contains("-old line") && !wide.contains("+new line"),
+            "markers are gone: {wide}"
+        );
+        // On a narrow screen it falls back to the unified view instead of squeezing.
+        let narrow = drawn(&r, 60, 24);
+        assert!(
+            narrow.contains("-old line") && narrow.contains("+new line"),
+            "{narrow}"
+        );
+        // Toggling back, and scrolling is reset and bounded by the rows of the current view.
+        r.on_key(Key::PageDown);
+        r.on_key(Key::Char('s'));
+        assert!(!r.side_by_side);
+        assert_eq!(r.scroll, 0);
+    }
+
+    #[test]
+    fn side_by_side_never_panics_at_any_size() {
+        let mut r = loaded(ok_checks());
+        r.side_by_side = true;
+        for w in 0..130 {
+            for h in 0..26 {
+                drawn(&r, w, h);
+            }
+        }
+    }
+
+    fn two_hunk_file() -> FileChange {
+        FileChange {
+            path: "src/long.rs".into(),
+            added: 2,
+            removed: 2,
+            diff: lines(&[
+                "--- a/src/long.rs",
+                "+++ b/src/long.rs",
+                "@@ -1,3 +1,3 @@",
+                "-first old",
+                "+first new",
+                "@@ -20,3 +20,3 @@",
+                "-second old",
+                "+second new",
+            ]),
+            skipped: vec![false, false],
+        }
+    }
+
+    #[test]
+    fn tab_picks_a_hunk_and_space_asks_to_skip_or_keep_it() {
+        let mut r = Review::default();
+        r.set("two hunks", vec![two_hunk_file()], ok_checks());
+        assert_eq!(
+            r.on_key(Key::Char(' ')),
+            Action::SetHunk {
+                file: 0,
+                hunk: 0,
+                keep: false
+            }
+        );
+        r.on_key(Key::Tab);
+        assert_eq!(r.hunk, 1);
+        r.files[0].skipped = vec![false, true];
+        assert_eq!(
+            r.on_key(Key::Char(' ')),
+            Action::SetHunk {
+                file: 0,
+                hunk: 1,
+                keep: true
+            },
+            "a skipped hunk is asked to be kept"
+        );
+        r.on_key(Key::Tab);
+        assert_eq!(r.hunk, 0, "wraps around");
+        // After applying, choosing is refused with a reason.
+        r.set_state(PatchState::Applied);
+        assert_eq!(r.on_key(Key::Char(' ')), Action::None);
+        assert!(r.message.contains("before the change is applied"));
+        // No hunks, no action.
+        let mut none = Review::default();
+        assert_eq!(none.on_key(Key::Char(' ')), Action::None);
+        assert_eq!(none.on_key(Key::Tab), Action::None);
+    }
+
+    #[test]
+    fn skipped_hunks_are_marked_and_dimmed_and_update_keeps_the_place() {
+        let mut r = Review::default();
+        r.set("two hunks", vec![two_hunk_file()], ok_checks());
+        r.on_key(Key::Tab);
+        let mut f = two_hunk_file();
+        f.skipped = vec![false, true];
+        r.update("two hunks", vec![f], ok_checks());
+        assert_eq!(r.hunk, 1, "same files: the place is kept");
+        r.scroll = 0; // Tab had scrolled to the chosen hunk
+        let t = drawn(&r, 80, 24);
+        assert!(t.contains("[x] @@ -1,3"), "{t}");
+        assert!(t.contains(">[ ] @@ -20,3"), "{t}");
+        // A different change starts over.
+        let mut other = two_hunk_file();
+        other.path = "src/other.rs".into();
+        r.update("another", vec![other], ok_checks());
+        assert_eq!(r.hunk, 0);
+    }
+
+    #[test]
+    fn n_brings_up_the_next_change_only_when_this_one_is_dealt_with() {
+        let mut r = loaded(ok_checks());
+        assert_eq!(r.on_key(Key::Char('n')), Action::None);
+        assert!(r.message.contains("No other change"));
+        r.waiting = 2;
+        assert_eq!(r.on_key(Key::Char('n')), Action::None);
+        assert!(r.message.contains("Apply or reject"), "{}", r.message);
+        assert!(drawn(&r, 80, 24).contains("(2 waiting)"));
+        r.set_state(PatchState::Rejected);
+        assert_eq!(r.on_key(Key::Char('n')), Action::NextPatch);
+        r.set_state(PatchState::Applied);
+        assert_eq!(r.on_key(Key::Char('n')), Action::NextPatch);
+        // With nothing loaded, the next one can be brought up.
+        let mut empty = Review {
+            waiting: 1,
+            ..Review::default()
+        };
+        assert_eq!(empty.on_key(Key::Char('n')), Action::NextPatch);
     }
 }

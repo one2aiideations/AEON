@@ -17,6 +17,7 @@ use mouli_code::quality::{assess, brackets_balanced, PatchPolicy};
 use mouli_code::workspace::{Receipt, Workspace as Files, WorkspaceError};
 use mouli_interface::{Application, Call, CapabilitySpec, Error, Output, Result, Risk};
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -80,8 +81,10 @@ pub struct ChangedFile {
     pub added: usize,
     /// Lines removed.
     pub removed: usize,
-    /// The diff lines.
+    /// The diff lines (every hunk, kept or skipped).
     pub diff: Vec<String>,
+    /// For each hunk in order, whether the reviewer skipped it (a skipped hunk is not written).
+    pub skipped: Vec<bool>,
 }
 
 /// A change under review, as the screen shows it.
@@ -102,6 +105,10 @@ pub struct View {
 pub struct CodeState {
     files: Option<Files>,
     patches: Vec<FilePatch>,
+    /// Hunks the reviewer skipped, as (file index, hunk index).
+    skipped: BTreeSet<(usize, usize)>,
+    /// The files' text as read when the change was proposed.
+    current: BTreeMap<String, String>,
     receipt: Option<Receipt>,
     passed: bool,
     view: Option<View>,
@@ -283,54 +290,168 @@ impl CodeState {
         let current = files
             .read_many(paths.iter().copied())
             .map_err(|e| PatchError::Files(format!("{e:?}")))?;
-        let report = assess(
+        // Check the whole change first, so a diff that does not fit is refused outright.
+        assess(
             &current,
             &patches,
             &PatchPolicy::default(),
             &brackets_balanced,
         )
         .map_err(|e| PatchError::DoesNotApply(format!("{e:?}")))?;
-        let mut checks = vec![
-            ("fits the files".to_string(), true),
-            ("policy".to_string(), report.acceptable),
-        ];
-        for f in report.findings.iter().filter(|f| f.kind.is_blocking()) {
-            checks.push((format!("{:?}", f.kind), false));
-        }
-        let changed: Vec<ChangedFile> = patches
+        self.patches = patches;
+        self.skipped.clear();
+        self.current = current;
+        self.receipt = None;
+        self.files = Some(files);
+        let summary = self.rebuild(Stage::Proposed);
+        self.version += 1;
+        Ok(summary)
+    }
+
+    /// The change with the skipped hunks left out (a file with every hunk skipped is left out).
+    fn kept_patches(&self) -> Vec<FilePatch> {
+        self.patches
             .iter()
-            .map(|p| {
-                let lines: Vec<String> = diff::render(std::slice::from_ref(p))
-                    .lines()
-                    .map(str::to_string)
-                    .collect();
-                let count = |c: char, skip: &str| {
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let mut p = p.clone();
+                if p.hunks.is_empty() {
+                    return Some(p);
+                }
+                let mut h = 0;
+                p.hunks.retain(|_| {
+                    let keep = !self.skipped.contains(&(i, h));
+                    h += 1;
+                    keep
+                });
+                (!p.hunks.is_empty()).then_some(p)
+            })
+            .collect()
+    }
+
+    /// Recomputes the checks and what the screen shows from the hunks now kept. Returns the
+    /// one-line summary.
+    fn rebuild(&mut self, stage: Stage) -> String {
+        let kept = self.kept_patches();
+        let hunks_total: usize = self.patches.iter().map(|p| p.hunks.len()).sum();
+        let hunks_kept = hunks_total - self.skipped.len();
+        let mut checks;
+        let risk;
+        if kept.is_empty() {
+            checks = vec![("something is kept".to_string(), false)];
+            self.passed = false;
+            risk = 0;
+        } else {
+            match assess(
+                &self.current,
+                &kept,
+                &PatchPolicy::default(),
+                &brackets_balanced,
+            ) {
+                Ok(report) => {
+                    checks = vec![
+                        ("fits the files".to_string(), true),
+                        ("policy".to_string(), report.acceptable),
+                    ];
+                    for f in report.findings.iter().filter(|f| f.kind.is_blocking()) {
+                        checks.push((format!("{:?}", f.kind), false));
+                    }
+                    self.passed = report.acceptable;
+                    risk = report.risk;
+                }
+                Err(_) => {
+                    // Possible when the kept hunks depend on a skipped one.
+                    checks = vec![("fits the files".to_string(), false)];
+                    self.passed = false;
+                    risk = 0;
+                }
+            }
+        }
+        let changed: Vec<ChangedFile> = self
+            .patches
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let lines_of = |p: &FilePatch| -> Vec<String> {
+                    diff::render(std::slice::from_ref(p))
+                        .lines()
+                        .map(str::to_string)
+                        .collect()
+                };
+                let count = |lines: &[String], c: char, skip: &str| {
                     lines
                         .iter()
                         .filter(|l| l.starts_with(c) && !l.starts_with(skip))
                         .count()
                 };
+                let kept_lines = kept
+                    .iter()
+                    .find(|k| k.path() == p.path())
+                    .map(lines_of)
+                    .unwrap_or_default();
                 ChangedFile {
                     path: p.path().to_string(),
-                    added: count('+', "+++"),
-                    removed: count('-', "---"),
-                    diff: lines,
+                    added: count(&kept_lines, '+', "+++"),
+                    removed: count(&kept_lines, '-', "---"),
+                    diff: lines_of(p),
+                    skipped: (0..p.hunks.len())
+                        .map(|h| self.skipped.contains(&(i, h)))
+                        .collect(),
                 }
             })
             .collect();
-        let summary = format!("{} file(s), risk {}/100", patches.len(), report.risk);
+        let summary = if self.skipped.is_empty() {
+            format!("{} file(s), risk {}/100", kept.len(), risk)
+        } else {
+            format!(
+                "{} file(s), {hunks_kept} of {hunks_total} hunks, risk {risk}/100",
+                kept.len()
+            )
+        };
         self.view = Some(View {
             summary: summary.clone(),
             files: changed,
             checks,
-            stage: Stage::Proposed,
+            stage,
         });
-        self.patches = patches;
-        self.receipt = None;
-        self.passed = report.acceptable;
-        self.files = Some(files);
+        summary
+    }
+
+    /// How many hunks are kept, and how many the change has.
+    pub fn hunks(&self) -> (usize, usize) {
+        let total: usize = self.patches.iter().map(|p| p.hunks.len()).sum();
+        (total - self.skipped.len(), total)
+    }
+
+    /// Keeps or skips one hunk of one file of the change under review. A skipped hunk is not
+    /// written when the change is applied; the checks are run again on what is kept.
+    ///
+    /// # Errors
+    /// A message when no change is under review, it is no longer only proposed, or there is no
+    /// such hunk.
+    pub fn set_hunk(
+        &mut self,
+        file: usize,
+        hunk: usize,
+        keep: bool,
+    ) -> std::result::Result<(), String> {
+        let Some(view) = &self.view else {
+            return Err("No change is loaded.".into());
+        };
+        if view.stage != Stage::Proposed || self.receipt.is_some() {
+            return Err("Hunks can only be chosen before the change is applied.".into());
+        }
+        if self.patches.get(file).is_none_or(|p| hunk >= p.hunks.len()) {
+            return Err("There is no such hunk.".into());
+        }
+        if keep {
+            self.skipped.remove(&(file, hunk));
+        } else {
+            self.skipped.insert((file, hunk));
+        }
+        self.rebuild(Stage::Proposed);
         self.version += 1;
-        Ok(summary)
+        Ok(())
     }
 
     /// Writes the held change to the files, all or nothing. Returns how many files changed.
@@ -348,7 +469,7 @@ impl CodeState {
         }
         let files = self.files.clone().ok_or("No project folder is open.")?;
         let receipt = files
-            .apply(&self.patches, ApplyOptions::default())
+            .apply(&self.kept_patches(), ApplyOptions::default())
             .map_err(|e| format!("Nothing was changed: {}", describe(&e)))?;
         let n = receipt.changed_paths().len();
         self.receipt = Some(receipt);
@@ -661,5 +782,114 @@ mod tests {
         assert!(st.edit("../x", "a\n").is_err());
         assert!(st.edit(".git/config", "a\n").is_err());
         assert!(CodeState::default().edit("a", "b\n").is_err());
+    }
+
+    /// A 30-line function; the two edits below are far enough apart to be separate hunks.
+    fn long_file() -> String {
+        let mut t = String::from("fn f() {\n");
+        for i in 1..=28 {
+            t.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        t.push_str("}\n");
+        t
+    }
+
+    fn two_hunks(second: &str) -> (tempfile::TempDir, CodeState, String, String) {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src")).unwrap();
+        let old = long_file();
+        fs::write(d.path().join("src/long.rs"), &old).unwrap();
+        let new = old
+            .replace("let v3 = 3;", "let v3 = 33;")
+            .replace("    let v25 = 25;", second);
+        let patch = make_patch("src/long.rs", Some(&old), Some(&new), 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(patch.hunks.len(), 2, "the edits must be two hunks");
+        let mut st = CodeState::default();
+        st.open(d.path()).unwrap();
+        st.propose(&diff::render(&[patch])).unwrap();
+        (d, st, old, new)
+    }
+
+    fn read_long(d: &tempfile::TempDir) -> String {
+        fs::read_to_string(d.path().join("src/long.rs")).unwrap()
+    }
+
+    #[test]
+    fn a_skipped_hunk_is_not_written_and_rollback_restores_the_original() {
+        let (d, mut st, old, _new) = two_hunks("    let v25 = 250;");
+        assert_eq!(st.hunks(), (2, 2));
+        st.set_hunk(0, 1, false).unwrap();
+        assert_eq!(st.hunks(), (1, 2));
+        let v = st.view().unwrap();
+        assert_eq!(v.files[0].skipped, [false, true]);
+        assert!(v.summary.contains("1 of 2 hunks"), "{}", v.summary);
+        assert_eq!(
+            (v.files[0].added, v.files[0].removed),
+            (1, 1),
+            "counts are of what is kept"
+        );
+        assert_eq!(st.apply(), Ok(1));
+        let written = read_long(&d);
+        assert!(written.contains("let v3 = 33;"), "{written}");
+        assert!(
+            written.contains("let v25 = 25;"),
+            "the skipped hunk must not be written"
+        );
+        assert!(!written.contains("250"));
+        st.rollback().unwrap();
+        assert_eq!(read_long(&d), old);
+    }
+
+    #[test]
+    fn the_checks_are_run_again_on_what_is_kept() {
+        // The second hunk opens a brace that is never closed: the whole change fails the policy.
+        let (d, mut st, _old, _new) = two_hunks("    if true {");
+        let failing = |st: &CodeState| st.view().unwrap().checks.iter().any(|(_, ok)| !ok);
+        assert!(failing(&st));
+        assert_eq!(st.apply(), Err(NOT_ALLOWED.to_string()));
+        assert!(!read_long(&d).contains("v3 = 33"), "nothing written");
+        // Skipping that hunk leaves a change that passes, and it can be applied.
+        st.set_hunk(0, 1, false).unwrap();
+        assert!(!failing(&st), "{:?}", st.view().unwrap().checks);
+        assert_eq!(st.apply(), Ok(1));
+        assert!(read_long(&d).contains("v3 = 33"));
+        assert!(!read_long(&d).contains("if true"));
+    }
+
+    #[test]
+    fn skipping_everything_cannot_be_applied_and_keeping_one_again_can() {
+        let (d, mut st, old, _new) = two_hunks("    let v25 = 250;");
+        st.set_hunk(0, 0, false).unwrap();
+        st.set_hunk(0, 1, false).unwrap();
+        assert_eq!(st.hunks(), (0, 2));
+        assert_eq!(
+            st.view().unwrap().checks,
+            [("something is kept".to_string(), false)]
+        );
+        assert_eq!(st.apply(), Err(NOT_ALLOWED.to_string()));
+        assert_eq!(read_long(&d), old);
+        st.set_hunk(0, 0, true).unwrap();
+        assert_eq!(st.apply(), Ok(1));
+        assert!(read_long(&d).contains("v3 = 33"));
+    }
+
+    #[test]
+    fn choosing_hunks_is_refused_with_no_change_after_applying_and_for_hunks_that_do_not_exist() {
+        let mut st = CodeState::default();
+        assert!(st.set_hunk(0, 0, false).is_err(), "no change is loaded");
+        let (_d, mut st, _old, _new) = two_hunks("    let v25 = 250;");
+        assert!(st.set_hunk(0, 2, false).is_err());
+        assert!(st.set_hunk(1, 0, false).is_err());
+        assert_eq!(st.hunks(), (2, 2), "refused choices change nothing");
+        st.apply().unwrap();
+        assert!(st
+            .set_hunk(0, 0, false)
+            .unwrap_err()
+            .contains("before the change is applied"));
+        // A fresh proposal starts with every hunk kept again.
+        st.reject();
+        assert!(st.set_hunk(0, 0, false).is_err());
     }
 }

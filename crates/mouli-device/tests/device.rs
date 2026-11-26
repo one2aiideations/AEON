@@ -2204,3 +2204,290 @@ fn only_someone_who_can_administer_may_set_up_the_first_account() {
     assert!(!d.shell.chat.is_secret());
     assert!(!dir.path().join("users.txt").exists());
 }
+
+fn origin_rows(d: &Device<Echo>) -> Vec<String> {
+    d.shell
+        .audit
+        .rows
+        .iter()
+        .filter(|r| r.action == "patch.origin" || r.action == "patch.propose")
+        .map(|r| format!("{} | {} | {}", r.actor, r.action, r.target))
+        .collect()
+}
+
+#[test]
+fn the_audit_trail_says_which_model_proposed_a_change_and_who_applied_it() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.propose_patch_by(dir.path(), &diff, "qwen2.5-1.5b-q4_k_m.gguf")
+        .unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('a'));
+    // Applying twice must not write a second origin line.
+    d.on_key(Key::Char('a'));
+    let rows = origin_rows(&d);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows[0].contains("patch.propose")
+            && rows[0].contains("[proposed by qwen2.5-1.5b-q4_k_m.gguf]"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[1],
+        "owner | patch.origin | proposed by qwen2.5-1.5b-q4_k_m.gguf, applied by owner"
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+#[test]
+fn a_hostile_or_empty_label_cannot_forge_audit_lines_and_a_rejected_change_has_no_origin() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    let hostile = format!("evil\n9 | owner | patch.origin | forged{}", "x".repeat(200));
+    d.propose_patch_by(dir.path(), &diff, &hostile).unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('x'));
+    let rows = origin_rows(&d);
+    assert_eq!(rows.len(), 1, "only the proposal: {rows:?}");
+    assert!(!rows[0].contains('\n'));
+    let label = rows[0]
+        .split("[proposed by ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']');
+    assert!(label.chars().count() <= 64, "{label}");
+    // An empty label and the plain call both say unknown.
+    d.propose_patch_by(dir.path(), &diff, "  \n ").unwrap();
+    d.propose_patch(dir.path(), &diff).unwrap();
+    d.on_key(Key::F(1)); // any key refreshes the audit rows
+    let rows = origin_rows(&d);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.contains("[proposed by unknown]"))
+            .count(),
+        2,
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_change_applied_after_a_second_persons_approval_names_its_proposer() {
+    let (dir, diff, new) = project();
+    let (ws, code) = code_workspace();
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "dana", "dev").unwrap();
+    d.attach_code(code);
+    d.propose_patch_by(dir.path(), &diff, "llama-3.2-3b.gguf")
+        .unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char('a'));
+    assert!(
+        origin_rows(&d).iter().all(|r| !r.contains("patch.origin")),
+        "held, not applied yet"
+    );
+    // The owner approves from the approvals screen of the same device.
+    d.switch_user("owner", "owner").unwrap();
+    d.on_key(Key::F(3));
+    let row = d
+        .shell
+        .approvals
+        .rows
+        .iter()
+        .position(|r| r.capability == "code.apply")
+        .expect("the held apply");
+    d.shell.approvals.cursor.selected = row;
+    d.on_key(Key::Char('a'));
+    assert_eq!(read(&dir), new, "approved apply wrote the file");
+    let rows = origin_rows(&d);
+    assert!(
+        rows.iter().any(|r| r == "owner | patch.origin | proposed by llama-3.2-3b.gguf, applied on approval by owner"),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn review_comments_on_lines_are_kept_in_the_audit_trail_under_the_reviewer() {
+    use mouli_device::CommentError;
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 2, "why +50?"),
+        Err(CommentError::NoChange)
+    );
+    d.propose_patch_by(dir.path(), &diff, "user").unwrap();
+    d.comment_on_patch("src/tax.rs", 2, "rounds half up,\n  please add a test")
+        .unwrap();
+    assert_eq!(
+        d.comment_on_patch("src/other.rs", 1, "x"),
+        Err(CommentError::NotInChange("src/other.rs".into()))
+    );
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 0, "x"),
+        Err(CommentError::BadLine)
+    );
+    assert_eq!(
+        d.comment_on_patch("src/tax.rs", 1, " \n\t "),
+        Err(CommentError::Empty)
+    );
+    let long = "y".repeat(2000);
+    d.comment_on_patch("src/tax.rs", 3, &long).unwrap();
+    d.on_key(Key::F(1)); // refresh the audit rows
+    let rows: Vec<_> = d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .filter(|r| r.action == "patch.comment")
+        .collect();
+    assert_eq!(rows.len(), 2, "refused comments leave no trace");
+    assert_eq!(rows[0].actor, "owner");
+    assert_eq!(
+        rows[0].target,
+        "src/tax.rs:2 rounds half up, please add a test"
+    );
+    assert_eq!(
+        rows[1].target.chars().count(),
+        "src/tax.rs:3 ".len() + mouli_device::MAX_COMMENT_CHARS
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+#[test]
+fn skipping_a_hunk_from_the_review_screen_writes_only_the_rest_and_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let mut old = String::from("fn f() {\n");
+    for i in 1..=28 {
+        old.push_str(&format!("    let v{i} = {i};\n"));
+    }
+    old.push_str("}\n");
+    std::fs::write(dir.path().join("src/long.rs"), &old).unwrap();
+    let new = old
+        .replace("let v3 = 3;", "let v3 = 33;")
+        .replace("let v25 = 25;", "let v25 = 250;");
+    let patch = make_patch("src/long.rs", Some(&old), Some(&new), 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(patch.hunks.len(), 2);
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.propose_patch(dir.path(), &render(&[patch])).unwrap();
+    d.on_key(Key::F(6));
+    d.on_key(Key::Tab); // second hunk
+    d.on_key(Key::Char(' ')); // skip it
+    assert_eq!(d.shell.review.files[0].skipped, [false, true]);
+    assert_eq!(d.shell.review.hunk, 1, "the place is kept after the reload");
+    assert!(
+        d.shell.review.summary.contains("1 of 2 hunks"),
+        "{}",
+        d.shell.review.summary
+    );
+    d.on_key(Key::Char('a'));
+    let written = std::fs::read_to_string(dir.path().join("src/long.rs")).unwrap();
+    assert!(
+        written.contains("v3 = 33") && written.contains("v25 = 25;") && !written.contains("250")
+    );
+    d.on_key(Key::F(1));
+    assert!(d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .any(|r| r.action == "patch.hunk" && r.target == "skip file 0 hunk 1"));
+    // Skipping after applying is refused.
+    d.on_key(Key::F(6));
+    d.on_key(Key::Char(' '));
+    assert!(
+        d.shell
+            .review
+            .message
+            .contains("before the change is applied"),
+        "{}",
+        d.shell.review.message
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+#[test]
+fn changes_queue_up_and_come_one_at_a_time_and_one_that_no_longer_fits_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let a0 = "fn a() -> i32 {\n    1\n}\n";
+    let a1 = "fn a() -> i32 {\n    2\n}\n";
+    let a2 = "fn a() -> i32 {\n    3\n}\n";
+    std::fs::write(dir.path().join("src/a.rs"), a0).unwrap();
+    let diff = |old: &str, new: &str| {
+        render(&[make_patch("src/a.rs", Some(old), Some(new), 3)
+            .unwrap()
+            .unwrap()])
+    };
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    // The first (a0 -> a1) is reviewed at once; the others wait. The second (a0 -> a2) will not
+    // fit once the first is applied; the third (a1 -> a2) will.
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a0, a1), "model one")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a0, a2), "model two")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        d.queue_patch_by(dir.path(), &diff(a1, a2), "model three")
+            .unwrap(),
+        2
+    );
+    d.on_key(Key::F(6));
+    assert_eq!(d.shell.review.waiting, 2);
+    // Not before this one is dealt with.
+    d.on_key(Key::Char('n'));
+    assert!(
+        d.shell.review.message.contains("Apply or reject"),
+        "{}",
+        d.shell.review.message
+    );
+    d.on_key(Key::Char('a'));
+    assert_eq!(read_a(&dir), a1);
+    d.on_key(Key::Char('n')); // "model two" (a0 -> a2) no longer fits: dropped; "model three" comes up
+    assert_eq!(d.shell.review.waiting, 0, "both were taken from the queue");
+    assert!(
+        d.shell.review.message.contains("dropped"),
+        "{}",
+        d.shell.review.message
+    );
+    assert_eq!(d.shell.review.state, PatchState::Proposed);
+    d.on_key(Key::Char('a'));
+    assert_eq!(
+        read_a(&dir),
+        a2,
+        "the third change was the one reviewed and applied"
+    );
+    d.on_key(Key::F(1));
+    let actions: Vec<_> = d
+        .shell
+        .audit
+        .rows
+        .iter()
+        .map(|r| (r.action.as_str(), r.target.as_str()))
+        .collect();
+    assert!(
+        actions.iter().filter(|(a, _)| *a == "patch.queue").count() >= 3,
+        "{actions:?}"
+    );
+    assert_eq!(d.shell.audit.chain, Chain::Verified);
+}
+
+fn read_a(dir: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap()
+}
+
+#[test]
+fn the_queue_is_bounded() {
+    let (dir, diff, _new) = project();
+    let mut d = Device::new(workspace(), Echo(vec![]), "acme", "owner", "owner").unwrap();
+    d.queue_patch_by(dir.path(), &diff, "m").unwrap();
+    for _ in 0..mouli_device::MAX_QUEUE {
+        d.queue_patch_by(dir.path(), &diff, "m").unwrap();
+    }
+    assert!(d.queue_patch_by(dir.path(), &diff, "m").is_err());
+}
