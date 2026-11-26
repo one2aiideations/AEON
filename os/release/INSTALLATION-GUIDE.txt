@@ -57,7 +57,7 @@ Windows. Use Rufus or balenaEtcher. In Rufus choose the ISO and, when asked, pic
 - In the MOULI menu choose "MOULI". If the screen stays blank, restart and choose "safe graphics" or "verbose boot messages".
 - To get a model without copying one yourself, connect to the network (cable, or w for Wi-Fi) and press d in the model menu. The model is saved in the models folder of the MOULI-DATA partition, so it is there on the next start. A model you copied onto the stick still works the same way.
 - To use a Bluetooth mouse or trackpad, put it in pairing mode and press b in the model menu before choosing a model, then pick it from the list. A touchpad or a USB mouse works without this. The chat window shows the input devices MOULI found; if the pointer does not move, send that line with your report.
-- After you pick a model, the MOULI desktop appears. Type in the Chat window; use a USB or PS/2 mouse if you like. F1 to F10 open windows, Ctrl+L starts a new chat, Ctrl+Q shuts down. If the desktop cannot start, or if you add mouli.text=1 to the kernel command line, the text chat is used instead.
+- After you pick a model, the MOULI desktop appears. Type in the Chat window; use a USB or PS/2 mouse if you like. F1 to F6, F9, F11 and F12 open windows (F1 Chat, F2 Models, F9 Code, F11 Storage, F12 Preview), Ctrl+B opens the Browser, Ctrl+N starts a new chat, Ctrl+Q shuts down. If the desktop cannot start, or if you add mouli.text=1 to the kernel command line, the text chat is used instead.
 
 ## 5. First start
 
