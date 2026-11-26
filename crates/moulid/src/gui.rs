@@ -666,6 +666,93 @@ fn save_view(store: Option<&crate::persist::Store>, key: &str, value: &str) -> &
     }
 }
 
+/// Blanks the screen after a while without a key or the mouse, and wakes it on the next one.
+/// (There is no lock: MOULI has no password to ask for yet, so waking needs no proof.)
+#[derive(Debug, Clone, Copy)]
+struct IdleBlank {
+    timeout: Option<Duration>,
+    last_input: Instant,
+    blanked: bool,
+}
+
+impl IdleBlank {
+    fn new(minutes: u32, now: Instant) -> Self {
+        Self {
+            timeout: (minutes > 0).then(|| Duration::from_secs(u64::from(minutes) * 60)),
+            last_input: now,
+            blanked: false,
+        }
+    }
+
+    /// How long to wait for input before blanking; `None` when blanking is off or done.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        if self.blanked {
+            return None;
+        }
+        self.timeout
+            .map(|t| t.saturating_sub(now.saturating_duration_since(self.last_input)))
+    }
+
+    /// True (once) when it is time to blank the screen.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.wait(now) == Some(Duration::ZERO) {
+            self.blanked = true;
+            return true;
+        }
+        false
+    }
+
+    /// A key or the mouse. Returns true when it only woke the screen and must not act.
+    fn input(&mut self, now: Instant) -> bool {
+        self.last_input = now;
+        std::mem::replace(&mut self.blanked, false)
+    }
+}
+
+const IDLE_KEY: &str = "view.idle";
+const DEFAULT_IDLE_MIN: u32 = 10;
+
+fn load_idle(store: Option<&crate::persist::Store>) -> u32 {
+    store
+        .and_then(|s| s.settings().get(IDLE_KEY).cloned())
+        .and_then(|v| v.parse().ok())
+        .filter(|m| [0, 5, 10, 30].contains(m))
+        .unwrap_or(DEFAULT_IDLE_MIN)
+}
+
+fn idle_label(minutes: u32) -> String {
+    if minutes == 0 {
+        "off".into()
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// Writes the picture as a new PNG file `screenshot-N.png` in `dir` (created if needed) and
+/// returns its name. Never replaces an existing file.
+fn save_screenshot(canvas: &Canvas, dir: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let png = mouli_screen::raster::to_png(canvas);
+    for n in 1..10_000 {
+        let name = format!("screenshot-{n}.png");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(mut f) => {
+                return std::io::Write::write_all(&mut f, &png)
+                    .and_then(|()| f.sync_all())
+                    .map(|()| name)
+                    .map_err(|e| e.to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("too many screenshots".into())
+}
+
 /// Signal strength as 1 to 4 bars.
 fn wifi_bars(dbm: i32) -> u8 {
     match dbm {
@@ -738,6 +825,7 @@ fn settings_rows(
     models: &ModelsInfo,
     offset: &AtomicI32,
     user: &str,
+    idle_min: u32,
 ) -> Vec<mouli_screen::screens::SettingRow> {
     use mouli_screen::screens::SettingRow;
     let row = |id: &str, label: &str, value: String, choices: &[&str], note: &str| SettingRow {
@@ -761,6 +849,13 @@ fn settings_rows(
             format!("{wanted_scale}x"),
             &["1x", "2x", "3x"],
             "Larger text for small or far screens. Takes effect after a restart.",
+        ),
+        row(
+            "idle",
+            "Blank screen after",
+            idle_label(idle_min),
+            &["off", "5 min", "10 min", "30 min"],
+            "Blanks after no key or mouse use; any key wakes it (no lock yet: there is no password).",
         ),
         row(
             "memory",
@@ -1162,6 +1257,8 @@ where
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
     let mut view = load_view(settings.as_ref());
+    let mut idle_min = load_idle(settings.as_ref());
+    let mut idle = IdleBlank::new(idle_min, Instant::now());
     let mut wanted_scale = view.scale;
     let scale = usable_scale(view.scale, w, h);
     view.scale = scale;
@@ -1182,6 +1279,7 @@ where
         models,
         &offset,
         device.user(),
+        idle_min,
     ));
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
@@ -1267,8 +1365,24 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let a = device.shell.preview.tick();
                     let b = device.shell.browser.view.tick();
-                    if a || b {
+                    if (a || b) && !idle.blanked {
                         display.present(&shape(desktop.render(&device.shell), view))?;
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(End::Eof),
+            }
+        } else if let Some(wait) = idle.wait(Instant::now()) {
+            match rx.recv_timeout(wait) {
+                Ok(first) => batch.push(first),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if idle.due(Instant::now()) {
+                        let (bw, bh) = display.size();
+                        display.present(&Canvas {
+                            width: bw,
+                            height: bh,
+                            pixels: vec![0; bw * bh],
+                        })?;
                     }
                     continue;
                 }
@@ -1287,8 +1401,28 @@ where
             }
         }
         for ev in batch {
+            if matches!(ev, Ev::Key(_) | Ev::Mouse(_)) && idle.input(Instant::now()) {
+                continue; // this key or movement only woke the screen
+            }
             let action = match ev {
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
+                Ev::Key(Key::Ctrl('p')) => {
+                    let note = match &data_root {
+                        Some(root) => {
+                            let picture = shape(desktop.render(&device.shell), view);
+                            match save_screenshot(&picture, &root.join("exports")) {
+                                Ok(name) => {
+                                    device.record_event("screenshot.save", &name, "ok");
+                                    format!("Screenshot saved as exports/{name}")
+                                }
+                                Err(e) => format!("Screenshot not saved: {e}"),
+                            }
+                        }
+                        None => "Screenshot not saved: there is no data disk.".into(),
+                    };
+                    device.shell.chat.push(Role::Notice, &note);
+                    Action::None
+                }
                 Ev::Key(Key::Ctrl('c')) if device.shell.chat.busy => {
                     cancel.store(true, Ordering::SeqCst);
                     Action::None
@@ -1451,6 +1585,22 @@ where
                             let (sw, sh) = display.size();
                             text_size_command(&k, &view, (sw, sh), settings.as_ref())
                         }
+                        "idle" => {
+                            let m = value.trim_end_matches(" min");
+                            match (m == "off", m.parse::<u32>()) {
+                                (true, _) | (_, Ok(0 | 5 | 10 | 30)) => {
+                                    idle_min = m.parse().unwrap_or(0);
+                                    idle = IdleBlank::new(idle_min, Instant::now());
+                                    let saved = save_view(
+                                        settings.as_ref(),
+                                        IDLE_KEY,
+                                        &idle_min.to_string(),
+                                    );
+                                    format!("Screen blanking: {}.{saved}", idle_label(idle_min))
+                                }
+                                _ => "Choose off, 5, 10 or 30 minutes.".into(),
+                            }
+                        }
                         _ => "That setting cannot be changed here.".into(),
                     };
                     device.shell.settings.message = note;
@@ -1577,8 +1727,11 @@ where
             models,
             &offset,
             device.user(),
+            idle_min,
         ));
-        display.present(&shape(desktop.render(&device.shell), view))?;
+        if !idle.blanked {
+            display.present(&shape(desktop.render(&device.shell), view))?;
+        }
     }
 }
 
@@ -2420,10 +2573,13 @@ mod tests {
             &m,
             &off,
             "owner",
+            10,
         );
         let get = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
         assert_eq!(get("contrast").value, "on");
         assert_eq!(get("textsize").value, "2x");
+        assert_eq!(get("idle").value, "10 min");
+        assert_eq!(get("idle").choices.len(), 4);
         assert!(get("memory").choices.is_empty());
         assert!(
             get("timezone").value.contains("5:30"),
@@ -2481,6 +2637,99 @@ mod tests {
         assert!(wifi_join_network(&sys, None, "Home", Some("password1")).is_err());
         assert_eq!(wifi_bars(-40), 4);
         assert_eq!(wifi_bars(-90), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn screenshots_are_new_png_files_and_never_replace_one() {
+        let dir = tmp("shots");
+        let c = Canvas {
+            width: 3,
+            height: 2,
+            pixels: vec![0xFF0000, 0x00FF00, 0x0000FF, 0, 0xFFFFFF, 0x123456],
+        };
+        let a = save_screenshot(&c, &dir.join("exports")).unwrap();
+        let b = save_screenshot(&c, &dir.join("exports")).unwrap();
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("screenshot-1.png", "screenshot-2.png")
+        );
+        let bytes = std::fs::read(dir.join("exports/screenshot-1.png")).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(bytes, mouli_screen::raster::to_png(&c));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_p_saves_a_screenshot_and_audits_it() {
+        let dir = tmp("shot-key");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        session.data_root = Some(dir.clone());
+        tx.send(Ev::Key(Key::Ctrl('p'))).unwrap();
+        tx.send(Ev::Key(Key::Ctrl('q'))).unwrap();
+        run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        let png = std::fs::read(dir.join("exports/screenshot-1.png")).unwrap();
+        assert_eq!(&png[1..4], b"PNG");
+        let log = std::fs::read_to_string(dir.join("state/audit.log")).unwrap();
+        assert!(log.contains("screenshot.save"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_screen_blanks_after_the_idle_time_and_the_waking_key_does_not_act() {
+        let t0 = Instant::now();
+        let mut i = IdleBlank::new(5, t0);
+        assert_eq!(i.wait(t0), Some(Duration::from_secs(300)));
+        assert_eq!(
+            i.wait(t0 + Duration::from_secs(100)),
+            Some(Duration::from_secs(200))
+        );
+        assert!(!i.due(t0 + Duration::from_secs(299)));
+        assert!(i.due(t0 + Duration::from_secs(300)));
+        assert!(i.blanked);
+        // It blanks once, and waits for input (no timer) while blank.
+        assert!(!i.due(t0 + Duration::from_secs(400)));
+        assert_eq!(i.wait(t0 + Duration::from_secs(400)), None);
+        // The first input wakes it and is swallowed; the next acts and restarts the timer.
+        assert!(i.input(t0 + Duration::from_secs(500)));
+        assert!(!i.blanked);
+        assert!(!i.input(t0 + Duration::from_secs(501)));
+        assert_eq!(
+            i.wait(t0 + Duration::from_secs(501)),
+            Some(Duration::from_secs(300))
+        );
+        // Off never blanks.
+        let off = IdleBlank::new(0, t0);
+        assert_eq!(off.wait(t0 + Duration::from_secs(99999)), None);
+    }
+
+    #[test]
+    fn the_idle_setting_defaults_validates_and_reloads() {
+        let dir = tmp("idle");
+        let store = crate::persist::Store::open(&dir).unwrap();
+        assert_eq!(load_idle(Some(&store)), 10);
+        assert_eq!(load_idle(None), 10);
+        store.set(IDLE_KEY, "30").unwrap();
+        assert_eq!(load_idle(Some(&store)), 30);
+        store.set(IDLE_KEY, "0").unwrap();
+        assert_eq!(load_idle(Some(&store)), 0);
+        store.set(IDLE_KEY, "7").unwrap();
+        assert_eq!(load_idle(Some(&store)), 10, "an unknown value falls back");
+        assert_eq!(idle_label(0), "off");
+        assert_eq!(idle_label(5), "5 min");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

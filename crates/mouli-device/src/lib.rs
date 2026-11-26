@@ -310,6 +310,13 @@ impl<B: Backend> Device<B> {
         self.notice(RESTORED);
     }
 
+    /// Writes an event of the host (for example a screenshot) into the audit chain as the
+    /// signed-in person.
+    pub fn record_event(&mut self, action: &str, subject: &str, outcome: &str) {
+        self.audit_event(action, subject, outcome);
+        self.refresh();
+    }
+
     /// Sets the folder `/save` writes answers into (created when first used).
     pub fn set_export_dir(&mut self, dir: &std::path::Path) {
         self.export_dir = Some(dir.to_path_buf());
