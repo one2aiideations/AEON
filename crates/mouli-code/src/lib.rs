@@ -3,6 +3,7 @@
 //! * [`diff`]: unified-diff types, strict parsing, rendering and reversal.
 //! * [`apply`]: exact in-memory application (context verified line by line), atomic multi-file
 //!   patch sets, and path safety.
+//! * [`git`]: a read-only view of the branch and changed files (runs `git status` only).
 //! * [`make`]: generating a unified diff from two texts.
 //! * [`quality`]: patch statistics, test-file detection, hard-coding heuristics and a risk score.
 //! * [`minimize`]: removing hunks that the tests do not need (delta debugging).
@@ -16,7 +17,7 @@
 //! * [`sandbox`]: running a command (the tests) in a throwaway copy of a folder, with a time limit
 //!   and an output cap. Not a security boundary: see its notes.
 //!
-//! Everything except [`workspace`], [`sandbox`] and [`repair`] works on text held in memory and never touches
+//! Everything except [`workspace`], [`sandbox`], [`repair`] and [`git`] works on text held in memory and never touches
 //! the file system or runs a command, so an agent's proposed change can be checked completely
 //! before anything is written.
 //! The design follows an earlier Python prototype whose diff application, minimiser and quality
@@ -28,6 +29,7 @@
 pub mod apply;
 pub mod budget;
 pub mod diff;
+pub mod git;
 pub mod make;
 pub mod minimize;
 pub mod quality;
