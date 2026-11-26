@@ -105,6 +105,9 @@ pub fn render_menu(models: &[Found], budget_mb: u64, ctx: u32) -> String {
             fit,
             m.path.display()
         ));
+        if let Some(why) = m.why_not(budget_mb, ctx) {
+            s.push_str(&format!("      It {why}\n"));
+        }
     }
     s.push_str("\n  Type a number and press Enter.  r = look again   w = Wi-Fi   b = Bluetooth mouse   d = download a model   h = hosted model (online)   i = hardware info   q = power off\n");
     s
@@ -132,6 +135,10 @@ pub fn parse_choice(line: &str, n: usize) -> Option<Choice> {
 
 /// Show the picker and read a valid choice. End of input counts as quit.
 ///
+/// A model that does not fit the memory budget is not loaded straight away: the reason is shown
+/// (see [`Found::why_not`]) and the person chooses the model that does fit (`f`), loading it anyway
+/// (`y`), or going back.
+///
 /// # Errors
 /// I/O errors on the console.
 pub fn pick_model<R: BufRead, W: Write>(
@@ -149,15 +156,66 @@ pub fn pick_model<R: BufRead, W: Write>(
         if input.read_line(&mut line)? == 0 {
             return Ok(Choice::Quit);
         }
-        if let Some(c) = parse_choice(&line, models.len()) {
-            return Ok(c);
+        match parse_choice(&line, models.len()) {
+            Some(Choice::Model(i)) => match confirm_fit(models, i, budget_mb, ctx, input, out)? {
+                Fit::Load(j) => return Ok(Choice::Model(j)),
+                Fit::Again => {}
+                Fit::Eof => return Ok(Choice::Quit),
+            },
+            Some(c) => return Ok(c),
+            None => writeln!(
+                out,
+                "  Please type a number from 1 to {}, r, w, h, i or q.",
+                models.len()
+            )?,
         }
-        writeln!(
-            out,
-            "  Please type a number from 1 to {}, r, w, h, i or q.",
-            models.len()
-        )?;
     }
+}
+
+/// What to do after a model was chosen.
+enum Fit {
+    Load(usize),
+    Again,
+    Eof,
+}
+
+/// A model that fits loads at once. One that does not gets its reason and a choice.
+fn confirm_fit<R: BufRead, W: Write>(
+    models: &[Found],
+    i: usize,
+    budget_mb: u64,
+    ctx: u32,
+    input: &mut R,
+    out: &mut W,
+) -> io::Result<Fit> {
+    let Some(why) = models[i].why_not(budget_mb, ctx) else {
+        return Ok(Fit::Load(i));
+    };
+    writeln!(out, "\n  {} {why}", models[i].name)?;
+    let other = crate::models::fallback(models, i, budget_mb, ctx);
+    match other {
+        Some(j) => writeln!(
+            out,
+            "  f = use {} instead (fits, about {} MB)   y = load it anyway (it may fail or be very slow)   anything else = choose again",
+            models[j].name,
+            models[j].needs_mb(ctx)
+        )?,
+        None => writeln!(
+            out,
+            "  Nothing else on this machine fits.   y = load it anyway (it may fail or be very slow)   anything else = choose again"
+        )?,
+    }
+    write!(out, "  > ")?;
+    out.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Ok(Fit::Eof);
+    }
+    Ok(match (line.trim().to_ascii_lowercase().as_str(), other) {
+        ("f", Some(j)) => Fit::Load(j),
+        ("y", _) => Fit::Load(i),
+        _ => Fit::Again,
+    })
 }
 
 /// Drop the oldest turns until the history fits `max_tokens` (estimated, see
@@ -339,6 +397,102 @@ mod tests {
         assert!(m.contains(" 1) small") && m.contains("fits in memory") && m.contains("TOO BIG"));
         assert!(m.contains("/mnt/sda1/small.gguf"));
         assert!(render_menu(&[], 0, 2048).contains("No models found"));
+    }
+
+    /// A model whose header says its layers and width, so the attention cache can be worked out.
+    fn model_with_cache(name: &str, mb: u64, layers: u64, width: u64) -> Found {
+        let mut m = model(name, mb);
+        m.gguf = Some(crate::gguf_info::GgufInfo {
+            version: 3,
+            tensor_count: 1,
+            architecture: Some("llama".into()),
+            name: None,
+            file_type: None,
+            context_length: None,
+            embedding_length: Some(width),
+            block_count: Some(layers),
+            header_bytes_read: 64,
+        });
+        m
+    }
+
+    #[test]
+    fn a_model_that_does_not_fit_says_where_the_memory_goes_and_what_would_fit() {
+        // 3000 MB file + 1024 MB cache (32 layers x 4096 wide x 2048 tokens x 4 bytes) + 256 MB.
+        let m = model_with_cache("m", 3000, 32, 4096);
+        assert!(m.why_not(5000, 2048).is_none());
+        let why = m.why_not(3500, 2048).unwrap();
+        assert!(why.contains("needs about 4280 MB"), "{why}");
+        assert!(
+            why.contains("3000 MB file + 1024 MB attention cache + 256 MB working memory"),
+            "{why}"
+        );
+        assert!(why.contains("only 3500 MB is free"), "{why}");
+        assert!(why.contains("up to 448 tokens"), "{why}");
+        // When the file alone is too big no context would help.
+        let huge = model_with_cache("h", 5000, 32, 4096);
+        let why = huge.why_not(3500, 512).unwrap();
+        assert!(why.contains("file alone does not fit"), "{why}");
+        // Without header information it still explains itself.
+        let plain = model("p", 9000);
+        assert!(plain.why_not(3500, 2048).unwrap().contains("smaller model"));
+    }
+
+    #[test]
+    fn the_fallback_is_the_largest_model_that_fits_and_is_no_bigger() {
+        use crate::models::fallback;
+        let ms = [
+            model("big", 5000),
+            model("mid", 3000),
+            model("small", 1000),
+            model("huge", 9000),
+        ];
+        assert_eq!(fallback(&ms, 0, 3500, 512), Some(1), "big -> mid");
+        assert_eq!(
+            fallback(&ms, 3, 3500, 512),
+            Some(1),
+            "huge -> mid, not the one that is too big"
+        );
+        // Nothing smaller fits, so the largest that does fit is offered.
+        let ms = [model("tiny", 400), model("mid", 3000), model("big", 5000)];
+        assert_eq!(fallback(&ms, 0, 100, 512), None, "nothing fits at all");
+        assert_eq!(fallback(&ms, 0, 3500, 512), Some(1));
+        assert_eq!(fallback(&[model("only", 9000)], 0, 100, 512), None);
+        assert_eq!(
+            fallback(&ms, 9, 3500, 512),
+            Some(1),
+            "an index out of range is not a crash"
+        );
+    }
+
+    #[test]
+    fn choosing_a_model_that_does_not_fit_shows_why_and_asks() {
+        let ms = [model("small", 1000), model("big", 9000)];
+        let run = |input: &str| {
+            let mut out = Vec::new();
+            let c = pick_model(&ms, 3500, 2048, &mut input.as_bytes(), &mut out).unwrap();
+            (c, String::from_utf8(out).unwrap())
+        };
+        // The menu itself already gives the reason.
+        let (_, text) = run("q\n");
+        assert!(text.contains("It needs at least 9000 MB"), "{text}");
+        // f takes the one that fits; y loads it anyway; anything else asks again.
+        let (c, text) = run("2\nf\n");
+        assert_eq!(c, Choice::Model(0));
+        assert!(text.contains("f = use small instead"), "{text}");
+        assert_eq!(run("2\ny\n").0, Choice::Model(1));
+        assert_eq!(run("2\nno\n1\n").0, Choice::Model(0), "back to choosing");
+        assert_eq!(run("2\n").0, Choice::Quit, "end of input while asked");
+        // A model that fits loads with no questions.
+        assert_eq!(run("1\n").0, Choice::Model(0));
+        // With nothing else that fits, f is not offered and does nothing.
+        let ms2 = [model("big", 9000)];
+        let mut out = Vec::new();
+        let c = pick_model(&ms2, 3500, 2048, &mut "1\nf\nq\n".as_bytes(), &mut out).unwrap();
+        assert_eq!(c, Choice::Quit);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Nothing else on this machine fits"));
     }
 
     #[test]

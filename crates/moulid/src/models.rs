@@ -4,7 +4,7 @@
 //! is described from its GGUF header so the picker can show architecture, size and whether it
 //! fits in memory.
 
-use crate::gguf_info::{self, estimate_ram, file_type_name, GgufInfo};
+use crate::gguf_info::{self, cache_bytes, estimate_ram, file_type_name, GgufInfo, OVERHEAD_BYTES};
 use mouli_llm::gguf::parse_header_only;
 use std::fs::File;
 use std::io::Read;
@@ -55,12 +55,81 @@ impl Found {
         self.needs_mb(ctx) <= budget_mb
     }
 
+    /// Bytes of attention cache per token of context (zero when the header does not say).
+    fn cache_per_token(&self) -> u64 {
+        self.gguf.as_ref().map_or(0, |g| cache_bytes(g, 1))
+    }
+
+    /// Why this model does not fit `budget_mb` at a `ctx`-token context, in words a person can act
+    /// on; `None` when it fits. It says where the memory goes, and either how long a context would
+    /// fit or that no context would.
+    #[must_use]
+    pub fn why_not(&self, budget_mb: u64, ctx: u32) -> Option<String> {
+        if self.fits(budget_mb, ctx) {
+            return None;
+        }
+        let mb = |b: u64| b.div_ceil(1 << 20);
+        let cache = self.cache_per_token().saturating_mul(u64::from(ctx));
+        let fixed = self.size.saturating_add(OVERHEAD_BYTES);
+        let mut s = if self.gguf.is_some() {
+            format!(
+                "needs about {} MB at a {ctx}-token context ({} MB file + {} MB attention cache + {} MB working memory), but only {budget_mb} MB is free for models.",
+                self.needs_mb(ctx),
+                self.size_mb(),
+                mb(cache),
+                mb(OVERHEAD_BYTES)
+            )
+        } else {
+            // No readable header: the estimate is the file size alone.
+            format!(
+                "needs at least {} MB (the file; its header could not be read, so the memory for the conversation is not counted), but only {budget_mb} MB is free for models.",
+                self.size_mb()
+            )
+        };
+        let budget = budget_mb.saturating_mul(1 << 20);
+        let per = self.cache_per_token();
+        let fit_ctx = if per > 0 && budget > fixed {
+            (budget - fixed) / per / 64 * 64
+        } else {
+            0
+        };
+        if fixed > budget {
+            s.push_str(" Even with no conversation memory the file alone does not fit: choose a smaller model or a smaller quantisation (Q4_K_M instead of Q8_0, for example).");
+        } else if fit_ctx >= 128 {
+            s.push_str(&format!(
+                " A context of up to {fit_ctx} tokens would fit, or choose a smaller model."
+            ));
+        } else {
+            s.push_str(" Choose a smaller model or a smaller quantisation.");
+        }
+        Some(s)
+    }
+
     /// The quantisation, for example `Q4_K_M`, when the header says.
     #[must_use]
     pub fn quant(&self) -> Option<&'static str> {
         let name = file_type_name(self.gguf.as_ref()?.file_type?);
         (name != "unknown").then_some(name)
     }
+}
+
+/// The model to use instead of `models[wanted]` when that one does not fit: the largest one that
+/// fits and is no bigger than the one asked for; if every fitting model is bigger, the largest that
+/// fits. `None` when nothing fits.
+#[must_use]
+pub fn fallback(models: &[Found], wanted: usize, budget_mb: u64, ctx: u32) -> Option<usize> {
+    let limit = models.get(wanted).map_or(u64::MAX, |m| m.size);
+    let fitting = || {
+        models
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| *i != wanted && m.fits(budget_mb, ctx))
+    };
+    fitting()
+        .filter(|(_, m)| m.size <= limit)
+        .max_by_key(|(_, m)| m.size)
+        .or_else(|| fitting().max_by_key(|(_, m)| m.size))
+        .map(|(i, _)| i)
 }
 
 /// Describe one file, or `None` when it is not a readable GGUF.

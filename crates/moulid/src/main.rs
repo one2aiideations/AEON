@@ -395,6 +395,9 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     m.name,
                     m.size_mb()
                 ));
+                if let Some(why) = m.why_not(plan.model_budget_mb, plan.ctx) {
+                    say(&format!("MOULI: warning: {} {why}", m.name));
+                }
                 let mut child = match launch(a, &m.path, plan, pid1) {
                     Ok(c) => c,
                     Err(e) => {
