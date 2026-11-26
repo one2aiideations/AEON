@@ -163,3 +163,98 @@ fn split_run_is_reproducible_and_honestly_labelled() {
     assert_eq!(Strategy::parse("ewc"), Some(Strategy::Ewc));
     assert_eq!(Strategy::parse("nope"), None);
 }
+
+fn ablation_cfg() -> AetheronMlCfg {
+    AetheronMlCfg {
+        in_dim: 6,
+        units: 4,
+        branches: 2,
+        hidden: 3,
+        n_classes: 3,
+        dk: 3,
+        eps: -1.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_attention_switch_changes_the_output_and_its_gradients_are_still_correct() {
+    let ds = synthetic_blobs(12, 6, 3, 4);
+    let mut on = AetheronMlLearner::new(ablation_cfg(), 5);
+    let off_cfg = AetheronMlCfg {
+        attention: false,
+        ..ablation_cfg()
+    };
+    let mut off = AetheronMlLearner::new(off_cfg, 5);
+    // Same seed and weights, different forward pass.
+    let a = on.logits(&ds.x, EvalNorm::FixedEma);
+    let b = off.logits(&ds.x, EvalNorm::FixedEma);
+    assert!(
+        a.d.iter().zip(&b.d).any(|(x, y)| (x - y).abs() > 1e-9),
+        "attention must matter when on"
+    );
+    // Gradients with attention off still match finite differences.
+    for _ in 0..3 {
+        off.step(&ds.x, &ds.y, Mode::Encode);
+    }
+    let mut rng = Rng::new(6);
+    assert_all(&gradcheck_model(&off, &ds.x, &ds.y, 10, &mut rng));
+}
+
+#[test]
+fn with_attention_off_the_query_and_key_weights_do_not_move_but_with_it_on_they_do() {
+    let ds = synthetic_blobs(24, 6, 3, 4);
+    for attention in [false, true] {
+        let cfg = AetheronMlCfg {
+            attention,
+            ..ablation_cfg()
+        };
+        let mut m = AetheronMlLearner::new(cfg, 5);
+        let (wq, wk) = (m.unit.wq.d.clone(), m.unit.wk.d.clone());
+        let before = m.logits(&ds.x, EvalNorm::FixedEma);
+        for _ in 0..10 {
+            m.step(&ds.x, &ds.y, Mode::Encode);
+        }
+        let after = m.logits(&ds.x, EvalNorm::FixedEma);
+        assert!(
+            before
+                .d
+                .iter()
+                .zip(&after.d)
+                .any(|(x, y)| (x - y).abs() > 1e-9),
+            "it still learns"
+        );
+        let moved = m.unit.wq.d != wq || m.unit.wk.d != wk;
+        assert_eq!(
+            moved, attention,
+            "attention={attention}: query/key weights moved = {moved}"
+        );
+    }
+}
+
+#[test]
+fn ablation_architectures_run_and_keep_their_own_names() {
+    let tr = synthetic_blobs(300, 8, 10, 41);
+    let te = synthetic_blobs(100, 8, 10, 42);
+    let cfg = RunCfg {
+        epochs: 1,
+        batch: 32,
+        lr: 0.05,
+        ewc_lambda: 100.0,
+        mem_per_class: 5,
+    };
+    for arch in [
+        "aetheron-no-attention",
+        "aetheron-no-gate",
+        "aetheron-no-homeostasis",
+    ] {
+        let r = run_split(arch, Strategy::None, 1, &tr, &te, &cfg);
+        assert_eq!(r.arch, arch);
+        assert!(r.final_avg.is_finite());
+    }
+    // An unknown name does not silently become Aetheron.
+    assert_eq!(
+        run_split("aetheron-no-everything", Strategy::None, 1, &tr, &te, &cfg).arch,
+        "mlp"
+    );
+}

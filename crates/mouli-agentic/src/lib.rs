@@ -9647,12 +9647,73 @@ pub mod agentmem {
             if !reader.is_done() {
                 return Err(CheckpointError::TrailingBytes);
             }
+            // The encoder writes streams sorted by (tenant, peer). Return the same canonical order,
+            // so equal checkpoints compare equal whatever order the bytes listed them in and
+            // `decode(encode(x)) == x` holds for every decodable input.
+            streams.sort_by(|a, b| {
+                a.tenant_id
+                    .cmp(&b.tenant_id)
+                    .then_with(|| a.peer_id.cmp(&b.peer_id))
+            });
             let checkpoint = ReplayCheckpoint {
                 window_size,
                 streams,
             };
             validate_checkpoint(&checkpoint, limits)?;
             Ok(checkpoint)
+        }
+
+        #[cfg(test)]
+        mod order_tests {
+            use super::*;
+
+            fn stream(t: &str) -> StreamCheckpoint {
+                StreamCheckpoint {
+                    tenant_id: t.into(),
+                    peer_id: "x".into(),
+                    highest_sequence: 5,
+                    accepted_sequences: [5u64].into_iter().collect(),
+                }
+            }
+
+            /// Bytes for two streams ("a" then "b") with their records swapped and the CRC redone:
+            /// valid by every rule except that the encoder would have written them the other way.
+            fn swapped_frame() -> (Vec<u8>, Vec<u8>) {
+                let cp = ReplayCheckpoint {
+                    window_size: 8,
+                    streams: vec![stream("a"), stream("b")],
+                };
+                let sorted = encode(&cp, &CodecLimits::default()).unwrap();
+                // header(10) + window(8) + count(4); then two records of equal length.
+                let start = HEADER_LEN + 8 + 4;
+                let end = sorted.len() - CHECKSUM_LEN;
+                let record = (end - start) / 2;
+                assert_eq!(start + 2 * record, end);
+                let mut swapped = sorted[..start].to_vec();
+                swapped.extend_from_slice(&sorted[start + record..end]);
+                swapped.extend_from_slice(&sorted[start..start + record]);
+                let crc = crc32(&swapped);
+                swapped.extend_from_slice(&crc.to_be_bytes());
+                assert_ne!(swapped, sorted);
+                (sorted, swapped)
+            }
+
+            #[test]
+            fn decoding_returns_the_canonical_order_the_encoder_writes() {
+                let (sorted, swapped) = swapped_frame();
+                let limits = CodecLimits::default();
+                let from_sorted = decode(&sorted, &limits).unwrap();
+                let from_swapped = decode(&swapped, &limits).unwrap();
+                assert_eq!(
+                    from_swapped, from_sorted,
+                    "the same streams are the same checkpoint"
+                );
+                assert_eq!(from_swapped.streams[0].tenant_id, "a");
+                // decode(encode(x)) == x for the decoded value, and re-encoding gives the canonical bytes.
+                let again = encode(&from_swapped, &limits).unwrap();
+                assert_eq!(again, sorted);
+                assert_eq!(decode(&again, &limits).unwrap(), from_swapped);
+            }
         }
 
         #[cfg(test)]
@@ -11265,6 +11326,11 @@ pub mod agentmem {
         //!
         //! Records decisions and lifecycle actions without storing memory contents.
         //! This is an in-memory component, not tamper-proof or durable audit storage.
+        //!
+        //! It is not suitable as an audit file format: it has no serialisation or integrity check, a
+        //! full journal silently drops its oldest events, and `append` refuses an event whose
+        //! timestamp goes backwards (so an action could go unrecorded after a clock step). The
+        //! tests in `tests/agentmem_journal_as_audit.rs` pin these down.
 
         use std::collections::VecDeque;
 
@@ -18229,6 +18295,9 @@ pub mod agentmem {
             if !reader.done() {
                 return Err(DeltaCodecError::TrailingBytes);
             }
+            // The encoder writes changes sorted by key; return the same canonical order (see the
+            // checkpoint decoder).
+            changes.sort_by_key(change_key);
             let delta = CheckpointDelta {
                 base_digest,
                 target_window_size,
@@ -18268,6 +18337,38 @@ pub mod agentmem {
                         },
                     ],
                 }
+            }
+
+            #[test]
+            fn decoding_returns_changes_in_the_canonical_order_the_encoder_writes() {
+                let key = |t: &str| StreamKey {
+                    tenant_id: t.into(),
+                    peer_id: "x".into(),
+                };
+                let delta = CheckpointDelta {
+                    base_digest: 1,
+                    target_window_size: 8,
+                    changes: vec![
+                        StreamChange::Remove { key: key("a") },
+                        StreamChange::Remove { key: key("b") },
+                    ],
+                };
+                let limits = DeltaCodecLimits::default();
+                let sorted = encode(&delta, &limits).unwrap();
+                // header(10) + digest(8) + window(8) + count(4); then two records of equal length.
+                let start = HEADER_LEN + 8 + 8 + 4;
+                let end = sorted.len() - CHECKSUM_LEN;
+                let record = (end - start) / 2;
+                assert_eq!(start + 2 * record, end);
+                let mut swapped = sorted[..start].to_vec();
+                swapped.extend_from_slice(&sorted[start + record..end]);
+                swapped.extend_from_slice(&sorted[start..start + record]);
+                let crc = crc32(&swapped);
+                swapped.extend_from_slice(&crc.to_be_bytes());
+                assert_ne!(swapped, sorted);
+                let from_swapped = decode(&swapped, &limits).unwrap();
+                assert_eq!(from_swapped, decode(&sorted, &limits).unwrap());
+                assert_eq!(encode(&from_swapped, &limits).unwrap(), sorted);
             }
 
             #[test]

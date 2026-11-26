@@ -116,8 +116,6 @@ pub struct SmpBootController {
     master_epoch_us: AtomicU64,
 }
 
-unsafe impl Sync for SmpBootController {}
-
 impl SmpBootController {
     pub const fn new() -> Self {
         Self {
@@ -319,6 +317,8 @@ impl MouliMasterMonolith {
             return Err(BootError::AsilDIntegrityViolation);
         }
 
+        // SAFETY: `metrics` is wrapped in `SingleContext` (see its construction above): by that contract only the
+        // primary core touches it, so no other reference is alive; this one ends with the function.
         let m = unsafe { &mut *self.metrics.get().get() };
         m.total_cycles_executed += 1;
 
@@ -342,11 +342,13 @@ impl MouliMasterMonolith {
             .store(true, Ordering::SeqCst);
         self.is_running.store(false, Ordering::SeqCst);
 
+        // SAFETY: same `SingleContext` contract as above: only the primary core touches `metrics`.
         let m = unsafe { &mut *self.metrics.get().get() };
         m.system_nominal = false;
     }
 
     pub fn get_metrics(&self) -> VehicleSystemMetrics {
+        // SAFETY: same `SingleContext` contract as above; the metrics are `Copy`, so this copies them out.
         unsafe { *self.metrics.get().get() }
     }
 }

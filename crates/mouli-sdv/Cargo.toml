@@ -24,6 +24,9 @@ missing_docs = "allow"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+# Every `unsafe` block and impl must say why it is sound (a `// SAFETY:` comment). New undocumented
+# unsafe fails the build.
+undocumented_unsafe_blocks = "deny"
 # Style lints that do not affect correctness in this register-and-ring-buffer style code:
 needless_range_loop = "allow"           # indexed loops mirror hardware tables and are clearer here
 declare_interior_mutable_const = "allow" # `const ZERO: AtomicU8` is the intended array initialiser

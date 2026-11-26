@@ -315,6 +315,7 @@ impl PassiveBalancingController {
         }
         self.target_voltage_mv.store(min_mv, Ordering::Relaxed);
 
+        // SAFETY: `PassiveBalancingController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the balancing mask is alive.
         let mask = unsafe { &mut *self.balancing_mask.get() };
         let mut count = 0u8;
 
@@ -339,6 +340,7 @@ impl PassiveBalancingController {
     }
 
     pub fn clear_all(&self) {
+        // SAFETY: `PassiveBalancingController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the balancing mask is alive.
         let mask = unsafe { &mut *self.balancing_mask.get() };
         for val in mask.iter_mut() {
             *val = false;
@@ -348,6 +350,8 @@ impl PassiveBalancingController {
 
     pub fn is_cell_balancing(&self, cell_idx: usize) -> bool {
         if cell_idx < BMS_SERIES_CELLS {
+            // SAFETY: `PassiveBalancingController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the balancing mask is alive.
+            // `cell_idx` was checked against the cell count above.
             let mask = unsafe { &*self.balancing_mask.get() };
             mask[cell_idx]
         } else {
@@ -488,6 +492,7 @@ impl ThermalSafetySupervisor {
 
         let last_time = self.last_timestamp_us.load(Ordering::Relaxed);
         let dt_sec = ((now_us.saturating_sub(last_time)) as f32) / 1_000_000.0;
+        // SAFETY: `ThermalSafetySupervisor` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the previous temperatures is alive.
         let prev = unsafe { &mut *self.last_temperatures.get() };
 
         for (i, &t) in temps.iter().enumerate() {
@@ -598,6 +603,7 @@ impl BatteryManagementSystem {
         // --- STEP 4: STATE ESTIMATION (DUAL EKF UPDATE) ---
         let pack_v = (telemetry.pack_voltage_deciav as f32) / 10.0;
         let pack_i = (telemetry.pack_current_milliamps as f32) / 1000.0;
+        // SAFETY: `BatteryManagementSystem` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the filter state is alive.
         let ekf = unsafe { &mut *self.ekf.get() };
         ekf.update_step(pack_i, pack_v, dt);
 
@@ -648,11 +654,15 @@ impl BatteryManagementSystem {
     }
 
     pub fn get_state_of_charge(&self) -> f32 {
+        // SAFETY: `BatteryManagementSystem` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the filter state is alive.
+        // It is only read here.
         let ekf = unsafe { &*self.ekf.get() };
         ekf.soc
     }
 
     pub fn get_state_of_health(&self) -> f32 {
+        // SAFETY: `BatteryManagementSystem` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the filter state is alive.
+        // It is only read here.
         let ekf = unsafe { &*self.ekf.get() };
         ekf.get_soh_percentage()
     }

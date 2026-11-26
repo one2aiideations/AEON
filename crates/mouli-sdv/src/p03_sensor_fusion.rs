@@ -304,6 +304,12 @@ pub struct PpuAcceleratorDriver {
     is_busy: AtomicBool,
 }
 
+// SAFETY: the interior-mutable descriptors form a ring with `job_head` and `job_tail` as atomics.
+// Sound only under the single-producer, single-consumer rule: one thread at a time calls
+// `dispatch_inference_job` (writes the slot at `head`, then publishes it with a Release store) and
+// one calls `poll_inference_complete` (reads the slot at `tail`, only below the Acquire-loaded
+// `head`). Nothing in the types enforces that; two producers would write the same slot.
+// `hardware_doorbell_reg` is a raw pointer that is only written through (see its use).
 unsafe impl Sync for PpuAcceleratorDriver {}
 
 impl PpuAcceleratorDriver {
@@ -343,6 +349,9 @@ impl PpuAcceleratorDriver {
         }
 
         let slot = head & (PPU_TENSOR_DESCRIPTOR_SLOTS - 1);
+        // SAFETY: the check above shows head - tail < slots, so the consumer cannot be reading this
+        // slot, and by the single-producer rule nobody else is writing it. It is not published
+        // until the Release store below.
         let desc = unsafe { &mut *self.descriptors[slot].get() };
         desc.input_frame_id = frame_id;
         desc.physical_address_src = src;
@@ -354,6 +363,9 @@ impl PpuAcceleratorDriver {
 
         // Ring MMIO doorbell to trigger DMA engine on PPU coprocessor
         if !self.hardware_doorbell_reg.is_null() {
+            // SAFETY: the pointer is non-null (checked) and was built from the doorbell address
+            // given to `new`; the integrator must have given the address of a writable 32-bit
+            // device register, which this code cannot check. Volatile so the write is kept.
             unsafe {
                 core::ptr::write_volatile(self.hardware_doorbell_reg, slot as u32);
             }
@@ -370,6 +382,9 @@ impl PpuAcceleratorDriver {
         }
 
         let slot = tail & (PPU_TENSOR_DESCRIPTOR_SLOTS - 1);
+        // SAFETY: `tail != head` was checked with `head` loaded as Acquire, so this slot was fully
+        // written and published by the producer, which does not write it again until `tail`
+        // moves past it.
         let desc = unsafe { &*self.descriptors[slot].get() };
 
         // Emulate completion when descriptor invalidation is processed
@@ -583,6 +598,10 @@ pub struct SensorFusionEngine {
     engine_lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable `track_pool` is only written between `acquire_lock` and
+// `release_lock` of `engine_lock` (in `update`), which makes writers mutually exclusive. Readers
+// that take no lock (`evaluate_aeb_intervention`) are only sound if they do not run at the same
+// time as `update`, as in a single control loop; nothing in the types enforces that.
 unsafe impl Sync for SensorFusionEngine {}
 
 impl SensorFusionEngine {
@@ -626,6 +645,8 @@ impl SensorFusionEngine {
 
         // 1. Predict all active tracks
         for slot in self.track_pool.iter() {
+            // SAFETY: `engine_lock` is held (taken at the top of this function), and this is the
+            // only reference to this slot: the reference ends each iteration.
             let track = unsafe { &mut *slot.get() };
             if track.status != TrackStatus::Free {
                 track.predict(dt_seconds);
@@ -639,6 +660,7 @@ impl SensorFusionEngine {
             let mut min_distance_sq = 16.0f32; // 4.0m gating threshold
 
             for (idx, slot) in self.track_pool.iter().enumerate() {
+                // SAFETY: `engine_lock` is held and no `&mut` to this slot is alive here.
                 let track = unsafe { &*slot.get() };
                 if track.status != TrackStatus::Free {
                     let dx = track.state.data[0] - cam.longitudinal_m;
@@ -652,6 +674,8 @@ impl SensorFusionEngine {
             }
 
             if let Some(idx) = best_idx {
+                // SAFETY: `engine_lock` is held; the shared references from the search loop above
+                // ended with it, so this is the only reference to slot `idx`.
                 let track = unsafe { &mut *self.track_pool[idx].get() };
                 track.update_camera(cam.longitudinal_m, cam.lateral_m, 0.35);
                 track.class = cam.class;
@@ -677,6 +701,7 @@ impl SensorFusionEngine {
             let mut min_dist_sq = 25.0f32; // 5.0m gating threshold
 
             for (idx, slot) in self.track_pool.iter().enumerate() {
+                // SAFETY: `engine_lock` is held and no `&mut` to this slot is alive here.
                 let track = unsafe { &*slot.get() };
                 if track.status != TrackStatus::Free {
                     let dx = track.state.data[0] - cart_x;
@@ -690,6 +715,8 @@ impl SensorFusionEngine {
             }
 
             if let Some(idx) = best_idx {
+                // SAFETY: `engine_lock` is held; the search loop's shared references ended, so
+                // this is the only reference to slot `idx`.
                 let track = unsafe { &mut *self.track_pool[idx].get() };
                 track.update_radar(
                     rad.radial_distance_m,
@@ -701,6 +728,7 @@ impl SensorFusionEngine {
 
         // 4. Track pruning & garbage collection for missed cycles
         for slot in self.track_pool.iter() {
+            // SAFETY: `engine_lock` is held and the reference ends each iteration.
             let track = unsafe { &mut *slot.get() };
             if track.status != TrackStatus::Free
                 && timestamp_micros.saturating_sub(track.last_updated_micros) > 500_000
@@ -724,6 +752,9 @@ impl SensorFusionEngine {
         ts: u64,
     ) {
         for slot in self.track_pool.iter() {
+            // SAFETY: this private function is called from `update`, which holds `engine_lock` and
+            // has no reference into the pool alive at the call, and from a single-threaded test.
+            // The reference ends at `break` or the end of the iteration.
             let track = unsafe { &mut *slot.get() };
             if track.status == TrackStatus::Free {
                 let new_id = self.next_track_id.fetch_add(1, Ordering::Relaxed);
@@ -775,6 +806,8 @@ impl CollisionAvoidanceArbitrator {
         let mut min_calculated_ttc = 99.0f32;
 
         for slot in fusion.track_pool.iter() {
+            // SAFETY: this takes no lock, so it is only sound if `update` is not running at the
+            // same time (the single control loop of the design); see the `Sync` impl.
             let track = unsafe { &*slot.get() };
             if track.status != TrackStatus::Confirmed {
                 continue;
@@ -900,6 +933,7 @@ mod tests {
         );
 
         // Force confirmation
+        // SAFETY: single-threaded test; no other reference to the pool exists.
         unsafe {
             let t = &mut *fusion.track_pool[0].get();
             t.status = TrackStatus::Confirmed;

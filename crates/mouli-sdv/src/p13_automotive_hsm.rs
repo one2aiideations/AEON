@@ -92,6 +92,8 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[inline(never)]
 pub fn secure_zero_memory(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a live `&mut u8` taken from the slice being iterated, so it is valid, aligned and
+        // exclusive. The write is volatile so the compiler cannot remove the zeroing as a dead store.
         unsafe {
             core::ptr::write_volatile(byte, 0);
         }
@@ -549,6 +551,9 @@ pub struct SecureKeyStore {
     lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable key slots are only accessed between `acquire` and `release` of the
+// same spin lock (Acquire/Release), so accesses are mutually exclusive and ordered. A thread that
+// panics while holding the lock leaves it locked.
 unsafe impl Sync for SecureKeyStore {}
 
 impl SecureKeyStore {
@@ -594,6 +599,8 @@ impl SecureKeyStore {
         }
 
         self.acquire();
+        // SAFETY: the lock taken by `self.acquire()` above is held until `release`, so this is the only reference
+        // to the key slots. `slot_id` was checked against the slot count above.
         let slots = unsafe { &mut *self.slots.get() };
         let slot = &mut slots[slot_id];
 
@@ -626,6 +633,8 @@ impl SecureKeyStore {
         }
 
         self.acquire();
+        // SAFETY: the lock taken by `self.acquire()` above is held until `release`, so this is the only reference
+        // to the key slots. `slot_id` was checked against the slot count above.
         let slots = unsafe { &mut *self.slots.get() };
         let slot = &mut slots[slot_id];
 
@@ -695,6 +704,9 @@ impl HsmMailboxController {
 
     /// Initializes the internal DRBG from hardware physical entropy sources (TRNG)
     pub fn seed_drbg_from_trng(&self, trng_entropy: &[u8; 32], nonce: &[u8; 16]) {
+        // SAFETY: `HsmMailboxController` holds `UnsafeCell`s and has no `Sync` impl, so it cannot be shared across
+        // threads and no other reference to the DRBG is alive. An interrupt handler on the same core that
+        // re-enters the controller would break this; nothing in the types prevents that.
         let drbg = unsafe { &mut *self.drbg.get() };
         drbg.instantiate(trng_entropy, nonce, b"mouli_OS_HSM_BOOT");
     }
@@ -719,6 +731,8 @@ impl HsmMailboxController {
             return Err(HsmError::BufferOverflow);
         }
 
+        // SAFETY: same single-context ownership as `seed_drbg_from_trng`: no other reference to the command buffer
+        // is alive. The length was checked against the buffer capacity above.
         let cmd_buf = unsafe { &mut *self.cmd_payload.get() };
         cmd_buf[..payload.len()].copy_from_slice(payload);
         self.cmd_reg.store(opcode as u16, Ordering::Release);
@@ -729,6 +743,7 @@ impl HsmMailboxController {
 
         match opcode {
             HsmCommandOpcode::GenerateRandom => {
+                // SAFETY: same single-context ownership as `seed_drbg_from_trng`: no other reference to the DRBG is alive.
                 let drbg = unsafe { &mut *self.drbg.get() };
                 let req_len = core::cmp::min(out_response.len(), HSM_MAILBOX_PAYLOAD_CAPACITY);
                 match drbg.generate(&mut out_response[..req_len]) {

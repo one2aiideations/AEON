@@ -281,6 +281,14 @@ pub struct Pse51Scheduler {
     lock: AtomicBool,
 }
 
+// SAFETY: this is only conditionally sound. `pthread_create`, `schedule_next` and `nanosleep` take
+// `&mut` to the whole `tcbs` array while holding `lock`, so they exclude each other. But
+// `handle_timer_tick` (documented as running from a timer interrupt) and the mutex functions take
+// `&` to the same array without the lock. If the tick preempts a function that is holding the
+// `&mut`, the two references alias, which is undefined behaviour in Rust's model even though the
+// fields the tick touches are atomics. It is sound only where the tick and the mutex functions
+// cannot run during those locked sections (for example a single core that masks the timer
+// interrupt while scheduling). Nothing in the types enforces that.
 unsafe impl Sync for Pse51Scheduler {}
 
 impl Pse51Scheduler {
@@ -329,6 +337,8 @@ impl Pse51Scheduler {
         }
 
         self.acquire();
+        // SAFETY: `acquire()` above is held (every return path releases it), so no other locked function has a reference into the task array.
+        // It is not written to be called from interrupt context (`handle_timer_tick` is the one meant for that).
         let tcbs = unsafe { &mut *self.tcbs.get() };
 
         // Search for an unused TCB slot
@@ -370,6 +380,7 @@ impl Pse51Scheduler {
     /// Cyclic timer tick called from hardware interrupt (e.g., 1000 Hz / 1ms)
     pub fn handle_timer_tick(&self, now_ns: u64) {
         self.system_ticks.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `handle_timer_tick` takes no lock: see the `Sync` impl for the condition under which a shared reference here cannot overlap a `&mut` held by a locked function.
         let tcbs = unsafe { &*self.tcbs.get() };
 
         // 1. Wake sleeping tasks whose timeout has expired
@@ -411,6 +422,7 @@ impl Pse51Scheduler {
     /// Selects next thread to run, returning (previous_ctx_ptr, next_ctx_ptr)
     pub fn schedule_next(&self) -> Option<(*const CpuContext, *const CpuContext)> {
         self.acquire();
+        // SAFETY: `acquire()` above is held (every return path releases it), so no other locked function has a reference into the task array.
         let tcbs = unsafe { &mut *self.tcbs.get() };
 
         let next_candidate = self.run_queue.dequeue_highest();
@@ -453,6 +465,7 @@ impl Pse51Scheduler {
         }
 
         self.acquire();
+        // SAFETY: `acquire()` above is held (every return path releases it), so no other locked function has a reference into the task array.
         let tcbs = unsafe { &mut *self.tcbs.get() };
         let tcb = &mut tcbs[thread_idx as usize];
 
@@ -502,6 +515,7 @@ impl PosixMutex {
 
     /// Locks the mutex, elevating calling thread's priority to ceiling
     pub fn lock(&self, thread_idx: u8, scheduler: &Pse51Scheduler) -> Result<(), i32> {
+        // SAFETY: `lock` takes no lock: see the `Sync` impl for the condition under which a shared reference here cannot overlap a `&mut` held by a locked function.
         let tcbs = unsafe { &*scheduler.tcbs.get() };
         if (thread_idx as usize) >= POSIX_MAX_THREADS {
             return Err(EINVAL);
@@ -549,6 +563,7 @@ impl PosixMutex {
             return Err(EPERM);
         }
 
+        // SAFETY: `unlock` takes no lock: see the `Sync` impl for the condition under which a shared reference here cannot overlap a `&mut` held by a locked function.
         let tcbs = unsafe { &*scheduler.tcbs.get() };
         let tcb = &tcbs[thread_idx as usize];
 
@@ -662,6 +677,8 @@ impl PosixFdTable {
             spin_loop();
         }
 
+        // SAFETY: the spin lock taken above is held, so this is the only reference to the descriptor table.
+        // `PosixFdTable` is not `Sync` (see the note on the type).
         let fds = unsafe { &mut *self.fds.get() };
 
         // Allocate first free file descriptor (starting past stdio 0, 1, 2)
@@ -687,6 +704,8 @@ impl PosixFdTable {
             return Err(EBADF);
         }
 
+        // SAFETY: `PosixFdTable` is not `Sync` (see the note on the type): one execution context owns it, so no
+        // other reference to the descriptor table is alive. `fd` was range-checked above.
         let fds = unsafe { &mut *self.fds.get() };
         if !fds[fd as usize].is_open.load(Ordering::Relaxed) {
             return Err(EBADF);
@@ -702,6 +721,8 @@ impl PosixFdTable {
         if fd < 0 || fd as usize >= POSIX_MAX_FDS {
             return Err(EBADF);
         }
+        // SAFETY: same single-context ownership as the other `PosixFdTable` methods; `fd` was range-checked above,
+        // and the entry's open flag is an atomic.
         let fds = unsafe { &*self.fds.get() };
         let entry = &fds[fd as usize];
 
@@ -720,6 +741,8 @@ impl PosixFdTable {
         if fd < 0 || fd as usize >= POSIX_MAX_FDS {
             return Err(EBADF);
         }
+        // SAFETY: same single-context ownership as the other `PosixFdTable` methods; `fd` was range-checked above,
+        // and the entry's open flag is an atomic.
         let fds = unsafe { &*self.fds.get() };
         let entry = &fds[fd as usize];
 
@@ -857,6 +880,7 @@ mod tests {
 
         // Put task to sleep for 50ms
         subsys.scheduler.nanosleep(0, 50_000_000).expect("Sleep ok");
+        // SAFETY: single-threaded test: nothing else references the task array.
         let tcbs = unsafe { &*subsys.scheduler.tcbs.get() };
         assert_eq!(tcbs[0].get_state(), ThreadState::BlockedOnTimer);
 
@@ -886,6 +910,7 @@ mod tests {
 
         // Acquire lock
         mutex.lock(0, &subsys.scheduler).expect("Lock ok");
+        // SAFETY: single-threaded test: nothing else references the task array.
         let tcbs = unsafe { &*subsys.scheduler.tcbs.get() };
         assert_eq!(tcbs[0].effective_priority.load(Ordering::Relaxed), 20);
 

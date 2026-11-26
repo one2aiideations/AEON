@@ -425,6 +425,10 @@ impl PcieRootPortController {
             return Err(PcieError::RingBufferFull);
         }
 
+        // SAFETY: the full-ring check above means the slot at `head` (always below the capacity,
+        // as `head` is kept modulo it) is not one the consumer can still read. Sound only with a
+        // single producer for this ring: two concurrent callers would both write the same slot,
+        // and this takes `&mut` to the whole queue.
         let ring = unsafe { &mut *self.tx_tlp_queue.get() };
         ring[head as usize] = *tlp;
 
@@ -673,6 +677,10 @@ pub struct CoreMailbox {
     processed_count: AtomicU32,
 }
 
+// SAFETY: each mailbox holds one message guarded by the `has_message` flag: the sender writes the
+// message and then sets the flag with Release, the receiver reads it after an Acquire load of the
+// flag and then clears it. That is sound for one sender at a time per mailbox and one receiving
+// core; two senders could both see the flag clear and write at once, which nothing prevents.
 unsafe impl Sync for CoreMailbox {}
 
 pub struct MultiCoreIpiEngine {
@@ -711,6 +719,8 @@ impl MultiCoreIpiEngine {
             return Err(IpiError::MailboxFull);
         }
 
+        // SAFETY: the flag was seen clear (Acquire), so the receiver is not reading the message;
+        // by the one-sender-per-mailbox rule (see the `Sync` impl) nobody else is writing it.
         let msg = unsafe { &mut *mb.message.get() };
         msg.command = cmd;
         msg.sender_core = sender;
@@ -732,6 +742,9 @@ impl MultiCoreIpiEngine {
             return None;
         }
 
+        // SAFETY: the flag was seen set (Acquire), so the sender finished writing the message
+        // (its Release store came after the write) and will not write again until the flag is
+        // cleared below. The message is `Copy`, so this copies it out.
         let msg = unsafe { *mb.message.get() };
         mb.processed_count.fetch_add(1, Ordering::Relaxed);
         mb.has_message.store(false, Ordering::Release);

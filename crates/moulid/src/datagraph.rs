@@ -8,6 +8,10 @@
 //! What is stored is the person's own data on their own disk: message text (cut to 2,000
 //! characters), the commands the model ran and a short result. `/graph.forget` erases it.
 
+use mouli_agentic::agentmem::access::{
+    AccessRequest, AccessRule, Effect, MemoryAccessPolicy, MemoryAction,
+};
+use mouli_agentic::agentmem::provenance::Provenance;
 use mouli_agentic::graph::{Graph, NodeId};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -33,6 +37,8 @@ pub struct Recorder {
     messages: u64,
     tools: u64,
     started: u64,
+    /// Who is typing: the source recorded for what they write.
+    actor: String,
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -54,6 +60,7 @@ impl Recorder {
             messages: 0,
             tools: 0,
             started: now,
+            actor: "unknown".to_string(),
         }
     }
 
@@ -142,14 +149,15 @@ impl Recorder {
 
     /// The person wrote `text` in the chat. Returns the message node.
     pub fn user_message(&mut self, text: &str, now: u64) -> Option<NodeId> {
-        let id = self.message("user", text, now)?;
+        let actor = self.actor.clone();
+        let id = self.message("user", text, ("user", &actor), now)?;
         self.save();
         Some(id)
     }
 
     /// The model answered `text`. `model` is the loaded model's name.
     pub fn assistant_message(&mut self, text: &str, model: &str, now: u64) -> Option<NodeId> {
-        let id = self.message("assistant", text, now)?;
+        let id = self.message("assistant", text, ("model", model), now)?;
         if !model.is_empty() {
             if let Ok(m) = self.graph.node("model", model, now) {
                 let _ = self.graph.link(id, m, "generated_by", now, &[]);
@@ -159,13 +167,40 @@ impl Recorder {
         Some(id)
     }
 
-    fn message(&mut self, role: &str, text: &str, now: u64) -> Option<NodeId> {
+    /// Who is typing, so what they write is recorded under their name.
+    pub fn set_actor(&mut self, user: &str) {
+        self.actor = short(user.trim(), 64);
+        if self.actor.is_empty() {
+            self.actor = "unknown".to_string();
+        }
+    }
+
+    fn message(
+        &mut self,
+        role: &str,
+        text: &str,
+        source: (&str, &str),
+        now: u64,
+    ) -> Option<NodeId> {
         let conv = self.conversation_node(now)?;
         self.messages += 1;
         let key = format!("{}/{}", self.conversation, self.messages);
         let id = self.graph.node("message", &key, now).ok()?;
         let _ = self.graph.set(id, "role", role);
         let _ = self.graph.set(id, "text", &short(text, KEEP));
+        // Where it came from, as the agent-memory provenance record describes it.
+        let p = provenance_for(source.0, source.1, now);
+        let _ = self.graph.set(id, "source_kind", &p.source_kind);
+        let _ = self
+            .graph
+            .set(id, "source_id", &short(&p.source_id.to_string(), 64));
+        let _ = self.graph.set(id, "source_name", &short(source.1, 64));
+        let _ = self
+            .graph
+            .set(id, "authority_rank", &p.authority_rank.to_string());
+        let _ = self
+            .graph
+            .set(id, "confidence_milli", &p.confidence_milli.to_string());
         let _ = self.graph.link(conv, id, "said", now, &[]);
         if let Some(prev) = self.last_message {
             let _ = self.graph.link(prev, id, "next", now, &[]);
@@ -329,6 +364,135 @@ impl Recorder {
             }
         }
         lines.join("\n")
+    }
+}
+
+// ------------------------------------------------------------------ provenance and access
+
+/// The tenant the device's own record belongs to (a device has one).
+pub const TENANT: u64 = 0;
+/// Permission to read the activity record (`/graph`, `/graph.file`).
+pub const PERM_READ: &str = "memory.read";
+/// Permission to erase the activity record (`/graph.forget`).
+pub const PERM_FORGET: &str = "memory.forget";
+
+/// How much a kind of source is trusted, as the agent-memory provenance record expresses it:
+/// what the person typed outranks a tool's output, which outranks what a model said. These are
+/// the device's own choices, not measurements; they are stored with each message so a reader can
+/// weigh them, and nothing here decides which source is true.
+#[must_use]
+pub fn provenance_for(kind: &str, id: &str, now: u64) -> Provenance {
+    let (authority_rank, confidence_milli) = match kind {
+        "user" => (100, 1000),
+        "tool" => (50, 900),
+        "model" => (10, 500),
+        _ => (0, 0),
+    };
+    Provenance {
+        source_id: u128::from(principal_id(id)),
+        source_kind: kind.to_string(),
+        observed_at_ns: now.saturating_mul(1_000_000_000),
+        confidence_milli,
+        authority_rank,
+    }
+}
+
+/// A stable number for a user name (FNV-1a), the form the access policy asks for.
+#[must_use]
+pub fn principal_id(user: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for b in user.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The access policy for whoever is signed in, built from the permissions their role holds
+/// (`may` answers "does the role hold this permission?"). A role with neither permission gets a
+/// policy with no rules, which denies everything by default.
+#[must_use]
+pub fn policy_for(may: &dyn Fn(&str) -> bool) -> MemoryAccessPolicy {
+    let mut policy = MemoryAccessPolicy::new(8);
+    let mut allow = |action| {
+        let _ = policy.add_rule(AccessRule {
+            tenant_id: TENANT,
+            principal_id: None,
+            memory_id: None,
+            action,
+            effect: Effect::Allow,
+            priority: 0,
+            expires_at_ns: None,
+        });
+    };
+    if may(PERM_READ) {
+        allow(MemoryAction::Read);
+        allow(MemoryAction::Search);
+    }
+    if may(PERM_FORGET) {
+        allow(MemoryAction::Delete);
+    }
+    policy
+}
+
+/// Whether `user` may do `action` to the activity record under `policy`.
+#[must_use]
+pub fn allowed(policy: &MemoryAccessPolicy, user: &str, action: MemoryAction) -> bool {
+    policy
+        .authorize(AccessRequest {
+            tenant_id: TENANT,
+            principal_id: principal_id(user),
+            memory_id: 0,
+            action,
+            now_ns: 0,
+        })
+        .allowed
+}
+
+/// The outcome of a `/graph` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    /// What to show the person.
+    pub text: String,
+    /// Set when the command was refused: (action, subject) for the audit trail.
+    pub refused: Option<(String, String)>,
+}
+
+/// Carries out `/graph<arg>` for `user` under `policy`: reading needs the read permission and
+/// erasing the forget permission. A refusal changes nothing and is reported for the audit trail.
+pub fn command(
+    graph: &mut Recorder,
+    policy: &MemoryAccessPolicy,
+    user: &str,
+    arg: &str,
+    now: u64,
+) -> Reply {
+    let arg = arg.trim();
+    let (action, permission, what) = if arg == ".forget" {
+        (MemoryAction::Delete, PERM_FORGET, "erase")
+    } else {
+        (MemoryAction::Read, PERM_READ, "read")
+    };
+    if !allowed(policy, user, action) {
+        return Reply {
+            text: format!(
+                "{user} is not allowed to {what} the activity record (it needs the {permission} permission)."
+            ),
+            refused: Some((format!("graph.{what}"), format!("{user} needs {permission}"))),
+        };
+    }
+    let text = if let Some(path) = arg.strip_prefix(".file") {
+        graph.describe_file(path.trim())
+    } else if arg == ".forget" {
+        graph.forget(now)
+    } else if arg.is_empty() {
+        graph.describe_recent()
+    } else {
+        "Use /graph (recent activity), /graph.file PATH (history of a file) or /graph.forget (erase the record).".to_string()
+    };
+    Reply {
+        text,
+        refused: None,
     }
 }
 
@@ -563,5 +727,149 @@ mod tests {
         assert!(r
             .describe_file("nope.rs")
             .starts_with("Nothing recorded about nope.rs"));
+    }
+
+    // ---- provenance and access ----
+
+    fn may_all(_: &str) -> bool {
+        true
+    }
+
+    fn may_none(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn what_is_written_carries_where_it_came_from_and_how_far_it_is_trusted() {
+        let mut r = Recorder::in_memory(100);
+        r.set_actor("dana");
+        let u = r.user_message("is the build green?", 101).unwrap();
+        let a = r
+            .assistant_message("yes", "qwen2.5-1.5b.gguf", 102)
+            .unwrap();
+        let g = r.graph();
+        let (up, ap) = (&g.get(u).unwrap().props, &g.get(a).unwrap().props);
+        assert_eq!(
+            (up["source_kind"].as_str(), up["source_name"].as_str()),
+            ("user", "dana")
+        );
+        assert_eq!(
+            (ap["source_kind"].as_str(), ap["source_name"].as_str()),
+            ("model", "qwen2.5-1.5b.gguf")
+        );
+        let rank = |p: &std::collections::BTreeMap<String, String>| {
+            p["authority_rank"].parse::<u16>().unwrap()
+        };
+        assert!(
+            rank(up) > rank(ap),
+            "what the person typed outranks what a model said"
+        );
+        // Without an actor the source says so, rather than guessing a name.
+        let mut anon = Recorder::in_memory(1);
+        let n = anon.user_message("hi", 2).unwrap();
+        assert_eq!(anon.graph().get(n).unwrap().props["source_name"], "unknown");
+        // A blank or hostile name is kept short and never empty.
+        anon.set_actor("   ");
+        assert_eq!(anon.actor, "unknown");
+        anon.set_actor(&"x".repeat(500));
+        assert_eq!(anon.actor.chars().count(), 64);
+    }
+
+    #[test]
+    fn provenance_ranks_the_kinds_of_source_and_unknown_kinds_get_no_authority() {
+        let p = |k| provenance_for(k, "n", 5);
+        assert!(p("user").authority_rank > p("tool").authority_rank);
+        assert!(p("tool").authority_rank > p("model").authority_rank);
+        let unknown = p("mystery");
+        assert_eq!((unknown.authority_rank, unknown.confidence_milli), (0, 0));
+        assert_eq!(p("user").observed_at_ns, 5_000_000_000);
+        assert_eq!(
+            provenance_for("user", "dana", 1).source_id,
+            provenance_for("model", "dana", 9).source_id,
+            "same name, same id"
+        );
+        assert_ne!(principal_id("dana"), principal_id("dan"));
+    }
+
+    #[test]
+    fn a_role_with_the_permissions_can_read_and_erase_and_one_without_cannot_do_either() {
+        let owner = policy_for(&may_all);
+        let nobody = policy_for(&may_none);
+        assert_eq!(owner.rule_count(), 3);
+        assert_eq!(nobody.rule_count(), 0);
+        assert!(allowed(&owner, "dana", MemoryAction::Read));
+        assert!(allowed(&owner, "dana", MemoryAction::Delete));
+        assert!(
+            !allowed(&nobody, "dana", MemoryAction::Read),
+            "no rule means denied"
+        );
+        assert!(!allowed(&nobody, "dana", MemoryAction::Delete));
+        // Read and erase are separate permissions.
+        let read_only = policy_for(&|p| p == PERM_READ);
+        assert!(allowed(&read_only, "x", MemoryAction::Search));
+        assert!(!allowed(&read_only, "x", MemoryAction::Delete));
+        let forget_only = policy_for(&|p| p == PERM_FORGET);
+        assert!(!allowed(&forget_only, "x", MemoryAction::Read));
+        assert!(allowed(&forget_only, "x", MemoryAction::Delete));
+    }
+
+    #[test]
+    fn graph_commands_are_refused_without_the_permission_and_change_nothing() {
+        let mut r = Recorder::in_memory(1);
+        r.set_actor("sam");
+        r.user_message("a private question", 2);
+        let nobody = policy_for(&may_none);
+        let read = command(&mut r, &nobody, "sam", "", 3);
+        assert!(
+            read.text.contains("not allowed to read") && read.text.contains(PERM_READ),
+            "{}",
+            read.text
+        );
+        assert_eq!(
+            read.refused,
+            Some(("graph.read".into(), format!("sam needs {PERM_READ}")))
+        );
+        assert!(
+            !read.text.contains("private question"),
+            "a refusal must not leak the content"
+        );
+        let file = command(&mut r, &nobody, "sam", ".file src/a.rs", 3);
+        assert!(file.refused.is_some());
+        let erase = command(&mut r, &nobody, "sam", ".forget", 4);
+        assert_eq!(erase.refused.map(|x| x.0), Some("graph.erase".to_string()));
+        assert_eq!(r.graph().nodes_of("message").len(), 1, "nothing was erased");
+    }
+
+    #[test]
+    fn graph_commands_work_for_a_role_that_holds_the_permissions() {
+        let mut r = Recorder::in_memory(1);
+        r.set_actor("dana");
+        r.user_message("remember the tax rounding", 2);
+        let owner = policy_for(&may_all);
+        let shown = command(&mut r, &owner, "dana", "", 3);
+        assert!(shown.refused.is_none());
+        assert_eq!(
+            shown.text,
+            r.describe_recent(),
+            "the permitted command shows the record"
+        );
+        assert!(command(&mut r, &owner, "dana", "oops", 3)
+            .text
+            .starts_with("Use /graph"));
+        let erased = command(&mut r, &owner, "dana", ".forget", 4);
+        assert!(erased.refused.is_none());
+        assert_eq!(
+            r.graph().nodes_of("message").len(),
+            0,
+            "the record was erased"
+        );
+        // Read-only: can look, cannot erase.
+        r.user_message("another note", 5);
+        let read_only = policy_for(&|p| p == PERM_READ);
+        assert!(command(&mut r, &read_only, "lee", "", 6).refused.is_none());
+        assert!(command(&mut r, &read_only, "lee", ".forget", 7)
+            .refused
+            .is_some());
+        assert_eq!(r.graph().nodes_of("message").len(), 1);
     }
 }

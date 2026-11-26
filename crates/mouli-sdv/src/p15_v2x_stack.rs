@@ -492,6 +492,9 @@ pub struct V2xSafetyCorridorArbitrator {
     emergency_vehicle_alert_active: AtomicBool,
 }
 
+// SAFETY: only conditionally sound. `remote_table` is accessed with no lock and `&mut` to the whole
+// table, so the arbitrator must be used from one execution context at a time (the single safety
+// loop of the design). The counters are atomics. Nothing in the types enforces the condition.
 unsafe impl Sync for V2xSafetyCorridorArbitrator {}
 
 impl V2xSafetyCorridorArbitrator {
@@ -551,6 +554,8 @@ impl V2xSafetyCorridorArbitrator {
             && dist_m < 60.0
             && (host_bsm.speed_m_s > remote_bsm.speed_m_s || eebl_active);
 
+        // SAFETY: `V2xSafetyCorridorArbitrator` takes no lock; see its `Sync` impl for the single-context
+        // condition. This is the only reference to the remote table and ends with this function.
         let table = unsafe { &mut *self.remote_table.get() };
         let count = self.active_count.load(Ordering::Relaxed) as usize;
 
@@ -669,6 +674,8 @@ impl V2xRadioController {
             self.temp_id_seed.store(x, Ordering::Relaxed);
 
             let new_bytes = x.to_be_bytes();
+            // SAFETY: `V2xRadioController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the temporary-ID cell is alive.
+            // This writes a `Copy` value and keeps no reference.
             unsafe {
                 *self.current_temp_id.get() = new_bytes;
             }
@@ -678,6 +685,8 @@ impl V2xRadioController {
     }
 
     pub fn get_current_temp_id(&self) -> [u8; 4] {
+        // SAFETY: `V2xRadioController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the temporary-ID cell is alive.
+        // This reads a `Copy` value.
         unsafe { *self.current_temp_id.get() }
     }
 
@@ -698,6 +707,8 @@ impl V2xRadioController {
             return Err(V2xError::TxQueueFull);
         }
 
+        // SAFETY: `V2xRadioController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the transmit queue is alive.
+        // `tail` is below the queue depth, and the full-queue check above shows the slot is free.
         let queue = unsafe { &mut *self.tx_queue.get() };
         queue[tail] = *frame;
 
@@ -714,6 +725,8 @@ impl V2xRadioController {
             return None;
         }
 
+        // SAFETY: `V2xRadioController` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the transmit queue is alive.
+        // `head != tail` was checked above, so the slot holds a queued frame.
         let queue = unsafe { &*self.tx_queue.get() };
         let frame = queue[head];
         let next_head = (head + 1) % V2X_TX_QUEUE_DEPTH;

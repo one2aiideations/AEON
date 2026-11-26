@@ -232,6 +232,10 @@ impl AvtpStreamReceiver {
         }
 
         let hdr_ptr = raw_frame.as_ptr() as *const AvtpStreamHeader;
+        // SAFETY: `AvtpStreamHeader` is `#[repr(C, packed)]`, so its alignment is 1 and any byte address is
+        // suitably aligned; all its fields are plain integers, so every bit pattern is a valid value; and
+        // the check above shows `raw_frame` has at least `size_of::<AvtpStreamHeader>()` bytes. This copies
+        // the header out by value.
         let header = unsafe { *hdr_ptr };
 
         if header.get_stream_id() != self.stream_id {
@@ -252,11 +256,18 @@ impl AvtpStreamReceiver {
             return Err(AvbError::BufferOverflow);
         }
 
+        // SAFETY: `AvtpStreamReceiver` is not `Sync` (see the note on the type): one execution context owns it, so
+        // no other reference to the slot array is alive. `write` is below the buffer depth (it is kept
+        // modulo it), and the full-buffer check above shows the slot is not one the reader still needs.
         let slots = unsafe { &mut *self.slots.get() };
         slots[write].header = header;
         slots[write].payload_len = payload_len;
         slots[write].ingress_timestamp_ns = current_ptp_time_ns;
 
+        // SAFETY: the source range `header_size..header_size + payload_len` lies inside `raw_frame` (checked
+        // above); the destination is `slots[write].payload`, whose capacity is `AVTP_MAX_PAYLOAD_BYTES`,
+        // and `payload_len` was checked not to exceed it. The ranges cannot overlap: `raw_frame` is a live
+        // shared slice and the slots are private to this receiver.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 raw_frame.as_ptr().add(header_size),
@@ -286,6 +297,8 @@ impl AvtpStreamReceiver {
             return Err(AvbError::StreamIdNotFound); // Buffer empty
         }
 
+        // SAFETY: same single-context ownership as `ingest_packet`: no other reference to the slot array is alive.
+        // `read` is below the buffer depth, and `read != write` was checked above.
         let slots = unsafe { &mut *self.slots.get() };
         let slot = &mut slots[read];
 
@@ -432,6 +445,8 @@ impl VirtioGpuDriver {
             height,
         };
 
+        // SAFETY: `VirtioGpuDriver` is not `Sync` (see the note on the type): one execution context owns it, so no
+        // other reference to the command ring is alive.
         let ring = unsafe { &mut *self.command_ring.get() };
         ring[head] = cmd.hdr;
 
@@ -460,6 +475,7 @@ impl VirtioGpuDriver {
             return Err(GpuError::RingBufferFull);
         }
 
+        // SAFETY: same single-context ownership as `create_surface_2d`.
         let ring = unsafe { &mut *self.command_ring.get() };
         ring[head] = VirtioGpuCtrlHeader::new(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
 
@@ -484,6 +500,7 @@ impl VirtioGpuDriver {
             return Err(GpuError::RingBufferFull);
         }
 
+        // SAFETY: same single-context ownership as `create_surface_2d`.
         let ring = unsafe { &mut *self.command_ring.get() };
         ring[head] = VirtioGpuCtrlHeader::new(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
 
@@ -545,6 +562,11 @@ pub struct CockpitCompositor {
     frame_counter: AtomicU64,
 }
 
+// SAFETY: only conditionally sound. `layers` is accessed only under `lock` (see `configure_plane`).
+// But the compositor contains a `VirtioGpuDriver`, which is deliberately not `Sync` (no lock), and
+// `trigger_vsync` calls into it without taking `lock`: two threads calling `trigger_vsync` at once
+// would race on the driver's command ring. It is sound only if the display path (`trigger_vsync`)
+// is driven from one context at a time. Nothing in the types enforces that.
 unsafe impl Sync for CockpitCompositor {}
 
 impl CockpitCompositor {
@@ -595,6 +617,8 @@ impl CockpitCompositor {
         }
 
         self.acquire();
+        // SAFETY: the lock taken by `self.acquire()` above is held until `self.release()`, so this is the only
+        // reference to the layer table.
         let layers = unsafe { &mut *self.layers.get() };
         layers[layer_idx] = CompositorLayer {
             layer_id: layer_idx as u8,
@@ -676,6 +700,7 @@ mod tests {
         let mut raw_packet = [0u8; 100];
         let hdr = AvtpStreamHeader::new(AVTP_SUBTYPE_CVF_VIDEO, stream_id, 1, 10_000_000, 50);
 
+        // SAFETY: single-threaded test: the header is plain bytes and the destination is large enough.
         unsafe {
             let hdr_bytes = core::slice::from_raw_parts(
                 &hdr as *const _ as *const u8,

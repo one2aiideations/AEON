@@ -328,6 +328,7 @@ impl IsoTpReceiver {
                 if sf_dl == 0 || sf_dl > (frame_len - 1) {
                     return Err(IsoTpError::BufferOverflow);
                 }
+                // SAFETY: `IsoTpReceiver` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the reassembly buffer is alive.
                 let buf = unsafe { &mut *self.buffer.get() };
                 buf[..sf_dl].copy_from_slice(&frame[1..1 + sf_dl]);
                 self.received_len.store(sf_dl as u16, Ordering::Release);
@@ -347,6 +348,7 @@ impl IsoTpReceiver {
                 }
 
                 let payload_in_ff = frame_len - 2;
+                // SAFETY: `IsoTpReceiver` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the reassembly buffer is alive.
                 let buf = unsafe { &mut *self.buffer.get() };
                 buf[..payload_in_ff].copy_from_slice(&frame[2..2 + payload_in_ff]);
 
@@ -377,6 +379,7 @@ impl IsoTpReceiver {
                 let remaining = total_len.saturating_sub(current_len);
                 let payload_bytes = core::cmp::min(frame_len - 1, remaining);
 
+                // SAFETY: `IsoTpReceiver` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the reassembly buffer is alive.
                 let buf = unsafe { &mut *self.buffer.get() };
                 buf[current_len..current_len + payload_bytes]
                     .copy_from_slice(&frame[1..1 + payload_bytes]);
@@ -411,6 +414,8 @@ impl IsoTpReceiver {
 
     pub fn get_payload<'a>(&self, out_buf: &'a mut [u8]) -> &'a [u8] {
         let len = self.received_len.load(Ordering::Acquire) as usize;
+        // SAFETY: `IsoTpReceiver` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the reassembly buffer is alive.
+        // It is only read here.
         let buf = unsafe { &*self.buffer.get() };
         let to_copy = core::cmp::min(len, out_buf.len());
         out_buf[..to_copy].copy_from_slice(&buf[..to_copy]);

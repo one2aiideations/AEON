@@ -442,6 +442,8 @@ impl TopologyRouter {
             return Err(MapError::OutOfMemoryBounds);
         }
 
+        // SAFETY: the spin lock acquired above is held (the early return releases it first), so this is the only
+        // reference to the node table. `count` was checked against the capacity above.
         let nodes = unsafe { &mut *self.map_nodes.get() };
         nodes[count] = node;
         nodes[count].is_active = true;
@@ -453,6 +455,8 @@ impl TopologyRouter {
 
     /// Finds which lanelet contains the given vehicle ENU coordinate
     pub fn match_current_lanelet(&self, vehicle_pos: &EnuPoint) -> Option<u32> {
+        // SAFETY: `TopologyRouter` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the node table is alive.
+        // This takes no lock, so it must not run during `insert_lanelet` (the single-context rule).
         let nodes = unsafe { &*self.map_nodes.get() };
         let count = self.node_count.load(Ordering::Acquire) as usize;
 
@@ -466,6 +470,8 @@ impl TopologyRouter {
 
     /// Zero-allocation bounded pathfinder planning from start lanelet to destination lanelet
     pub fn plan_route(&self, start_id: u32, goal_id: u32) -> Result<RoutePlan, MapError> {
+        // SAFETY: `TopologyRouter` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the node table is alive.
+        // This takes no lock, so it must not run during `insert_lanelet`.
         let nodes = unsafe { &*self.map_nodes.get() };
         let total = self.node_count.load(Ordering::Acquire) as usize;
 
@@ -618,6 +624,8 @@ impl LocalizationEstimator {
     }
 
     pub fn set_origin(&self, origin: Wgs84Point) {
+        // SAFETY: `LocalizationEstimator` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the origin is alive.
+        // This writes a `Copy` value and keeps no reference.
         unsafe {
             *self.origin.get() = origin;
         }
@@ -631,9 +639,13 @@ impl LocalizationEstimator {
             self.set_origin(rtk.position);
         }
 
+        // SAFETY: `LocalizationEstimator` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the origin is alive.
+        // It is only read here.
         let origin = unsafe { &*self.origin.get() };
         let enu = GeodeticTransform::wgs84_to_enu(origin, &rtk.position);
 
+        // SAFETY: `LocalizationEstimator` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the pose cells is alive.
+        // These are separate cells, each written once by value.
         unsafe {
             *self.last_position_enu.get() = enu;
             *self.last_heading_rad.get() =
@@ -649,7 +661,11 @@ impl LocalizationEstimator {
     }
 
     pub fn get_current_pose(&self) -> (EnuPoint, f32, RtkFixStatus) {
+        // SAFETY: `LocalizationEstimator` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the position is alive.
+        // This reads a `Copy` value.
         let pos = unsafe { *self.last_position_enu.get() };
+        // SAFETY: `LocalizationEstimator` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the heading is alive.
+        // This reads a `Copy` value.
         let heading = unsafe { *self.last_heading_rad.get() };
         let fix = match self.last_fix_status.load(Ordering::Acquire) {
             1 => RtkFixStatus::AutonomousGnss,
@@ -705,6 +721,8 @@ impl HdMapLocalizationSubsystem {
         };
 
         // Extract lateral deviation from centerline and speed regulation
+        // SAFETY: `TopologyRouter` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the node table (`self.router` belongs to this struct) is alive.
+        // It is only read here.
         let nodes = unsafe { &*self.router.map_nodes.get() };
         let total = self.router.node_count.load(Ordering::Acquire) as usize;
 

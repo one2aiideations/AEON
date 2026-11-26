@@ -171,6 +171,9 @@ pub struct FlashTranslationLayer {
     total_erases_completed: AtomicU64,
 }
 
+// SAFETY: the interior-mutable maps and block records are only accessed between `acquire_lock` and
+// `release_lock` of the same spin lock (Acquire/Release), so accesses are mutually exclusive and
+// ordered. A thread that panics while holding the lock leaves it locked.
 unsafe impl Sync for FlashTranslationLayer {}
 
 impl FlashTranslationLayer {
@@ -209,7 +212,9 @@ impl FlashTranslationLayer {
         }
 
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the logical-to-physical map.
         let l2p = unsafe { &*self.logical_to_physical_map.get() };
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the block records.
         let records = unsafe { &*self.block_records.get() };
 
         let mut phys = l2p[logical_block as usize];
@@ -235,7 +240,9 @@ impl FlashTranslationLayer {
         bad_phys: u16,
     ) -> Result<u16, FtlError> {
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the block records.
         let records = unsafe { &mut *self.block_records.get() };
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the logical-to-physical map. (a different cell from the block records above).
         let l2p = unsafe { &mut *self.logical_to_physical_map.get() };
 
         if (bad_phys as usize) >= TOTAL_ERASE_BLOCKS {
@@ -267,6 +274,7 @@ impl FlashTranslationLayer {
         }
 
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the block records.
         let records = unsafe { &mut *self.block_records.get() };
         records[phys_block as usize].erase_cycles =
             records[phys_block as usize].erase_cycles.saturating_add(1);
@@ -280,6 +288,7 @@ impl FlashTranslationLayer {
     /// Checks wear variance across all blocks and returns (min_wear_block, max_wear_block, delta)
     pub fn calculate_wear_variance(&self) -> (u16, u16, u32) {
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the block records.
         let records = unsafe { &*self.block_records.get() };
 
         let mut min_wear = u32::MAX;
@@ -389,6 +398,9 @@ pub struct JournalEngine {
     lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable journal ring is only accessed between `acquire_lock` and
+// `release_lock` of the same spin lock, so accesses are mutually exclusive and ordered. A thread
+// that panics while holding the lock leaves it locked.
 unsafe impl Sync for JournalEngine {}
 
 impl JournalEngine {
@@ -429,6 +441,7 @@ impl JournalEngine {
     ) -> Result<u16, FtlError> {
         self.acquire_lock();
         let head = self.write_head.load(Ordering::Relaxed) as usize;
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the journal ring.
         let ring = unsafe { &mut *self.ring.get() };
 
         let tx_id = self.tx_sequence.fetch_add(1, Ordering::Relaxed);
@@ -459,6 +472,7 @@ impl JournalEngine {
     /// Step 2: Commits the transaction after physical flash payload write completes (Phase 2 of 2PC)
     pub fn commit_transaction(&self, slot: u16) -> Result<(), FtlError> {
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the journal ring.
         let ring = unsafe { &mut *self.ring.get() };
         let entry = &mut ring[slot as usize];
 
@@ -480,6 +494,7 @@ impl JournalEngine {
     /// Recovery scan executed on system bringup to resolve torn writes from sudden power failure
     pub fn recover_from_power_loss(&self) -> u32 {
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the journal ring.
         let ring = unsafe { &mut *self.ring.get() };
         let mut rolled_back_count = 0u32;
 
@@ -564,6 +579,10 @@ pub struct FailSafeFileSystem {
     lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable inode table is only accessed between `acquire_lock` and
+// `release_lock` of this type's own spin lock; the flash translation layer and the journal it
+// contains are `Sync` on their own locks. A thread that panics while holding a lock leaves it
+// locked.
 unsafe impl Sync for FailSafeFileSystem {}
 
 impl FailSafeFileSystem {
@@ -613,6 +632,7 @@ impl FailSafeFileSystem {
         )?;
 
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the inode table.
         let inodes = unsafe { &mut *self.inodes.get() };
 
         for node in inodes.iter_mut() {
@@ -664,6 +684,7 @@ impl FailSafeFileSystem {
         )?;
 
         self.acquire_lock();
+        // SAFETY: the lock taken by `acquire_lock()` above is held until `release_lock()`, so this is the only reference to the inode table.
         let inodes = unsafe { &mut *self.inodes.get() };
 
         for node in inodes.iter_mut() {
@@ -780,6 +801,7 @@ mod tests {
         assert_eq!(rolled_back, 1);
 
         // Verify transaction is marked aborted
+        // SAFETY: single-threaded test: nothing else references the journal ring.
         let ring = unsafe { &*journal.ring.get() };
         assert_eq!(ring[slot as usize].state, TransactionState::Aborted);
     }

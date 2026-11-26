@@ -255,6 +255,8 @@ impl Virtqueue {
             return Err(VirtioError::DescriptorPoolExhausted);
         }
 
+        // SAFETY: `acquire()` above is still held (every return path releases it), so no other reference
+        // into the descriptor table exists.
         let desc_table = unsafe { &mut *self.desc.get() };
         let next_free = desc_table[head as usize].next;
         self.free_head.store(next_free, Ordering::Relaxed);
@@ -269,6 +271,8 @@ impl Virtqueue {
     /// Return a descriptor chain back to the free list
     pub fn free_descriptor_chain(&self, mut head: u16) {
         self.acquire();
+        // SAFETY: the lock taken by `acquire()` on the previous line is held until `release()`, so this is the
+        // only reference into the descriptor table.
         let desc_table = unsafe { &mut *self.desc.get() };
         let orig_head = head;
         let mut count = 0;
@@ -294,6 +298,9 @@ impl Virtqueue {
 
     /// Submit a descriptor chain to the device via the Available ring
     pub fn submit_descriptor_chain(&self, head_idx: u16) {
+        // SAFETY: `Virtqueue` holds `UnsafeCell`s and is not `Sync`, so it cannot be shared across threads, and
+        // this takes no lock: it relies on there being one submitter, not re-entered from an interrupt
+        // handler on the same core, so no other reference to the available ring is alive.
         let avail = unsafe { &mut *self.avail.get() };
         let current_idx = avail.idx.load(Ordering::Relaxed);
         let ring_slot = (current_idx as usize) % (self.queue_size as usize);
@@ -309,6 +316,8 @@ impl Virtqueue {
 
     /// Poll for completed buffers from the Device Used ring
     pub fn poll_completion(&self) -> Option<(u32, u32)> {
+        // SAFETY: same single-context reliance as `submit_descriptor_chain`: no other reference to the used ring
+        // is alive while this shared one is, and the device-written index is read with Acquire.
         let used = unsafe { &*self.used.get() };
         let last_used = self.last_used_idx.load(Ordering::Relaxed);
         let dev_idx = used.idx.load(Ordering::Acquire);
@@ -355,17 +364,20 @@ impl VirtioBlockDevice {
 
     /// Initialize and negotiate VirtIO MMIO registers
     pub fn initialize(&self) -> Result<(), VirtioError> {
+        // SAFETY: the address was given to `new` by the integrator, who must have mapped a VirtIO MMIO window there that is valid for 32-bit volatile reads at this offset; the code cannot check that.
         let magic = unsafe { core::ptr::read_volatile(self.base_mmio_addr as *const u32) };
         if magic != VIRTIO_MMIO_MAGIC_VALUE {
             return Err(VirtioError::InvalidMagicNumber);
         }
 
+        // SAFETY: the address was given to `new` by the integrator, who must have mapped a VirtIO MMIO window there that is valid for 32-bit volatile reads at this offset; the code cannot check that.
         let version =
             unsafe { core::ptr::read_volatile((self.base_mmio_addr + 0x004) as *const u32) };
         if version != VIRTIO_MMIO_VERSION_MODERN {
             return Err(VirtioError::UnsupportedVersion);
         }
 
+        // SAFETY: the address was given to `new` by the integrator, who must have mapped a VirtIO MMIO window there that is valid for 32-bit volatile reads at this offset; the code cannot check that.
         let dev_id =
             unsafe { core::ptr::read_volatile((self.base_mmio_addr + 0x008) as *const u32) };
         if dev_id != VIRTIO_DEV_BLOCK {
@@ -373,6 +385,7 @@ impl VirtioBlockDevice {
         }
 
         // State Machine handshake: Reset -> Acknowledge -> Driver
+        // SAFETY: as for the reads: the integrator-supplied base address must be a mapped VirtIO MMIO window valid for 32-bit volatile writes at this offset; the code cannot check that.
         unsafe {
             core::ptr::write_volatile(
                 (self.base_mmio_addr + 0x070) as *mut u32,
@@ -418,6 +431,8 @@ impl VirtioBlockDevice {
             sector,
         };
 
+        // SAFETY: `alloc_descriptor` returned `d0` to this call alone, and `Virtqueue` is single-context (see
+        // `submit_descriptor_chain`), so no other reference into the descriptor table is alive.
         let desc = unsafe { &mut *self.vq.desc.get() };
 
         // D0: Header (Driver -> Device)
@@ -442,6 +457,7 @@ impl VirtioBlockDevice {
         self.vq.submit_descriptor_chain(d0);
 
         // Notify MMIO Doorbell Register (QueueNotify offset 0x050)
+        // SAFETY: as for the reads: the integrator-supplied base address must be a mapped VirtIO MMIO window valid for 32-bit volatile writes at this offset; the code cannot check that.
         unsafe {
             core::ptr::write_volatile((self.base_mmio_addr + 0x050) as *mut u32, 0);
         }
@@ -530,6 +546,8 @@ impl VirtioNetDevice {
         let d1 = self.tx_queue.alloc_descriptor()?;
 
         let net_hdr = VirtioNetHeader::empty();
+        // SAFETY: `alloc_descriptor` returned these descriptors to this call alone, and the queue is
+        // single-context, so no other reference into the descriptor table is alive.
         let desc = unsafe { &mut *self.tx_queue.desc.get() };
 
         // D0: VirtioNetHeader
@@ -547,6 +565,7 @@ impl VirtioNetDevice {
         self.tx_queue.submit_descriptor_chain(d0);
 
         // Notify TX Queue Doorbell
+        // SAFETY: as for the reads: the integrator-supplied base address must be a mapped VirtIO MMIO window valid for 32-bit volatile writes at this offset; the code cannot check that.
         unsafe {
             core::ptr::write_volatile((self.base_mmio_addr + 0x050) as *mut u32, 1);
         }
@@ -647,6 +666,9 @@ impl InterVmMailbox {
         }
 
         let slot_idx = (head as usize) % INTER_VM_QUEUE_CAPACITY;
+        // SAFETY: one sender at a time (single producer): the full-ring check above shows the slot at `head`
+        // is not one the receiver can still read, and nobody else writes it. This takes `&mut` to the
+        // whole slot array, so a second concurrent sender would be a data race.
         let slots = unsafe { &mut *self.slots.get() };
 
         slots[slot_idx].sender_partition_id = sender_id;
@@ -663,6 +685,8 @@ impl InterVmMailbox {
         // Ring the virtual hypervisor doorbell
         let doorbell = self.doorbell_address.load(Ordering::Relaxed);
         if doorbell != 0 {
+            // SAFETY: the doorbell address was given to `new`; non-zero was checked. The integrator must have given
+            // the address of a writable 32-bit hypervisor doorbell register; the code cannot check that.
             unsafe {
                 core::ptr::write_volatile(doorbell as *mut u32, receiver_id as u32);
             }
@@ -681,6 +705,8 @@ impl InterVmMailbox {
         }
 
         let slot_idx = (tail as usize) % INTER_VM_QUEUE_CAPACITY;
+        // SAFETY: one receiver (single consumer): `tail != head` was checked with `head` loaded Acquire, so this
+        // slot was fully written and published, and the sender will not write it before `tail` moves on.
         let slots = unsafe { &*self.slots.get() };
 
         *out_slot = slots[slot_idx];
@@ -726,6 +752,10 @@ pub struct HardwareDmaEngine {
     lock: AtomicBool,
 }
 
+// SAFETY: the interior-mutable `ring` is only accessed in `submit_transfer`, between taking and
+// releasing the spin `lock` (Acquire/Release), so accesses are mutually exclusive. `base_registers`
+// is a plain address used only for volatile register accesses. A thread that panics while holding
+// the lock leaves it locked.
 unsafe impl Sync for HardwareDmaEngine {}
 
 impl HardwareDmaEngine {
@@ -758,6 +788,8 @@ impl HardwareDmaEngine {
             return Err(DmaError::RingFull);
         }
 
+        // SAFETY: the spin lock taken at the top of this function is held until the store that releases it
+        // below, so this is the only reference to the ring.
         let ring = unsafe { &mut *self.ring.get() };
         ring[count].source_addr = src;
         ring[count].dest_addr = dst;
@@ -772,6 +804,8 @@ impl HardwareDmaEngine {
         self.lock.store(false, Ordering::Release);
 
         // Trigger hardware engine via MMIO DMA trigger register (offset 0x10)
+        // SAFETY: the register base was given to `new`; the integrator must have mapped a DMA controller
+        // register block there valid for 32-bit volatile writes at offset 0x10; the code cannot check that.
         unsafe {
             core::ptr::write_volatile((self.base_registers + 0x10) as *mut u32, count as u32);
         }
@@ -781,6 +815,7 @@ impl HardwareDmaEngine {
 
     /// Poll DMA controller status register (offset 0x04)
     pub fn is_transfer_complete(&self, job_id: u32) -> bool {
+        // SAFETY: as for the write above: a mapped register block valid for 32-bit volatile reads at offset 0x04.
         let status =
             unsafe { core::ptr::read_volatile((self.base_registers + 0x04) as *const u32) };
         (status & (1 << (job_id % 32))) != 0
@@ -806,6 +841,7 @@ mod tests {
         assert_eq!(vq.num_free.load(Ordering::Relaxed), 62);
 
         // Chain d0 -> d1
+        // SAFETY: single-threaded test: no other reference to the descriptor table exists.
         let desc = unsafe { &mut *vq.desc.get() };
         desc[d0 as usize].flags = VRING_DESC_F_NEXT;
         desc[d0 as usize].next = d1;

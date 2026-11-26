@@ -494,6 +494,16 @@ impl<B: Backend> Device<B> {
         &self.user
     }
 
+    /// The signed-in user's role.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Whether the signed-in user's role holds `permission` (the same check the gate makes).
+    pub fn may(&self, permission: &str) -> bool {
+        self.ws.role_can(&self.role, permission)
+    }
+
     /// Feeds one key to the interface and carries out whatever it asked for.
     pub fn on_key(&mut self, key: Key) -> Outcome {
         // Locked: only the conversation takes keys, so no other screen can be reached.

@@ -556,6 +556,7 @@ impl GateDriverInterface {
         let dt_ticks =
             (self.clock_freq_hz as u64 * INVERTER_DEAD_TIME_NS as u64 / 1_000_000_000) as u32;
 
+        // SAFETY: `GateDriverInterface` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the register block is alive.
         let regs = unsafe { &mut *self.raw_regs.get() };
         regs.pwm_period_ticks = period;
         regs.deadtime_ticks = dt_ticks;
@@ -575,6 +576,7 @@ impl GateDriverInterface {
             return;
         }
 
+        // SAFETY: `GateDriverInterface` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the register block is alive.
         let regs = unsafe { &mut *self.raw_regs.get() };
         let period = regs.pwm_period_ticks as f32;
 
@@ -585,6 +587,7 @@ impl GateDriverInterface {
 
     /// Triggers ASIL-D Hardware Active Short Circuit (ASC) clamping all low-side MOSFETs
     pub fn trigger_emergency_asc(&self, mode: AscMode) {
+        // SAFETY: `GateDriverInterface` is not `Sync` (see the note on the type): one execution context owns it, so no other reference to the register block is alive.
         let regs = unsafe { &mut *self.raw_regs.get() };
         regs.gate_enable = 0; // Disable standard PWM modulation
 
@@ -622,6 +625,11 @@ pub struct MotorDriveSubsystem {
     last_torque_feedback_nm: UnsafeCell<f32>,
 }
 
+// SAFETY: only conditionally sound. The `last_*` cells are plain `f32`s in `UnsafeCell`s that are
+// read and written with no lock, and the contained `GateDriverInterface` is deliberately not
+// `Sync` (no lock). Sharing this between threads, or with an interrupt handler that runs while
+// the control loop is inside one of its methods, would race on those cells. It is sound only if
+// one execution context drives it at a time; nothing in the types enforces that.
 unsafe impl Sync for MotorDriveSubsystem {}
 
 impl MotorDriveSubsystem {
@@ -688,6 +696,8 @@ impl MotorDriveSubsystem {
             return Err(InverterFault::DcBusUnderVoltage);
         }
 
+        // SAFETY: the three phase-current cells are written once each by value and no reference is kept. This
+        // takes no lock; see the `Sync` impl for the single-context condition.
         unsafe {
             *self.last_phase_a_current.get() = current_abc.a;
             *self.last_phase_b_current.get() = current_abc.b;
@@ -720,6 +730,8 @@ impl MotorDriveSubsystem {
             * (MOTOR_POLE_PAIRS as f32)
             * (MOTOR_PERMANENT_FLUX_WB * i_dq.q
                 + (MOTOR_D_AXIS_INDUCTANCE_H - MOTOR_Q_AXIS_INDUCTANCE_H) * i_dq.d * i_dq.q);
+        // SAFETY: the torque cell is written once by value and no reference is kept. This takes no lock; see the
+        // `Sync` impl for the single-context condition.
         unsafe {
             *self.last_torque_feedback_nm.get() = actual_torque;
         }
