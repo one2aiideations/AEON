@@ -662,6 +662,68 @@ fn save_view(store: Option<&crate::persist::Store>, key: &str, value: &str) -> &
     }
 }
 
+/// The rows of the Settings screen from what the desktop is running with.
+fn settings_rows(
+    view: &ViewOpts,
+    wanted_scale: usize,
+    models: &ModelsInfo,
+    offset: &AtomicI32,
+    user: &str,
+) -> Vec<mouli_screen::screens::SettingRow> {
+    use mouli_screen::screens::SettingRow;
+    let row = |id: &str, label: &str, value: String, choices: &[&str], note: &str| SettingRow {
+        id: id.into(),
+        label: label.into(),
+        value,
+        choices: choices.iter().map(|c| (*c).to_string()).collect(),
+        note: note.into(),
+    };
+    vec![
+        row(
+            "contrast",
+            "High contrast",
+            if view.contrast { "on" } else { "off" }.into(),
+            &["off", "on"],
+            "Stronger colours for hard-to-see screens. Takes effect at once.",
+        ),
+        row(
+            "textsize",
+            "Text size",
+            format!("{wanted_scale}x"),
+            &["1x", "2x", "3x"],
+            "Larger text for small or far screens. Takes effect after a restart.",
+        ),
+        row(
+            "memory",
+            "Memory for a model",
+            format!("{} MB", models.budget_mb),
+            &[],
+            "Chosen from this machine's memory when it starts.",
+        ),
+        row(
+            "context",
+            "Context length",
+            format!("{} tokens", models.ctx),
+            &[],
+            "Chosen with the memory above; longer needs more memory.",
+        ),
+        row(
+            "timezone",
+            "Time zone",
+            sysinfo::zone_label(offset.load(Ordering::Relaxed)),
+            &[],
+            "Type /time.zone +05:30 (or -8, or UTC) in Chat to change it.",
+        ),
+        row(
+            "user",
+            "Signed in as",
+            user.to_string(),
+            &[],
+            "Type /signin <name> <role> in Chat to switch.",
+        ),
+    ]
+}
+
 /// Handles `/contrast [on|off]`. Returns the notice to show.
 fn contrast_command(
     arg: &str,
@@ -1031,6 +1093,7 @@ where
     let _tty = TtyGuard::new();
     let (w, h) = display.size();
     let mut view = load_view(settings.as_ref());
+    let mut wanted_scale = view.scale;
     let scale = usable_scale(view.scale, w, h);
     view.scale = scale;
     let mut desktop = Desktop::new(
@@ -1044,6 +1107,13 @@ where
     };
     desktop.status = base_status.clone();
     show_models(&mut device.shell, models);
+    device.shell.settings.set_rows(settings_rows(
+        &view,
+        wanted_scale,
+        models,
+        &offset,
+        device.user(),
+    ));
     desktop.open(&mut device.shell, Tab::Chat);
     if !inputs.has_pointer() {
         device.shell.chat.push(
@@ -1268,6 +1338,21 @@ where
                     let note = time_zone_command(&arg, &offset, settings.as_ref());
                     device.shell.chat.push(Role::Notice, &note);
                 }
+                Action::Setting { id, value } => {
+                    let note = match id.as_str() {
+                        "contrast" => contrast_command(&value, &mut view, settings.as_ref()),
+                        "textsize" => {
+                            let k = value.trim_end_matches('x').to_string();
+                            if let Ok(n) = k.parse::<usize>() {
+                                wanted_scale = n;
+                            }
+                            let (sw, sh) = display.size();
+                            text_size_command(&k, &view, (sw, sh), settings.as_ref())
+                        }
+                        _ => "That setting cannot be changed here.".into(),
+                    };
+                    device.shell.settings.message = note;
+                }
                 Action::Send(text) if text.trim_start().starts_with("/contrast") => {
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/contrast".len()..].to_string();
@@ -1278,6 +1363,14 @@ where
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/textsize".len()..].to_string();
                     let (sw, sh) = display.size();
+                    if let Some(k) = arg
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|k| (1..=MAX_SCALE).contains(k))
+                    {
+                        wanted_scale = k;
+                    }
                     let note = text_size_command(&arg, &view, (sw, sh), settings.as_ref());
                     device.shell.chat.push(Role::Notice, &note);
                 }
@@ -1376,6 +1469,13 @@ where
             &device.shell.chat.model,
             device.shell.approvals.rows.len(),
         );
+        device.shell.settings.set_rows(settings_rows(
+            &view,
+            wanted_scale,
+            models,
+            &offset,
+            device.user(),
+        ));
         display.present(&shape(desktop.render(&device.shell), view))?;
     }
 }
@@ -2168,6 +2268,67 @@ mod tests {
         assert_eq!(usable_scale(2, 1920, 1080), 2);
         assert_eq!(usable_scale(0, 1920, 1080), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_screen_shows_the_real_values_and_changes_contrast() {
+        let dir = tmp("settings-screen");
+        let shots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let device = build_device(Some(&dir)).unwrap();
+        let mut session = Session::new(Shots(shots.clone()), tx.clone(), rx, device);
+        session.settings = Some(crate::persist::Store::open(&dir).unwrap());
+        // ^O opens Settings; Enter changes the first row (High contrast) to on; ^Q quits.
+        for e in [
+            Ev::Key(Key::Ctrl('o')),
+            Ev::Key(Key::Enter),
+            Ev::Key(Key::Ctrl('q')),
+        ] {
+            tx.send(e).unwrap();
+        }
+        run(
+            session,
+            Scripted {
+                replies: vec!["ok"],
+                seen: Default::default(),
+            },
+            "base prompt",
+            100_000,
+            &ModelsInfo::only("tiny"),
+        )
+        .unwrap();
+        let saved = crate::persist::Store::open(&dir).unwrap().settings();
+        assert_eq!(saved.get(CONTRAST_KEY).map(String::as_str), Some("on"));
+        // The last picture was drawn in high contrast: pure black and pure white are present.
+        let last = shots.lock().unwrap().last().unwrap().clone();
+        assert!(last.pixels.contains(&0x000000) && last.pixels.contains(&0xFFFFFF));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_rows_report_what_is_running() {
+        let off = AtomicI32::new(330);
+        let m = ModelsInfo::only("tiny");
+        let rows = settings_rows(
+            &ViewOpts {
+                contrast: true,
+                scale: 1,
+            },
+            2,
+            &m,
+            &off,
+            "owner",
+        );
+        let get = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(get("contrast").value, "on");
+        assert_eq!(get("textsize").value, "2x");
+        assert!(get("memory").choices.is_empty());
+        assert!(
+            get("timezone").value.contains("5:30"),
+            "{}",
+            get("timezone").value
+        );
+        assert_eq!(get("user").value, "owner");
     }
 
     #[test]

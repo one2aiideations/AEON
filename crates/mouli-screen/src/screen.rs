@@ -52,6 +52,13 @@ pub enum Action {
         /// Its arguments, as name and value.
         args: Vec<(String, String)>,
     },
+    /// Change a setting: the host knows it by `id` and applies `value`.
+    Setting {
+        /// Which setting (the id of its row).
+        id: String,
+        /// The value chosen.
+        value: String,
+    },
     /// Run a fresh security scan.
     RefreshSecurity,
     /// Apply the patch under review.
@@ -91,11 +98,13 @@ pub enum Tab {
     Preview,
     /// The web browser.
     Browser,
+    /// How the screen looks and what the machine is set up with.
+    Settings,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 13] = [
+    pub const ALL: [Tab; 14] = [
         Tab::Chat,
         Tab::Models,
         Tab::Approvals,
@@ -109,6 +118,7 @@ impl Tab {
         Tab::Storage,
         Tab::Preview,
         Tab::Browser,
+        Tab::Settings,
     ];
 
     /// The name shown in the tab bar.
@@ -127,6 +137,7 @@ impl Tab {
             Tab::Storage => "Storage",
             Tab::Preview => "Preview",
             Tab::Browser => "Browser",
+            Tab::Settings => "Settings",
         }
     }
 
@@ -134,6 +145,7 @@ impl Tab {
     pub const fn key(self) -> Key {
         match self {
             Tab::Browser => Key::Ctrl('b'),
+            Tab::Settings => Key::Ctrl('o'),
             t => Key::F(t as u8 + 1),
         }
     }
@@ -142,6 +154,7 @@ impl Tab {
     pub fn key_name(self) -> String {
         match self {
             Tab::Browser => "^B".into(),
+            Tab::Settings => "^O".into(),
             t => format!("F{}", t as u8 + 1),
         }
     }
@@ -222,7 +235,9 @@ mod tests {
         assert_eq!(Tab::Chat.key(), Key::F(1));
         assert_eq!(Tab::Review.key(), Key::F(6));
         assert_eq!(Tab::Studio.key(), Key::F(8));
-        assert_eq!(Tab::ALL.len(), 13);
+        assert_eq!(Tab::ALL.len(), 14);
+        assert_eq!(Tab::Settings.key(), Key::Ctrl('o'));
+        assert_eq!(Tab::Settings.key_name(), "^O");
         assert_eq!(Tab::Browser.key(), Key::Ctrl('b'));
         assert_eq!(Tab::Browser.key_name(), "^B");
         assert_eq!(Tab::Chat.key_name(), "F1");
@@ -245,7 +260,8 @@ mod tests {
                 "Player",
                 "Storage",
                 "Preview",
-                "Browser"
+                "Browser",
+                "Settings"
             ]
         );
     }

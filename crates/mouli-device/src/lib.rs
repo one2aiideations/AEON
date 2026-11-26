@@ -478,7 +478,8 @@ impl<B: Backend> Device<B> {
             | Action::DeleteStorage(_)
             | Action::Wifi
             | Action::Hosted
-            | Action::HardwareInfo) => Outcome::Host(other),
+            | Action::HardwareInfo
+            | Action::Setting { .. }) => Outcome::Host(other),
         }
     }
 
