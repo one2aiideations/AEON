@@ -10,9 +10,11 @@ pub type F = f64;
 
 pub mod aetheron_ml;
 pub mod baselines;
+pub mod cli;
 pub mod continual;
 pub mod core;
 pub mod data;
+pub mod experiments;
 pub mod linalg;
 pub mod report;
 pub mod rng;
