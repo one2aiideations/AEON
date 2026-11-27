@@ -53,6 +53,7 @@ pub mod sysinfo;
 pub mod textwrap;
 pub mod toolloop;
 pub mod ui;
+pub mod updatecheck;
 pub mod verify;
 
 use std::path::{Path, PathBuf};

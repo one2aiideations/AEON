@@ -1660,6 +1660,10 @@ where
     let mut speed = Speed::default();
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if device.is_locked() {
+        // Accounts exist: nothing but the sign-in window is on the screen until someone signs in.
+        desktop.cover(&mut device.shell);
+    }
     display.present(&shape(desktop.render(&device.shell), view))?;
     loop {
         let mut batch = Vec::new();
@@ -1682,6 +1686,16 @@ where
                 Ok(first) => batch.push(first),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if idle.due(Instant::now()) {
+                        if device.has_accounts() && !device.is_locked() {
+                            // Blanking also locks: the next person has to sign in, and does not
+                            // see the last person's windows or conversation.
+                            device.record_event("lock", "-", "idle");
+                            device.lock();
+                            history = fresh(&system_text);
+                            steps = 0;
+                            graph.new_conversation(unix_now());
+                            desktop.cover(&mut device.shell);
+                        }
                         let (bw, bh) = display.size();
                         display.present(&Canvas {
                             width: bw,
@@ -1710,6 +1724,17 @@ where
                 continue; // this key or movement only woke the screen
             }
             let action = match ev {
+                // Locked: the pointer does nothing, and keys go only to the sign-in conversation
+                // (no other window, menu, screenshot or setting can be reached).
+                Ev::Mouse(_) if device.is_locked() => Action::None,
+                Ev::Key(k) if device.is_locked() => {
+                    match device.on_key(k) {
+                        Outcome::Quit => return Ok(End::Quit),
+                        Outcome::Reboot => return Ok(End::Reboot),
+                        _ => {}
+                    }
+                    Action::None
+                }
                 Ev::Mouse(m) => desktop.on_mouse(&mut device.shell, m, now_ms()),
                 Ev::Key(Key::Ctrl('p')) => {
                     let note = match &data_root {
@@ -1884,6 +1909,29 @@ where
                     );
                     refresh_storage(&mut device.shell, data_root.as_deref());
                     device.shell.storage.message = message;
+                }
+                Action::Send(text) if text.trim_start() == "/update" => {
+                    // Asks the update server (set up in updates/update.conf on the data disk)
+                    // whether a newer release exists. It only reports; nothing is installed.
+                    device.shell.chat.push(Role::User, &text);
+                    device.record_event("update.check", "-", "started");
+                    device
+                        .shell
+                        .chat
+                        .push(Role::Notice, "Asking the update server...");
+                    let (tx, root) = (tx.clone(), data_root.clone());
+                    std::thread::spawn(move || {
+                        let note = match crate::fetch::HttpFetcher::system() {
+                            Ok(f) => crate::updatecheck::command(
+                                &f,
+                                root.as_deref(),
+                                i64::try_from(unix_now()).unwrap_or(0),
+                                "mouli",
+                            ),
+                            Err(e) => format!("Update check failed: {e}."),
+                        };
+                        let _ = tx.send(Ev::NewInput(note));
+                    });
                 }
                 Action::Send(text) if text.trim_start().starts_with("/time.zone") => {
                     device.shell.chat.push(Role::User, &text);
@@ -3527,6 +3575,89 @@ mod tests {
         let got = shots.lock().unwrap().clone();
         assert_eq!(got.first(), Some(&(800, 600)));
         assert_eq!(got.last(), Some(&(1024, 768)), "{got:?}");
+    }
+
+    /// A display that keeps a cheap fingerprint of every picture shown.
+    struct Prints(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+    impl Display for Prints {
+        fn size(&self) -> (usize, usize) {
+            (800, 600)
+        }
+        fn present(&mut self, c: &Canvas) -> io::Result<()> {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            c.pixels.hash(&mut h);
+            self.0.lock().unwrap().push(h.finish());
+            Ok(())
+        }
+    }
+
+    /// Runs the desktop on `device`, feeds it `keys`, and returns the fingerprints of the pictures.
+    fn pictures_after(device: Device<NoRoute>, keys: Vec<Key>) -> Vec<u64> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let session = Session::new(Prints(seen.clone()), tx.clone(), rx, device);
+        // One key at a time, each waited for, so every key gets its own picture.
+        let (t2, s2) = (tx.clone(), seen.clone());
+        let feeder = std::thread::spawn(move || {
+            let wait_for = |n: usize| {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while s2.lock().unwrap().len() < n && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            wait_for(1);
+            for (i, k) in keys.into_iter().enumerate() {
+                t2.send(Ev::Key(k)).unwrap();
+                wait_for(i + 2);
+            }
+            t2.send(Ev::Terminate).unwrap();
+        });
+        run(session, Echo, "p", 1000, &ModelsInfo::only("tiny")).unwrap();
+        feeder.join().unwrap();
+        let got = seen.lock().unwrap().clone();
+        got
+    }
+
+    #[test]
+    fn a_locked_device_shows_only_sign_in_and_keys_open_nothing() {
+        let dir = tmp("locked");
+        {
+            // Set up the owner's passphrase, as /passwd does.
+            let mut d = build_device(Some(&dir)).unwrap();
+            d.on_key(Key::F(1));
+            for line in ["/passwd", "correct horse battery"] {
+                for c in line.chars() {
+                    d.on_key(Key::Char(c));
+                }
+                d.on_key(Key::Enter);
+            }
+            assert!(d.has_accounts());
+        }
+        // After a restart the device is locked: the Browser and Settings keys do nothing.
+        let locked = build_device(Some(&dir)).unwrap();
+        assert!(locked.is_locked());
+        let last = |keys: Vec<Key>| {
+            *pictures_after(build_device(Some(&dir)).unwrap(), keys)
+                .last()
+                .unwrap()
+        };
+        let _ = locked;
+        // The picture after the window keys is the one after harmless keys.
+        let harmless = last(vec![Key::Esc, Key::Esc, Key::Esc, Key::Esc]);
+        let window_keys = last(vec![Key::Esc, Key::Ctrl('b'), Key::Ctrl('o'), Key::F(3)]);
+        assert_eq!(window_keys, harmless, "a locked desktop opened something");
+        // Without accounts the same keys do open windows (so the check above can fail).
+        let plain = |keys: Vec<Key>| {
+            *pictures_after(build_device(None).unwrap(), keys)
+                .last()
+                .unwrap()
+        };
+        assert_ne!(
+            plain(vec![Key::Esc, Key::Ctrl('b'), Key::Ctrl('o'), Key::F(3)]),
+            plain(vec![Key::Esc, Key::Esc, Key::Esc, Key::Esc])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
