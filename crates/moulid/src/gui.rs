@@ -1226,6 +1226,8 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
     mouli_device::add_default_roles(&mut ws);
+    // Audit records get a wall-clock time when the machine's clock looks set.
+    ws.set_clock(wall_clock);
     // What the model may do when it uses tools: the Code tools only. Changes still need approval.
     ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
@@ -1284,6 +1286,20 @@ pub struct Session<D: Display> {
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it).
+/// The time for audit records: Unix seconds, or 0 when the clock is clearly not set (a machine
+/// without a battery clock starts in 1970 until the network sets it).
+fn wall_clock() -> u64 {
+    let t = unix_now();
+    if t >= CLOCK_SET_AFTER {
+        t
+    } else {
+        0
+    }
+}
+
+/// 2024-01-01 00:00 UTC: any earlier time means the clock has not been set.
+const CLOCK_SET_AFTER: u64 = 1_704_067_200;
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1774,6 +1790,9 @@ where
                 }
                 Ev::Status(s) => {
                     desktop.system = *s;
+                    // The time zone may have been changed (/time.zone); the device judges the
+                    // hour of day in audit records with it.
+                    device.set_utc_offset_min(offset.load(Ordering::Relaxed));
                     // The status thread ticks every second: a good moment to see whether the
                     // video mode changed.
                     if display.refresh() {

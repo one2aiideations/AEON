@@ -165,6 +165,11 @@ impl Workspace {
         })
     }
 
+    /// Gives audit records from now on a wall-clock time (Unix seconds from `clock`; 0 = unknown).
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.audit.set_clock(clock);
+    }
+
     fn now(&mut self) -> u64 {
         self.tick += 1;
         self.tick
@@ -536,7 +541,11 @@ impl Workspace {
         for r in &records {
             self.ids.observe(&r.subject);
         }
+        let clock = self.audit.clock();
         self.audit = AuditLog::from_records(records);
+        if let Some(c) = clock {
+            self.audit.set_clock(c);
+        }
         Ok(())
     }
 
