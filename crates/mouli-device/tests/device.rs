@@ -1531,6 +1531,73 @@ fn five_refusals_lock_a_person_out_until_an_approver_unlocks_them() {
     assert!(chat_texts(&d).pop().unwrap().1.contains("ran note.read"));
 }
 
+/// 2026-11-27 02:30 UTC.
+fn small_hours() -> u64 {
+    1_795_824_000 + 2 * 3600 + 30 * 60
+}
+
+#[test]
+fn activity_in_the_small_hours_is_reported_judged_in_the_local_zone_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = workspace();
+    mouli_device::restore(&mut ws, dir.path()).unwrap();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.keep_state_in(dir.path()).unwrap();
+    d.set_clock(small_hours);
+    d.on_key(Key::F(1));
+    for _ in 0..3 {
+        type_line(&mut d, "/note.read");
+    }
+    let f = finding(&d, "odd-hours-gus").expect("an odd-hours finding");
+    assert_eq!(f.severity, mouli_screen::screens::Severity::Low);
+    // Records written before the clock was set (opening the session) have no time; the rest do.
+    let timed: Vec<_> = d
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .filter(|r| r.at != 0)
+        .collect();
+    assert!(timed.len() >= 3 && timed.iter().all(|r| r.at == small_hours()));
+    assert!(d.workspace().audit().records().iter().any(|r| r.at == 0));
+    assert!(
+        d.workspace().audit().verify().is_ok(),
+        "a log mixing timed and untimed records verifies"
+    );
+    // In a zone eight hours ahead it was mid-morning: no finding after the next refresh.
+    d.set_utc_offset_min(480);
+    type_line(&mut d, "/note.read");
+    assert!(finding(&d, "odd-hours-gus").is_none());
+    d.set_utc_offset_min(0);
+    type_line(&mut d, "/note.read");
+    assert!(finding(&d, "odd-hours-gus").is_some());
+    // The times are saved with the records and the chain still verifies after a restart.
+    drop(d);
+    let again = reopen_as(dir.path(), "gus");
+    assert!(again.workspace().audit().verify().is_ok());
+    assert!(again
+        .workspace()
+        .audit()
+        .records()
+        .iter()
+        .any(|r| r.at == small_hours()));
+    assert!(finding(&again, "odd-hours-gus").is_some());
+}
+
+#[test]
+fn no_clock_means_no_times_and_no_odd_hours_finding() {
+    let mut ws = workspace();
+    ws.add_role(Permissions::new("guest", &["note.read"]));
+    let mut d = Device::new(ws, Echo(vec![]), "acme", "gus", "guest").unwrap();
+    d.on_key(Key::F(1));
+    for _ in 0..5 {
+        type_line(&mut d, "/note.read");
+    }
+    assert!(d.workspace().audit().records().iter().all(|r| r.at == 0));
+    assert!(finding(&d, "odd-hours-gus").is_none());
+}
+
 #[test]
 fn a_burst_of_refusals_between_successes_is_reported_as_an_anomaly() {
     let mut ws = workspace();

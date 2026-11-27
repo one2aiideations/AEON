@@ -51,9 +51,11 @@ fn unesc(s: &str) -> Result<String, String> {
     Ok(o)
 }
 
+/// One record as a line. The wall-clock time is a ninth field written only when it is known, so
+/// a log without times is byte-for-byte what earlier versions wrote.
 fn record_line(r: &AuditRecord) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    let mut line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         r.seq,
         r.tick,
         esc(&r.actor),
@@ -62,17 +64,27 @@ fn record_line(r: &AuditRecord) -> String {
         esc(&r.outcome),
         r.prev,
         r.hash
-    )
+    );
+    if r.at != 0 {
+        line.push_str(&format!("\t{}", r.at));
+    }
+    line.push('\n');
+    line
 }
 
 fn parse_record(line: &str) -> Result<AuditRecord, String> {
     let f: Vec<&str> = line.split('\t').collect();
-    if f.len() != 8 {
+    if f.len() != 8 && f.len() != 9 {
         return Err("wrong number of fields".into());
     }
+    let at = match f.get(8) {
+        Some(t) => t.parse().map_err(|_| "bad time")?,
+        None => 0,
+    };
     Ok(AuditRecord {
         seq: f[0].parse().map_err(|_| "bad seq")?,
         tick: f[1].parse().map_err(|_| "bad tick")?,
+        at,
         actor: unesc(f[2])?,
         action: unesc(f[3])?,
         subject: unesc(f[4])?,
@@ -465,6 +477,7 @@ mod tests {
         let r = AuditRecord {
             seq: 3,
             tick: 4,
+            at: 0,
             actor: "a\tb".into(),
             action: "act".into(),
             subject: "s\nt".into(),
@@ -473,6 +486,19 @@ mod tests {
             hash: "1".repeat(64),
         };
         assert_eq!(parse_record(record_line(&r).trim_end()).unwrap(), r);
+        assert_eq!(
+            record_line(&r).matches('\t').count(),
+            7,
+            "no time, no extra field"
+        );
+        let timed = AuditRecord {
+            at: 1_800_000_000,
+            ..r
+        };
+        let line = record_line(&timed);
+        assert_eq!(line.matches('\t').count(), 8);
+        assert_eq!(parse_record(line.trim_end()).unwrap(), timed);
+        assert!(parse_record(&format!("{}\tx", line.trim_end())).is_err());
         assert!(parse_record("1\t2\t3").is_err());
         assert!(parse_record("x\t2\ta\tb\tc\td\te\tf").is_err());
     }

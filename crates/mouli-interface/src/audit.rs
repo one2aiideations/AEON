@@ -10,6 +10,10 @@ pub struct AuditRecord {
     pub seq: u64,
     /// Logical time.
     pub tick: u64,
+    /// Wall-clock time in Unix seconds, or 0 when it was not known (no clock, or a clock that
+    /// had not been set). It is part of the hash only when it is not 0, so logs written before
+    /// this field existed still verify; a record cannot lose its time without breaking the chain.
+    pub at: u64,
     /// Who acted.
     pub actor: String,
     /// What was attempted.
@@ -25,10 +29,13 @@ pub struct AuditRecord {
 }
 
 fn digest(r: &AuditRecord) -> String {
-    let text = format!(
+    let mut text = format!(
         "{}|{}|{}|{}|{}|{}|{}",
         r.seq, r.tick, r.actor, r.action, r.subject, r.outcome, r.prev
     );
+    if r.at != 0 {
+        text.push_str(&format!("|{}", r.at));
+    }
     hex(&Sha256::digest(text.as_bytes()))
 }
 
@@ -36,6 +43,7 @@ fn digest(r: &AuditRecord) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct AuditLog {
     records: Vec<AuditRecord>,
+    clock: Option<fn() -> u64>,
 }
 
 impl AuditLog {
@@ -50,7 +58,21 @@ impl AuditLog {
     /// as it is so the damage stays visible.
     #[must_use]
     pub fn from_records(records: Vec<AuditRecord>) -> Self {
-        Self { records }
+        Self {
+            records,
+            clock: None,
+        }
+    }
+
+    /// Gives new records a wall-clock time from `clock` (Unix seconds; 0 means "not known").
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = Some(clock);
+    }
+
+    /// The clock in use, if any (kept when a saved log replaces this one).
+    #[must_use]
+    pub fn clock(&self) -> Option<fn() -> u64> {
+        self.clock
     }
 
     /// Append a record and return it.
@@ -69,6 +91,7 @@ impl AuditLog {
         let mut r = AuditRecord {
             seq: self.records.len() as u64,
             tick,
+            at: self.clock.map_or(0, |c| c()),
             actor: actor.into(),
             action: action.into(),
             subject: subject.into(),
@@ -103,6 +126,11 @@ impl AuditLog {
     }
 
     #[cfg(test)]
+    fn set_at(&mut self, i: usize, at: u64) {
+        self.records[i].at = at;
+    }
+
+    #[cfg(test)]
     fn tamper(&mut self, i: usize) {
         self.records[i].outcome = "ok".into();
     }
@@ -123,5 +151,39 @@ mod tests {
         assert_eq!(l.records()[1].prev, l.records()[0].hash);
         l.tamper(0);
         assert_eq!(l.verify(), Err(0));
+    }
+
+    #[test]
+    fn a_time_is_covered_by_the_hash_and_old_records_still_verify() {
+        // Without a clock the record is hashed exactly as before the time field existed.
+        let mut old = AuditLog::new();
+        old.append(1, "u", "a", "s", "ok");
+        assert_eq!(old.records()[0].at, 0);
+        let legacy = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            0,
+            1,
+            "u",
+            "a",
+            "s",
+            "ok",
+            "0".repeat(64)
+        );
+        assert_eq!(
+            old.records()[0].hash,
+            hex(&Sha256::digest(legacy.as_bytes()))
+        );
+        // With a clock the time is part of the hash.
+        let mut l = AuditLog::new();
+        l.set_clock(|| 1_800_000_000);
+        l.append(1, "u", "a", "s", "ok");
+        l.append(2, "u", "a", "s", "ok");
+        assert_eq!(l.records()[0].at, 1_800_000_000);
+        assert!(l.verify().is_ok());
+        l.set_at(1, 1_800_000_999); // moving a record in time breaks the chain
+        assert_eq!(l.verify(), Err(1));
+        l.set_at(1, 0); // so does removing its time
+        assert_eq!(l.verify(), Err(1));
+        assert!(l.clock().is_some());
     }
 }

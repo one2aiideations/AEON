@@ -75,6 +75,8 @@ pub struct Device<B: Backend> {
     accounts_error: Option<String>,
     locked: bool,
     export_dir: Option<std::path::PathBuf>,
+    /// Minutes east of UTC, for judging the hour of day in audit records.
+    utc_offset_min: i32,
     #[cfg(feature = "office")]
     apps: Option<Apps>,
     #[cfg(feature = "office")]
@@ -118,6 +120,7 @@ impl<B: Backend> Device<B> {
             accounts_error: None,
             locked: false,
             export_dir: None,
+            utc_offset_min: 0,
             #[cfg(feature = "office")]
             apps: None,
             #[cfg(feature = "office")]
@@ -395,6 +398,17 @@ impl<B: Backend> Device<B> {
     pub fn record_event(&mut self, action: &str, subject: &str, outcome: &str) {
         self.audit_event(action, subject, outcome);
         self.refresh();
+    }
+
+    /// Gives audit records from now on a wall-clock time (see [`Workspace::set_clock`]).
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.ws.set_clock(clock);
+    }
+
+    /// Sets the time zone (minutes east of UTC) used to tell what hour of the day a record was
+    /// written. Findings are worked out again at the next refresh.
+    pub fn set_utc_offset_min(&mut self, minutes: i32) {
+        self.utc_offset_min = minutes;
     }
 
     /// Sets the folder `/save` writes answers into (created when first used).
@@ -941,7 +955,7 @@ impl<B: Backend> Device<B> {
             .collect();
         self.shell.audit.set(records, chain);
 
-        let (score, findings) = security::assess(&self.ws);
+        let (score, findings) = security::assess(&self.ws, self.utc_offset_min);
         self.shell.security.set(score, findings);
         #[cfg(feature = "office")]
         {

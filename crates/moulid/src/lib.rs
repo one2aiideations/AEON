@@ -41,6 +41,7 @@ pub mod gguf_info;
 pub mod gui;
 pub mod hosted;
 pub mod http;
+pub mod layout;
 pub mod lineedit;
 pub mod models;
 pub mod persist;

@@ -182,6 +182,7 @@ mod tests {
         AuditRecord {
             seq,
             tick: seq,
+            at: 0,
             actor: actor.into(),
             action: action.into(),
             subject: subject.into(),

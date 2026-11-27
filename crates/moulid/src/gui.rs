@@ -307,54 +307,31 @@ impl<W: Write + Seek> Display for Framebuffer<W> {
 
 const EV_KEY: u16 = 1;
 
-/// Printable keys of a US keyboard by evdev code: `(code, plain, shifted)`.
-const PRINTABLE: &[(u16, char, char)] = &[
-    (2, '1', '!'),
-    (3, '2', '@'),
-    (4, '3', '#'),
-    (5, '4', '$'),
-    (6, '5', '%'),
-    (7, '6', '^'),
-    (8, '7', '&'),
-    (9, '8', '*'),
-    (10, '9', '('),
-    (11, '0', ')'),
-    (12, '-', '_'),
-    (13, '=', '+'),
-    (26, '[', '{'),
-    (27, ']', '}'),
-    (39, ';', ':'),
-    (40, '\'', '"'),
-    (41, '`', '~'),
-    (43, '\\', '|'),
-    (51, ',', '<'),
-    (52, '.', '>'),
-    (53, '/', '?'),
-    (57, ' ', ' '),
-];
-
-/// The letter on a key, by evdev code.
-fn letter(code: u16) -> Option<char> {
-    const ROWS: [(u16, &str); 3] = [(16, "qwertyuiop"), (30, "asdfghjkl"), (44, "zxcvbnm")];
-    ROWS.iter().find_map(|(first, row)| {
-        let i = usize::from(code.checked_sub(*first)?);
-        row.chars().nth(i)
-    })
-}
-
-/// Turns evdev key records into [`Key`]s for a US layout, tracking Shift, Ctrl and Caps Lock.
+/// Turns evdev key records into [`Key`]s, tracking Shift, Ctrl, AltGr and Caps Lock. The
+/// characters come from a keyboard layout: the one given to [`KeyDecoder::with_layout`], or else
+/// the desktop's current one (see [`crate::layout`]).
 #[derive(Debug, Clone, Default)]
 pub struct KeyDecoder {
     buf: Vec<u8>,
     shift: bool,
     ctrl: bool,
+    altgr: bool,
     caps: bool,
+    layout: Option<crate::layout::Layout>,
 }
 
 impl KeyDecoder {
     /// A decoder with no keys held.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A decoder fixed to one layout, whatever the desktop's setting.
+    pub fn with_layout(layout: crate::layout::Layout) -> Self {
+        Self {
+            layout: Some(layout),
+            ..Self::default()
+        }
     }
 
     /// Feeds bytes (in any split) and returns the keys they complete.
@@ -385,6 +362,10 @@ impl KeyDecoder {
                 self.ctrl = value != 0;
                 return None;
             }
+            100 => {
+                self.altgr = value != 0;
+                return None;
+            }
             58 => {
                 if value == 1 {
                     self.caps = !self.caps;
@@ -396,17 +377,20 @@ impl KeyDecoder {
         if value == 0 {
             return None;
         }
-        if let Some(c) = letter(code) {
-            return Some(if self.ctrl {
-                Key::Ctrl(c)
-            } else if self.shift ^ self.caps {
-                Key::Char(c.to_ascii_uppercase())
-            } else {
-                Key::Char(c)
-            });
+        let layout = self.layout.unwrap_or_else(crate::layout::current);
+        if self.ctrl {
+            // Ctrl with a letter key: the letter the layout puts there.
+            if let Some(c) = layout
+                .char_for(code, false, false)
+                .filter(char::is_ascii_alphabetic)
+            {
+                return Some(Key::Ctrl(c.to_ascii_lowercase()));
+            }
         }
-        if let Some((_, plain, shifted)) = PRINTABLE.iter().find(|(c, _, _)| *c == code) {
-            return Some(Key::Char(if self.shift { *shifted } else { *plain }));
+        // Caps Lock acts like Shift on keys that carry a letter (not with AltGr).
+        let shift = self.shift ^ (self.caps && !self.altgr && layout.is_letter(code));
+        if let Some(c) = layout.char_for(code, shift, self.altgr) {
+            return Some(Key::Char(c));
         }
         Some(match code {
             1 => Key::Esc,
@@ -849,6 +833,7 @@ impl IdleBlank {
 }
 
 const IDLE_KEY: &str = "view.idle";
+const LAYOUT_KEY: &str = "input.layout";
 const DEFAULT_IDLE_MIN: u32 = 10;
 
 fn load_idle(store: Option<&crate::persist::Store>) -> u32 {
@@ -857,6 +842,45 @@ fn load_idle(store: Option<&crate::persist::Store>) -> u32 {
         .and_then(|v| v.parse().ok())
         .filter(|m| [0, 5, 10, 30].contains(m))
         .unwrap_or(DEFAULT_IDLE_MIN)
+}
+
+/// Switches the keyboard layout by name (as typed, or the label from the Settings row), keeps the
+/// choice, and says what happened.
+fn layout_command(arg: &str, store: Option<&crate::persist::Store>) -> String {
+    use crate::layout::{self, Layout};
+    let arg = arg.trim();
+    let list = layout::ALL
+        .iter()
+        .map(|l| l.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if arg.is_empty() {
+        return format!(
+            "Keyboard layout: {}. Choose one of: {list}. Example: /keymap de",
+            layout::current().label
+        );
+    }
+    let found = Layout::by_name(arg).or_else(|| {
+        layout::ALL
+            .iter()
+            .copied()
+            .find(|l| l.label.eq_ignore_ascii_case(arg))
+    });
+    match found {
+        Some(l) => {
+            layout::set_current(l.name);
+            let saved = save_view(store, LAYOUT_KEY, l.name);
+            format!("Keyboard layout: {}.{saved}", l.label)
+        }
+        None => format!("Unknown layout {arg:?}. Choose one of: {list}."),
+    }
+}
+
+/// The layout the person chose before, if one was kept.
+fn load_layout(store: Option<&crate::persist::Store>) -> Option<crate::layout::Layout> {
+    store
+        .and_then(|s| s.settings().get(LAYOUT_KEY).cloned())
+        .and_then(|v| crate::layout::Layout::by_name(&v))
 }
 
 fn idle_label(minutes: u32) -> String {
@@ -995,6 +1019,13 @@ fn settings_rows(
             idle_label(idle_min),
             &["off", "5 min", "10 min", "30 min"],
             "Blanks after no key or mouse use; any key wakes it (no lock yet: there is no password).",
+        ),
+        row(
+            "layout",
+            "Keyboard layout",
+            crate::layout::current().label.into(),
+            &crate::layout::ALL.map(|l| l.label),
+            "Which characters the keys type (also /keymap de, or mouli.keymap=de at boot). Takes effect at once.",
         ),
         row(
             "memory",
@@ -1195,6 +1226,8 @@ pub fn build_device(data_dir: Option<&Path>) -> Result<Device<NoRoute>, String> 
     let fail = |e: &dyn std::fmt::Display| format!("cannot set up the applications: {e}");
     let mut ws = Workspace::new(Policy::default(), Default::default()).map_err(|e| fail(&e))?;
     mouli_device::add_default_roles(&mut ws);
+    // Audit records get a wall-clock time when the machine's clock looks set.
+    ws.set_clock(wall_clock);
     // What the model may do when it uses tools: the Code tools only. Changes still need approval.
     ws.add_role(Permissions::new("agent", &["code.*"]));
     ws.add_model(ModelEntry {
@@ -1253,6 +1286,20 @@ pub struct Session<D: Display> {
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it).
+/// The time for audit records: Unix seconds, or 0 when the clock is clearly not set (a machine
+/// without a battery clock starts in 1970 until the network sets it).
+fn wall_clock() -> u64 {
+    let t = unix_now();
+    if t >= CLOCK_SET_AFTER {
+        t
+    } else {
+        0
+    }
+}
+
+/// 2024-01-01 00:00 UTC: any earlier time means the clock has not been set.
+const CLOCK_SET_AFTER: u64 = 1_704_067_200;
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1326,6 +1373,10 @@ pub fn start(data_dir: Option<&Path>) -> Result<Session<Framebuffer<File>>, Stri
     s.saving = data_dir.is_some();
     s.inputs = inputs;
     s.settings = data_dir.and_then(|d| crate::persist::Store::open(d).ok());
+    // A layout the person chose wins over the boot default (mouli.keymap=, set by main).
+    if let Some(l) = load_layout(s.settings.as_ref()) {
+        crate::layout::set_current(l.name);
+    }
     if let Some(d) = data_dir {
         s.graph = Recorder::open(d, unix_now());
         s.data_root = Some(d.to_path_buf());
@@ -1739,6 +1790,9 @@ where
                 }
                 Ev::Status(s) => {
                     desktop.system = *s;
+                    // The time zone may have been changed (/time.zone); the device judges the
+                    // hour of day in audit records with it.
+                    device.set_utc_offset_min(offset.load(Ordering::Relaxed));
                     // The status thread ticks every second: a good moment to see whether the
                     // video mode changed.
                     if display.refresh() {
@@ -1864,9 +1918,16 @@ where
                                 _ => "Choose off, 5, 10 or 30 minutes.".into(),
                             }
                         }
+                        "layout" => layout_command(&value, settings.as_ref()),
                         _ => "That setting cannot be changed here.".into(),
                     };
                     device.shell.settings.message = note;
+                }
+                Action::Send(text) if text.trim_start().starts_with("/keymap") => {
+                    device.shell.chat.push(Role::User, &text);
+                    let arg = text.trim_start()["/keymap".len()..].to_string();
+                    let note = layout_command(&arg, settings.as_ref());
+                    device.shell.chat.push(Role::Notice, &note);
                 }
                 Action::Send(text) if text.trim_start().starts_with("/contrast") => {
                     device.shell.chat.push(Role::User, &text);
@@ -2274,7 +2335,7 @@ mod tests {
 
     #[test]
     fn letters_digits_and_symbols() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         assert_eq!(d.feed(&press(16)), vec![Key::Char('q')]);
         assert_eq!(d.feed(&press(30)), vec![Key::Char('a')]);
         assert_eq!(d.feed(&press(50)), vec![Key::Char('m')]);
@@ -2286,7 +2347,7 @@ mod tests {
 
     #[test]
     fn every_letter_key_gives_its_own_letter() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         let mut got = String::new();
         for code in (16..=25).chain(30..=38).chain(44..=50) {
             for k in d.feed(&press(code)) {
@@ -2300,7 +2361,7 @@ mod tests {
 
     #[test]
     fn shift_caps_and_ctrl() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         let shifted = [rec(1, 42, 1), rec(1, 30, 1), rec(1, 30, 0), rec(1, 42, 0)].concat();
         assert_eq!(d.feed(&shifted), vec![Key::Char('A')]);
         assert_eq!(
@@ -2321,8 +2382,41 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_decides_the_character_and_altgr_and_caps_follow_it() {
+        use crate::layout::{DE, FR, GB};
+        let with = |codes: &[(u16, i32)]| -> Vec<u8> {
+            codes.iter().flat_map(|&(c, v)| rec(1, c, v)).collect()
+        };
+        // German: the key that is Z on a US keyboard types y; AltGr+Q is @.
+        let mut d = KeyDecoder::with_layout(DE);
+        assert_eq!(d.feed(&press(44)), vec![Key::Char('y')]);
+        assert_eq!(
+            d.feed(&with(&[(100, 1), (16, 1), (16, 0), (100, 0)])),
+            vec![Key::Char('@')]
+        );
+        assert_eq!(d.feed(&press(16)), vec![Key::Char('q')], "AltGr released");
+        // French: Caps Lock capitalises letters but the digit row still types symbols.
+        let mut d = KeyDecoder::with_layout(FR);
+        d.feed(&press(58));
+        assert_eq!(d.feed(&press(16)), vec![Key::Char('A')]);
+        assert_eq!(d.feed(&press(2)), vec![Key::Char('&')]);
+        // Ctrl follows the letter the layout puts on the key: Ctrl on the key marked Q in
+        // French (US A position, code 30) is Ctrl-q, which quits the desktop.
+        let ctrl = with(&[(29, 1), (30, 1), (30, 0), (29, 0)]);
+        assert_eq!(d.feed(&ctrl), vec![Key::Ctrl('q')]);
+        // UK: £ on Shift-3.
+        let mut d = KeyDecoder::with_layout(GB);
+        assert_eq!(
+            d.feed(&with(&[(42, 1), (4, 1), (4, 0), (42, 0)])),
+            vec![Key::Char('£')]
+        );
+        // AltGr alone and unknown keys give nothing.
+        assert!(d.feed(&with(&[(100, 1), (100, 0)])).is_empty());
+    }
+
+    #[test]
     fn special_and_function_keys() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         for (code, key) in [
             (28, Key::Enter),
             (1, Key::Esc),
@@ -2348,7 +2442,7 @@ mod tests {
 
     #[test]
     fn repeats_count_releases_and_unknown_keys_do_not() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         assert_eq!(d.feed(&rec(1, 30, 2)), vec![Key::Char('a')], "auto-repeat");
         assert!(d.feed(&rec(1, 30, 0)).is_empty(), "release");
         assert!(d.feed(&press(116)).is_empty(), "power key is ignored");
@@ -2358,7 +2452,7 @@ mod tests {
 
     #[test]
     fn records_split_across_reads_are_joined() {
-        let mut d = KeyDecoder::new();
+        let mut d = KeyDecoder::with_layout(crate::layout::US);
         let bytes = press(30);
         let (a, b) = bytes.split_at(10);
         assert!(d.feed(a).is_empty());
@@ -3159,6 +3253,52 @@ mod tests {
         assert_eq!(load_idle(Some(&store)), 10, "an unknown value falls back");
         assert_eq!(idle_label(0), "off");
         assert_eq!(idle_label(5), "5 min");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_keyboard_layout_command_switches_keeps_and_reloads_the_choice() {
+        let _guard = crate::layout::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tmp("layout");
+        let store = crate::persist::Store::open(&dir).unwrap();
+        crate::layout::set_current("us");
+        assert!(load_layout(Some(&store)).is_none());
+        assert!(layout_command("", Some(&store)).contains("US English"));
+        // By name, then by the label the Settings row shows.
+        let said = layout_command("de", Some(&store));
+        assert!(said.starts_with("Keyboard layout: German."), "{said}");
+        assert_eq!(crate::layout::current().name, "de");
+        assert_eq!(load_layout(Some(&store)).map(|l| l.name), Some("de"));
+        layout_command("French", Some(&store));
+        assert_eq!(crate::layout::current().name, "fr");
+        // A name that is not known changes nothing.
+        let said = layout_command("klingon", Some(&store));
+        assert!(said.contains("Unknown layout"), "{said}");
+        assert_eq!(crate::layout::current().name, "fr");
+        assert_eq!(load_layout(Some(&store)).map(|l| l.name), Some("fr"));
+        // Without a data disk it works but says it will be forgotten.
+        assert!(layout_command("es", None).contains("forgotten"));
+        // The Settings screen offers every layout.
+        let rows = settings_rows(
+            &ViewOpts {
+                contrast: false,
+                scale: 1,
+            },
+            1,
+            &ModelsInfo::only("m"),
+            &AtomicI32::new(0),
+            "owner",
+            10,
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.id == "layout")
+            .expect("a layout row");
+        assert_eq!(row.choices.len(), crate::layout::ALL.len());
+        assert_eq!(row.value, "Spanish");
+        crate::layout::set_current("us");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

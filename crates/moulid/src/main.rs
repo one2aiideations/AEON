@@ -457,6 +457,9 @@ fn interactive(a: &Args, plan: &Plan, pid1: bool, store: Option<&Store>) -> Exit
                     reply_tokens,
                     stop: moulid::reply::stops(&cmdline),
                 };
+                if let Some(l) = moulid::layout::from_cmdline(&cmdline) {
+                    moulid::layout::set_current(l.name);
+                }
                 let text_only = cmdline_has(&system::kernel_cmdline(), "mouli.text=1");
                 let session = if text_only {
                     None
