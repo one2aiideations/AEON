@@ -13,6 +13,7 @@ pub mod input;
 pub mod menu;
 pub mod paint;
 mod render;
+pub use render::splash;
 pub mod status;
 pub mod theme;
 pub mod wm;

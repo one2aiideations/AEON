@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot an ISO in QEMU with a virtual display and check that something is drawn on the screen.
 
-  screencheck.py ISO bios|uefi OUT_PREFIX [SECONDS]
+  screencheck.py ISO bios|uefi OUT_PREFIX [SECONDS] [--expect-desktop]
 
 The serial-console boot tests cannot see a black screen, which is what a real PC shows when the
 kernel has no working display console. This takes screenshots (QEMU `screendump`), saves the last
@@ -30,6 +30,20 @@ def lit(pix):
     return n
 
 
+WALLPAPER = (0x26, 0x32, 0x38)  # the desktop's background colour (mouli-desk theme::WALLPAPER)
+DESKTOP_MIN = 0.15  # share of the screen the wallpaper must cover when the desktop is up
+
+
+def wallpaper_share(pix):
+    """The fraction of pixels that are exactly the desktop wallpaper colour."""
+    n = len(pix) // 3
+    if n == 0:
+        return 0.0
+    want = bytes(WALLPAPER)
+    hits = sum(1 for i in range(0, n * 3, 3) if pix[i:i + 3] == want)
+    return hits / n
+
+
 def write_png(path, w, h, pix):
     raw = b"".join(b"\0" + pix[y * w * 3:(y + 1) * w * 3] for y in range(h))
 
@@ -43,8 +57,10 @@ def write_png(path, w, h, pix):
 
 
 def main():
-    iso, fw, out = sys.argv[1:4]
-    seconds = int(sys.argv[4]) if len(sys.argv) > 4 else 120
+    argv = [a for a in sys.argv[1:] if a != "--expect-desktop"]
+    expect_desktop = len(argv) != len(sys.argv) - 1
+    iso, fw, out = argv[0:3]
+    seconds = int(argv[3]) if len(argv) > 3 else 120
     tmp = tempfile.mkdtemp()
     sock = os.path.join(tmp, "mon.sock")
     accel = ["-enable-kvm", "-cpu", "host"] if os.access("/dev/kvm", os.W_OK) else ["-cpu", "max"]
@@ -77,8 +93,9 @@ def main():
             if os.path.exists(path) and os.path.getsize(path) > 100:
                 w, h, pix = read_ppm(path)
                 n = lit(pix)
-                print(f"[{int(time.time() - t0):4d}s] {w}x{h} lit pixels: {n}", flush=True)
-                last = (w, h, pix, n)
+                share = wallpaper_share(pix)
+                print(f"[{int(time.time() - t0):4d}s] {w}x{h} lit pixels: {n}, desktop wallpaper: {share:.0%}", flush=True)
+                last = (w, h, pix, n, share)
             shot += 1
         if last is None:
             sys.exit(f"{fw}: no screenshot could be taken")
@@ -91,9 +108,16 @@ def main():
         if last[3] < LIT_MIN:
             sys.exit(f"{fw}: the screen is (nearly) black after {seconds}s: {last[3]} lit pixels")
         print(f"{fw}: the screen shows output ({last[3]} lit pixels)")
+        if last[4] >= DESKTOP_MIN:
+            print(f"{fw}: the desktop is showing ({last[4]:.0%} of the screen is wallpaper)")
+        elif expect_desktop:
+            sys.exit(f"{fw}: the desktop is not showing ({last[4]:.0%} wallpaper, need {DESKTOP_MIN:.0%})")
+        else:
+            print(f"{fw}: the desktop is not showing ({last[4]:.0%} wallpaper); not required here")
     finally:
         qemu.kill()
         qemu.wait()
 
 
-main()
+if __name__ == "__main__":
+    main()

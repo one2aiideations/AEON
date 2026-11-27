@@ -13,6 +13,49 @@ use mouli_screen::screen::Tab;
 use mouli_screen::shell::Shell;
 use mouli_screen::typeface::{ui, ui_medium, ui_small};
 
+/// The picture shown while the system starts: the name large in the middle of the wallpaper, a
+/// line of text under it, and a thin bar showing `progress` (0 to 100) of the way through.
+pub fn splash(width: usize, height: usize, line: &str, progress: u32) -> Canvas {
+    let mut c = canvas(width, height, WALLPAPER);
+    let (w, h) = (width as i32, height as i32);
+    // The name, drawn small and enlarged so it stays sharp at any size.
+    let face = ui_medium();
+    let word = "MOULI";
+    let mut small = canvas(
+        (text_width(face, word) + 2) as usize,
+        face.line_height as usize + 2,
+        WALLPAPER,
+    );
+    text(&mut small, face, 1, 1, word, ON_SURFACE);
+    let k = (width / small.width.max(1) / 4).clamp(1, 8);
+    let big = small.scaled(k);
+    let (bw, bh) = (big.width as i32, big.height as i32);
+    let (x, y) = ((w - bw) / 2, (h - bh) / 2 - 24);
+    blit(&mut c, &big, x, y, Rect::new(0, 0, w, h));
+    // The line of text.
+    let lw = text_width(ui(), line);
+    text(
+        &mut c,
+        ui(),
+        (w - lw) / 2,
+        y + bh + 20,
+        line,
+        ON_SURFACE_DIM,
+    );
+    // The bar.
+    let bar_w = (w / 3).max(120);
+    let bar = Rect::new(
+        (w - bar_w) / 2,
+        y + bh + 20 + ui().line_height + 14,
+        bar_w,
+        4,
+    );
+    fill(&mut c, bar, OUTLINE);
+    let done = (i64::from(bar_w) * i64::from(progress.min(100)) / 100) as i32;
+    fill(&mut c, Rect::new(bar.x, bar.y, done, 4), PRIMARY_FILL);
+    c
+}
+
 /// A filled primary button with a centred label.
 fn button(c: &mut Canvas, r: Rect, label: &str) {
     fill(c, r, PRIMARY_FILL);
@@ -225,5 +268,30 @@ impl Desktop {
         let (px, py) = self.pointer;
         sprite(&mut c, px, py, &POINTER, &POINTER_PALETTE, 1);
         c
+    }
+}
+
+#[cfg(test)]
+mod splash_tests {
+    use super::*;
+
+    #[test]
+    fn the_splash_fills_the_screen_shows_the_name_and_the_progress() {
+        let c = splash(800, 600, "Starting", 50);
+        assert_eq!((c.width, c.height), (800, 600));
+        let at = |pct, colour| {
+            let c = splash(800, 600, "Starting", pct);
+            c.pixels.iter().filter(|&&p| p == colour).count()
+        };
+        assert!(at(50, ON_SURFACE) > 100, "the name is drawn");
+        assert_eq!(at(0, PRIMARY_FILL), 0);
+        assert!(at(50, PRIMARY_FILL) > 0 && at(100, PRIMARY_FILL) > at(50, PRIMARY_FILL));
+        assert_eq!(
+            at(500, PRIMARY_FILL),
+            at(100, PRIMARY_FILL),
+            "progress is capped"
+        );
+        // A tiny screen does not panic.
+        let _ = splash(10, 10, "x", 10);
     }
 }
