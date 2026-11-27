@@ -151,6 +151,23 @@ impl Desktop {
         self.menu_press = false;
     }
 
+    /// Clears the desktop for a locked device: every window is closed, any dialog or open menu is
+    /// dropped, and only the Chat window is left, filling the desktop, so that nothing from before
+    /// the lock stays on the screen.
+    pub fn cover(&mut self, shell: &mut Shell) {
+        self.wm.windows.clear();
+        self.alert = None;
+        self.menu.open = None;
+        self.menu.hover = None;
+        self.press = None;
+        self.menu_press = false;
+        self.selected_icon = None;
+        self.open(shell, Tab::Chat);
+        if let Some(id) = self.wm.top().filter(|w| !w.zoomed).map(|w| w.id) {
+            self.wm.toggle_zoom(id);
+        }
+    }
+
     /// Where icon `i` sits. Icons run down the right edge; when they do not all fit in one column
     /// they continue in the next column to the left.
     pub fn icon_rect(&self, i: usize) -> crate::geom::Rect {
@@ -630,6 +647,27 @@ mod tests {
         let c = d.render(&sh);
         assert_eq!((c.width, c.height), (1280, 1024));
         let _ = &mut sh;
+    }
+
+    #[test]
+    fn covering_leaves_only_a_zoomed_chat_window() {
+        let (mut d, mut sh) = setup();
+        d.open(&mut sh, Tab::Settings);
+        d.open(&mut sh, Tab::Browser);
+        d.open(&mut sh, Tab::Chat);
+        d.show_power_dialog();
+        d.menu.open = Some(0);
+        d.selected_icon = Some(1);
+        d.cover(&mut sh);
+        assert_eq!(d.wm.windows.len(), 1);
+        assert_eq!(d.wm.windows[0].tab, Tab::Chat);
+        assert!(d.wm.windows[0].zoomed);
+        assert!(d.alert.is_none() && d.menu.open.is_none() && d.selected_icon.is_none());
+        assert_eq!(sh.active, Tab::Chat);
+        // Doing it again changes nothing (does not un-zoom).
+        d.cover(&mut sh);
+        assert_eq!(d.wm.windows.len(), 1);
+        assert!(d.wm.windows[0].zoomed);
     }
 
     fn setup() -> (Desktop, Shell) {
