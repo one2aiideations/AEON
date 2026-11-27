@@ -339,8 +339,31 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let t = std::thread::spawn(move || {
             let (mut c, _) = l.accept().unwrap();
+            // Read the whole request (headers, then the body) before answering; answering and
+            // closing with unread request bytes can reset the connection under load.
+            let mut req = Vec::new();
             let mut buf = [0u8; 4096];
-            let _ = c.read(&mut buf).unwrap();
+            loop {
+                let n = c.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let want = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= end + 4 + want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
             let body = "data: {\"delta\":{\"content\":\"Hi\"}}\n\ndata: {\"delta\":{\"content\":\" there\"}}\n\ndata: [DONE]\n\n";
             write!(
                 c,
