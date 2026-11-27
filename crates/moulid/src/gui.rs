@@ -1910,6 +1910,29 @@ where
                     refresh_storage(&mut device.shell, data_root.as_deref());
                     device.shell.storage.message = message;
                 }
+                Action::Send(text) if text.trim_start() == "/update" => {
+                    // Asks the update server (set up in updates/update.conf on the data disk)
+                    // whether a newer release exists. It only reports; nothing is installed.
+                    device.shell.chat.push(Role::User, &text);
+                    device.record_event("update.check", "-", "started");
+                    device
+                        .shell
+                        .chat
+                        .push(Role::Notice, "Asking the update server...");
+                    let (tx, root) = (tx.clone(), data_root.clone());
+                    std::thread::spawn(move || {
+                        let note = match crate::fetch::HttpFetcher::system() {
+                            Ok(f) => crate::updatecheck::command(
+                                &f,
+                                root.as_deref(),
+                                i64::try_from(unix_now()).unwrap_or(0),
+                                "mouli",
+                            ),
+                            Err(e) => format!("Update check failed: {e}."),
+                        };
+                        let _ = tx.send(Ev::NewInput(note));
+                    });
+                }
                 Action::Send(text) if text.trim_start().starts_with("/time.zone") => {
                     device.shell.chat.push(Role::User, &text);
                     let arg = text.trim_start()["/time.zone".len()..].to_string();
